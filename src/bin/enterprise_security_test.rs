@@ -2,6 +2,7 @@ use anyhow::Result;
 
 #[derive(Debug)]
 struct AttackTest {
+    #[allow(dead_code)]  // Used for debugging and future test expansion
     name: String,
     attack_type: String,
     payloads: Vec<String>,

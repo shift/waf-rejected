@@ -324,6 +324,7 @@ impl Config {
     }
     
     /// Get the upstream URI as a hyper::Uri
+    #[cfg_attr(not(test), allow(dead_code))]  // Used in tests and future API compatibility
     pub fn upstream_uri(&self) -> anyhow::Result<http::Uri> {
         self.upstream_uri.parse()
             .map_err(|e| anyhow::anyhow!("Invalid upstream URI '{}': {}", self.upstream_uri, e))
@@ -333,7 +334,6 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
 
     #[test]
     fn test_default_config() {
