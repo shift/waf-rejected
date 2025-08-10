@@ -1,0 +1,41 @@
+[
+{
+  "event": {
+    "blocked": true,
+    "event_type": "sql_injection_attempt",
+    "request_path": "/login",
+    "severity": "high",
+    "source_ip": "192.168.1.100",
+    "user_agent": "sqlmap/1.0"
+  },
+  "timestamp": "2025-08-09_22:10:00.123_UTC"
+},
+{
+  "event": {
+    "blocked": true,
+    "event_type": "xss_attempt",
+    "request_path": "/search",
+    "severity": "medium",
+    "source_ip": "10.0.0.50"
+  },
+  "timestamp": "2025-08-09_22:15:00.456_UTC"
+},
+{
+  "event": {
+    "blocked": true,
+    "event_type": "rate_limit_exceeded",
+    "severity": "low",
+    "source_ip": "203.0.113.42"
+  },
+  "timestamp": "2025-08-09_22:20:00.789_UTC"
+},
+{
+  "event": {
+    "blocked": true,
+    "event_type": "command_injection_attempt",
+    "severity": "critical",
+    "source_ip": "198.51.100.25"
+  },
+  "timestamp": "2025-08-09_22:25:00.321_UTC"
+}
+]

@@ -1,0 +1,41 @@
+🏢 WAF Rejected Development Environment
+=====================================
+✅ Rust rustc 1.89.0 (29483883e 2025-08-04)
+✅ GCC gcc (GCC) 14.2.1 20250322
+✅ Clang clang version 19.1.7
+
+🚀 Ready for enterprise development!
+📚 Available commands:
+   • cargo build --release         # Build optimized WAF
+   • cargo test                    # Run test suite
+   • ./enterprise_waf_test.sh      # Enterprise validation
+   • just bench                    # Run benchmarks
+
+   Compiling waf-ingress v0.1.0 (/home/shift/code/waf-rejected)
+warning: field `name` is never read
+ --> src/bin/enterprise_security_test.rs:5:5
+  |
+4 | struct AttackTest {
+  |        ---------- field in this struct
+5 |     name: String,
+  |     ^^^^
+  |
+  = note: `AttackTest` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+  = note: `#[warn(dead_code)]` on by default
+
+warning: `waf-ingress` (bin "enterprise_security_test") generated 1 warning
+warning: method `upstream_uri` is never used
+   --> src/config.rs:327:12
+    |
+302 | impl Config {
+    | ----------- method in this implementation
+...
+327 |     pub fn upstream_uri(&self) -> anyhow::Result<http::Uri> {
+    |            ^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+
+warning: `waf-ingress` (bin "waf-ingress") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 32.44s
+warning: the following packages contain code that will be rejected by a future version of Rust: redis v0.25.4
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`

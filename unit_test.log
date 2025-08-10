@@ -1,0 +1,83 @@
+🏢 WAF Rejected Development Environment
+=====================================
+✅ Rust rustc 1.89.0 (29483883e 2025-08-04)
+✅ GCC gcc (GCC) 14.2.1 20250322
+✅ Clang clang version 19.1.7
+
+🚀 Ready for enterprise development!
+📚 Available commands:
+   • cargo build --release         # Build optimized WAF
+   • cargo test                    # Run test suite
+   • ./enterprise_waf_test.sh      # Enterprise validation
+   • just bench                    # Run benchmarks
+
+   Compiling waf-ingress v0.1.0 (/home/shift/code/waf-rejected)
+warning: field `name` is never read
+ --> src/bin/enterprise_security_test.rs:5:5
+  |
+4 | struct AttackTest {
+  |        ---------- field in this struct
+5 |     name: String,
+  |     ^^^^
+  |
+  = note: `AttackTest` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+  = note: `#[warn(dead_code)]` on by default
+
+warning: `waf-ingress` (bin "enterprise_security_test" test) generated 1 warning
+warning: unused import: `std::env`
+   --> src/config.rs:336:9
+    |
+336 |     use std::env;
+    |         ^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` on by default
+
+warning: `waf-ingress` (bin "waf-ingress" test) generated 1 warning (run `cargo fix --bin "waf-ingress" --tests` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 11.39s
+warning: the following packages contain code that will be rejected by a future version of Rust: redis v0.25.4
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/release/deps/waf_ingress-c3394e23c23b45a5)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/enterprise_availability_test.rs (target/release/deps/enterprise_availability_test-e1a784171f182048)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/enterprise_compliance_test.rs (target/release/deps/enterprise_compliance_test-9b15659594c815bc)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/enterprise_performance_test.rs (target/release/deps/enterprise_performance_test-e3337df385e285c8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/enterprise_security_test.rs (target/release/deps/enterprise_security_test-4fad8c9df30b98d0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/release/deps/waf_ingress-5128594a7bfa337f)
+
+running 3 tests
+test config::tests::test_config_from_env ... ok
+test config::tests::test_upstream_uri_parsing ... ok
+test config::tests::test_default_config ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests waf_ingress
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
