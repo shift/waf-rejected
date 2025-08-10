@@ -1,0 +1,112 @@
+# WAF Configuration with Security Event Exporters
+# This example shows how to configure OpenTelemetry and CEF export for security events
+
+[server]
+host = "0.0.0.0"
+port = 8080
+workers = 4
+max_connections = 10000
+max_request_size = "10MB"
+
+[proxy]
+upstream_host = "127.0.0.1"
+upstream_port = 3000
+timeout_ms = 30000
+keepalive = true
+
+[waf]
+enabled = true
+
+# Security Events Configuration with Export Capabilities
+[waf.security_events]
+enabled = true
+format = "json"
+min_threat_level = "medium"
+
+# Common Event Format (CEF) Exporter for SIEM Integration
+enable_cef = true
+cef_output_file = "/var/log/waf/security-events.cef"
+cef_device_vendor = "WAF-Rejected"
+cef_device_product = "Security WAF"
+cef_device_version = "1.0.0"
+
+# OpenTelemetry Exporter for Observability Platforms
+enable_otel = true
+otel_service_name = "waf-security-events"
+otel_service_version = "1.0.0"
+otel_export_traces = true
+otel_export_logs = true
+
+# Sled Database Persistence (embedded K/V store before full K/V integration)
+enable_sled = true
+sled_db_path = "./data/waf_security_events.sled"
+sled_max_events = 100000  # Keep last 100K events, cleanup older ones
+sled_compress = false     # Enable compression for smaller storage
+
+[waf.content_inspection]
+enabled = true
+inspect_headers = true
+inspect_body = true
+max_body_size = 1048576  # 1MB
+threat_patterns = [
+    # SQL Injection Patterns
+    "(?i)(union|select|insert|update|delete|drop|create|alter|exec|declare)\\s+",
+    "(?i)'\\s*(or|and)\\s+'.*=.*",
+    "(?i)\\b(@@version|information_schema|sysobjects)\\b",
+    
+    # XSS Patterns  
+    "(?i)<script[^>]*>.*</script>",
+    "(?i)javascript\\s*:",
+    "(?i)on(load|error|click|mouseover)\\s*=",
+    
+    # Command Injection
+    "(?i)\\b(system|exec|shell_exec|passthru|eval)\\s*\\(",
+    "(?i)[;&|`]\\s*(ls|cat|pwd|whoami|id|uname|ps|netstat)\\b",
+    
+    # Path Traversal
+    "(?i)\\.\\.\\/",
+    "(?i)\\.\\.\\\\",
+    "(?i)%2e%2e%2f",
+    
+    # LFI/RFI Patterns
+    "(?i)(file|php|data|http|ftp|jar)\\s*:",
+    "(?i)\\b(etc\\/passwd|boot\\.ini|web\\.config)\\b",
+]
+
+[waf.geo_blocking]
+enabled = true
+blocked_countries = ["CN", "RU", "KP"]
+blocked_regions = []
+block_tor = true
+block_vpn = false
+block_datacenter = true
+
+[rate_limit]
+per_ip_enabled = true
+per_ip_max_requests = 100
+per_ip_window_secs = 60
+global_enabled = true  
+global_max_requests = 1000
+global_window_secs = 60
+
+[logging]
+level = "info"
+format = "json"
+
+# OpenTelemetry Configuration
+# Set these environment variables to configure OTel endpoints:
+# OTEL_EXPORTER_OTLP_ENDPOINT=http://your-otel-collector:4317
+# OTEL_EXPORTER_OTLP_HEADERS=x-api-key=your-api-key
+# OTEL_SERVICE_NAME=waf-rejected
+# OTEL_SERVICE_VERSION=1.0.0
+
+# Example: Export to Jaeger
+# OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:14268/api/traces
+
+# Example: Export to Elastic APM
+# OTEL_EXPORTER_OTLP_ENDPOINT=https://your-elastic-apm.elastic-cloud.com:443
+# OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer your-secret-token
+
+# Example: Export to Honeycomb
+# OTEL_EXPORTER_OTLP_ENDPOINT=https://api.honeycomb.io
+# OTEL_EXPORTER_OTLP_HEADERS=x-honeycomb-team=your-api-key

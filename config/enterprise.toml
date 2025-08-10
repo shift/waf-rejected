@@ -1,0 +1,119 @@
+# Enterprise WAF Configuration for Testing
+# Optimized for high-performance enterprise deployment
+
+[server]
+host = "0.0.0.0"
+port = 8080
+workers = 8
+max_connections = 10000
+
+[server.tls]
+enabled = true
+cert_file = "/etc/ssl/certs/waf.crt"
+key_file = "/etc/ssl/private/waf.key"
+min_version = "1.2"
+ciphers = "ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:!aNULL:!MD5:!DSS"
+
+[proxy]
+upstream = "https://backend.enterprise.local:8443"
+timeout_seconds = 30
+retry_attempts = 3
+health_check_interval = 10
+
+[wasm]
+enabled = true
+module_path = "rules/enterprise-modsecurity.wasm"
+memory_limit = 33554432  # 32MB for enterprise rules
+execution_timeout_ms = 150
+debug_mode = false
+async_execution = true
+
+[wasm.pooling]
+max_instances = 200
+instance_reuse = true
+gc_interval_seconds = 180
+
+[security]
+max_request_size = 10485760  # 10MB
+max_header_size = 32768      # 32KB
+rate_limit_requests = 10000  # Per IP per minute
+rate_limit_window = 60
+
+[security.geo]
+enabled = true
+database_path = "/var/lib/waf/GeoIP.mmdb"
+cache_ttl_seconds = 3600
+threat_intel_enabled = true
+
+[waf.geo_blocking]
+enabled = false
+blocked_countries = []
+
+[logging]
+level = "info"
+format = "json"
+access_log = "/var/log/waf/access.log"
+error_log = "/var/log/waf/error.log"
+security_log = "/var/log/waf/security.log"
+
+[export]
+enabled = true
+
+[export.cef]
+enabled = true
+output_file = "/var/log/waf/security-events.cef"
+severity_mapping = "enterprise"
+max_file_size_mb = 100
+rotate_files = 5
+
+[export.opentelemetry]
+enabled = true
+endpoint = "http://jaeger:14250"
+service_name = "enterprise-waf"
+batch_timeout = "2s"
+max_batch_size = 512
+
+[export.sled]
+enabled = true
+database_path = "/var/lib/waf/security_events.db"
+retention_days = 90
+compression_enabled = true
+
+[metrics]
+enabled = true
+port = 9090
+endpoint = "/metrics"
+
+[health]
+enabled = true
+port = 8081
+endpoint = "/health"
+
+[redis]
+url = "redis://redis-cluster.enterprise.local:6379"
+pool_size = 20
+timeout_seconds = 5
+retry_attempts = 3
+
+# Enterprise compliance settings
+[compliance]
+pci_dss_enabled = true
+gdpr_enabled = true
+hipaa_enabled = true
+soc2_enabled = true
+
+[compliance.audit]
+enabled = true
+log_format = "json"
+include_request_body = false  # Security: don't log sensitive data
+include_response_body = false
+retention_days = 2555  # 7 years for compliance
+
+# Performance tuning for enterprise workloads
+[performance]
+worker_threads = 16
+blocking_threads = 32
+tcp_backlog = 8192
+tcp_nodelay = true
+tcp_keepalive = true
+memory_pool_size = 268435456  # 256MB

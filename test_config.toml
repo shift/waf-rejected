@@ -1,0 +1,57 @@
+
+bind_addr = "127.0.0.1:9090"
+upstream_uri = "http://example.com:8080"
+
+[server]
+max_connections = 5000
+timeout_seconds = 30
+graceful_shutdown_seconds = 10
+
+[logging]
+level = "info"
+format = "json"
+
+[waf]
+enabled = true
+
+[waf.rate_limit]
+per_ip_enabled = true
+global_enabled = false
+per_ip_requests = 100
+per_ip_window_seconds = 60
+global_requests = 10000
+global_window_seconds = 60
+
+[waf.security_events]
+enabled = true
+log_blocked_requests = true
+log_rate_limited_requests = true
+log_suspicious_activity = true
+include_request_body = false
+include_response_body = false
+max_request_body_size = 1024
+max_response_body_size = 1024
+
+[waf.content_inspection]
+enabled = true
+max_body_size = 1048576
+scan_uploads = true
+block_malicious_uploads = true
+
+[waf.geo_blocking]
+enabled = true
+blocked_countries = ["CN", "RU"]
+blocked_regions = []
+block_tor = true
+block_vpn = false
+block_datacenter = false
+
+[security.events]
+enabled = true
+log_blocked_requests = true
+log_rate_limited_requests = true
+log_suspicious_activity = true
+include_request_body = false
+include_response_body = false
+max_request_body_size = 1024
+max_response_body_size = 1024

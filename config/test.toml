@@ -1,0 +1,34 @@
+# Simple WAF Configuration for Testing
+[server]
+host = "0.0.0.0"
+port = 8080
+workers = 2
+
+[proxy] 
+upstream = "http://httpbin.org"
+timeout_seconds = 10
+retry_attempts = 1
+
+[waf.geo_blocking]
+enabled = false
+blocked_countries = []
+
+[security]
+max_request_size = 1048576  # 1MB
+rate_limit_requests = 100   # Per minute
+
+[logging]
+level = "info"
+format = "json"
+
+[health]
+enabled = true
+port = 8081
+endpoint = "/health"
+
+[metrics]
+enabled = true  
+port = 9090
+
+[export]
+enabled = false

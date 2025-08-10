@@ -1,0 +1,6 @@
+/target
+result*
+certs/*.key
+certs/*.ts.net.*
+clickhouse_logs/
+clickhouse_data/
