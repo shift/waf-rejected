@@ -63,5 +63,5 @@ The MVP will be considered "done" when the following criteria are met:
 2.  The application successfully proxies HTTP traffic to a configured upstream service.
 3.  The WAF, running the Coraza WASM module, correctly blocks a standard OWASP ZAP test suite for SQL Injection and logs the blocked events to `stdout`.
 4.  The application can sustain a baseline performance of **[TODO: Define a target RPS, e.g., 50,000 RPS]** on a specific, documented hardware configuration.
-5.  The application adds less than **[TODO: Define a target latency, e.g., 5ms]** of latency to proxied requests under the baseline load.
-6.  The core library code has a unit test coverage of at least **[TODO: Confirm target code coverage percentage, e.g., 80%]**.
+5.  The application adds less than **5ms** of latency to proxied requests under the baseline load.
+6.  The core library code has a unit test coverage of at least **85%**.
