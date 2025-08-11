@@ -192,7 +192,7 @@ impl EndToEndTestHarness {
 
                 for request_id in 0..requests_per_user {
                     let payload_idx = (user_id + request_id) % payloads.len();
-                    let (http_request, should_be_blocked) = &payloads[payload_idx];
+                    let (http_request, _should_be_blocked) = &payloads[payload_idx];
 
                     let start = Instant::now();
                     

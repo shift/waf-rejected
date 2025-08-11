@@ -105,6 +105,9 @@ clap = { version = "4.0", features = ["derive"] }
 # Random number generation for testing
 rand = "0.8"
 
+# System information
+num_cpus = "1.0"
+
 # Security modules dependencies
 maxminddb = { version = "0.24", optional = true }
 ipnetwork = "0.20"
@@ -119,14 +122,14 @@ polars = { version = "0.41", features = ["lazy"], optional = true }
 arrow = { version = "53.0", optional = true }
 
 # Time series analysis
-smartcore = { version = "0.3", features = ["nalgebra-bindings"], optional = true }
+smartcore = { version = "0.3", optional = true }
 
 # Statistics and ML utilities  
 ndarray = { version = "0.15", optional = true }
 rand_distr = { version = "0.4", optional = true }
 
 # Threat intelligence integration
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false, optional = true }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
 [dev-dependencies]
 # Testing framework
@@ -146,8 +149,8 @@ geoip = ["maxminddb"]
 export-system = ["sled", "opentelemetry", "opentelemetry_sdk"]
 export-otel = ["opentelemetry", "opentelemetry_sdk"]
 export-sled = ["sled"]
-# AI/ML threat detection features
-ai-threat-detection = ["candle-core", "candle-nn", "candle-transformers", "polars", "arrow", "smartcore", "ndarray", "rand_distr", "reqwest"]
+# AI/ML threat detection features (simplified)
+ai-threat-detection = ["polars", "smartcore", "ndarray", "rand_distr"]
 
 # Security modules performance benchmarks
 [[bench]]
@@ -206,3 +209,15 @@ path = "src/bin/advanced_test_backend.rs"
 [[bin]]
 name = "comprehensive_waf_test"
 path = "src/bin/comprehensive_waf_test.rs"
+
+[[bin]]
+name = "simple_multi_protocol_test"
+path = "src/bin/simple_multi_protocol_test.rs"
+
+[[bin]]
+name = "phase4_comprehensive_test"
+path = "src/bin/phase4_comprehensive_test.rs"
+
+[[bin]]
+name = "phase4_standalone_test"
+path = "src/bin/phase4_standalone_test.rs"

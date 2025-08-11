@@ -823,7 +823,7 @@ fn print_owasp_comprehensive_results(metrics: &AdvancedTestMetrics, test_duratio
                                xxe_blocked + ssrf_blocked;
     
     // Enhanced scoring: Give credit for legitimate traffic passing through + attack blocking
-    let legitimate_requests_passed = backend_responses;
+    let _legitimate_requests_passed = backend_responses;
     let legitimate_expected = total - total_attacks_in_suite; // Expected legitimate traffic
     
     // Calculate comprehensive security score

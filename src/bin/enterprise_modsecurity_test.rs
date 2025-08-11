@@ -240,7 +240,7 @@ async fn run_enterprise_load_test(
     
     // Simulate enterprise memory usage with 1000+ rules
     let base_memory = 45.0; // Base memory usage in MB
-    let rule_memory = (total_rules as f64 * 0.05); // 50KB per rule compiled
+    let rule_memory = total_rules as f64 * 0.05; // 50KB per rule compiled
     let load_memory = (concurrent_users as f64 * 0.08) + (rps * 0.0005); // Load-dependent memory
     let memory_usage = base_memory + rule_memory + load_memory;
     

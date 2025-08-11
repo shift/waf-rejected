@@ -1,19 +1,35 @@
-mod config;
+pub mod ai_threat_detection;
+pub mod waf;
+pub mod proxy;
+pub mod health;
+pub mod config;
+pub mod error;
+pub mod modsecurity;
+pub mod threat_intelligence;
+pub mod advanced_ml_models;
+pub mod ai_waf_integration;
+pub mod ai_optimization_engine;
+pub mod advanced_ai_waf_integration;
 
 #[cfg(feature = "wasm-waf")]
 mod wasm;
 
 use clap::{Arg, Command};
 use config::Config;
-use tracing::{info, error};
+use tracing::{info, error, warn};
 use anyhow::Result;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper::body::{Incoming, Bytes};
+use crate::ai_waf_integration::AiWafMiddleware;
 use http_body_util::{BodyExt, Full};
 use std::convert::Infallible;
 use std::time::Duration;
+use std::sync::Arc;
 use tokio::net::TcpListener;
+
+#[cfg(feature = "ai-threat-detection")]
+use ai_waf_integration::AiWafMiddleware;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -86,15 +102,41 @@ async fn start_waf_server(config: Config) -> Result<()> {
 
     let upstream_uri = config.upstream_uri.clone();
 
+    // Initialize AI WAF middleware if feature is enabled
+    #[cfg(feature = "ai-threat-detection")]
+    let ai_waf_middleware = {
+        info!("🧠 Initializing AI Threat Detection System...");
+        match AiWafMiddleware::new().await {
+            Ok(middleware) => {
+                info!("✅ AI Threat Detection System initialized successfully");
+                Some(Arc::new(middleware))
+            }
+            Err(e) => {
+                warn!("⚠️ Failed to initialize AI Threat Detection: {}", e);
+                warn!("Continuing with traditional WAF rules only");
+                None
+            }
+        }
+    };
+
+    #[cfg(not(feature = "ai-threat-detection"))]
+    let ai_waf_middleware: Option<Arc<AiWafMiddleware>> = None;
+
     loop {
         let (stream, _) = listener.accept().await?;
         let io = hyper_util::rt::TokioIo::new(stream);
         let upstream = upstream_uri.clone();
         let config_clone = config.clone();
+        
+        #[cfg(feature = "ai-threat-detection")]
+        let ai_middleware = ai_waf_middleware.clone();
+        
+        #[cfg(not(feature = "ai-threat-detection"))]
+        let ai_middleware = None;
 
         tokio::task::spawn(async move {
             let service = service_fn(move |req| {
-                handle_request(req, upstream.clone(), config_clone.clone())
+                handle_request_with_ai(req, upstream.clone(), config_clone.clone(), ai_middleware.clone())
             });
             
             if let Err(err) = hyper::server::conn::http1::Builder::new()
@@ -107,20 +149,43 @@ async fn start_waf_server(config: Config) -> Result<()> {
     }
 }
 
-async fn handle_request(
+async fn handle_request_with_ai(
     req: Request<Incoming>, 
     upstream_uri: String,
     config: Config,
+    #[cfg(feature = "ai-threat-detection")]
+    ai_middleware: Option<Arc<AiWafMiddleware>>,
+    #[cfg(not(feature = "ai-threat-detection"))]
+    _ai_middleware: Option<()>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     // Health check endpoint
     if req.uri().path() == "/health" {
-        let health_response = r#"{"status":"healthy","service":"waf-rejected","timestamp":"#.to_string() + 
-            &std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis().to_string() + "\"}";
-        
+        let mut health_status = serde_json::json!({
+            "status": "healthy",
+            "service": "waf-rejected",
+            "timestamp": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+            "features": {
+                "traditional_waf": true,
+                "ai_threat_detection": cfg!(feature = "ai-threat-detection"),
+                "geoip": cfg!(feature = "geoip"),
+                "export_system": cfg!(feature = "export-system")
+            }
+        });
+
+        #[cfg(feature = "ai-threat-detection")]
+        if let Some(ref ai_waf) = ai_middleware {
+            if let Ok(ai_status) = ai_waf.get_health_status().await {
+                health_status["ai_threat_detection_status"] = ai_status;
+            }
+        }
+
         return Ok(Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "application/json")
-            .body(Full::new(Bytes::from(health_response)))
+            .body(Full::new(Bytes::from(health_status.to_string())))
             .unwrap());
     }
 
@@ -135,41 +200,57 @@ async fn handle_request(
             // On timeout or error, reconstruct request and check without body
             let req = Request::from_parts(parts, Bytes::new());
             if should_block_request_basic(&req, &config) {
-                let block_response = r#"{"error":"Request blocked by WAF","reason":"Security policy violation","timestamp":"#.to_string() + 
-                    &std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis().to_string() + "\"}";
-                    
-                return Ok(Response::builder()
-                    .status(StatusCode::FORBIDDEN)
-                    .header("Content-Type", "application/json")
-                    .header("X-WAF-Action", "blocked")
-                    .body(Full::new(Bytes::from(block_response)))
-                    .unwrap());
+                let block_response = generate_block_response("Security policy violation (body timeout)");
+                return Ok(block_response);
             }
             
-            let error_response = r#"{"error":"Request body timeout or malformed","timestamp":"#.to_string() + 
-                &std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis().to_string() + "\"}";
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .header("Content-Type", "application/json")
-                .body(Full::new(Bytes::from(error_response)))
-                .unwrap());
+            let error_response = generate_error_response("Request body timeout or malformed", StatusCode::BAD_REQUEST);
+            return Ok(error_response);
         }
     };
 
     // Reconstruct request for inspection
     let req = Request::from_parts(parts, body_bytes.clone());
 
-    // Enhanced WAF filtering with body inspection
+    // Traditional WAF filtering first
     if should_block_request_with_body(&req, &body_bytes, &config).await {
-        let block_response = r#"{"error":"Request blocked by WAF","reason":"Security policy violation","timestamp":"#.to_string() + 
-            &std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis().to_string() + "\"}";
-            
-        return Ok(Response::builder()
-            .status(StatusCode::FORBIDDEN)
-            .header("Content-Type", "application/json")
-            .header("X-WAF-Action", "blocked")
-            .body(Full::new(Bytes::from(block_response)))
-            .unwrap());
+        let block_response = generate_block_response("Traditional WAF rules violated");
+        return Ok(block_response);
+    }
+
+    // AI-enhanced threat detection if available
+    #[cfg(feature = "ai-threat-detection")]
+    if let Some(ref ai_waf) = ai_middleware {
+        match ai_waf.analyze_request(&req, &body_bytes).await {
+            Ok(ai_result) => {
+                info!("🧠 AI Analysis: Risk={:.2}, Action={:?}, Confidence={:.2}", 
+                      ai_result.analysis.overall_risk_score, 
+                      ai_result.analysis.recommended_action,
+                      ai_result.analysis.confidence);
+                      
+                // Log threat categories if any detected
+                if !ai_result.analysis.threat_categories.is_empty() {
+                    let categories: Vec<String> = ai_result.analysis.threat_categories
+                        .iter()
+                        .map(|c| format!("{}({:.2})", c.category, c.score))
+                        .collect();
+                    info!("🧠 AI Threats detected: {}", categories.join(", "));
+                }
+                
+                // Check if AI recommends blocking
+                if ai_result.should_block {
+                    let ai_block_response = generate_ai_block_response(&ai_result);
+                    return Ok(ai_block_response);
+                }
+                
+                // Add AI analysis headers to response (for monitoring)
+                // We'll add these later when proxying the response
+            }
+            Err(e) => {
+                warn!("AI threat detection failed: {}", e);
+                // Continue with traditional processing
+            }
+        }
     }
 
     // Reconstruct request for proxying
@@ -184,89 +265,192 @@ async fn handle_request(
     ).await;
 
     match upstream_result {
-        Ok(Ok(response)) => Ok(response),
+        Ok(Ok(mut response)) => {
+            // Add AI analysis headers if available
+            #[cfg(feature = "ai-threat-detection")]
+            if let Some(ref ai_waf) = ai_middleware {
+                if let Some(last_analysis) = ai_waf.get_last_analysis().await {
+                    response.headers_mut().insert(
+                        "X-WAF-AI-Risk-Score",
+                        format!("{:.2}", last_analysis.overall_risk_score).parse().unwrap()
+                    );
+                    response.headers_mut().insert(
+                        "X-WAF-AI-Confidence",
+                        format!("{:.2}", last_analysis.confidence).parse().unwrap()
+                    );
+                    if !last_analysis.threat_categories.is_empty() {
+                        let categories: String = last_analysis.threat_categories
+                            .iter()
+                            .map(|c| c.category.clone())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        response.headers_mut().insert(
+                            "X-WAF-AI-Threats",
+                            categories.parse().unwrap()
+                        );
+                    }
+                }
+            }
+            Ok(response)
+        }
         Ok(Err(proxy_error)) => {
             error!("Upstream proxy error: {}", proxy_error);
-            handle_upstream_failure(&config, proxy_error)
+            Ok(handle_upstream_failure(&config, proxy_error))
         }
         Err(_timeout_error) => {
             error!("Upstream timeout after {}ms", config.waf.upstream_timeout_ms);
-            handle_upstream_timeout(&config)
+            Ok(handle_upstream_timeout(&config))
         }
     }
 }
 
-fn handle_upstream_failure(config: &Config, error: Box<dyn std::error::Error + Send + Sync>) -> Result<Response<Full<Bytes>>, Infallible> {
+fn generate_block_response(reason: &str) -> Response<Full<Bytes>> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+        
+    let block_response = serde_json::json!({
+        "error": "Request blocked by WAF",
+        "reason": reason,
+        "timestamp": timestamp,
+        "request_id": uuid::Uuid::new_v4().to_string()
+    });
+    
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header("Content-Type", "application/json")
+        .header("X-WAF-Action", "blocked")
+        .header("X-WAF-Block-Reason", reason)
+        .body(Full::new(Bytes::from(block_response.to_string())))
+        .unwrap()
+}
+
+#[cfg(feature = "ai-threat-detection")]
+fn generate_ai_block_response(ai_result: &ai_waf_integration::AiAnalysisResult) -> Response<Full<Bytes>> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    
+    let threat_categories: Vec<String> = ai_result.analysis.threat_categories
+        .iter()
+        .map(|c| format!("{}({:.2})", c.category, c.score))
+        .collect();
+        
+    let block_response = serde_json::json!({
+        "error": "Request blocked by AI-enhanced WAF",
+        "reason": "AI threat detection triggered",
+        "ai_analysis": {
+            "overall_risk_score": ai_result.analysis.overall_risk_score,
+            "confidence": ai_result.analysis.confidence,
+            "threat_categories": threat_categories,
+            "recommended_action": format!("{:?}", ai_result.analysis.recommended_action)
+        },
+        "timestamp": timestamp,
+        "request_id": ai_result.analysis.request_id
+    });
+    
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header("Content-Type", "application/json")
+        .header("X-WAF-Action", "ai-blocked")
+        .header("X-WAF-AI-Risk-Score", &format!("{:.2}", ai_result.analysis.overall_risk_score))
+        .header("X-WAF-AI-Confidence", &format!("{:.2}", ai_result.analysis.confidence))
+        .header("X-WAF-Block-Reason", "AI threat detection")
+        .body(Full::new(Bytes::from(block_response.to_string())))
+        .unwrap()
+}
+
+fn generate_error_response(message: &str, status: StatusCode) -> Response<Full<Bytes>> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+        
+    let error_response = serde_json::json!({
+        "error": message,
+        "timestamp": timestamp
+    });
+    
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .body(Full::new(Bytes::from(error_response.to_string())))
+        .unwrap()
+}
+
+fn handle_upstream_failure(config: &Config, error: Box<dyn std::error::Error + Send + Sync>) -> Response<Full<Bytes>> {
     let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis().to_string();
     
     match config.waf.fail_mode.as_str() {
         "open" => {
             // Fail-open: Allow request through with a warning
-            let warning_response = format!(
-                r#"{{"warning":"Upstream service unavailable - request allowed due to fail-open mode","error":"{}","timestamp":"{}"}}"#,
-                error.to_string().replace('"', "'"), // Escape quotes for JSON
-                timestamp
-            );
+            let warning_response = serde_json::json!({
+                "warning": "Upstream service unavailable - request allowed due to fail-open mode",
+                "error": error.to_string(),
+                "timestamp": timestamp
+            });
             
-            Ok(Response::builder()
+            Response::builder()
                 .status(StatusCode::OK)
                 .header("Content-Type", "application/json")
                 .header("X-WAF-Mode", "fail-open")
                 .header("X-WAF-Warning", "upstream-unavailable")
-                .body(Full::new(Bytes::from(warning_response)))
-                .unwrap())
+                .body(Full::new(Bytes::from(warning_response.to_string())))
+                .unwrap()
         }
         _ => {
             // Fail-closed (default): Block request
-            let error_response = format!(
-                r#"{{"error":"Upstream service unavailable","mode":"fail-closed","timestamp":"{}"}}"#,
-                timestamp
-            );
+            let error_response = serde_json::json!({
+                "error": "Upstream service unavailable",
+                "mode": "fail-closed",
+                "timestamp": timestamp
+            });
                 
-            Ok(Response::builder()
+            Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .header("Content-Type", "application/json")
                 .header("X-WAF-Mode", "fail-closed")
-                .body(Full::new(Bytes::from(error_response)))
-                .unwrap())
+                .body(Full::new(Bytes::from(error_response.to_string())))
+                .unwrap()
         }
     }
 }
 
-fn handle_upstream_timeout(config: &Config) -> Result<Response<Full<Bytes>>, Infallible> {
+fn handle_upstream_timeout(config: &Config) -> Response<Full<Bytes>> {
     let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis().to_string();
     
     match config.waf.fail_mode.as_str() {
         "open" => {
             // Fail-open: Allow request through with a timeout warning
-            let timeout_response = format!(
-                r#"{{"warning":"Upstream timeout ({}ms) - request allowed due to fail-open mode","timestamp":"{}"}}"#,
-                config.waf.upstream_timeout_ms,
-                timestamp
-            );
+            let timeout_response = serde_json::json!({
+                "warning": format!("Upstream timeout ({}ms) - request allowed due to fail-open mode", config.waf.upstream_timeout_ms),
+                "timestamp": timestamp
+            });
             
-            Ok(Response::builder()
+            Response::builder()
                 .status(StatusCode::OK)
                 .header("Content-Type", "application/json")
                 .header("X-WAF-Mode", "fail-open")
                 .header("X-WAF-Warning", "upstream-timeout")
-                .body(Full::new(Bytes::from(timeout_response)))
-                .unwrap())
+                .body(Full::new(Bytes::from(timeout_response.to_string())))
+                .unwrap()
         }
         _ => {
             // Fail-closed (default): Block request
-            let timeout_response = format!(
-                r#"{{"error":"Upstream timeout ({}ms)","mode":"fail-closed","timestamp":"{}"}}"#,
-                config.waf.upstream_timeout_ms,
-                timestamp
-            );
+            let timeout_response = serde_json::json!({
+                "error": format!("Upstream timeout ({}ms)", config.waf.upstream_timeout_ms),
+                "mode": "fail-closed",
+                "timestamp": timestamp
+            });
                 
-            Ok(Response::builder()
+            Response::builder()
                 .status(StatusCode::GATEWAY_TIMEOUT)
                 .header("Content-Type", "application/json")
                 .header("X-WAF-Mode", "fail-closed")
-                .body(Full::new(Bytes::from(timeout_response)))
-                .unwrap())
+                .body(Full::new(Bytes::from(timeout_response.to_string())))
+                .unwrap()
         }
     }
 }
@@ -431,7 +615,7 @@ fn should_block_request_basic<T>(req: &Request<T>, _config: &Config) -> bool {
     }
     
     // CRS-920170: GET/HEAD Request with Body - detect via content-length header
-    if (method == "GET" || method == "HEAD") {
+    if method == "GET" || method == "HEAD" {
         if let Some(content_length) = req.headers().get("content-length") {
             if let Ok(length_str) = content_length.to_str() {
                 if let Ok(length) = length_str.parse::<u64>() {

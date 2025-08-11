@@ -1,12 +1,11 @@
 // AI/ML Threat Detection Service Implementation
 // This is a practical starting point for neural network integration
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::time::interval;
 
 /// Core AI/ML threat detection service
 #[derive(Debug, Clone)]
@@ -94,6 +93,7 @@ impl ThreatDetectionService {
             features.user_agent_entropy = calculate_entropy(ua);
             features.is_known_scanner = is_known_scanner_ua(ua);
             features.browser_automation_score = detect_automation_ua(ua);
+            features.user_agent = ua.clone();
         }
         
         // PII/PHI detection
@@ -102,10 +102,29 @@ impl ThreatDetectionService {
         features.contains_ssn = detect_ssn(&full_content);
         features.contains_email = detect_email(&full_content);
         features.contains_phone = detect_phone(&full_content);
+        features.contains_pii = features.contains_credit_cards || features.contains_ssn || features.contains_email || features.contains_phone;
         
         // Rate limiting features
         features.requests_per_minute = self.get_request_rate(&request.client_ip, Duration::from_secs(60));
-        features.requests_per_hour = self.get_request_rate(&request.client_ip, Duration::from_hours(1));
+        features.requests_per_hour = self.get_request_rate(&request.client_ip, Duration::from_secs(3600));
+        
+        // Phase 2 additional fields
+        features.client_ip = request.client_ip.clone();
+        features.path = request.uri.clone();
+        features.query_string = request.headers.get("query-string").unwrap_or(&String::new()).clone();
+        features.referer = request.headers.get("referer").unwrap_or(&String::new()).clone();
+        features.content_type = request.headers.get("content-type").unwrap_or(&String::new()).clone();
+        features.accept = request.headers.get("accept").unwrap_or(&String::new()).clone();
+        
+        // Business context
+        let now = std::time::SystemTime::now();
+        features.is_business_hours = self.is_business_hours(now);
+        
+        // Reputation and behavioral scoring (placeholder values)
+        features.geographic_score = 0.5; // TODO: Implement geo-scoring
+        features.reputation_score = 0.5; // TODO: Implement IP reputation
+        features.behavioral_score = 0.5; // TODO: Implement behavioral analysis
+        features.seasonal_score = 0.5; // TODO: Implement seasonal analysis
         
         Ok(features)
     }
@@ -196,10 +215,20 @@ impl ThreatDetectionService {
         confidence_factors.iter().sum::<f32>() / confidence_factors.len() as f32
     }
     
-    fn get_request_rate(&self, ip: &str, window: Duration) -> f32 {
+    fn get_request_rate(&self, _ip: &str, _window: Duration) -> f32 {
         // Implementation would track request rates per IP
         // For now, return mock data
         1.5
+    }
+    
+    fn is_business_hours(&self, timestamp: std::time::SystemTime) -> bool {
+        // Convert to seconds since epoch
+        let duration = timestamp.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        let timestamp_secs = duration.as_secs();
+        
+        // Simplified business hours check (9 AM - 6 PM UTC)
+        let hour = ((timestamp_secs % 86400) / 3600) as u8;
+        hour >= 9 && hour < 18
     }
 }
 
@@ -255,7 +284,7 @@ impl AnomalyDetector {
     
     async fn detect_statistical_anomalies(&self, features: &RequestFeatures) -> Result<f32> {
         let baselines = self.feature_baselines.lock().unwrap();
-        let mut anomaly_score = 0.0;
+        let mut anomaly_score: f32 = 0.0;
         
         // Check URI length anomaly
         if let Some(baseline) = baselines.get("uri_length") {
@@ -291,7 +320,7 @@ impl AnomalyDetector {
     }
     
     async fn detect_pattern_anomalies(&self, features: &RequestFeatures) -> Result<f32> {
-        let mut anomaly_score = 0.0;
+        let mut anomaly_score: f32 = 0.0;
         
         // Suspicious keyword combinations
         if features.sql_keywords_count > 5 && features.base64_ratio > 0.3 {
@@ -319,7 +348,7 @@ impl AnomalyDetector {
     }
     
     async fn detect_frequency_anomalies(&self, features: &RequestFeatures) -> Result<f32> {
-        let mut anomaly_score = 0.0;
+        let mut anomaly_score: f32 = 0.0;
         
         // High frequency requests
         if features.requests_per_minute > 100.0 {
@@ -391,7 +420,7 @@ pub struct BusinessIntelligenceEngine {
     event_calendar: Arc<Mutex<Vec<BusinessEvent>>>,
     
     /// Traffic pattern baselines
-    traffic_baselines: Arc<Mutex<HashMap<String, TrafficBaseline>>>,
+    traffic_baselines: Arc<Mutex<HashMap<String, f32>>>,
 }
 
 impl BusinessIntelligenceEngine {
@@ -407,7 +436,7 @@ impl BusinessIntelligenceEngine {
     }
     
     pub async fn analyze_business_context(&self, features: &RequestFeatures, timestamp: u64) -> Result<BusinessContext> {
-        let datetime = UNIX_EPOCH + Duration::from_secs(timestamp);
+        let _datetime = UNIX_EPOCH + Duration::from_secs(timestamp);
         
         // Detect current business context
         let is_business_hours = self.is_business_hours(timestamp);
@@ -630,7 +659,7 @@ impl BusinessIntelligenceEngine {
     
     fn calculate_baseline_score(&self, features: &RequestFeatures, traffic_multiplier: f32) -> f32 {
         // Baseline score based on expected behavior during this business context
-        let mut baseline = 0.1; // Low baseline risk
+        let mut baseline: f32 = 0.1; // Low baseline risk
         
         // Adjust for traffic patterns
         if traffic_multiplier > 2.0 {
@@ -814,6 +843,8 @@ pub struct RequestContext {
     pub headers: HashMap<String, String>,
     pub body: String,
     pub timestamp: u64,
+    pub session_id: Option<String>,
+    pub is_https: bool,
 }
 
 impl RequestContext {
@@ -826,7 +857,7 @@ impl RequestContext {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestFeatures {
     // HTTP Protocol Features
     pub method: String,
@@ -855,6 +886,81 @@ pub struct RequestFeatures {
     // Rate Limiting Features
     pub requests_per_minute: f32,
     pub requests_per_hour: f32,
+    
+    // Phase 2 Additional Fields
+    pub client_ip: String,
+    pub user_agent: String,
+    pub path: String,
+    pub query_string: String,
+    pub referer: String,
+    pub content_type: String,
+    pub accept: String,
+    pub is_business_hours: bool,
+    pub contains_pii: bool,
+    pub geographic_score: f32,
+    pub reputation_score: f32,
+    pub behavioral_score: f32,
+    pub seasonal_score: f32,
+    
+    // Phase 3: Threat Intelligence fields
+    pub request_id: String,
+    pub client_ip_parsed: Option<std::net::IpAddr>,
+    pub timestamp: u64,
+    pub session_id: Option<String>,
+    pub is_encrypted: bool,
+    pub contains_financial_data: bool,
+    pub contains_healthcare_data: bool,
+    pub regulatory_zone: String,
+    pub headers: Vec<(String, String)>,
+    pub request_body: String,
+}
+
+impl Default for RequestFeatures {
+    fn default() -> Self {
+        Self {
+            method: "GET".to_string(),
+            uri_length: 0,
+            header_count: 0,
+            body_size: 0,
+            entropy_score: 0.0,
+            base64_ratio: 0.0,
+            sql_keywords_count: 0,
+            xss_keywords_count: 0,
+            shell_keywords_count: 0,
+            user_agent_entropy: 0.0,
+            is_known_scanner: false,
+            browser_automation_score: 0.0,
+            contains_credit_cards: false,
+            contains_ssn: false,
+            contains_email: false,
+            contains_phone: false,
+            requests_per_minute: 0.0,
+            requests_per_hour: 0.0,
+            client_ip: "0.0.0.0".to_string(),
+            user_agent: "unknown".to_string(),
+            path: "/".to_string(),
+            query_string: "".to_string(),
+            referer: "".to_string(),
+            content_type: "".to_string(),
+            accept: "".to_string(),
+            is_business_hours: false,
+            contains_pii: false,
+            geographic_score: 0.0,
+            reputation_score: 0.0,
+            behavioral_score: 0.0,
+            seasonal_score: 0.0,
+            request_id: "default".to_string(),
+            client_ip_parsed: None,
+            timestamp: 0,
+            session_id: None,
+            is_encrypted: false,
+            contains_financial_data: false,
+            contains_healthcare_data: false,
+            regulatory_zone: "unknown".to_string(),
+            headers: Vec::new(),
+            request_body: "".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -882,6 +988,29 @@ pub struct BusinessContext {
     pub confidence: f32,
 }
 
+impl Default for BusinessContext {
+    fn default() -> Self {
+        Self {
+            is_business_hours: false,
+            is_weekend: false,
+            seasonal_context: SeasonalContext {
+                active_pattern: None,
+                traffic_impact: 1.0,
+                security_impact: 1.0,
+            },
+            event_context: EventContext {
+                active_events: Vec::new(),
+                combined_traffic_impact: 1.0,
+                combined_security_impact: 1.0,
+            },
+            expected_traffic_multiplier: 1.0,
+            risk_level: BusinessRiskLevel::Normal,
+            baseline_score: 0.5,
+            confidence: 0.8,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreatCategory {
     pub category: String,
@@ -898,6 +1027,7 @@ pub enum SecurityAction {
     Challenge,
     Quarantine,
     Block,
+    Alert,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1165,7 +1295,7 @@ impl DataExfiltrationScorer { pub fn new() -> Self { Self } }
 #[async_trait::async_trait]
 impl CategoryScorer for DataExfiltrationScorer {
     async fn score(&self, features: &RequestFeatures) -> Result<f32> {
-        let mut score = 0.0;
+        let mut score: f32 = 0.0;
         
         // PII presence increases data exfiltration risk
         if features.contains_credit_cards { score += 0.4; }
@@ -1222,7 +1352,7 @@ impl ComplianceScorer { pub fn new() -> Self { Self } }
 #[async_trait::async_trait]
 impl CategoryScorer for ComplianceScorer {
     async fn score(&self, features: &RequestFeatures) -> Result<f32> {
-        let mut score = 0.0;
+        let mut score: f32 = 0.0;
         
         // PCI-DSS violations
         if features.contains_credit_cards {
@@ -1449,6 +1579,8 @@ mod tests {
             ]),
             body: r#"{"username": "admin' OR 1=1--", "password": "test"}"#.to_string(),
             timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            session_id: Some("test_session_123".to_string()),
+            is_https: true,
         };
         
         let analysis = service.analyze_request(&request).await.unwrap();
@@ -1462,7 +1594,7 @@ mod tests {
     fn test_feature_extraction() {
         assert!(calculate_entropy("aaaa") < calculate_entropy("abcd"));
         assert!(calculate_base64_ratio("YWJjZGVmZw==") > 0.8);
-        assert!(count_sql_keywords("SELECT * FROM users WHERE 1=1") > 3);
+        assert!(count_sql_keywords("SELECT * FROM users WHERE 1=1") >= 3); // Should match SELECT, FROM, WHERE
         assert!(count_xss_keywords("<script>alert('xss')</script>") > 2);
         assert!(is_known_scanner_ua("Mozilla/5.0 (compatible; Nmap Scripting Engine)"));
     }

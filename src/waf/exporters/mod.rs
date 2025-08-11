@@ -14,7 +14,7 @@ pub mod sled;
 
 // Re-exports for easier access
 pub use cef::CefExporter;
-pub use dispatcher::ExportDispatcher;
+pub use dispatcher::ExporterDispatcher;
 
 #[cfg(feature = "export-otel")]
 pub use otel::OpenTelemetryExporter;

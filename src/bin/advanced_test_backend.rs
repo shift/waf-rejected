@@ -1,5 +1,5 @@
 use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode, Method, Version};
+use hyper::{Request, Response, StatusCode, Version};
 use hyper::body::{Incoming, Bytes};
 use http_body_util::{BodyExt, Full};
 use serde_json::json;

@@ -3,7 +3,6 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use anyhow::Result;
-use rand::Rng;
 
 #[derive(Debug)]
 struct SafetyMetrics {
@@ -130,7 +129,7 @@ async fn run_safe_progressive_load_test(
     let chunk_size = tasks.len() / 10; // Monitor progress in 10% chunks
     let mut completed = 0;
     
-    for (i, task) in tasks.into_iter().enumerate() {
+    for (_i, task) in tasks.into_iter().enumerate() {
         match task.await.unwrap() {
             Ok(latency) => {
                 latencies.push(latency.as_millis() as u64);
