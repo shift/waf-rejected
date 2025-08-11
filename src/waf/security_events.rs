@@ -8,7 +8,19 @@ use crate::waf::{Decision, RequestContext};
 use crate::config::SecurityEventsConfig;
 
 // Import exporters
-use super::exporters::{ExporterDispatcher, SecurityEventExporter, CefExporter, OtelExporter, SledExporter};
+use super::exporters::{ExporterDispatcher, SecurityEventExporter, CefExporter};
+
+#[cfg(feature = "export-otel")]
+use super::exporters::OpenTelemetryExporter;
+
+#[cfg(feature = "export-sled")]
+use super::exporters::SledExporter;
+
+#[cfg(feature = "export-otel")]
+use super::exporters::OpenTelemetryExporter;
+
+#[cfg(feature = "export-sled")]
+use super::exporters::SledExporter;
 
 /// Enhanced security event structure for comprehensive logging and export
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,8 +177,9 @@ impl SecurityEventLogger {
         }
         
         // Add OpenTelemetry exporter if enabled
+        #[cfg(feature = "export-otel")]
         if config.enable_otel {
-            let otel_exporter = OtelExporter::new(
+            let otel_exporter = OpenTelemetryExporter::new(
                 config.otel_service_name.clone(),
                 config.otel_service_version.clone(),
                 config.otel_export_traces.unwrap_or(true),
@@ -176,6 +189,7 @@ impl SecurityEventLogger {
         }
         
         // Add Sled database exporter if enabled
+        #[cfg(feature = "export-sled")]
         if config.enable_sled {
             let sled_path = config.sled_db_path.as_deref().unwrap_or("./waf_security_events.sled");
             match SledExporter::new(
@@ -248,7 +262,7 @@ impl SecurityEventLogger {
             triggered_rules,
             
             // Request/response metrics
-            request_size: ctx.body_size,
+            request_size: ctx.body_size.map(|size| size as u64),
             response_status: match decision {
                 Decision::Block { status, .. } => Some(*status),
                 Decision::Allow => Some(200), // Assume success for allowed requests

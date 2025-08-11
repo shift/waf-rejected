@@ -1,0 +1,93 @@
+# WAF-Rejected Default Configuration
+# High-Performance Enterprise Web Application Firewall
+
+# Server configuration
+bind_addr = "0.0.0.0:8080"
+upstream_uri = "http://127.0.0.1:3000"
+
+[server]
+max_connections = 1000
+request_timeout_secs = 30
+keep_alive_timeout_secs = 90
+enable_http2 = true
+max_body_size = 10485760
+
+[logging]
+level = "info"
+json_format = false
+
+[waf]
+enabled = true
+
+[waf.rate_limit]
+per_ip_enabled = true
+per_ip_max_requests = 100
+per_ip_window_secs = 60
+global_enabled = true
+global_max_requests = 10000
+global_window_secs = 60
+
+[waf.security_events]
+enabled = true
+
+# Export configuration with local collector by default
+enable_cef = true
+cef_output_file = "./logs/security_events.cef"
+cef_device_vendor = "WAF-Rejected"
+cef_device_product = "Security WAF"
+cef_device_version = "1.0.0"
+
+# OpenTelemetry with local collector (default)
+enable_otel = true
+otel_service_name = "waf-security-events"
+otel_service_version = "1.0.0"
+otel_export_traces = true
+otel_export_logs = true
+otel_endpoint = "http://localhost:4317"  # Local collector
+
+# Local embedded database for development
+enable_sled = true
+sled_db_path = "./data/waf_security_events.sled"
+sled_max_events = 100000
+sled_compress = false
+
+[waf.content_inspection]
+enabled = true
+max_body_size = 10485760
+threat_patterns = ["<script>", "' OR ", "UNION SELECT", "../", "../../"]
+
+[waf.geo_blocking]
+enabled = false
+blocked_countries = []
+blocked_regions = []
+block_tor = false
+block_vpn = false
+block_datacenter = false
+
+# AI/ML Threat Detection Configuration
+[waf.ai_threat_detection]
+enabled = true
+model_inference_timeout_ms = 5
+batch_size = 64
+explainable_ai = true
+
+# Local Observability Stack (Default Configuration)
+[monitoring]
+# OpenTelemetry Configuration
+otel_enabled = true
+otel_endpoint = "http://localhost:4317"
+otel_service_name = "waf-rejected"
+otel_service_version = "1.0.0"
+
+# Local stack endpoints
+prometheus_endpoint = "http://localhost:9090"
+jaeger_endpoint = "http://localhost:14268/api/traces"
+grafana_endpoint = "http://localhost:3000"
+
+# Health check settings
+health_check_interval_secs = 30
+metrics_collection_interval_secs = 10
+
+[security]
+[security.events]
+enabled = true

@@ -20,6 +20,8 @@ pub enum WafError {
     ValidationError(String),
     /// Internal error
     InternalError(String),
+    /// Upstream connection error
+    Upstream(String),
 }
 
 impl fmt::Display for WafError {
@@ -33,7 +35,25 @@ impl fmt::Display for WafError {
             WafError::AuthError(msg) => write!(f, "Authentication error: {}", msg),
             WafError::ValidationError(msg) => write!(f, "Validation error: {}", msg),
             WafError::InternalError(msg) => write!(f, "Internal error: {}", msg),
+            WafError::Upstream(msg) => write!(f, "Upstream error: {}", msg),
         }
+    }
+}
+
+impl WafError {
+    /// Create an internal error
+    pub fn internal<T: Into<String>>(msg: T) -> Self {
+        WafError::InternalError(msg.into())
+    }
+    
+    /// Create an HTTP error
+    pub fn Http<T: Into<String>>(msg: T) -> Self {
+        WafError::NetworkError(msg.into())
+    }
+    
+    /// Create an upstream connection error
+    pub fn upstream_connection<T: Into<String>>(msg: T) -> Self {
+        WafError::NetworkError(format!("Upstream connection error: {}", msg.into()))
     }
 }
 

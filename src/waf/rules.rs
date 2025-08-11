@@ -2,6 +2,7 @@ use crate::waf::{WafRule, RequestContext, Decision};
 use crate::config::Config;
 use hyper::{Method, HeaderMap};
 use std::collections::HashSet;
+use std::net::IpAddr;
 use tracing::{debug, warn};
 use regex::Regex;
 
@@ -375,6 +376,65 @@ impl WafRuleFactory {
         
         debug!("Created {} basic WAF rules", rules.len());
         rules
+    }
+}
+
+/// Rule for IP-based blocking/allowing
+pub struct IpRule {
+    name: String,
+    blocked_ips: HashSet<IpAddr>,
+    allowed_ips: HashSet<IpAddr>,
+    enabled: bool,
+}
+
+impl IpRule {
+    pub fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            blocked_ips: HashSet::new(),
+            allowed_ips: HashSet::new(),
+            enabled: true,
+        }
+    }
+    
+    pub fn block_ip(mut self, ip: IpAddr) -> Self {
+        self.blocked_ips.insert(ip);
+        self
+    }
+    
+    pub fn allow_ip(mut self, ip: IpAddr) -> Self {
+        self.allowed_ips.insert(ip);
+        self
+    }
+}
+
+impl WafRule for IpRule {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn evaluate(&self, ctx: &RequestContext) -> Decision {
+        // Check if IP is in blocked list
+        if self.blocked_ips.contains(&ctx.client_ip) {
+            return Decision::Block {
+                status: 403,
+                reason: format!("IP {} is blocked", ctx.client_ip),
+            };
+        }
+        
+        // If there's an allow list and IP is not in it, block
+        if !self.allowed_ips.is_empty() && !self.allowed_ips.contains(&ctx.client_ip) {
+            return Decision::Block {
+                status: 403,
+                reason: format!("IP {} is not in allow list", ctx.client_ip),
+            };
+        }
+        
+        Decision::Allow
     }
 }
 

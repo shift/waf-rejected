@@ -37,13 +37,10 @@ impl WafProxyService {
         );
         
         // Add method blocking rules (block dangerous methods)
-        engine.add_rule(
-            MethodRule::new("blocked_methods")
-                .block_methods(vec![
-                    hyper::Method::TRACE,
-                    hyper::Method::CONNECT,
-                ])
-        );
+        let method_rule = MethodRule::new("blocked_methods")
+            .block_method(hyper::Method::TRACE)
+            .block_method(hyper::Method::CONNECT);
+        engine.add_rule(method_rule);
         
         // Add per-IP rate limiting if enabled
         if config.waf.rate_limit.per_ip_enabled {
@@ -51,6 +48,7 @@ impl WafProxyService {
                 RateLimiter::new(
                     "per_ip_rate_limit",
                     config.waf.rate_limit.per_ip_max_requests,
+                    (config.waf.rate_limit.per_ip_max_requests as u64 / config.waf.rate_limit.per_ip_window_secs) as u32, // refill rate
                     std::time::Duration::from_secs(config.waf.rate_limit.per_ip_window_secs)
                 )
             );
@@ -62,7 +60,7 @@ impl WafProxyService {
                 GlobalRateLimiter::new(
                     "global_rate_limit",
                     config.waf.rate_limit.global_max_requests,
-                    std::time::Duration::from_secs(config.waf.rate_limit.global_window_secs)
+                    (config.waf.rate_limit.global_max_requests as u64 / config.waf.rate_limit.global_window_secs) as u32 // refill rate
                 )
             );
         }
@@ -70,7 +68,7 @@ impl WafProxyService {
         // Add basic header validation
         engine.add_rule(
             HeaderRule::new("security_headers")
-                .block_header_value("user-agent", "")  // Block empty user-agent
+                .forbid_header("x-forwarded-for")  // Example forbidden header
         );
         
         // Build service with WAF middleware
@@ -135,7 +133,7 @@ impl Service<Request<Incoming>> for BaseProxyService {
                 .method(parts.method)
                 .uri(full_upstream_uri)
                 .body(Full::new(body_bytes))
-                .map_err(|e| WafError::Http(e))?;
+                .map_err(|e| WafError::Http(e.to_string()))?;
             
             // Copy headers (but skip host header to avoid conflicts)
             *upstream_req.headers_mut() = parts.headers;

@@ -68,7 +68,8 @@ impl ModSecurityEngine {
         let mut error_count = 0;
         
         for rule_file in rule_files {
-            match new_ruleset.load_from_file(&rule_file) {
+            let rule_file_str = rule_file.to_string_lossy();
+            match new_ruleset.load_from_file(&rule_file_str) {
                 Ok(count) => {
                     loaded_count += count;
                     debug!("Loaded {} rules from {:?}", count, rule_file);
@@ -131,9 +132,11 @@ impl ModSecurityEngine {
             return Ok(());
         }
         
-        let entries = std::fs::read_dir(dir)?;
+        let entries = std::fs::read_dir(dir)
+            .map_err(|e| ModSecurityError::EngineInit(format!("Failed to read rules directory: {}", e)))?;
         for entry in entries {
-            let entry = entry?;
+            let entry = entry
+                .map_err(|e| ModSecurityError::EngineInit(format!("Failed to read directory entry: {}", e)))?;
             let path = entry.path();
             
             if path.is_file() {

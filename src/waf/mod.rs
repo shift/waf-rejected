@@ -150,62 +150,75 @@ impl WafEngine {
     /// Evaluate all rules against the request context
     /// Returns the first blocking decision or Allow if all rules pass
     pub async fn evaluate(&self, request: &RequestContext) -> Decision {
-        let rules = self.rules.read().unwrap();
         let mut triggered_rules = Vec::new();
+        let mut blocking_decision = None;
+        let rules_count;
         
-        debug!(
-            "Evaluating {} rules for request from {}",
-            rules.len(),
-            request.client_ip
-        );
-        
-        for rule in rules.iter() {
-            if !rule.is_enabled() {
-                continue;
-            }
+        // Scope the lock guard to avoid Send issues
+        {
+            let rules = self.rules.read().unwrap();
+            rules_count = rules.len();
             
-            let decision = rule.evaluate(request);
-            match &decision {
-                Decision::Block { status, reason } => {
-                    triggered_rules.push(rule.name().to_string());
-                    
-                    warn!(
-                        "Rule '{}' blocked request from {}: {} ({})",
-                        rule.name(), request.client_ip, reason, status
-                    );
-                    
-                    // Log security event with enhanced logging
-                    self.event_logger.log_event(request, &decision, triggered_rules).await;
-                    
-                    return decision;
-                },
-                Decision::RateLimit { reason } => {
-                    triggered_rules.push(rule.name().to_string());
-                    
-                    warn!(
-                        "Rule '{}' rate limited request from {}: {}",
-                        rule.name(), request.client_ip, reason
-                    );
-                    
-                    // Log security event with enhanced logging
-                    self.event_logger.log_event(request, &decision, triggered_rules).await;
-                    
-                    return decision;
-                },
-                Decision::Allow => {
-                    debug!("Rule '{}' allowed request from {}", rule.name(), request.client_ip);
+            debug!(
+                "Evaluating {} rules for request from {}",
+                rules_count,
+                request.client_ip
+            );
+            
+            for rule in rules.iter() {
+                if !rule.is_enabled() {
                     continue;
                 }
+                
+                let decision = rule.evaluate(request);
+                match &decision {
+                    Decision::Block { status, reason } => {
+                        triggered_rules.push(rule.name().to_string());
+                        
+                        warn!(
+                            "Rule '{}' blocked request from {}: {} ({})",
+                            rule.name(), request.client_ip, reason, status
+                        );
+                        
+                        // Store the blocking decision and break
+                        blocking_decision = Some(decision);
+                        break;
+                    }
+                    Decision::RateLimit { reason } => {
+                        triggered_rules.push(rule.name().to_string());
+                        
+                        warn!(
+                            "Rule '{}' rate limited request from {}: {}",
+                            rule.name(), request.client_ip, reason
+                        );
+                        
+                        // Store the rate limit decision and break
+                        blocking_decision = Some(decision);
+                        break;
+                    }
+                    Decision::Allow => {
+                        debug!("Rule '{}' allowed request", rule.name());
+                        // Continue evaluating other rules
+                    }
+                }
             }
+        } // RwLockReadGuard is dropped here
+        
+        // Now we can safely do async operations
+        if let Some(decision) = blocking_decision {
+            // Log security event with enhanced logging
+            self.event_logger.log_event(request, &decision, triggered_rules).await;
+            return decision;
         }
         
-        debug!("All rules passed for request from {}", request.client_ip);
+        // If we get here, all rules passed
+        debug!("All {} rules passed for request from {}", rules_count, request.client_ip);
         
         // Log allowed request if configured to log low-threat events
-        let decision = Decision::Allow;
-        self.event_logger.log_event(request, &decision, triggered_rules).await;
+        let allow_decision = Decision::Allow;
+        self.event_logger.log_event(request, &allow_decision, triggered_rules).await;
         
-        decision
+        allow_decision
     }
 
     pub fn rule_count(&self) -> usize {
@@ -267,29 +280,29 @@ mod tests {
         )
     }
 
-    #[test]
-    fn test_waf_engine_empty() {
+    #[tokio::test]
+    async fn test_waf_engine_empty() {
         let engine = WafEngine::new();
         let ctx = create_test_context();
         
-        assert_eq!(engine.evaluate(&ctx), Decision::Allow);
+        assert_eq!(engine.evaluate(&ctx).await, Decision::Allow);
         assert_eq!(engine.rule_count(), 0);
         assert_eq!(engine.enabled_rule_count(), 0);
     }
 
-    #[test]
-    fn test_waf_engine_allow_rule() {
+    #[tokio::test]
+    async fn test_waf_engine_allow_rule() {
         let mut engine = WafEngine::new();
         engine.add_rule(TestRule::new("allow_rule", Decision::Allow));
         
         let ctx = create_test_context();
-        assert_eq!(engine.evaluate(&ctx), Decision::Allow);
+        assert_eq!(engine.evaluate(&ctx).await, Decision::Allow);
         assert_eq!(engine.rule_count(), 1);
         assert_eq!(engine.enabled_rule_count(), 1);
     }
 
-    #[test]
-    fn test_waf_engine_block_rule() {
+    #[tokio::test]
+    async fn test_waf_engine_block_rule() {
         let mut engine = WafEngine::new();
         engine.add_rule(TestRule::new(
             "block_rule",
@@ -297,7 +310,7 @@ mod tests {
         ));
         
         let ctx = create_test_context();
-        let result = engine.evaluate(&ctx);
+        let result = engine.evaluate(&ctx).await;
         
         match result {
             Decision::Block { status, reason } => {
@@ -308,8 +321,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_waf_engine_first_block_wins() {
+    #[tokio::test]
+    async fn test_waf_engine_first_block_wins() {
         let mut engine = WafEngine::new();
         engine.add_rule(TestRule::new("allow_rule", Decision::Allow));
         engine.add_rule(TestRule::new(
@@ -322,7 +335,7 @@ mod tests {
         ));
         
         let ctx = create_test_context();
-        let result = engine.evaluate(&ctx);
+        let result = engine.evaluate(&ctx).await;
         
         match result {
             Decision::Block { reason, .. } => {
