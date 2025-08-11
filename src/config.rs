@@ -55,6 +55,12 @@ pub struct WafConfig {
     /// Enable WAF functionality
     pub enabled: bool,
     
+    /// Fail mode: "closed" (block on errors) or "open" (allow on errors)
+    pub fail_mode: String,
+    
+    /// Connection timeout for upstream in milliseconds
+    pub upstream_timeout_ms: u64,
+    
     /// Rate limiting configuration
     pub rate_limit: RateLimitConfig,
     
@@ -214,6 +220,8 @@ impl Default for WafConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            fail_mode: "closed".to_string(), // Default to fail-closed (secure)
+            upstream_timeout_ms: 5000, // 5 second timeout
             rate_limit: RateLimitConfig::default(),
             security_events: SecurityEventsConfig::default(),
             content_inspection: ContentInspectionConfig::default(),

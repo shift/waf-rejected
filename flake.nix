@@ -45,6 +45,7 @@
             wrk
             curl
             jq
+            gnuplot  # Added for Criterion benchmark plotting
             
             # Monitoring and observability
             prometheus

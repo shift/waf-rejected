@@ -1,0 +1,18 @@
+[server]
+bind_addr = "0.0.0.0:8080"
+upstream_uri = "http://127.0.0.1:3000"
+
+[waf]
+enabled = true
+fail_mode = "open"  # Test fail-open mode
+upstream_timeout_ms = 3000
+
+[waf.content_inspection]
+enabled = true
+inspect_headers = true
+inspect_body = true
+max_body_size = 1048576  # 1MB
+
+[logging]
+level = "info"
+json_format = false

@@ -3665,6 +3665,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
  "pin-project",
+ "rand",
  "redis",
  "regex",
  "rustls 0.23.31",

@@ -102,9 +102,31 @@ sled = { version = "0.34", optional = true }
 # CLI utilities
 clap = { version = "4.0", features = ["derive"] }
 
+# Random number generation for testing
+rand = "0.8"
+
 # Security modules dependencies
 maxminddb = { version = "0.24", optional = true }
 ipnetwork = "0.20"
+
+# AI/ML dependencies for threat detection
+candle-core = { version = "0.7", optional = true }
+candle-nn = { version = "0.7", optional = true }
+candle-transformers = { version = "0.7", optional = true }
+
+# Data processing for ML
+polars = { version = "0.41", features = ["lazy"], optional = true }
+arrow = { version = "53.0", optional = true }
+
+# Time series analysis
+smartcore = { version = "0.3", features = ["nalgebra-bindings"], optional = true }
+
+# Statistics and ML utilities  
+ndarray = { version = "0.15", optional = true }
+rand_distr = { version = "0.4", optional = true }
+
+# Threat intelligence integration
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false, optional = true }
 
 [dev-dependencies]
 # Testing framework
@@ -124,6 +146,8 @@ geoip = ["maxminddb"]
 export-system = ["sled", "opentelemetry", "opentelemetry_sdk"]
 export-otel = ["opentelemetry", "opentelemetry_sdk"]
 export-sled = ["sled"]
+# AI/ML threat detection features
+ai-threat-detection = ["candle-core", "candle-nn", "candle-transformers", "polars", "arrow", "smartcore", "ndarray", "rand_distr", "reqwest"]
 
 # Security modules performance benchmarks
 [[bench]]
@@ -158,3 +182,27 @@ path = "src/bin/enterprise_compliance_test.rs"
 [[bin]]
 name = "enterprise_availability_test"  
 path = "src/bin/enterprise_availability_test.rs"
+
+[[bin]]
+name = "enterprise_modsecurity_test"
+path = "src/bin/enterprise_modsecurity_test.rs"
+
+[[bin]]
+name = "progressive_load_test"
+path = "src/bin/progressive_load_test.rs"
+
+[[bin]]
+name = "echo_backend"
+path = "src/bin/echo_backend.rs"
+
+[[bin]]
+name = "end_to_end_test"
+path = "src/bin/end_to_end_test.rs"
+
+[[bin]]
+name = "advanced_test_backend"
+path = "src/bin/advanced_test_backend.rs"
+
+[[bin]]
+name = "comprehensive_waf_test"
+path = "src/bin/comprehensive_waf_test.rs"
