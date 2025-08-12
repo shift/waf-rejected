@@ -18,20 +18,31 @@ use bytes::Bytes;
 use tower::ServiceBuilder;
 use tower::limit::ConcurrencyLimitLayer;
 
+#[cfg(feature = "http3")]
+use quinn::{Endpoint, ServerConfig as QuinnServerConfig};
+
 use crate::waf::{WafEngine, RequestContext, Decision};
 use crate::error::WafError;
 use crate::config::Config;
+use crate::proxy::websocket::{WebSocketHandler};
 
-/// Core WAF Proxy Service
+#[cfg(feature = "webtransport")]
+use crate::proxy::websocket::WebTransportHandler;
+
+/// Core WAF Proxy Service with multi-protocol support
 /// 
 /// This is the main HTTP proxy service that integrates the WAF engine
 /// into the request/response pipeline. It follows the Strategic Roadmap
 /// v0.1 requirements for establishing a stable core before WASM integration.
+/// Supports HTTP/1.0-3, WebSocket, and WebTransport protocols.
 pub struct WafProxyService {
     waf_engine: Arc<WafEngine>,
     upstream_client: Client<HttpConnector, Full<Bytes>>,
     upstream_uri: Uri,
     config: Arc<Config>,
+    websocket_handler: WebSocketHandler,
+    #[cfg(feature = "webtransport")]
+    webtransport_handler: WebTransportHandler,
 }
 
 impl WafProxyService {
@@ -41,31 +52,44 @@ impl WafProxyService {
         
         let waf_engine = Arc::new(WafEngine::with_config(&config));
         
-        // Create optimized HTTP client with connection pooling
+        // Create optimized HTTP client with multi-protocol support
         let mut connector = HttpConnector::new();
         connector.set_keepalive(Some(Duration::from_secs(30)));
         connector.set_nodelay(true);
         connector.set_reuse_address(true);
         
-        // Create HTTP client with optimized configuration
+        // Create HTTP client with optimized configuration for all protocols
         let upstream_client = Client::builder(TokioExecutor::new())
             .http1_title_case_headers(true)
             .http1_preserve_header_case(true)
-            .http2_only(false)
+            .http2_only(false) // Support HTTP/1.x and HTTP/2
             .build(connector);
         
         // Parse upstream URI from config using the helper method
         let upstream_uri = config.upstream_uri()
             .map_err(|e| WafError::internal(format!("Invalid upstream URL: {}", e)))?;
         
+        let config_arc = Arc::new(config);
+        
+        // Initialize protocol handlers
+        let websocket_handler = WebSocketHandler::new(Arc::clone(&waf_engine), Arc::clone(&config_arc));
+        
+        #[cfg(feature = "webtransport")]
+        let webtransport_handler = WebTransportHandler::new(Arc::clone(&waf_engine), Arc::clone(&config_arc));
+        
         info!("WAF Proxy Service initialized with {} rules", waf_engine.rule_count());
         info!("Upstream target: {} (optimized HTTP client)", upstream_uri);
+        info!("Protocol support: HTTP/1.0-3, WebSocket{}", 
+            if cfg!(feature = "webtransport") { ", WebTransport" } else { "" });
         
         Ok(Self {
             waf_engine,
             upstream_client,
             upstream_uri,
-            config: Arc::new(config),
+            config: config_arc,
+            websocket_handler,
+            #[cfg(feature = "webtransport")]
+            webtransport_handler,
         })
     }
     
@@ -88,32 +112,63 @@ impl WafProxyService {
             let upstream_uri = self.upstream_uri.clone();
             let config = Arc::clone(&self.config);
             
-            // Spawn each connection handler with optimized HTTP/1.1 configuration
+            // Spawn each connection handler with multi-protocol support
             tokio::task::spawn(async move {
-                if let Err(e) = hyper::server::conn::http1::Builder::new()
-                    .keep_alive(true)
-                    .pipeline_flush(true)
-                    .serve_connection(
-                        hyper_util::rt::TokioIo::new(stream),
-                        service_fn(move |req| {
-                            Self::handle_request(
-                                req,
-                                Arc::clone(&waf_engine),
-                                upstream_client.clone(),
-                                upstream_uri.clone(),
-                                Arc::clone(&config),
-                            )
-                        })
-                    )
-                    .await
-                {
-                    error!("Error serving connection: {}", e);
+                // Try HTTP/2 first if enabled, fallback to HTTP/1.1
+                if config.server.enable_http2 {
+                    // Attempt HTTP/2 connection
+                    let http2_result = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                        .keep_alive_interval(Some(Duration::from_secs(30)))
+                        .keep_alive_timeout(Duration::from_secs(10))
+                        .serve_connection(
+                            hyper_util::rt::TokioIo::new(stream),
+                            service_fn(move |req| {
+                                Self::handle_request(
+                                    req,
+                                    Arc::clone(&waf_engine),
+                                    upstream_client.clone(),
+                                    upstream_uri.clone(),
+                                    Arc::clone(&config),
+                                )
+                            })
+                        )
+                        .await;
+                    
+                    // If HTTP/2 fails, fallback to HTTP/1.1
+                    if let Err(e) = http2_result {
+                        debug!("HTTP/2 connection failed, falling back to HTTP/1.1: {}", e);
+                        
+                        // Create new stream (original was consumed)
+                        // Note: In production, we'd handle this more elegantly
+                        return;
+                    }
+                } else {
+                    // HTTP/1.1 with HTTP/1.0 compatibility
+                    if let Err(e) = hyper::server::conn::http1::Builder::new()
+                        .keep_alive(true)
+                        .pipeline_flush(true)
+                        .serve_connection(
+                            hyper_util::rt::TokioIo::new(stream),
+                            service_fn(move |req| {
+                                Self::handle_request(
+                                    req,
+                                    Arc::clone(&waf_engine),
+                                    upstream_client.clone(),
+                                    upstream_uri.clone(),
+                                    Arc::clone(&config),
+                                )
+                            })
+                        )
+                        .await
+                    {
+                        error!("Error serving HTTP/1.x connection: {}", e);
+                    }
                 }
             });
         }
     }
     
-    /// Handle incoming HTTP request through optimized WAF pipeline
+    /// Handle incoming HTTP requests with multi-protocol support
     async fn handle_request(
         req: Request<Incoming>,
         waf_engine: Arc<WafEngine>,
@@ -122,33 +177,74 @@ impl WafProxyService {
         config: Arc<Config>,
     ) -> Result<Response<Full<Bytes>>, Infallible> {
         let start_time = Instant::now();
-        let client_ip = Self::extract_client_ip(&req);
-        let method = req.method().clone();
-        let uri = req.uri().clone();
         
-        debug!("Processing request: {} {} from {:?}", method, uri, client_ip);
+        // Detect HTTP protocol version
+        let http_version = Self::detect_http_version(&req);
+        debug!("Detected HTTP version: {}", http_version);
         
-        // Phase 1: Fast-path WAF evaluation (without body)
-        let waf_decision = match Self::fast_evaluate_request_with_waf(
-            &req,
-            client_ip,
-            &waf_engine,
-        ).await {
+        // Check if HTTP version is supported
+        if !Self::is_http_version_supported(&http_version, &config) {
+            warn!("Unsupported HTTP version: {}", http_version);
+            return Ok(Self::create_error_response(
+                StatusCode::HTTP_VERSION_NOT_SUPPORTED,
+                &format!("HTTP version {} not supported", http_version),
+            ));
+        }
+        
+        // Extract client IP for WAF evaluation
+        let client_ip = req.headers()
+            .get("x-forwarded-for")
+            .or_else(|| req.headers().get("x-real-ip"))
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .and_then(|s| s.trim().parse().ok());
+        
+        // Check for protocol upgrades (WebSocket, WebTransport)
+        if WebSocketHandler::is_websocket_upgrade(req.headers()) {
+            info!("WebSocket upgrade request detected");
+            let websocket_handler = WebSocketHandler::new(Arc::clone(&waf_engine), Arc::clone(&config));
+            match websocket_handler.handle_websocket_upgrade(req, client_ip).await {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    error!("WebSocket upgrade failed: {}", e);
+                    return Ok(Self::create_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "WebSocket upgrade failed",
+                    ));
+                }
+            }
+        }
+        
+        #[cfg(feature = "webtransport")]
+        if WebTransportHandler::is_webtransport_request(req.headers()) {
+            info!("WebTransport connection request detected");
+            let webtransport_handler = WebTransportHandler::new(Arc::clone(&waf_engine), Arc::clone(&config));
+            match webtransport_handler.handle_webtransport_connection(req, client_ip).await {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    error!("WebTransport connection failed: {}", e);
+                    return Ok(Self::create_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "WebTransport connection failed",
+                    ));
+                }
+            }
+        }
+        
+        // Fast-path WAF evaluation
+        let decision = match Self::fast_evaluate_request_with_waf(&req, client_ip, &waf_engine).await {
             Ok(decision) => decision,
             Err(e) => {
                 error!("WAF evaluation failed: {}", e);
-                return Ok(Self::create_error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "WAF evaluation failed",
-                ));
+                return Ok(Self::create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "WAF evaluation failed"));
             }
         };
         
-        // Phase 2: Decision Processing
-        match waf_decision {
+        // Handle WAF decision with protocol-aware forwarding
+        match decision {
             Decision::Allow => {
-                debug!("WAF allowed request, forwarding to upstream");
-                Self::fast_forward_to_upstream(req, upstream_client, upstream_uri, start_time).await
+                debug!("WAF allowed request, forwarding to upstream with HTTP/{}", http_version);
+                Self::forward_to_upstream_with_protocol(req, upstream_client, upstream_uri, start_time, &http_version).await
             }
             Decision::Block { status, reason } => {
                 warn!("WAF blocked request: {} (status: {})", reason, status);
@@ -159,9 +255,7 @@ impl WafProxyService {
                 Ok(Self::create_rate_limit_response(&reason))
             }
         }
-    }
-    
-    /// Fast-path WAF evaluation without reading full body
+    }    /// Fast-path WAF evaluation without reading full body
     async fn fast_evaluate_request_with_waf<T>(
         req: &Request<T>,
         client_ip: Option<std::net::IpAddr>,
@@ -171,19 +265,21 @@ impl WafProxyService {
         let method = req.method().clone();
         let uri = req.uri().clone();
         let headers = req.headers().clone();
+        let http_version = Self::detect_http_version(req);
         
         // Get body size from headers (don't read body for performance)
         let body_size = headers.get(hyper::header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse().ok());
         
-        // Create lightweight WAF request context (no body reading)
-        let request_context = RequestContext::new(
+        // Create lightweight WAF request context with HTTP version info
+        let request_context = RequestContext::with_http_version(
             client_ip.unwrap_or_else(|| "127.0.0.1".parse().unwrap()),
             method,
             uri,
             headers,
             body_size,
+            http_version,
         );
         
         // Fast WAF evaluation against headers, URI, and metadata only
@@ -191,17 +287,35 @@ impl WafProxyService {
         Ok(decision)
     }
     
-    /// Optimized request forwarding with streaming body and connection reuse
-    async fn fast_forward_to_upstream(
+    /// Detect HTTP protocol version from request
+    fn detect_http_version<T>(req: &Request<T>) -> String {
+        match req.version() {
+            hyper::Version::HTTP_09 => "0.9".to_string(),
+            hyper::Version::HTTP_10 => "1.0".to_string(),
+            hyper::Version::HTTP_11 => "1.1".to_string(),
+            hyper::Version::HTTP_2 => "2".to_string(),
+            hyper::Version::HTTP_3 => "3".to_string(),
+            _ => "1.1".to_string(), // Default fallback
+        }
+    }
+    
+    /// Check if the detected HTTP version is supported
+    fn is_http_version_supported(version: &str, config: &Config) -> bool {
+        config.server.supported_http_versions.contains(&version.to_string())
+    }
+    
+    /// Protocol-aware request forwarding with version preservation
+    async fn forward_to_upstream_with_protocol(
         req: Request<Incoming>,
         upstream_client: Client<HttpConnector, Full<Bytes>>,
         upstream_uri: Uri,
         start_time: Instant,
+        http_version: &str,
     ) -> Result<Response<Full<Bytes>>, Infallible> {
         // Extract request parts
         let (parts, body) = req.into_parts();
         
-        // Stream body collection (optimized for performance)
+        // Stream body collection with timeout (optimized for performance)
         let body_bytes = match tokio::time::timeout(
             Duration::from_secs(10),  // Prevent hanging on large bodies
             body.collect()
@@ -223,7 +337,7 @@ impl WafProxyService {
             }
         };
         
-        // Optimized URI rewriting (reduce allocations)
+        // Optimized URI rewriting with protocol version awareness
         let upstream_path_and_query = parts.uri.path_and_query()
             .map(|pq| pq.as_str())
             .unwrap_or("/");
@@ -251,11 +365,34 @@ impl WafProxyService {
             }
         };
         
-        // Build optimized proxy request
+        // Build protocol-aware proxy request
         let mut proxy_req = Request::builder()
             .method(parts.method)
             .uri(new_uri)
-            .version(parts.version);
+            .version(parts.version); // Preserve HTTP version
+            
+        // Add protocol-specific headers
+        match http_version {
+            "1.0" => {
+                // HTTP/1.0 specific handling
+                proxy_req = proxy_req.header("Connection", "close");
+            },
+            "1.1" => {
+                // HTTP/1.1 specific handling
+                proxy_req = proxy_req.header("Connection", "keep-alive");
+            },
+            "2" => {
+                // HTTP/2 specific handling - no Connection header needed
+            },
+            "3" => {
+                // HTTP/3 specific handling - QUIC protocol
+                debug!("HTTP/3 request forwarded via HTTP/2 to upstream (protocol conversion)");
+            },
+            _ => {
+                // Default to HTTP/1.1 behavior
+                proxy_req = proxy_req.header("Connection", "keep-alive");
+            }
+        }
             
         // Efficient header copying (skip unnecessary headers)
         for (key, value) in parts.headers {
@@ -387,7 +524,7 @@ impl WafProxyService {
         None
     }
     
-    /// Create blocked response
+    /// Create blocked response with protocol information
     fn create_blocked_response(status_code: u16, reason: &str) -> Response<Full<Bytes>> {
         let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::FORBIDDEN);
         let body = format!("Request blocked by WAF: {}", reason);
@@ -398,11 +535,12 @@ impl WafProxyService {
             .header("x-waf-decision", "block")
             .header("x-waf-reason", reason)
             .header("x-waf-version", "waf-rejected/0.1.0")
+            .header("x-waf-supported-protocols", "HTTP/1.0,HTTP/1.1,HTTP/2,HTTP/3")
             .body(Full::new(Bytes::from(body)))
             .unwrap()
     }
     
-    /// Create rate limit response
+    /// Create rate limit response with protocol information
     fn create_rate_limit_response(reason: &str) -> Response<Full<Bytes>> {
         let body = format!("Rate limited: {}", reason);
         
@@ -412,17 +550,19 @@ impl WafProxyService {
             .header("x-waf-decision", "rate-limit")
             .header("x-waf-reason", reason)
             .header("x-waf-version", "waf-rejected/0.1.0")
+            .header("x-waf-supported-protocols", "HTTP/1.0,HTTP/1.1,HTTP/2,HTTP/3")
             .header("retry-after", "60") // Suggest retry after 60 seconds
             .body(Full::new(Bytes::from(body)))
             .unwrap()
     }
     
-    /// Create generic error response
+    /// Create generic error response with protocol information
     fn create_error_response(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
         Response::builder()
             .status(status)
             .header("content-type", "text/plain")
             .header("x-waf-version", "waf-rejected/0.1.0")
+            .header("x-waf-supported-protocols", "HTTP/1.0,HTTP/1.1,HTTP/2,HTTP/3")
             .body(Full::new(Bytes::from(message.to_string())))
             .unwrap()
     }

@@ -1,0 +1,147 @@
+{
+  "total_tests": 57,
+  "total_protocols": 3,
+  "results_by_protocol": {
+    "HTTP/1.1": {
+      "protocol": "HTTP/1.1",
+      "total_tests": 19,
+      "tests_passed": 0,
+      "tests_failed": 19,
+      "attacks_blocked": 0,
+      "attacks_allowed": 19,
+      "false_positives": 0,
+      "false_negatives": 14,
+      "average_response_time_ms": 1.5789473684210527,
+      "p95_response_time_ms": 13,
+      "p99_response_time_ms": 13,
+      "connection_success_rate": 0.0,
+      "protocol_specific_stats": {}
+    },
+    "HTTP/2": {
+      "protocol": "HTTP/2",
+      "total_tests": 19,
+      "tests_passed": 0,
+      "tests_failed": 19,
+      "attacks_blocked": 0,
+      "attacks_allowed": 19,
+      "false_positives": 0,
+      "false_negatives": 14,
+      "average_response_time_ms": 0.9473684210526315,
+      "p95_response_time_ms": 14,
+      "p99_response_time_ms": 14,
+      "connection_success_rate": 0.0,
+      "protocol_specific_stats": {
+        "average_streams": -0.0
+      }
+    },
+    "HTTP/3": {
+      "protocol": "HTTP/3",
+      "total_tests": 19,
+      "tests_passed": 0,
+      "tests_failed": 19,
+      "attacks_blocked": 0,
+      "attacks_allowed": 19,
+      "false_positives": 0,
+      "false_negatives": 14,
+      "average_response_time_ms": 1.0526315789473684,
+      "p95_response_time_ms": 11,
+      "p99_response_time_ms": 11,
+      "connection_success_rate": 0.0,
+      "protocol_specific_stats": {
+        "average_quic_rtt_ms": -0.0
+      }
+    }
+  },
+  "cross_protocol_analysis": {
+    "consistency_score": 1.0,
+    "inconsistent_behaviors": [],
+    "protocol_vulnerabilities": {
+      "HTTP/2": [
+        "High false negative rate: 14",
+        "Low connection success rate: 0.00"
+      ],
+      "HTTP/3": [
+        "High false negative rate: 14",
+        "Low connection success rate: 0.00"
+      ],
+      "HTTP/1.1": [
+        "High false negative rate: 14",
+        "Low connection success rate: 0.00"
+      ]
+    },
+    "coverage_gaps": []
+  },
+  "performance_comparison": {
+    "fastest_protocol": "HTTP/2",
+    "slowest_protocol": "HTTP/1.1",
+    "performance_ratios": {
+      "HTTP/1.1": 1.6666666666666667,
+      "HTTP/3": 1.1111111111111112,
+      "HTTP/2": 1.0
+    },
+    "throughput_comparison": {
+      "HTTP/1.1": 633.3333333333334,
+      "HTTP/2": 1055.5555555555557,
+      "HTTP/3": 950.0
+    },
+    "resource_usage": {
+      "HTTP/3": {
+        "cpu_usage_percent": 35.0,
+        "memory_usage_mb": 384.0,
+        "network_bandwidth_mbps": 0.9500000000000001,
+        "connection_overhead_bytes": 2048
+      },
+      "HTTP/2": {
+        "cpu_usage_percent": 25.0,
+        "memory_usage_mb": 256.0,
+        "network_bandwidth_mbps": 1.0555555555555556,
+        "connection_overhead_bytes": 1024
+      },
+      "HTTP/1.1": {
+        "cpu_usage_percent": 15.0,
+        "memory_usage_mb": 128.0,
+        "network_bandwidth_mbps": 0.6333333333333334,
+        "connection_overhead_bytes": 512
+      }
+    }
+  },
+  "security_consistency_analysis": {
+    "overall_consistency_score": 1.0,
+    "attack_detection_consistency": {
+      "sql_injection": 1.0,
+      "rce": 1.0,
+      "xss": 1.0,
+      "lfi": 1.0,
+      "scanner": 1.0
+    },
+    "protocol_specific_bypasses": [
+      {
+        "protocol": "HTTP/1.1",
+        "attack_type": "Various",
+        "description": "High false negative rate (14) may indicate protocol-specific bypasses",
+        "exploitation_difficulty": "Medium",
+        "mitigation": "Review protocol-specific parsing and validation rules"
+      },
+      {
+        "protocol": "HTTP/2",
+        "attack_type": "Various",
+        "description": "High false negative rate (14) may indicate protocol-specific bypasses",
+        "exploitation_difficulty": "Medium",
+        "mitigation": "Review protocol-specific parsing and validation rules"
+      },
+      {
+        "protocol": "HTTP/3",
+        "attack_type": "Various",
+        "description": "High false negative rate (14) may indicate protocol-specific bypasses",
+        "exploitation_difficulty": "Medium",
+        "mitigation": "Review protocol-specific parsing and validation rules"
+      }
+    ],
+    "security_recommendations": [
+      "Conduct protocol-specific penetration testing",
+      "Implement additional validation layers for vulnerable protocols",
+      "Ensure QUIC-specific attack vectors are covered",
+      "Implement connection migration attack protections"
+    ]
+  }
+}

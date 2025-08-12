@@ -44,6 +44,7 @@ pub struct RequestContext {
     pub body_size: Option<usize>,
     pub body: Option<Bytes>,
     pub timestamp: Instant,
+    pub http_version: String,
 }
 
 impl RequestContext {
@@ -62,6 +63,28 @@ impl RequestContext {
             body_size,
             body: None,
             timestamp: Instant::now(),
+            http_version: "1.1".to_string(), // Default to HTTP/1.1
+        }
+    }
+    
+    /// Create RequestContext with explicit HTTP version
+    pub fn with_http_version(
+        client_ip: IpAddr,
+        method: Method,
+        uri: Uri,
+        headers: HeaderMap,
+        body_size: Option<usize>,
+        http_version: String,
+    ) -> Self {
+        Self {
+            client_ip,
+            method,
+            uri,
+            headers,
+            body_size,
+            body: None,
+            timestamp: Instant::now(),
+            http_version,
         }
     }
 

@@ -28,6 +28,20 @@ hyper = { version = "1.0", features = ["full", "server", "client", "http1", "htt
 hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
 
+# HTTP/3 and QUIC support
+h3 = { version = "0.0.5", optional = true }
+h3-quinn = { version = "0.0.5", optional = true }
+quinn = { version = "0.11", optional = true }
+rustls-native-certs = { version = "0.7", optional = true }
+
+# WebSocket and WebTransport support
+tokio-tungstenite = { version = "0.20", features = ["native-tls"] }
+tungstenite = { version = "0.20", features = ["native-tls"] }
+futures-util = { version = "0.3", features = ["sink"] }
+
+# WebTransport support (experimental)
+web-transport = { git = "https://github.com/kixelated/web-transport-rs", optional = true }
+
 # Tower middleware stack
 tower = { version = "0.4", features = ["full"] }
 tower-http = { version = "0.5", features = ["trace", "cors", "add-extension"] }
@@ -72,7 +86,6 @@ wasmtime-wasi = { version = "26.0", optional = true }
 wasmtime-wasi-http = { version = "26.0", optional = true }
 
 # Streaming body processing
-futures-util = "0.3"
 async-stream = "0.3"
 
 # Enhanced JSON handling for WASM calls
@@ -91,6 +104,10 @@ uuid = { version = "1.6", features = ["v4", "serde"] }
 notify = "6.1"
 urlencoding = "2.1"
 async-trait = "0.1"
+
+# WebSocket handshake dependencies
+sha1 = "0.10"
+base64 = "0.22"
 
 # OpenTelemetry dependencies for security event export (simplified)
 opentelemetry = { version = "0.20", optional = true }
@@ -140,9 +157,13 @@ tempfile = "3.0"
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 
 [features]
-default = ["wasm-waf", "export-system"]
+default = ["wasm-waf", "export-system", "http3", "websocket"]
 integration-tests = []
 wasm-waf = ["wasmtime", "wasmtime-wasi", "wasmtime-wasi-http"]
+# Protocol support features
+http3 = ["h3", "h3-quinn", "quinn", "rustls-native-certs"]
+websocket = []
+webtransport = ["web-transport"]
 # Security features
 geoip = ["maxminddb"]
 # Export system features

@@ -55,6 +55,12 @@ pub struct ServerConfig {
     /// Enable HTTP/2 support
     pub enable_http2: bool,
     
+    /// Enable HTTP/3 support (QUIC)
+    pub enable_http3: bool,
+    
+    /// Supported HTTP versions (1.0, 1.1, 2, 3)
+    pub supported_http_versions: Vec<String>,
+    
     /// Maximum request body size in bytes
     pub max_body_size: usize,
 }
@@ -265,6 +271,13 @@ impl Default for ServerConfig {
             request_timeout_secs: 30,
             keep_alive_timeout_secs: 90,
             enable_http2: true,
+            enable_http3: true,
+            supported_http_versions: vec![
+                "1.0".to_string(),
+                "1.1".to_string(), 
+                "2".to_string(),
+                "3".to_string(),
+            ],
             max_body_size: 10 * 1024 * 1024, // 10MB
         }
     }
