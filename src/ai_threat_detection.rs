@@ -976,6 +976,22 @@ pub struct ThreatAnalysis {
     pub processing_time_ms: f32,
 }
 
+impl Default for ThreatAnalysis {
+    fn default() -> Self {
+        Self {
+            request_id: String::new(),
+            timestamp: 0,
+            anomaly_score: 0.0,
+            business_context: BusinessContext::default(),
+            threat_categories: Vec::new(),
+            overall_risk_score: 0.0,
+            recommended_action: SecurityAction::Allow,
+            confidence: 0.0,
+            processing_time_ms: 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BusinessContext {
     pub is_business_hours: bool,

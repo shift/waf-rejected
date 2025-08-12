@@ -4,31 +4,16 @@
 //! This module handles the communication protocol between the Rust host
 //! and the WASM guest modules.
 
-use wasmtime::component::*;
+use wasmtime::component::{Component, Linker};
 use anyhow::Result;
 
-// Component bindings generated from WIT files
-// In a production setup, these would be auto-generated using wit-bindgen
+// Note: In production, these would be auto-generated using wit-bindgen
+// For now, we use a simplified interface for the MVP
 
 /// WASM component interface for ModSecurity
-#[derive(Component)]
-#[interface = "modsecurity:engine/process@1.0.0"]
 pub struct ModSecurityComponent {
-    /// Process an HTTP request and return security decision
-    #[method = "process-request"]
-    pub process_request: fn(&str) -> Result<SecurityDecision, SecurityError>,
-    
-    /// Load security rules from configuration
-    #[method = "load-rules"] 
-    pub load_rules: fn(&str) -> Result<u32, SecurityError>,
-    
-    /// Get engine statistics
-    #[method = "get-stats"]
-    pub get_stats: fn() -> EngineStats,
-    
-    /// Update geographic context for request processing
-    #[method = "update-geo-context"]
-    pub update_geo_context: fn(&GeoUpdateRequest) -> Result<(), SecurityError>,
+    /// Component instance (simplified for MVP)
+    _component: Component,
 }
 
 /// Security decision returned by WASM component
@@ -68,6 +53,12 @@ pub enum SecurityError {
     InternalError(String),
     /// Memory limit exceeded
     MemoryLimitExceeded,
+}
+
+impl From<anyhow::Error> for SecurityError {
+    fn from(err: anyhow::Error) -> Self {
+        SecurityError::InternalError(err.to_string())
+    }
 }
 
 /// Severity levels for security events
@@ -201,7 +192,7 @@ pub struct GeoInfo {
 /// WASM component loader and manager
 pub struct ComponentManager {
     engine: wasmtime::Engine,
-    linker: component::Linker<WasmHostContext>,
+    linker: Linker<WasmHostContext>,
 }
 
 /// Host context for WASM execution
@@ -220,7 +211,7 @@ impl ComponentManager {
         config.async_support(true);
         
         let engine = wasmtime::Engine::new(&config)?;
-        let mut linker = component::Linker::new(&engine);
+        let mut linker = Linker::new(&engine);
         
         // Add host function bindings
         Self::add_host_functions(&mut linker)?;
@@ -239,41 +230,15 @@ impl ComponentManager {
         component: &Component,
         store: &mut wasmtime::Store<WasmHostContext>,
     ) -> Result<ModSecurityComponent> {
-        let instance = self.linker.instantiate_async(store, component).await?;
-        
-        // Extract typed interface
-        let process_request = instance.get_typed_func::<(&str,), (Result<SecurityDecision, SecurityError>,)>(store, "process-request")?;
-        let load_rules = instance.get_typed_func::<(&str,), (Result<u32, SecurityError>,)>(store, "load-rules")?;
-        let get_stats = instance.get_typed_func::<(), (EngineStats,)>(store, "get-stats")?;
-        let update_geo_context = instance.get_typed_func::<(&GeoUpdateRequest,), (Result<(), SecurityError>,)>(store, "update-geo-context")?;
+        // Simplified instantiation for MVP
+        // In production, this would use the component model
         
         Ok(ModSecurityComponent {
-            process_request: |input| {
-                // This would be the actual function call
-                // Simplified for now
-                Ok(SecurityDecision::Allow)
-            },
-            load_rules: |rules| {
-                // This would be the actual function call
-                Ok(0)
-            },
-            get_stats: || {
-                EngineStats {
-                    total_requests: 0,
-                    blocked_requests: 0,
-                    logged_requests: 0,
-                    rules_loaded: 0,
-                    memory_usage: 0,
-                    avg_processing_time_us: 0,
-                }
-            },
-            update_geo_context: |update| {
-                Ok(())
-            },
+            _component: component.clone(),
         })
     }
     
-    fn add_host_functions(linker: &mut component::Linker<WasmHostContext>) -> Result<()> {
+    fn add_host_functions(linker: &mut Linker<WasmHostContext>) -> Result<()> {
         // Add host function implementations
         // This would bind the actual host functions to the WASM module
         

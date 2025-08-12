@@ -221,3 +221,12 @@ path = "src/bin/phase4_comprehensive_test.rs"
 [[bin]]
 name = "phase4_standalone_test"
 path = "src/bin/phase4_standalone_test.rs"
+
+[[bin]]
+name = "test_wasm_integration"
+path = "src/bin/test_wasm_integration.rs"
+required-features = ["wasm-waf"]
+
+[[bin]]
+name = "benchmark_core"
+path = "src/bin/benchmark_core.rs"

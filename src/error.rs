@@ -22,6 +22,8 @@ pub enum WafError {
     InternalError(String),
     /// Upstream connection error
     Upstream(String),
+    /// Request blocked by WAF rule
+    Blocked { rule_id: String },
 }
 
 impl fmt::Display for WafError {
@@ -36,6 +38,7 @@ impl fmt::Display for WafError {
             WafError::ValidationError(msg) => write!(f, "Validation error: {}", msg),
             WafError::InternalError(msg) => write!(f, "Internal error: {}", msg),
             WafError::Upstream(msg) => write!(f, "Upstream error: {}", msg),
+            WafError::Blocked { rule_id } => write!(f, "Request blocked by rule: {}", rule_id),
         }
     }
 }

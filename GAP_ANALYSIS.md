@@ -44,7 +44,7 @@ This analysis compares the project against industry-standard best practices for 
 *   **Desired State:** A fully automated "CI/CD" pipeline that builds, tests, and packages the application for release. Production deployments should be automated and repeatable.
 *   **Identified Gaps:**
     *   **Missing CI Pipeline:** No configuration file for a CI service (e.g., `.github/workflows/main.yml` for GitHub Actions) that runs tests on every pull request and merge.
-    *   **Missing `Dockerfile`:** No container definition for packaging the application for production deployment, which is standard practice for modern services.
+    *   **Missing OCI Image Build Process Documentation:** While OCI images are produced for Kubernetes, the documentation does not detail the Nix-based process for building these images.
     *   **No Automated Release Process:** A process for versioning, tagging, and creating release artifacts automatically.
 
 ### E. User & Operator Documentation

@@ -315,14 +315,14 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // Mock exporter for testing
-    struct MockExporter {
+    pub struct MockExporter {
         name: &'static str,
         export_count: AtomicUsize,
         should_fail: bool,
     }
 
     impl MockExporter {
-        fn new(name: &'static str, should_fail: bool) -> Self {
+        pub fn new(name: &'static str, should_fail: bool) -> Self {
             Self {
                 name,
                 export_count: AtomicUsize::new(0),
@@ -330,7 +330,7 @@ mod tests {
             }
         }
 
-        fn get_export_count(&self) -> usize {
+        pub fn get_export_count(&self) -> usize {
             self.export_count.load(Ordering::Relaxed)
         }
     }

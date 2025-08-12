@@ -10,6 +10,9 @@ pub struct Config {
     /// Upstream URI to proxy requests to
     pub upstream_uri: String,
     
+    /// Proxy configuration
+    pub proxy: ProxyConfig,
+    
     /// Server configuration
     pub server: ServerConfig,
     
@@ -21,6 +24,21 @@ pub struct Config {
     
     // Security module configurations
     pub security: SecurityConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyConfig {
+    /// Upstream server URL
+    pub upstream_url: String,
+    
+    /// Proxy bind address
+    pub bind_addr: String,
+    
+    /// Request timeout in seconds
+    pub timeout_seconds: u64,
+    
+    /// Maximum request size in bytes
+    pub max_request_size: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +90,10 @@ pub struct WafConfig {
     
     /// Geographic blocking configuration
     pub geo_blocking: GeoBlockingConfig,
+    
+    /// WASM ModSecurity configuration
+    #[cfg(feature = "wasm-waf")]
+    pub wasm: WasmConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,6 +192,35 @@ pub struct GeoBlockingConfig {
     pub block_datacenter: bool,
 }
 
+/// WASM ModSecurity configuration
+#[cfg(feature = "wasm-waf")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WasmConfig {
+    /// Enable WASM ModSecurity engine
+    pub enabled: bool,
+    
+    /// Path to the WASM module file
+    pub module_path: String,
+    
+    /// Memory limit for WASM instances (bytes)
+    pub memory_limit: usize,
+    
+    /// Execution timeout (milliseconds)
+    pub timeout_ms: u64,
+    
+    /// Enable debug mode
+    pub debug: bool,
+    
+    /// Number of WASM instances to pool
+    pub instance_pool_size: usize,
+    
+    /// Enable hot reloading of WASM modules
+    pub hot_reload: bool,
+    
+    /// Rules configuration file
+    pub rules_config: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecurityConfig {
     /// Security events configuration
@@ -187,10 +238,22 @@ impl Default for Config {
         Self {
             bind_addr: "0.0.0.0:8080".parse().unwrap(),
             upstream_uri: "http://127.0.0.1:3000".to_string(),
+            proxy: ProxyConfig::default(),
             server: ServerConfig::default(),
             logging: LoggingConfig::default(),
             waf: WafConfig::default(),
             security: SecurityConfig::default(),
+        }
+    }
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            upstream_url: "http://127.0.0.1:3000".to_string(),
+            bind_addr: "0.0.0.0:8080".to_string(),
+            timeout_seconds: 30,
+            max_request_size: 10 * 1024 * 1024, // 10MB
         }
     }
 }
@@ -226,6 +289,8 @@ impl Default for WafConfig {
             security_events: SecurityEventsConfig::default(),
             content_inspection: ContentInspectionConfig::default(),
             geo_blocking: GeoBlockingConfig::default(),
+            #[cfg(feature = "wasm-waf")]
+            wasm: WasmConfig::default(),
         }
     }
 }
@@ -303,6 +368,22 @@ impl Default for SecurityConfig {
             events: SecurityEventsConfig::default(),
             content_inspection: ContentInspectionConfig::default(),
             geo_blocking: GeoBlockingConfig::default(),
+        }
+    }
+}
+
+#[cfg(feature = "wasm-waf")]
+impl Default for WasmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            module_path: "rules/coraza.wasm".to_string(),
+            memory_limit: 16 * 1024 * 1024, // 16MB
+            timeout_ms: 100,
+            debug: false,
+            instance_pool_size: 10,
+            hot_reload: true,
+            rules_config: "rules/coraza.conf".to_string(),
         }
     }
 }

@@ -261,10 +261,10 @@ impl Phase4TestRunner {
                 ExplanationResult {
                     success: analysis_result.is_ok(),
                     explanation_duration,
-                    explanation_quality: analysis_result
+                    explanation_quality: analysis_result.as_ref()
                         .map(|a| a.explanations.lime_explanation.local_fidelity)
                         .unwrap_or(0.0),
-                    natural_language_length: analysis_result
+                    natural_language_length: analysis_result.as_ref()
                         .map(|a| a.explanations.natural_explanation.len())
                         .unwrap_or(0),
                 }
@@ -381,10 +381,10 @@ impl Phase4TestRunner {
                 ResponseResult {
                     success: response_result.is_ok(),
                     response_duration,
-                    mitigation_steps: response_result
+                    mitigation_steps: response_result.as_ref()
                         .map(|r| r.adaptive_response.mitigation_steps.len())
                         .unwrap_or(0),
-                    effectiveness_score: response_result
+                    effectiveness_score: response_result.as_ref()
                         .map(|r| r.adaptive_response.effectiveness_score)
                         .unwrap_or(0.0),
                 }
@@ -692,15 +692,47 @@ impl Phase4TestRunner {
     // Helper methods
     fn convert_to_features(request: &RequestAnalysisData) -> RequestFeatures {
         RequestFeatures {
-            request_size: request.content_length,
-            header_count: Some(request.headers.len() as u32),
-            method: Some(request.method.clone()),
-            path: Some(request.path.clone()),
-            query_params: request.query_params.clone(),
-            user_agent: request.user_agent.clone(),
-            ip_reputation_score: request.ip_reputation,
-            request_rate: request.request_rate,
-            ..Default::default()
+            uri_length: request.content_length.unwrap_or(0),
+            header_count: request.headers.len() as u32,
+            method: request.method.clone(),
+            path: request.path.clone(),
+            user_agent: request.user_agent.clone().unwrap_or("Unknown".to_string()),
+            reputation_score: request.ip_reputation.unwrap_or(0.5),
+            requests_per_minute: request.request_rate.unwrap_or(10.0),
+            client_ip: "192.168.1.100".to_string(),
+            query_string: "test=1".to_string(),
+            referer: "".to_string(),
+            content_type: "application/json".to_string(),
+            accept: "application/json".to_string(),
+            body_size: request.content_length.unwrap_or(0),
+            entropy_score: 4.5,
+            base64_ratio: 0.1,
+            sql_keywords_count: 0,
+            xss_keywords_count: 0,
+            shell_keywords_count: 0,
+            user_agent_entropy: 4.0,
+            is_known_scanner: false,
+            browser_automation_score: 0.2,
+            contains_credit_cards: false,
+            contains_ssn: false,
+            contains_email: false,
+            contains_phone: false,
+            requests_per_hour: 100.0,
+            is_business_hours: true,
+            contains_pii: false,
+            geographic_score: 0.5,
+            behavioral_score: 0.5,
+            seasonal_score: 0.5,
+            request_id: "test-123".to_string(),
+            client_ip_parsed: Some("192.168.1.100".parse().unwrap()),
+            timestamp: 1234567890,
+            session_id: Some("session-123".to_string()),
+            is_encrypted: false,
+            contains_financial_data: false,
+            contains_healthcare_data: false,
+            regulatory_zone: "US".to_string(),
+            headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+            request_body: "{}".to_string(),
         }
     }
 
@@ -709,14 +741,47 @@ impl Phase4TestRunner {
         let mut rng = rand::thread_rng();
         
         RequestFeatures {
-            request_size: Some(rng.gen_range(100..10000)),
-            header_count: Some(rng.gen_range(5..50)),
-            method: Some("GET".to_string()),
-            path: Some("/api/test".to_string()),
-            ip_reputation_score: Some(rng.gen_range(0.0..1.0)),
-            request_rate: Some(rng.gen_range(1.0..100.0)),
-            payload_entropy: Some(rng.gen_range(0.0..8.0)),
-            ..Default::default()
+            uri_length: rng.gen_range(100..10000),
+            header_count: rng.gen_range(5..50),
+            method: "GET".to_string(),
+            path: "/api/test".to_string(),
+            reputation_score: rng.gen_range(0.0..1.0),
+            requests_per_minute: rng.gen_range(1.0..100.0),
+            entropy_score: rng.gen_range(0.0..8.0),
+            client_ip: "192.168.1.100".to_string(),
+            user_agent: "test-agent".to_string(),
+            query_string: "test=1".to_string(),
+            referer: "".to_string(),
+            content_type: "application/json".to_string(),
+            accept: "application/json".to_string(),
+            body_size: rng.gen_range(100..10000),
+            base64_ratio: 0.1,
+            sql_keywords_count: 0,
+            xss_keywords_count: 0,
+            shell_keywords_count: 0,
+            user_agent_entropy: 4.0,
+            is_known_scanner: false,
+            browser_automation_score: 0.2,
+            contains_credit_cards: false,
+            contains_ssn: false,
+            contains_email: false,
+            contains_phone: false,
+            requests_per_hour: 100.0,
+            is_business_hours: true,
+            contains_pii: false,
+            geographic_score: 0.5,
+            behavioral_score: 0.5,
+            seasonal_score: 0.5,
+            request_id: "test-123".to_string(),
+            client_ip_parsed: Some("192.168.1.100".parse().unwrap()),
+            timestamp: 1234567890,
+            session_id: Some("session-123".to_string()),
+            is_encrypted: false,
+            contains_financial_data: false,
+            contains_healthcare_data: false,
+            regulatory_zone: "US".to_string(),
+            headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+            request_body: "{}".to_string(),
         }
     }
 

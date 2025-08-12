@@ -5,6 +5,12 @@
 bind_addr = "0.0.0.0:8080"
 upstream_uri = "http://127.0.0.1:3000"
 
+[proxy]
+upstream_url = "http://127.0.0.1:3000"
+bind_addr = "0.0.0.0:8080"
+timeout_seconds = 30
+max_request_size = 10485760
+
 [server]
 max_connections = 1000
 request_timeout_secs = 30
@@ -29,6 +35,8 @@ global_window_secs = 60
 
 [waf.security_events]
 enabled = true
+format = "json"
+min_threat_level = "Medium"
 
 # Export configuration with local collector by default
 enable_cef = true
@@ -70,6 +78,17 @@ enabled = true
 model_inference_timeout_ms = 5
 batch_size = 64
 explainable_ai = true
+
+# WASM ModSecurity Configuration
+[waf.wasm]
+enabled = true
+module_path = "rules/coraza.wasm"
+memory_limit = 16777216  # 16MB
+timeout_ms = 100
+debug = false
+instance_pool_size = 10
+hot_reload = true
+rules_config = "rules/coraza.conf"
 
 # Local Observability Stack (Default Configuration)
 [monitoring]

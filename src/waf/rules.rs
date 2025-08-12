@@ -179,16 +179,16 @@ pub struct SqlInjectionRule {
 impl SqlInjectionRule {
     pub fn new(name: &str) -> Self {
         let patterns = vec![
-            Regex::new(r"(?i)(\bunion\b.*\bselect\b)").unwrap(),
-            Regex::new(r"(?i)(\bselect\b.*\bfrom\b)").unwrap(),
-            Regex::new(r"(?i)(\binsert\b.*\binto\b)").unwrap(),
-            Regex::new(r"(?i)(\bupdate\b.*\bset\b)").unwrap(),
-            Regex::new(r"(?i)(\bdelete\b.*\bfrom\b)").unwrap(),
-            Regex::new(r"(?i)(\bdrop\b.*\btable\b)").unwrap(),
-            Regex::new(r"(?i)(\bor\b.*\b=\b.*\bor\b)").unwrap(),
-            Regex::new(r"(?i)(\band\b.*\b=\b.*\band\b)").unwrap(),
+            Regex::new(r"(?i)\bunion(\s|%20|\+)+select\b").unwrap(),
+            Regex::new(r"(?i)\bselect(\s|%20|\+)+.*(\s|%20|\+)+from\b").unwrap(),
+            Regex::new(r"(?i)\binsert(\s|%20|\+)+into\b").unwrap(),
+            Regex::new(r"(?i)\bupdate(\s|%20|\+)+.*(\s|%20|\+)+set\b").unwrap(),
+            Regex::new(r"(?i)\bdelete(\s|%20|\+)+from\b").unwrap(),
+            Regex::new(r"(?i)\bdrop(\s|%20|\+)+table\b").unwrap(),
+            Regex::new(r"(?i)\bor(\s|%20|\+)+.*(\s|%20|\+)*=").unwrap(),
+            Regex::new(r"(?i)\band(\s|%20|\+)+.*(\s|%20|\+)*=").unwrap(),
             Regex::new(r"'.*(\bor\b|\band\b).*'").unwrap(),
-            Regex::new(r"(?i)(\bexec\b|\bexecute\b)").unwrap(),
+            Regex::new(r"(?i)\b(exec|execute)\b").unwrap(),
         ];
         
         Self {
@@ -269,16 +269,16 @@ pub struct XssRule {
 impl XssRule {
     pub fn new(name: &str) -> Self {
         let patterns = vec![
-            Regex::new(r"(?i)<script[^>]*>").unwrap(),
-            Regex::new(r"(?i)</script>").unwrap(),
+            Regex::new(r"(?i)(<|%3C)script[^>%]*?(>|%3E)").unwrap(),
+            Regex::new(r"(?i)(<|%3C)/script(>|%3E)").unwrap(),
             Regex::new(r"(?i)javascript:").unwrap(),
-            Regex::new(r"(?i)on\w+\s*=").unwrap(),
-            Regex::new(r"(?i)<iframe[^>]*>").unwrap(),
-            Regex::new(r"(?i)<object[^>]*>").unwrap(),
-            Regex::new(r"(?i)<embed[^>]*>").unwrap(),
-            Regex::new(r"(?i)expression\s*\(").unwrap(),
+            Regex::new(r"(?i)on\w+(\s|%20)*=").unwrap(),
+            Regex::new(r"(?i)(<|%3C)iframe[^>%]*?(>|%3E)").unwrap(),
+            Regex::new(r"(?i)(<|%3C)object[^>%]*?(>|%3E)").unwrap(),
+            Regex::new(r"(?i)(<|%3C)embed[^>%]*?(>|%3E)").unwrap(),
+            Regex::new(r"(?i)expression(\s|%20)*\(").unwrap(),
             Regex::new(r"(?i)vbscript:").unwrap(),
-            Regex::new(r"(?i)<meta[^>]*http-equiv").unwrap(),
+            Regex::new(r"(?i)(<|%3C)meta[^>%]*http-equiv").unwrap(),
         ];
         
         Self {
@@ -402,9 +402,21 @@ impl IpRule {
         self
     }
     
+    pub fn block_ip_str(mut self, ip_str: &str) -> Result<Self, std::net::AddrParseError> {
+        let ip: IpAddr = ip_str.parse()?;
+        self.blocked_ips.insert(ip);
+        Ok(self)
+    }
+    
     pub fn allow_ip(mut self, ip: IpAddr) -> Self {
         self.allowed_ips.insert(ip);
         self
+    }
+    
+    pub fn allow_ip_str(mut self, ip_str: &str) -> Result<Self, std::net::AddrParseError> {
+        let ip: IpAddr = ip_str.parse()?;
+        self.allowed_ips.insert(ip);
+        Ok(self)
     }
 }
 
@@ -487,7 +499,7 @@ mod tests {
     fn test_sql_injection_rule() {
         let rule = SqlInjectionRule::new("test");
         let mut ctx = create_test_context();
-        ctx.uri = Uri::from_str("/test?id=1' OR '1'='1").unwrap();
+        ctx.uri = Uri::from_str("/test?id=1+OR+1=1").unwrap();
         
         match rule.evaluate(&ctx) {
             Decision::Block { status, reason } => {
@@ -502,7 +514,7 @@ mod tests {
     fn test_xss_rule() {
         let rule = XssRule::new("test");
         let mut ctx = create_test_context();
-        ctx.uri = Uri::from_str("/test?script=<script>alert('xss')</script>").unwrap();
+        ctx.uri = Uri::from_str("/test?script=%3Cscript%3Ealert('xss')%3C/script%3E").unwrap();
         
         match rule.evaluate(&ctx) {
             Decision::Block { status, reason } => {

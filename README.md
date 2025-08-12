@@ -294,21 +294,7 @@ sudo systemctl enable waf-rejected
 sudo systemctl start waf-rejected
 ```
 
-### Docker Deployment
-```yaml
-# docker-compose.yml
-version: '3.8'
-services:
-  waf-rejected:
-    image: ghcr.io/your-org/waf-rejected:latest
-    ports:
-      - "443:8443"
-      - "80:8080"
-    volumes:
-      - ./config.toml:/app/config.toml:ro
-    environment:
-      - RUST_LOG=info
-```
+
 
 ### Kubernetes Deployment
 ```yaml

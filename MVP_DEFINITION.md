@@ -12,7 +12,7 @@ Traditional WAFs like ModSecurity are powerful but can be complex to manage and 
 
 ## 3. Target User
 
-**[TODO: Define the primary user persona. e.g., A DevOps engineer at a mid-sized tech company with responsibility for application security.]**
+A DevOps engineer or platform engineering team at a mid- to large-sized tech company with responsibility for application security.
 
 ## 4. Value Proposition
 
@@ -30,7 +30,7 @@ To achieve our focused goal, the scope of the MVP is strictly limited.
 *   **WASM Runtime:** A WebAssembly runtime integrated into the request pipeline, capable of executing WASM modules.
 *   **Rule Engine:** The WAF will load and run the **Coraza rule engine** as its primary WASM module.
 *   **Rule Set:** The Coraza module will be configured to load a defined subset of the OWASP Core Rule Set (CRS) from a local file.
-    *   **[TODO: Specify the exact subset of OWASP CRS rules to be supported. Suggestion: Only SQLi and XSS rules from PL1.]**
+    *   The WAF will support the SQLi and XSS rules from the OWASP Core Rule Set at Paranoia Level 1 (PL1).
 *   **Logging:** Logs all blocked requests to `stdout`. Log entries must be in a simple, machine-readable JSON format.
 *   **Configuration:** All configuration will be managed through a single `config.toml` file with parameters for the proxy and the rule engine.
 
@@ -49,7 +49,7 @@ To achieve our focused goal, the scope of the MVP is strictly limited.
 
 *   **Language:** Rust
 *   **Core Libraries:** Tokio, Hyper
-*   **WASM Runtime:** **[TODO: Specify the chosen WASM runtime, e.g., Wasmtime, Wasmer.]**
+*   **WASM Runtime:** Wasmtime
 *   **Rule Engine:** Coraza (via WASM)
 *   **Build System:** Cargo, Nix
 
@@ -62,6 +62,6 @@ The MVP will be considered "done" when the following criteria are met:
 1.  The application compiles into a single, self-contained binary via `cargo build --release`.
 2.  The application successfully proxies HTTP traffic to a configured upstream service.
 3.  The WAF, running the Coraza WASM module, correctly blocks a standard OWASP ZAP test suite for SQL Injection and logs the blocked events to `stdout`.
-4.  The application can sustain a baseline performance of **[TODO: Define a target RPS, e.g., 50,000 RPS]** on a specific, documented hardware configuration.
+4.  The application can sustain a baseline performance of 50,000 RPS on a specific, documented hardware configuration.
 5.  The application adds less than **5ms** of latency to proxied requests under the baseline load.
 6.  The core library code has a unit test coverage of at least **85%**.

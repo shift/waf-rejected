@@ -28,8 +28,8 @@ async fn simulate_waf_request(request_id: u64) -> Result<Duration> {
     
     sleep(processing_time).await;
     
-    // Simulate occasional failures (0.05% failure rate - improved reliability)
-    if request_id % 2000 == 0 {
+    // Simulate occasional failures (0.1% failure rate)
+    if request_id % 1000 == 0 {
         return Err(anyhow::anyhow!("Simulated processing failure"));
     }
     
@@ -92,9 +92,9 @@ async fn run_concurrent_load_test(
     let min_latency = *latencies.iter().min().unwrap_or(&0);
     let rps = total_requests as f64 / total_duration.as_secs_f64();
     
-    // Simulate memory usage calculation (optimized for enterprise)
+    // Simulate memory usage calculation
     let base_memory = 45.0; // Base memory usage in MB
-    let load_memory = (concurrent_users as f64 * 0.08) + (rps * 0.0005); // Reduced per-user overhead
+    let load_memory = (concurrent_users as f64 * 0.15) + (rps * 0.001); // Memory per user + per RPS
     let memory_usage = base_memory + load_memory;
     
     Ok(PerformanceMetrics {
@@ -188,11 +188,11 @@ fn validate_performance_requirements(metrics: &PerformanceMetrics) -> Result<()>
         all_passed = false;
     }
     
-    // Requirement 4: Memory usage <512MB under enterprise load (realistic for 1000 users)
-    if metrics.memory_usage_mb < 512.0 { // 45MB base + 467MB enterprise load allowance
-        println!("✅ Memory Usage: {:.1}MB (<512MB required)", metrics.memory_usage_mb);
+    // Requirement 4: Memory usage <100MB growth under load
+    if metrics.memory_usage_mb < 145.0 { // 45MB base + 100MB growth
+        println!("✅ Memory Usage: {:.1}MB (<145MB required)", metrics.memory_usage_mb);
     } else {
-        println!("❌ Memory Usage: {:.1}MB (<512MB required)", metrics.memory_usage_mb);
+        println!("❌ Memory Usage: {:.1}MB (<145MB required)", metrics.memory_usage_mb);
         all_passed = false;
     }
     

@@ -557,27 +557,39 @@ impl PerformanceOptimizer {
         inference_time: Duration,
         result: &ThreatAnalysis
     ) -> Result<()> {
-        let mut metrics = self.metrics.lock().unwrap();
-        
-        metrics.total_inferences += 1;
-        metrics.total_inference_time += inference_time;
-        metrics.average_inference_time = metrics.total_inference_time / metrics.total_inferences;
-        
-        if inference_time > Duration::from_millis(100) {
-            metrics.slow_inferences += 1;
+        {
+            let mut metrics = self.metrics.lock().unwrap();
+            
+            metrics.total_inferences += 1;
+            metrics.total_inference_time += inference_time;
+            metrics.average_inference_time = metrics.total_inference_time / metrics.total_inferences;
+            
+            if inference_time > Duration::from_millis(100) {
+                metrics.slow_inferences += 1;
+            }
+            
+            metrics.last_risk_score = result.overall_risk_score;
+            metrics.confidence_sum += result.confidence;
+            metrics.average_confidence = metrics.confidence_sum / metrics.total_inferences as f32;
         }
         
-        metrics.last_risk_score = result.overall_risk_score;
-        metrics.confidence_sum += result.confidence;
-        metrics.average_confidence = metrics.confidence_sum / metrics.total_inferences as f32;
+        // Trigger optimization if performance degrades (check after releasing the lock)
+        let should_optimize = {
+            let metrics = self.metrics.lock().unwrap();
+            metrics.average_inference_time > Duration::from_millis(50)
+        };
         
-        // Trigger optimization if performance degrades
-        if metrics.average_inference_time > Duration::from_millis(50) {
+        if should_optimize {
             self.strategies.optimize_performance().await?;
         }
         
-        // Trigger auto-scaling if needed
-        if metrics.slow_inferences > 100 {
+        // Trigger auto-scaling if needed (check after releasing the lock)
+        let slow_inferences = {
+            let metrics = self.metrics.lock().unwrap();
+            metrics.slow_inferences
+        };
+        
+        if slow_inferences > 100 {
             self.auto_scaler.scale_up().await?;
         }
         
@@ -586,17 +598,26 @@ impl PerformanceOptimizer {
 
     /// Get current performance metrics
     pub async fn get_current_metrics(&self) -> Result<OptimizationMetrics> {
-        let metrics = self.metrics.lock().unwrap();
+        let (inference_time_ms, total_inferences, total_inference_time, average_confidence) = {
+            let metrics = self.metrics.lock().unwrap();
+            (
+                metrics.average_inference_time.as_millis() as u32,
+                metrics.total_inferences,
+                metrics.total_inference_time,
+                metrics.average_confidence,
+            )
+        };
+        
         let resource_usage = self.resource_monitor.get_current_usage().await?;
         
         Ok(OptimizationMetrics {
-            inference_time_ms: metrics.average_inference_time.as_millis() as u32,
-            throughput_per_second: if metrics.total_inference_time.as_secs() > 0 {
-                metrics.total_inferences as f32 / metrics.total_inference_time.as_secs() as f32
+            inference_time_ms,
+            throughput_per_second: if total_inference_time.as_secs() > 0 {
+                total_inferences as f32 / total_inference_time.as_secs() as f32
             } else {
                 0.0
             },
-            accuracy: metrics.average_confidence,
+            accuracy: average_confidence,
             resource_utilization: resource_usage,
             optimization_level: OptimizationLevel::Maximum,
         })
@@ -1213,11 +1234,47 @@ mod tests {
     async fn test_optimized_threat_analysis() {
         let engine = AiOptimizationEngine::new();
         let features = RequestFeatures {
-            request_size: Some(1024),
-            header_count: Some(10),
-            suspicious_keywords: Some(vec!["script".to_string()]),
-            ip_reputation_score: Some(0.8),
-            ..Default::default()
+            method: "POST".to_string(),
+            uri_length: 50,
+            header_count: 10,
+            body_size: 1024,
+            entropy_score: 4.2,
+            base64_ratio: 0.1,
+            sql_keywords_count: 0,
+            xss_keywords_count: 1,
+            shell_keywords_count: 0,
+            user_agent_entropy: 3.5,
+            is_known_scanner: false,
+            browser_automation_score: 0.2,
+            contains_credit_cards: false,
+            contains_ssn: false,
+            contains_email: false,
+            contains_phone: false,
+            requests_per_minute: 5.0,
+            requests_per_hour: 100.0,
+            client_ip: "192.168.1.100".to_string(),
+            user_agent: "Mozilla/5.0".to_string(),
+            path: "/api/test".to_string(),
+            query_string: "test=1".to_string(),
+            referer: "".to_string(),
+            content_type: "application/json".to_string(),
+            accept: "application/json".to_string(),
+            is_business_hours: true,
+            contains_pii: false,
+            geographic_score: 0.5,
+            reputation_score: 0.8,
+            behavioral_score: 0.6,
+            seasonal_score: 0.7,
+            request_id: "test-123".to_string(),
+            client_ip_parsed: Some("192.168.1.100".parse().unwrap()),
+            timestamp: 1628000000,
+            session_id: None,
+            is_encrypted: true,
+            contains_financial_data: false,
+            contains_healthcare_data: false,
+            regulatory_zone: "US".to_string(),
+            headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+            request_body: "{\"test\": \"data\"}".to_string(),
         };
 
         let result = engine.analyze_with_optimization(&features).await;

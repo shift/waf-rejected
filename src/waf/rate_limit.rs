@@ -449,9 +449,10 @@ mod tests {
             _ => panic!("Expected RateLimit decision"),
         }
         
-        // Increase threat level and create new limiter instance
+        // Increase threat level and test with same limiter
         limiter.set_threat_multiplier(2.0);
-        let limiter2 = AdaptiveRateLimiter::new("test2", 4, 1);
+        let mut limiter2 = AdaptiveRateLimiter::new("test2", 4, 1);
+        limiter2.set_threat_multiplier(2.0);  // Apply threat multiplier to new instance
         let ctx2 = create_test_context("192.168.1.3");
         
         // Should now allow only 2 requests (4/2)

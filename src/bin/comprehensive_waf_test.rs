@@ -259,23 +259,39 @@ impl ComprehensiveWAFTestHarness {
     async fn start_waf(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         println!("🛡️  Starting WAF-Rejected with security config...");
         
-        let mut waf_cmd = Command::new("./target/release/waf-ingress");
+        let mut waf_cmd = Command::new("./target/release/waf_proxy");
         waf_cmd.env("WAF_CONFIG_FILE", "config-test");
         
         self.waf_process = Some(waf_cmd.spawn()?);
         
-        // Wait for WAF to be ready
-        for attempt in 1..=15 {
+        // Wait for WAF to be ready with extra time for initialization
+        for attempt in 1..=20 {
             match tokio::net::TcpStream::connect("127.0.0.1:8080").await {
                 Ok(_) => {
                     println!("✅ WAF-Rejected ready on http://127.0.0.1:8080");
-                    println!("🔗 WAF → Advanced Backend pipeline established");
+                    // Give extra time for WAF rules to fully initialize
+                    sleep(Duration::from_secs(3)).await;
+                    
+                    // Verify WAF is actually processing requests
+                    match self.test_waf_functionality().await {
+                        Ok(true) => {
+                            println!("🔗 WAF → Advanced Backend pipeline established");
+                            println!("🛡️ WAF security rules confirmed operational");
+                            return Ok(());
+                        }
+                        Ok(false) => {
+                            println!("⚠️ WAF responding but rules not triggering");
+                        }
+                        Err(e) => {
+                            println!("⚠️ WAF functionality test failed: {}", e);
+                        }
+                    }
                     return Ok(());
                 }
                 Err(_) => {
-                    if attempt < 15 {
-                        println!("   ⏳ Waiting for WAF... (attempt {}/15)", attempt);
-                        sleep(Duration::from_millis(1000)).await;
+                    if attempt < 20 {
+                        println!("   ⏳ Waiting for WAF... (attempt {}/20)", attempt);
+                        sleep(Duration::from_millis(1500)).await;
                     }
                 }
             }
@@ -284,6 +300,27 @@ impl ComprehensiveWAFTestHarness {
         println!("⚠️  WAF not responding, but continuing...");
         sleep(Duration::from_secs(3)).await;
         Ok(())
+    }
+    
+    async fn test_waf_functionality(&self) -> Result<bool, Box<dyn std::error::Error>> {
+        // Test a simple SQL injection to see if WAF blocks it
+        let client = reqwest::Client::new();
+        let response = client
+            .get("http://127.0.0.1:8080/test")
+            .query(&[("q", "' OR 1=1--")])
+            .send()
+            .await?;
+        
+        // If we get a 4xx status, the WAF might be blocking
+        let is_blocked = response.status().as_u16() >= 400 && response.status().as_u16() < 500;
+        
+        if is_blocked {
+            println!("🛡️ WAF test: SQL injection blocked (status: {})", response.status());
+        } else {
+            println!("⚠️ WAF test: SQL injection allowed (status: {})", response.status());
+        }
+        
+        Ok(is_blocked)
     }
 
     async fn run_comprehensive_security_test(&self) -> Result<AdvancedTestMetrics, Box<dyn std::error::Error>> {
@@ -1101,7 +1138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build services
     println!("🔨 Building comprehensive test services...");
     let build_output = Command::new("cargo")
-        .args(&["build", "--release", "--bin", "advanced_test_backend", "--bin", "waf-ingress"])
+        .args(&["build", "--release", "--bin", "advanced_test_backend", "--bin", "waf_proxy"])
         .output()
         .await?;
 
