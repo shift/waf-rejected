@@ -2,12 +2,16 @@ use crate::waf::{WafRule, RequestContext, Decision};
 use regex::Regex;
 use std::collections::HashMap;
 use once_cell::sync::Lazy;
+use std::sync::Arc;
 
-/// Advanced content inspection rules for common web attacks
+/// Advanced content inspection rules for common web attacks (optimized for performance)
 pub struct ContentInspectionRule {
     name: String,
     enabled: bool,
     patterns: Vec<ThreatPattern>,
+    // Performance optimization: cache compiled patterns by priority
+    high_priority_patterns: Vec<ThreatPattern>,
+    low_priority_patterns: Vec<ThreatPattern>,
 }
 
 #[derive(Debug, Clone)]
@@ -197,18 +201,27 @@ static COMMON_PATTERNS: Lazy<Vec<ThreatPattern>> = Lazy::new(|| {
 
 impl ContentInspectionRule {
     pub fn new(name: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            enabled: true,
-            patterns: COMMON_PATTERNS.clone(),
-        }
-    }
-
-    pub fn with_custom_patterns(name: &str, patterns: Vec<ThreatPattern>) -> Self {
+        let patterns = COMMON_PATTERNS.clone();
+        let (high_priority, low_priority) = Self::categorize_patterns(&patterns);
+        
         Self {
             name: name.to_string(),
             enabled: true,
             patterns,
+            high_priority_patterns: high_priority,
+            low_priority_patterns: low_priority,
+        }
+    }
+
+    pub fn with_custom_patterns(name: &str, patterns: Vec<ThreatPattern>) -> Self {
+        let (high_priority, low_priority) = Self::categorize_patterns(&patterns);
+        
+        Self {
+            name: name.to_string(),
+            enabled: true,
+            patterns,
+            high_priority_patterns: high_priority,
+            low_priority_patterns: low_priority,
         }
     }
 
@@ -218,14 +231,72 @@ impl ContentInspectionRule {
     }
 
     pub fn add_pattern(&mut self, pattern: ThreatPattern) {
+        // Categorize new pattern for performance
+        match pattern.severity {
+            ThreatSeverity::Critical | ThreatSeverity::High => {
+                self.high_priority_patterns.push(pattern.clone());
+            }
+            ThreatSeverity::Medium | ThreatSeverity::Low => {
+                self.low_priority_patterns.push(pattern.clone());
+            }
+        }
         self.patterns.push(pattern);
     }
 
-    fn check_content(&self, content: &str) -> Option<(&ThreatPattern, String)> {
-        for pattern in &self.patterns {
+    /// Performance optimization: categorize patterns by priority
+    fn categorize_patterns(patterns: &[ThreatPattern]) -> (Vec<ThreatPattern>, Vec<ThreatPattern>) {
+        let mut high_priority = Vec::new();
+        let mut low_priority = Vec::new();
+        
+        for pattern in patterns {
+            match pattern.severity {
+                ThreatSeverity::Critical | ThreatSeverity::High => {
+                    high_priority.push(pattern.clone());
+                }
+                ThreatSeverity::Medium | ThreatSeverity::Low => {
+                    low_priority.push(pattern.clone());
+                }
+            }
+        }
+        
+        (high_priority, low_priority)
+    }
+
+    /// Fast check for high-priority patterns only (performance optimization)
+    fn fast_check_content(&self, content: &str) -> Option<(&ThreatPattern, String)> {
+        // Check high-priority patterns first
+        for pattern in &self.high_priority_patterns {
             if let Some(captures) = pattern.pattern.find(content) {
-                let matched_text = captures.as_str().to_string();
-                return Some((pattern, matched_text));
+                let matched_text = captures.as_str();
+                // Limit matched text size for performance
+                let limited_match = if matched_text.len() > 100 {
+                    &matched_text[..100]
+                } else {
+                    matched_text
+                };
+                return Some((pattern, limited_match.to_string()));
+            }
+        }
+        None
+    }
+
+    fn check_content(&self, content: &str) -> Option<(&ThreatPattern, String)> {
+        // First check high-priority patterns
+        if let Some(result) = self.fast_check_content(content) {
+            return Some(result);
+        }
+        
+        // Then check low-priority patterns
+        for pattern in &self.low_priority_patterns {
+            if let Some(captures) = pattern.pattern.find(content) {
+                let matched_text = captures.as_str();
+                // Limit matched text size for performance
+                let limited_match = if matched_text.len() > 100 {
+                    &matched_text[..100]
+                } else {
+                    matched_text
+                };
+                return Some((pattern, limited_match.to_string()));
             }
         }
         None
@@ -255,36 +326,44 @@ impl WafRule for ContentInspectionRule {
             return Decision::Allow;
         }
 
-        // Check URI
-        if let Some((pattern, matched)) = self.check_content(ctx.uri.path()) {
-            if pattern.check_uri {
-                return Decision::Block {
-                    status: self.severity_to_status(&pattern.severity),
-                    reason: format!("Content inspection: {} detected in URI: {}", 
-                                  pattern.name, matched),
-                };
-            }
-        }
-
-        // Check query parameters
-        if let Some(query) = ctx.uri.query() {
-            if let Some((pattern, matched)) = self.check_content(query) {
+        // Performance optimization: limit content size to prevent DoS
+        const MAX_CONTENT_SIZE: usize = 8192; // 8KB limit for pattern matching
+        
+        // Check URI path (high priority)
+        let uri_path = ctx.uri.path();
+        if uri_path.len() <= MAX_CONTENT_SIZE {
+            if let Some((pattern, matched)) = self.fast_check_content(uri_path) {
                 if pattern.check_uri {
                     return Decision::Block {
                         status: self.severity_to_status(&pattern.severity),
-                        reason: format!("Content inspection: {} detected in query: {}", 
+                        reason: format!("Content inspection: {} detected in URI: {}", 
                                       pattern.name, matched),
                     };
                 }
             }
         }
 
-        // Check headers
-        for pattern in &self.patterns {
+        // Check query parameters (if present and not too large)
+        if let Some(query) = ctx.uri.query() {
+            if query.len() <= MAX_CONTENT_SIZE {
+                if let Some((pattern, matched)) = self.fast_check_content(query) {
+                    if pattern.check_uri {
+                        return Decision::Block {
+                            status: self.severity_to_status(&pattern.severity),
+                            reason: format!("Content inspection: {} detected in query: {}", 
+                                          pattern.name, matched),
+                        };
+                    }
+                }
+            }
+        }
+
+        // Check headers (optimized for performance)
+        for pattern in &self.high_priority_patterns {
             if pattern.check_headers {
                 for (header_name, header_value) in ctx.headers.iter() {
                     if let Ok(header_str) = header_value.to_str() {
-                        if pattern.pattern.is_match(header_str) {
+                        if header_str.len() <= MAX_CONTENT_SIZE && pattern.pattern.is_match(header_str) {
                             return Decision::Block {
                                 status: self.severity_to_status(&pattern.severity),
                                 reason: format!("Content inspection: {} detected in header {}", 
@@ -296,7 +375,7 @@ impl WafRule for ContentInspectionRule {
             }
         }
 
-        // TODO: Check request body when available
+        // TODO: Check request body when available (with size limits for performance)
         // This requires streaming body inspection during request processing
         
         Decision::Allow

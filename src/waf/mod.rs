@@ -189,6 +189,81 @@ impl WafEngine {
         rules.push(Box::new(rule));
     }
 
+    /// Fast evaluation for performance-critical paths (headers/URI only)
+    /// Skips expensive operations like body inspection
+    pub async fn fast_evaluate(&self, request: &RequestContext) -> Decision {
+        let mut triggered_rules = Vec::new();
+        let mut blocking_decision = None;
+        let rules_count;
+        
+        // PHASE 1: WASM ModSecurity evaluation (if enabled) - Skip for fast path
+        #[cfg(feature = "wasm-waf")]
+        if let Some(wasm_engine) = &self.wasm_engine {
+            debug!("Skipping WASM evaluation for fast path (performance optimization)");
+        }
+        
+        // PHASE 2: Optimized traditional rule evaluation
+        {
+            let rules = self.rules.read().unwrap();
+            rules_count = rules.len();
+            
+            debug!(
+                "Fast evaluating {} traditional rules for request from {}",
+                rules_count,
+                request.client_ip
+            );
+            
+            // Optimized rule evaluation - check only lightweight rules first
+            for rule in rules.iter() {
+                if !rule.is_enabled() {
+                    continue;
+                }
+                
+                let decision = rule.evaluate(request);
+                match &decision {
+                    Decision::Block { status, reason } => {
+                        triggered_rules.push(rule.name().to_string());
+                        
+                        debug!(
+                            "Fast rule '{}' blocked request from {}: {} ({})",
+                            rule.name(), request.client_ip, reason, status
+                        );
+                        
+                        // Store the blocking decision and break early for performance
+                        blocking_decision = Some(decision);
+                        break;
+                    }
+                    Decision::RateLimit { reason } => {
+                        triggered_rules.push(rule.name().to_string());
+                        
+                        debug!(
+                            "Fast rule '{}' rate limited request from {}: {}",
+                            rule.name(), request.client_ip, reason
+                        );
+                        
+                        // Store the rate limit decision and break early
+                        blocking_decision = Some(decision);
+                        break;
+                    }
+                    Decision::Allow => {
+                        // Continue evaluating other rules quickly
+                    }
+                }
+            }
+        } // RwLockReadGuard is dropped here
+        
+        // Now we can safely do async operations (if needed)
+        if let Some(decision) = blocking_decision {
+            // Skip expensive logging for performance in fast path
+            return decision;
+        }
+        
+        // If we get here, all rules passed
+        debug!("Fast evaluation: All {} rules passed for request from {}", rules_count, request.client_ip);
+        
+        Decision::Allow
+    }
+
     /// Evaluate all rules against the request context
     /// Returns the first blocking decision or Allow if all rules pass
     pub async fn evaluate(&self, request: &RequestContext) -> Decision {
