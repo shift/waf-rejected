@@ -346,7 +346,8 @@ impl WafRule for ContentInspectionRule {
         // Check query parameters (if present and not too large)
         if let Some(query) = ctx.uri.query() {
             if query.len() <= MAX_CONTENT_SIZE {
-                if let Some((pattern, matched)) = self.fast_check_content(query) {
+                // Use full check on query to include medium/low severity patterns (e.g., javascript:)
+                if let Some((pattern, matched)) = self.check_content(query) {
                     if pattern.check_uri {
                         return Decision::Block {
                             status: self.severity_to_status(&pattern.severity),

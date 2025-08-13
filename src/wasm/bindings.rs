@@ -195,6 +195,12 @@ pub struct ComponentManager {
     linker: Linker<WasmHostContext>,
 }
 
+/// Represents a successfully loaded WASM artifact (component model or core module)
+pub enum LoadedWasm {
+    Component(Component),
+    Module(wasmtime::Module),
+}
+
 /// Host context for WASM execution
 pub struct WasmHostContext {
     /// Host functions implementation
@@ -222,6 +228,15 @@ impl ComponentManager {
     /// Load a WASM component from bytes
     pub fn load_component(&self, bytes: &[u8]) -> Result<Component> {
         Component::new(&self.engine, bytes)
+    }
+
+    /// Load either a component (preferred) or fallback to a core WASM module
+    pub fn load_any(&self, bytes: &[u8]) -> Result<LoadedWasm> {
+        if let Ok(c) = Component::new(&self.engine, bytes) {
+            return Ok(LoadedWasm::Component(c));
+        }
+        let m = wasmtime::Module::new(&self.engine, bytes)?;
+        Ok(LoadedWasm::Module(m))
     }
     
     /// Create an instance of a component

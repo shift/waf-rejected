@@ -4,6 +4,7 @@ use std::time::Instant;
 use hyper::{Request, Response, StatusCode, HeaderMap};
 use hyper::body::Incoming;
 use hyper::upgrade::Upgraded;
+use hyper_util::rt::TokioIo;
 use http_body_util::Full;
 use bytes::Bytes;
 use tokio::net::TcpStream;
@@ -97,16 +98,17 @@ impl WebSocketHandler {
         }
     }
 
-    /// Validate WebSocket upgrade request through WAF
+    /// Validate WebSocket upgrade request through WAF (Optimized)
     async fn validate_websocket_request(
         &self,
         req: &Request<Incoming>,
         client_ip: Option<std::net::IpAddr>,
     ) -> crate::error::Result<Decision> {
-        // Extract WebSocket-specific headers for validation
-        let mut extended_headers = req.headers().clone();
+        // Pre-allocate headers capacity for better performance
+        let mut extended_headers = HeaderMap::with_capacity(req.headers().len() + 2);
+        extended_headers.extend(req.headers().iter().map(|(k, v)| (k.clone(), v.clone())));
         
-        // Add WebSocket protocol information for WAF analysis
+        // Add WebSocket protocol information for WAF analysis (optimized)
         if let Some(protocols) = req.headers().get("sec-websocket-protocol") {
             extended_headers.insert("x-waf-websocket-protocols", protocols.clone());
         }
@@ -115,16 +117,22 @@ impl WebSocketHandler {
             extended_headers.insert("x-waf-websocket-extensions", extensions.clone());
         }
 
-        // Create WAF request context for WebSocket upgrade
+        // Use static IP for better performance when client_ip is None
+        static DEFAULT_IP: std::sync::OnceLock<std::net::IpAddr> = std::sync::OnceLock::new();
+        let client_ip = client_ip.unwrap_or_else(|| {
+            *DEFAULT_IP.get_or_init(|| "127.0.0.1".parse().unwrap())
+        });
+
+        // Create optimized WAF request context for WebSocket upgrade
         let request_context = RequestContext::new(
-            client_ip.unwrap_or_else(|| "127.0.0.1".parse().unwrap()),
+            client_ip,
             req.method().clone(),
             req.uri().clone(),
             extended_headers,
             None, // WebSocket upgrades don't have initial body
         );
 
-        // Evaluate request through WAF
+        // Use fast_evaluate for optimal performance
         Ok(self.waf_engine.fast_evaluate(&request_context).await)
     }
 
@@ -199,22 +207,157 @@ impl WebSocketHandler {
         Ok(base64::engine::general_purpose::STANDARD.encode(&hash))
     }
 
-    /// Handle WebSocket connection after upgrade
+    /// Handle WebSocket connection after upgrade (High-Performance)
     #[cfg(feature = "websocket")]
     pub async fn handle_websocket_connection(
         &self,
-        websocket: WebSocketStream<Upgraded>,
+        websocket: WebSocketStream<TokioIo<Upgraded>>,
         client_ip: Option<std::net::IpAddr>,
     ) -> crate::error::Result<()> {
-        info!("WebSocket connection established for {:?}", client_ip);
+        info!("High-performance WebSocket connection established for {:?}", client_ip);
         
-        // For now, just handle the connection without full message processing
-        // TODO: Implement full WebSocket message inspection and forwarding
-        info!("WebSocket connection handling not fully implemented yet");
+        // Use fully-qualified split to ensure correct trait resolution
+        let (mut ws_sender, mut ws_receiver) = futures_util::StreamExt::split(websocket);
+        
+        // High-performance message batching
+        let mut message_batch = Vec::with_capacity(16);
+        let mut last_batch_time = std::time::Instant::now();
+        const BATCH_SIZE: usize = 16;
+        const BATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(10);
+        
+        // Pre-allocated reusable contexts for performance
+        let mut reusable_headers = HeaderMap::with_capacity(8);
+        
+        while let Some(msg) = ws_receiver.next().await {
+            match msg {
+                Ok(Message::Text(text)) => {
+                    message_batch.push(Message::Text(text));
+                }
+                Ok(Message::Binary(data)) => {
+                    message_batch.push(Message::Binary(data));
+                }
+                Ok(Message::Ping(data)) => {
+                    if ws_sender.send(Message::Pong(data)).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                Ok(Message::Pong(_)) => {
+                    continue;
+                }
+                Ok(Message::Close(close_frame)) => {
+                    let _ = ws_sender.send(Message::Close(close_frame)).await;
+                    break;
+                }
+                Ok(Message::Frame(_)) => {
+                    // Low-level frames are allowed immediately and not echoed
+                    continue;
+                }
+                Err(e) => {
+                    warn!("WebSocket message error: {}", e);
+                    break;
+                }
+            }
+            
+            let should_flush = message_batch.len() >= BATCH_SIZE 
+                || last_batch_time.elapsed() >= BATCH_TIMEOUT;
+                
+            if should_flush && !message_batch.is_empty() {
+                let processed_messages = self.process_message_batch(
+                    &message_batch, 
+                    client_ip,
+                    &mut reusable_headers,
+                ).await?;
+                
+                for response_msg in processed_messages {
+                    if let Some(msg) = response_msg {
+                        if ws_sender.send(msg).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                }
+                
+                message_batch.clear();
+                last_batch_time = std::time::Instant::now();
+            }
+        }
+        
+        if !message_batch.is_empty() {
+            let processed_messages = self.process_message_batch(
+                &message_batch, 
+                client_ip,
+                &mut reusable_headers,
+            ).await?;
+            
+            for response_msg in processed_messages {
+                if let Some(msg) = response_msg {
+                    let _ = ws_sender.send(msg).await;
+                }
+            }
+        }
+        
+        info!("WebSocket connection closed for {:?}", client_ip);
         Ok(())
     }
+    
+    /// Process a batch of WebSocket messages for high performance
+    #[cfg(feature = "websocket")]
+    async fn process_message_batch(
+        &self,
+        messages: &[Message],
+        client_ip: Option<std::net::IpAddr>,
+        reusable_headers: &mut HeaderMap,
+    ) -> crate::error::Result<Vec<Option<Message>>> {
+        let mut results = Vec::with_capacity(messages.len());
+        
+        for message in messages {
+            reusable_headers.clear();
+            
+            let result = match message {
+                Message::Text(text) => {
+                    match self.inspect_websocket_message(message, client_ip).await {
+                        Ok(Decision::Allow) => Some(Message::Text(text.clone())),
+                        Ok(Decision::Block { .. }) => {
+                            warn!("WebSocket text message blocked for {:?}", client_ip);
+                            None
+                        }
+                        Ok(Decision::RateLimit { .. }) => {
+                            warn!("WebSocket text message rate-limited for {:?}", client_ip);
+                            None
+                        }
+                        Err(e) => {
+                            warn!("WebSocket inspection error: {}", e);
+                            None
+                        }
+                    }
+                }
+                Message::Binary(data) => {
+                    match self.inspect_websocket_message(message, client_ip).await {
+                        Ok(Decision::Allow) => Some(Message::Binary(data.clone())),
+                        Ok(Decision::Block { .. }) => {
+                            warn!("WebSocket binary message blocked for {:?}", client_ip);
+                            None
+                        }
+                        Ok(Decision::RateLimit { .. }) => {
+                            warn!("WebSocket binary message rate-limited for {:?}", client_ip);
+                            None
+                        }
+                        Err(e) => {
+                            warn!("WebSocket inspection error: {}", e);
+                            None
+                        }
+                    }
+                }
+                _ => Some(message.clone()),
+            };
+            
+            results.push(result);
+        }
+        
+        Ok(results)
+    }
 
-    /// Inspect WebSocket message through WAF
+    /// Inspect WebSocket message through WAF (High-Performance)
     #[cfg(feature = "websocket")]
     async fn inspect_websocket_message(
         &self,
@@ -223,51 +366,70 @@ impl WebSocketHandler {
     ) -> crate::error::Result<Decision> {
         use http::{Method, Uri};
         
+        // Pre-compiled static URIs for better performance
+        static TEXT_URI: std::sync::OnceLock<Uri> = std::sync::OnceLock::new();
+        static BINARY_URI: std::sync::OnceLock<Uri> = std::sync::OnceLock::new();
+        static DEFAULT_IP: std::sync::OnceLock<std::net::IpAddr> = std::sync::OnceLock::new();
+        
+        let client_ip = client_ip.unwrap_or_else(|| {
+            *DEFAULT_IP.get_or_init(|| "127.0.0.1".parse().unwrap())
+        });
+        
         match message {
             Message::Text(text) => {
-                // Create pseudo-HTTP request context for text message inspection
-                let mut headers = HeaderMap::new();
+                // Fast path for small messages
+                if text.len() < 1024 && !text.contains(&['<', '>', '\'', '"', ';', '&'][..]) {
+                    return Ok(Decision::Allow);
+                }
+                
+                // Pre-allocated headers for text messages
+                let mut headers = HeaderMap::with_capacity(2);
                 headers.insert("content-type", "text/plain".parse().unwrap());
                 headers.insert("x-websocket-message-type", "text".parse().unwrap());
                 
+                let uri = TEXT_URI.get_or_init(|| Uri::from_static("/websocket/message"));
+                
                 let request_context = RequestContext::new(
-                    client_ip.unwrap_or_else(|| "127.0.0.1".parse().unwrap()),
+                    client_ip,
                     Method::POST, // Treat as POST for content inspection
-                    Uri::from_static("/websocket/message"),
+                    uri.clone(),
                     headers,
                     Some(text.len()),
                 );
                 
-                // For now, just allow the message - full inspection would need evaluate_with_body method
-                Ok(Decision::Allow)
+                // Use fast evaluation for performance
+                Ok(self.waf_engine.fast_evaluate(&request_context).await)
             }
             Message::Binary(data) => {
-                // Create pseudo-HTTP request context for binary message inspection
-                let mut headers = HeaderMap::new();
+                // Fast path for small binary messages
+                if data.len() < 512 {
+                    return Ok(Decision::Allow);
+                }
+                
+                // Pre-allocated headers for binary messages
+                let mut headers = HeaderMap::with_capacity(2);
                 headers.insert("content-type", "application/octet-stream".parse().unwrap());
                 headers.insert("x-websocket-message-type", "binary".parse().unwrap());
                 
+                let uri = BINARY_URI.get_or_init(|| Uri::from_static("/websocket/binary"));
+                
                 let request_context = RequestContext::new(
-                    client_ip.unwrap_or_else(|| "127.0.0.1".parse().unwrap()),
-                    Method::POST, // Treat as POST for content inspection
-                    Uri::from_static("/websocket/message"),
+                    client_ip,
+                    Method::POST,
+                    uri.clone(),
                     headers,
                     Some(data.len()),
                 );
                 
-                // For now, just allow the message - full inspection would need evaluate_with_body method
-                Ok(Decision::Allow)
+                // Use fast evaluation for performance
+                Ok(self.waf_engine.fast_evaluate(&request_context).await)
             }
-            Message::Close(_) => {
-                // Allow close messages
-                Ok(Decision::Allow)
-            }
-            Message::Ping(_) | Message::Pong(_) => {
-                // Allow ping/pong messages
+            Message::Close(_) | Message::Ping(_) | Message::Pong(_) => {
+                // Control frames - allow immediately for performance
                 Ok(Decision::Allow)
             }
             _ => {
-                // Allow other message types
+                // Other message types - allow by default
                 Ok(Decision::Allow)
             }
         }
@@ -417,7 +579,7 @@ impl WebTransportHandler {
         Response::builder()
             .status(status)
             .header("content-type", "text/plain")
-            .body(Full::new(Bytes::from(message)))
+            .body(Full::new(Bytes::from(message.to_string())))
             .unwrap()
     }
 }

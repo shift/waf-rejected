@@ -41,6 +41,7 @@ futures-util = { version = "0.3", features = ["sink"] }
 
 # WebTransport support (experimental)
 web-transport = { git = "https://github.com/kixelated/web-transport-rs", optional = true }
+web-transport-quinn = { git = "https://github.com/kixelated/web-transport-rs", optional = true }
 
 # Tower middleware stack
 tower = { version = "0.4", features = ["full"] }
@@ -105,6 +106,9 @@ notify = "6.1"
 urlencoding = "2.1"
 async-trait = "0.1"
 
+# Development-only dependencies
+rcgen = { version = "0.12", optional = true }
+
 # WebSocket handshake dependencies
 sha1 = "0.10"
 base64 = "0.22"
@@ -148,6 +152,10 @@ rand_distr = { version = "0.4", optional = true }
 # Threat intelligence integration
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
+# New dependencies for WebTransport binaries
+url = { version = "2.5" }
+rustls-pki-types = { version = "1.7" }
+
 [dev-dependencies]
 # Testing framework
 testcontainers = "0.15"
@@ -163,7 +171,7 @@ wasm-waf = ["wasmtime", "wasmtime-wasi", "wasmtime-wasi-http"]
 # Protocol support features
 http3 = ["h3", "h3-quinn", "quinn", "rustls-native-certs"]
 websocket = []
-webtransport = ["web-transport"]
+webtransport = ["web-transport", "web-transport-quinn", "rcgen"]
 # Security features
 geoip = ["maxminddb"]
 # Export system features
@@ -251,3 +259,23 @@ required-features = ["wasm-waf"]
 [[bin]]
 name = "benchmark_core"
 path = "src/bin/benchmark_core.rs"
+
+[[bin]]
+name = "websocket_performance_test"
+path = "src/bin/websocket_performance_test.rs"
+
+# New WebTransport E2E components (guarded by feature)
+[[bin]]
+name = "webtransport_waf_proxy"
+path = "src/bin/webtransport_waf_proxy.rs"
+required-features = ["webtransport"]
+
+[[bin]]
+name = "webtransport_echo_backend"
+path = "src/bin/webtransport_echo_backend.rs"
+required-features = ["webtransport"]
+
+[[bin]]
+name = "webtransport_performance_test"
+path = "src/bin/webtransport_performance_test.rs"
+required-features = ["webtransport"]
