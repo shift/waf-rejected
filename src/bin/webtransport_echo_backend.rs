@@ -19,7 +19,8 @@ async fn main() -> Result<()> {
 
     let mut server = wtq::ServerBuilder::new()
         .with_addr(bind)
-        .with_congestion_control(wtq::CongestionControl::LowLatency)
+        // Prefer throughput for perf scenarios (micro-messages, high rate)
+        .with_congestion_control(wtq::CongestionControl::Throughput)
         .with_certificate(certs, key)?;
 
     info!("WebTransport echo backend listening on {} (HTTP/3/QUIC)", bind);
