@@ -1,11 +1,11 @@
 //! WASM Request and Security Context
-//! 
+//!
 //! Defines the context structures passed to WASM ModSecurity modules
 //! for request processing and security evaluation.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use serde::{Serialize, Deserialize};
-use wasmtime_wasi::{WasiCtx, ResourceTable};
+use wasmtime_wasi::{ResourceTable, WasiCtx};
 
 /// Request context passed to WASM ModSecurity engine
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,7 +115,7 @@ impl Default for WasmRequestContext {
 impl Default for SecurityMetadata {
     fn default() -> Self {
         use std::time::{SystemTime, UNIX_EPOCH};
-        
+
         Self {
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -147,6 +147,15 @@ pub struct WasmSecurityContext {
     pub limiter: wasmtime::StoreLimits,
 }
 
+impl std::fmt::Debug for WasmSecurityContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WasmSecurityContext")
+            .field("table", &"ResourceTable")
+            .field("limiter", &"StoreLimits")
+            .finish()
+    }
+}
+
 impl WasmSecurityContext {
     pub fn new(wasi: WasiCtx) -> Self {
         let table = ResourceTable::new();
@@ -157,7 +166,7 @@ impl WasmSecurityContext {
             .tables(1)
             .memories(1)
             .build();
-            
+
         Self {
             wasi,
             table,
@@ -175,10 +184,11 @@ impl WasmRequestContext {
         client_ip: &str,
         body: Option<&[u8]>,
     ) -> Self {
-        let headers_map: HashMap<String, String> = headers.iter()
+        let headers_map: HashMap<String, String> = headers
+            .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-            
+
         Self {
             method: method.to_string(),
             uri: uri.to_string(),
@@ -190,55 +200,48 @@ impl WasmRequestContext {
             security_metadata: SecurityMetadata::default(),
         }
     }
-    
+
     /// Add geographic context (for K/V store integration)
     pub fn with_geo_context(mut self, geo: GeoContext) -> Self {
         self.geo_context = Some(geo);
         self
     }
-    
+
     /// Add session information
     pub fn with_session_info(mut self, session: SessionInfo) -> Self {
         self.security_metadata.session_info = Some(session);
         self
     }
-    
+
     /// Update rate limit context
     pub fn with_rate_limit_context(mut self, rate_limit: RateLimitContext) -> Self {
         self.security_metadata.rate_limit_context = rate_limit;
         self
     }
-    
+
     /// Get request size for memory management
     pub fn estimated_size(&self) -> usize {
-        let headers_size: usize = self.headers.iter()
-            .map(|(k, v)| k.len() + v.len())
-            .sum();
-            
-        let body_size = self.body.as_ref()
-            .map(|b| b.len())
-            .unwrap_or(0);
-            
+        let headers_size: usize = self.headers.iter().map(|(k, v)| k.len() + v.len()).sum();
+
+        let body_size = self.body.as_ref().map(|b| b.len()).unwrap_or(0);
+
         // Rough estimate including all fields
-        self.method.len() + 
-        self.uri.len() + 
-        headers_size + 
-        body_size + 
-        1024 // Metadata overhead
+        self.method.len() + self.uri.len() + headers_size + body_size + 1024 // Metadata overhead
     }
-    
+
     /// Check if request should be processed by WASM
     pub fn should_process_with_wasm(&self) -> bool {
         // Skip WASM for very large requests to avoid memory issues
-        if self.estimated_size() > 1024 * 1024 { // 1MB limit
+        if self.estimated_size() > 1024 * 1024 {
+            // 1MB limit
             return false;
         }
-        
+
         // Skip WASM for internal health checks
         if self.uri.starts_with("/health") || self.uri.starts_with("/metrics") {
             return false;
         }
-        
+
         true
     }
 }
@@ -246,7 +249,7 @@ impl WasmRequestContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_request_context_creation() {
         let ctx = WasmRequestContext::from_http_request(
@@ -256,35 +259,35 @@ mod tests {
             "192.168.1.1",
             Some(b"test body"),
         );
-        
+
         assert_eq!(ctx.method, "GET");
         assert_eq!(ctx.uri, "/test");
         assert_eq!(ctx.client_ip, "192.168.1.1");
         assert_eq!(ctx.headers.len(), 2);
         assert!(ctx.body.is_some());
     }
-    
+
     #[test]
     fn test_size_estimation() {
         let mut ctx = WasmRequestContext::default();
         ctx.body = Some(vec![0u8; 1000]);
-        
+
         let size = ctx.estimated_size();
         assert!(size > 1000);
         assert!(size < 5000); // Should include overhead but not be excessive (increased threshold)
     }
-    
+
     #[test]
     fn test_wasm_processing_decision() {
         let mut ctx = WasmRequestContext::default();
-        
+
         // Normal request should be processed
         assert!(ctx.should_process_with_wasm());
-        
+
         // Health check should be skipped
         ctx.uri = "/health".to_string();
         assert!(!ctx.should_process_with_wasm());
-        
+
         // Large request should be skipped
         ctx.uri = "/normal".to_string();
         ctx.body = Some(vec![0u8; 2 * 1024 * 1024]); // 2MB
