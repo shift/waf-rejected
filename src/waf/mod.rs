@@ -175,6 +175,8 @@ impl WafEngine {
             debug: config.waf.wasm.debug,
             instance_pool_size: config.waf.wasm.instance_pool_size,
             hot_reload: config.waf.wasm.hot_reload,
+            enable_memory_mapping: true,
+            enable_shared_memory: true,
         };
 
         match WasmEngine::new(wasm_config) {

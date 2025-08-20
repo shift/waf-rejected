@@ -519,6 +519,24 @@ impl WafPatternMatcher {
     }
 }
 
+/// Public API functions for WAF pattern matching
+/// These provide the interface expected by the WAF module
+
+/// Fast pattern search using SIMD acceleration
+pub fn fast_pattern_search(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    SimdStringOps::find_pattern(haystack, needle)
+}
+
+/// Check for SQL injection patterns using SIMD-accelerated matching
+pub fn contains_sql_injection_patterns(payload: &[u8]) -> bool {
+    WafPatternMatcher::contains_sql_injection(payload)
+}
+
+/// Check for XSS patterns using SIMD-accelerated matching
+pub fn contains_xss_patterns(payload: &[u8]) -> bool {
+    WafPatternMatcher::contains_xss(payload)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
