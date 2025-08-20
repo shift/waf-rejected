@@ -1,3 +1,4 @@
+use crate::waf::simd_ops::WafPatternMatcher;
 use crate::waf::{Decision, RequestContext, WafRule};
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -254,41 +255,124 @@ impl ContentInspectionRule {
         (high_priority, low_priority)
     }
 
-    /// Fast check for high-priority patterns only (performance optimization)
+    /// Fast check for high-priority patterns using SIMD acceleration
     fn fast_check_content(&self, content: &str) -> Option<(&ThreatPattern, String)> {
-        // Check high-priority patterns first
-        for pattern in &self.high_priority_patterns {
-            if let Some(captures) = pattern.pattern.find(content) {
-                let matched_text = captures.as_str();
-                // Limit matched text size for performance
-                let limited_match = if matched_text.len() > 100 {
-                    &matched_text[..100]
-                } else {
-                    matched_text
-                };
-                return Some((pattern, limited_match.to_string()));
+        let content_bytes = content.as_bytes();
+
+        // SIMD-accelerated pre-filtering for common attack patterns
+        // This provides significant performance improvement for large payloads
+        if WafPatternMatcher::contains_sql_injection(content_bytes) {
+            // Found potential SQL injection, now verify with precise regex patterns
+            for pattern in &self.high_priority_patterns {
+                if matches!(pattern.attack_type, AttackType::SqlInjection) {
+                    if let Some(captures) = pattern.pattern.find(content) {
+                        let matched_text = captures.as_str();
+                        let limited_match = if matched_text.len() > 100 {
+                            &matched_text[..100]
+                        } else {
+                            matched_text
+                        };
+                        return Some((pattern, limited_match.to_string()));
+                    }
+                }
             }
         }
+
+        if WafPatternMatcher::contains_xss(content_bytes) {
+            // Found potential XSS, now verify with precise regex patterns
+            for pattern in &self.high_priority_patterns {
+                if matches!(pattern.attack_type, AttackType::XssAttack) {
+                    if let Some(captures) = pattern.pattern.find(content) {
+                        let matched_text = captures.as_str();
+                        let limited_match = if matched_text.len() > 100 {
+                            &matched_text[..100]
+                        } else {
+                            matched_text
+                        };
+                        return Some((pattern, limited_match.to_string()));
+                    }
+                }
+            }
+        }
+
+        // Check remaining high-priority patterns with traditional regex
+        // (patterns not covered by SIMD fast-path)
+        for pattern in &self.high_priority_patterns {
+            if !matches!(
+                pattern.attack_type,
+                AttackType::SqlInjection | AttackType::XssAttack
+            ) {
+                if let Some(captures) = pattern.pattern.find(content) {
+                    let matched_text = captures.as_str();
+                    let limited_match = if matched_text.len() > 100 {
+                        &matched_text[..100]
+                    } else {
+                        matched_text
+                    };
+                    return Some((pattern, limited_match.to_string()));
+                }
+            }
+        }
+
         None
     }
 
     fn check_content(&self, content: &str) -> Option<(&ThreatPattern, String)> {
-        // First check high-priority patterns
+        // First check high-priority patterns with SIMD acceleration
         if let Some(result) = self.fast_check_content(content) {
             return Some(result);
         }
 
-        // Then check low-priority patterns
+        let content_bytes = content.as_bytes();
+
+        // SIMD-accelerated pre-filtering for low-priority patterns
+        if WafPatternMatcher::contains_sql_injection(content_bytes) {
+            for pattern in &self.low_priority_patterns {
+                if matches!(pattern.attack_type, AttackType::SqlInjection) {
+                    if let Some(captures) = pattern.pattern.find(content) {
+                        let matched_text = captures.as_str();
+                        let limited_match = if matched_text.len() > 100 {
+                            &matched_text[..100]
+                        } else {
+                            matched_text
+                        };
+                        return Some((pattern, limited_match.to_string()));
+                    }
+                }
+            }
+        }
+
+        if WafPatternMatcher::contains_xss(content_bytes) {
+            for pattern in &self.low_priority_patterns {
+                if matches!(pattern.attack_type, AttackType::XssAttack) {
+                    if let Some(captures) = pattern.pattern.find(content) {
+                        let matched_text = captures.as_str();
+                        let limited_match = if matched_text.len() > 100 {
+                            &matched_text[..100]
+                        } else {
+                            matched_text
+                        };
+                        return Some((pattern, limited_match.to_string()));
+                    }
+                }
+            }
+        }
+
+        // Check remaining low-priority patterns with traditional regex
         for pattern in &self.low_priority_patterns {
-            if let Some(captures) = pattern.pattern.find(content) {
-                let matched_text = captures.as_str();
-                // Limit matched text size for performance
-                let limited_match = if matched_text.len() > 100 {
-                    &matched_text[..100]
-                } else {
-                    matched_text
-                };
-                return Some((pattern, limited_match.to_string()));
+            if !matches!(
+                pattern.attack_type,
+                AttackType::SqlInjection | AttackType::XssAttack
+            ) {
+                if let Some(captures) = pattern.pattern.find(content) {
+                    let matched_text = captures.as_str();
+                    let limited_match = if matched_text.len() > 100 {
+                        &matched_text[..100]
+                    } else {
+                        matched_text
+                    };
+                    return Some((pattern, limited_match.to_string()));
+                }
             }
         }
         None

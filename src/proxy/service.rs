@@ -16,6 +16,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::error::WafError;
+use crate::proxy::buffer_pool::BufferPool;
 use crate::proxy::websocket::WebSocketHandler;
 use crate::waf::{Decision, RequestContext, WafEngine};
 
@@ -33,6 +34,7 @@ pub struct WafProxyService {
     upstream_client: Client<HttpConnector, Full<Bytes>>,
     upstream_uri: Uri,
     config: Arc<Config>,
+    buffer_pool: Arc<BufferPool>,
     websocket_handler: WebSocketHandler,
     #[cfg(feature = "webtransport")]
     webtransport_handler: WebTransportHandler,
@@ -44,6 +46,15 @@ impl WafProxyService {
         info!("Initializing WAF Proxy Service with performance optimizations");
 
         let waf_engine = Arc::new(WafEngine::with_config(&config));
+
+        // Initialize high-performance buffer pool for zero-allocation HTTP processing
+        let buffer_pool = BufferPool::new();
+        info!(
+            "Buffer pool initialized with {} total buffers",
+            buffer_pool.stats().small_capacity
+                + buffer_pool.stats().medium_capacity
+                + buffer_pool.stats().large_capacity
+        );
 
         // Create optimized HTTP client with multi-protocol support
         let mut connector = HttpConnector::new();
@@ -92,6 +103,7 @@ impl WafProxyService {
             upstream_client,
             upstream_uri,
             config: config_arc,
+            buffer_pool,
             websocket_handler,
             #[cfg(feature = "webtransport")]
             webtransport_handler,
@@ -122,6 +134,7 @@ impl WafProxyService {
             let upstream_client = self.upstream_client.clone();
             let upstream_uri = self.upstream_uri.clone();
             let config = Arc::clone(&self.config);
+            let buffer_pool = Arc::clone(&self.buffer_pool);
 
             // Spawn each connection handler with multi-protocol support
             tokio::task::spawn(async move {
@@ -141,6 +154,7 @@ impl WafProxyService {
                                         upstream_client.clone(),
                                         upstream_uri.clone(),
                                         Arc::clone(&config),
+                                        Arc::clone(&buffer_pool),
                                     )
                                 }),
                             )
@@ -168,6 +182,7 @@ impl WafProxyService {
                                     upstream_client.clone(),
                                     upstream_uri.clone(),
                                     Arc::clone(&config),
+                                    Arc::clone(&buffer_pool),
                                 )
                             }),
                         )
@@ -187,6 +202,7 @@ impl WafProxyService {
         upstream_client: Client<HttpConnector, Full<Bytes>>,
         upstream_uri: Uri,
         config: Arc<Config>,
+        buffer_pool: Arc<BufferPool>,
     ) -> Result<Response<Full<Bytes>>, Infallible> {
         let start_time = Instant::now();
 
@@ -278,6 +294,7 @@ impl WafProxyService {
                     upstream_uri,
                     start_time,
                     &http_version,
+                    buffer_pool,
                 )
                 .await
             }
@@ -351,20 +368,24 @@ impl WafProxyService {
         upstream_uri: Uri,
         start_time: Instant,
         http_version: &str,
+        buffer_pool: Arc<BufferPool>,
     ) -> Result<Response<Full<Bytes>>, Infallible> {
         // Extract request parts
         let (parts, body) = req.into_parts();
 
-        // Stream body collection with timeout (optimized for performance)
+        // Stream body collection using optimized buffer pool
         let body_bytes = match tokio::time::timeout(
             Duration::from_secs(10), // Prevent hanging on large bodies
-            body.collect(),
+            buffer_pool.read_incoming_body(body, None),
         )
         .await
         {
-            Ok(Ok(collected)) => collected.to_bytes(),
+            Ok(Ok(pooled_buffer)) => {
+                // Convert pooled buffer to bytes efficiently
+                pooled_buffer.freeze()
+            }
             Ok(Err(e)) => {
-                error!("Failed to collect request body: {}", e);
+                error!("Failed to collect request body with buffer pool: {}", e);
                 return Ok(Self::create_error_response(
                     StatusCode::BAD_REQUEST,
                     "Failed to read request body",

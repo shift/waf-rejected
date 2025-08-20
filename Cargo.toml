@@ -89,6 +89,7 @@ bytes = "1.0"
 # Async utilities
 futures = "0.3"
 pin-project = "1.0"
+parking_lot = "0.12"
 
 # Time handling
 chrono = { version = "0.4", features = ["serde"] }
@@ -146,6 +147,9 @@ rand = "0.8"
 
 # System information
 num_cpus = "1.0"
+
+# Memory mapping for optimized WASM loading
+memmap2 = "0.9"
 
 # Security modules dependencies
 maxminddb = { version = "0.24", optional = true }

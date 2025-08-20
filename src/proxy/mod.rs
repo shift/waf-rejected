@@ -4,9 +4,11 @@
 //! requests to upstream servers while applying WAF rules for security filtering.
 //! Includes support for HTTP/1.0-3, WebSocket, and WebTransport protocols.
 
+pub mod buffer_pool;
 pub mod service;
 pub mod websocket;
 
+pub use buffer_pool::BufferPool;
 pub use service::WafProxyService;
 pub use websocket::WebSocketHandler;
 
