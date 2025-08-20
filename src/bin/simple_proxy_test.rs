@@ -1,7 +1,7 @@
-use tokio::time::{sleep, Duration};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tokio::time::{sleep, Duration};
 use waf_ingress::config::Config;
 
 #[tokio::main]
@@ -11,7 +11,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Load configuration to ensure it works
     println!("📋 Loading configuration...");
-    
+
     let config = match Config::load() {
         Ok(cfg) => {
             println!("✅ Configuration loaded successfully");
@@ -90,40 +90,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 async fn test_health_check(port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{}/health", port);
-    
+
     let response = client
         .get(&url)
         .timeout(Duration::from_secs(5))
         .send()
         .await?;
-    
+
     println!("   Status: {}", response.status());
     let body = response.text().await?;
     println!("   Response: {}", body);
-    
+
     Ok(())
 }
 
 async fn test_normal_request(port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{}/api/test", port);
-    
+
     let response = client
         .get(&url)
         .timeout(Duration::from_secs(5))
         .send()
         .await?;
-    
+
     println!("   Status: {}", response.status());
     println!("   Headers: {:?}", response.headers());
-    
+
     Ok(())
 }
 
-async fn test_sql_injection_attack(port: u16) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+async fn test_sql_injection_attack(
+    port: u16,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{}/api/users", port);
-    
+
     // Send a request with SQL injection payload
     let response = client
         .get(&url)
@@ -131,15 +133,15 @@ async fn test_sql_injection_attack(port: u16) -> Result<bool, Box<dyn std::error
         .timeout(Duration::from_secs(5))
         .send()
         .await?;
-    
+
     let status = response.status();
     println!("   Status: {}", status);
     println!("   Headers: {:?}", response.headers());
-    
+
     // Check if request was blocked (403/406/blocked status)
-    let blocked = status == reqwest::StatusCode::FORBIDDEN 
+    let blocked = status == reqwest::StatusCode::FORBIDDEN
         || status == reqwest::StatusCode::NOT_ACCEPTABLE
         || status.as_u16() >= 400;
-    
+
     Ok(blocked)
 }

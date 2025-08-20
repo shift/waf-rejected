@@ -35,8 +35,8 @@ quinn = { version = "0.11", optional = true }
 rustls-native-certs = { version = "0.7", optional = true }
 
 # WebSocket and WebTransport support
-tokio-tungstenite = { version = "0.20", features = ["native-tls"] }
-tungstenite = { version = "0.20", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.20", features = ["rustls-tls-webpki-roots"] }
+tungstenite = { version = "0.20", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", features = ["sink"] }
 
 # WebTransport support (experimental)

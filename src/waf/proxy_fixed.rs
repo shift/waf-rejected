@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use crate::Config;
+use std::sync::Arc;
 
 pub struct WafProxyService {
     config: Arc<Config>,

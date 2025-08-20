@@ -1,5 +1,5 @@
-use std::fmt;
 use std::error::Error as StdError;
+use std::fmt;
 
 /// WAF error types
 #[derive(Debug, Clone)]
@@ -48,12 +48,12 @@ impl WafError {
     pub fn internal<T: Into<String>>(msg: T) -> Self {
         WafError::InternalError(msg.into())
     }
-    
+
     /// Create an HTTP error
     pub fn Http<T: Into<String>>(msg: T) -> Self {
         WafError::NetworkError(msg.into())
     }
-    
+
     /// Create an upstream connection error
     pub fn upstream_connection<T: Into<String>>(msg: T) -> Self {
         WafError::NetworkError(format!("Upstream connection error: {}", msg.into()))

@@ -8,16 +8,27 @@ use url::Url;
 use web_transport_quinn as wtq;
 
 #[derive(Clone, Copy)]
-enum Mode { Bidi, Datagram }
+enum Mode {
+    Bidi,
+    Datagram,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // Reduce harness logging overhead
-    tracing_subscriber::fmt().with_max_level(tracing::Level::WARN).init();
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .init();
 
     // Start backend and WAF proxy in-process for an end-to-end benchmark
-    let backend_addr: SocketAddr = SocketAddr::from(("127.0.0.1".parse::<std::net::IpAddr>().unwrap(), find_free_udp_port()?));
-    let waf_addr: SocketAddr = SocketAddr::from(("127.0.0.1".parse::<std::net::IpAddr>().unwrap(), find_free_udp_port()?));
+    let backend_addr: SocketAddr = SocketAddr::from((
+        "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
+        find_free_udp_port()?,
+    ));
+    let waf_addr: SocketAddr = SocketAddr::from((
+        "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
+        find_free_udp_port()?,
+    ));
 
     // Resolve sibling binaries from the current binary directory
     let bin_dir = std::env::current_exe()?.parent().unwrap().to_path_buf();
@@ -54,12 +65,19 @@ async fn main() -> Result<()> {
     const RUNS: usize = 3;
 
     for (name, mode, conns, msgs, size) in scenarios {
-        println!("\n🔥 Running {} via WAF ({} conns × {} msgs, {}B)", name, conns, msgs, size);
+        println!(
+            "\n🔥 Running {} via WAF ({} conns × {} msgs, {}B)",
+            name, conns, msgs, size
+        );
 
         // Warmup (not recorded)
         match mode {
-            Mode::Bidi => { let _ = run_bidi_benchmark(waf_addr, conns, msgs, size).await?; }
-            Mode::Datagram => { let _ = run_dgram_benchmark(waf_addr, conns, msgs, size).await?; }
+            Mode::Bidi => {
+                let _ = run_bidi_benchmark(waf_addr, conns, msgs, size).await?;
+            }
+            Mode::Datagram => {
+                let _ = run_dgram_benchmark(waf_addr, conns, msgs, size).await?;
+            }
         }
 
         // Recorded runs
@@ -80,7 +98,11 @@ async fn main() -> Result<()> {
         println!("Median success rate: {:.1}%", med_ratio * 100.0);
         println!(
             "10K threshold (median): {}",
-            if med >= 10_000.0 && med_ratio >= 0.95 { "ACHIEVED" } else { "NOT MET" }
+            if med >= 10_000.0 && med_ratio >= 0.95 {
+                "ACHIEVED"
+            } else {
+                "NOT MET"
+            }
         );
     }
 
@@ -101,10 +123,16 @@ fn find_free_udp_port() -> std::io::Result<u16> {
 
 async fn wait_ready(addr: SocketAddr, max_wait: Duration) {
     let url = Url::parse(&format!("https://{}/", addr)).unwrap();
-    let client = unsafe { wtq::ClientBuilder::new().with_no_certificate_verification().unwrap() };
+    let client = unsafe {
+        wtq::ClientBuilder::new()
+            .with_no_certificate_verification()
+            .unwrap()
+    };
     let start = Instant::now();
     loop {
-        if start.elapsed() > max_wait { break; }
+        if start.elapsed() > max_wait {
+            break;
+        }
         match client.connect(url.clone()).await {
             Ok(_session) => break,
             Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
@@ -150,7 +178,12 @@ async fn connect_sessions(addr: SocketAddr, conns: usize) -> Result<Vec<wtq::Ses
     Ok(sessions)
 }
 
-async fn run_bidi_benchmark(addr: SocketAddr, conns: usize, msgs_per_conn: usize, size: usize) -> Result<ResultSet> {
+async fn run_bidi_benchmark(
+    addr: SocketAddr,
+    conns: usize,
+    msgs_per_conn: usize,
+    size: usize,
+) -> Result<ResultSet> {
     // Pre-connect all sessions
     let sessions = connect_sessions(addr, conns).await?;
 
@@ -160,7 +193,11 @@ async fn run_bidi_benchmark(addr: SocketAddr, conns: usize, msgs_per_conn: usize
     for s in sessions {
         open_tasks.push(tokio::spawn(async move { s.open_bi().await }));
     }
-    for t in open_tasks { if let Ok(Ok(p)) = t.await { streams.push(p); } }
+    for t in open_tasks {
+        if let Ok(Ok(p)) = t.await {
+            streams.push(p);
+        }
+    }
 
     let ok = Arc::new(AtomicU64::new(0));
     let sent = Arc::new(AtomicU64::new(0));
@@ -180,7 +217,9 @@ async fn run_bidi_benchmark(addr: SocketAddr, conns: usize, msgs_per_conn: usize
             let payload_tx = payload.clone();
             let send_task = tokio::spawn(async move {
                 for _ in 0..msgs_per_conn {
-                    if send.write_all(&payload_tx).await.is_err() { break; }
+                    if send.write_all(&payload_tx).await.is_err() {
+                        break;
+                    }
                     sent.fetch_add(1, Ordering::Relaxed);
                 }
                 let _ = send.finish();
@@ -199,13 +238,25 @@ async fn run_bidi_benchmark(addr: SocketAddr, conns: usize, msgs_per_conn: usize
         }));
     }
 
-    for t in tasks { let _ = t.await; }
+    for t in tasks {
+        let _ = t.await;
+    }
 
     let dur = start.elapsed();
-    Ok(ResultSet { conns, msgs: sent.load(Ordering::Relaxed), ok: ok.load(Ordering::Relaxed), dur })
+    Ok(ResultSet {
+        conns,
+        msgs: sent.load(Ordering::Relaxed),
+        ok: ok.load(Ordering::Relaxed),
+        dur,
+    })
 }
 
-async fn run_dgram_benchmark(addr: SocketAddr, conns: usize, msgs_per_conn: usize, size: usize) -> Result<ResultSet> {
+async fn run_dgram_benchmark(
+    addr: SocketAddr,
+    conns: usize,
+    msgs_per_conn: usize,
+    size: usize,
+) -> Result<ResultSet> {
     // Pre-connect all sessions
     let sessions = connect_sessions(addr, conns).await?;
 
@@ -259,8 +310,11 @@ async fn run_dgram_benchmark(addr: SocketAddr, conns: usize, msgs_per_conn: usiz
                             }
                             Err(_) => {
                                 attempt += 1;
-                                if attempt >= 8 { break; }
-                                tokio::time::sleep(Duration::from_micros(50 * attempt as u64)).await;
+                                if attempt >= 8 {
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_micros(50 * attempt as u64))
+                                    .await;
                             }
                         }
                     }
@@ -274,7 +328,12 @@ async fn run_dgram_benchmark(addr: SocketAddr, conns: usize, msgs_per_conn: usiz
             let recv_task = tokio::spawn(async move {
                 loop {
                     // Stop when sender finished and we've received all echoes for successful sends
-                    if send_done_rx.load(Ordering::Relaxed) && ok_conn_rx.load(Ordering::Acquire) >= sent_conn_rx.load(Ordering::Acquire) { break; }
+                    if send_done_rx.load(Ordering::Relaxed)
+                        && ok_conn_rx.load(Ordering::Acquire)
+                            >= sent_conn_rx.load(Ordering::Acquire)
+                    {
+                        break;
+                    }
                     match tokio::time::timeout(recv_idle, session.read_datagram()).await {
                         Ok(Ok(_d)) => {
                             ok_global.fetch_add(1, Ordering::Relaxed);
@@ -290,10 +349,17 @@ async fn run_dgram_benchmark(addr: SocketAddr, conns: usize, msgs_per_conn: usiz
         }));
     }
 
-    for t in tasks { let _ = t.await; }
+    for t in tasks {
+        let _ = t.await;
+    }
 
     let dur = start.elapsed();
-    Ok(ResultSet { conns, msgs: sent.load(Ordering::Relaxed), ok: ok.load(Ordering::Relaxed), dur })
+    Ok(ResultSet {
+        conns,
+        msgs: sent.load(Ordering::Relaxed),
+        ok: ok.load(Ordering::Relaxed),
+        dur,
+    })
 }
 
 struct ResultSet {
@@ -303,17 +369,29 @@ struct ResultSet {
     dur: Duration,
 }
 
-fn throughput(r: &ResultSet) -> f64 { r.ok as f64 / r.dur.as_secs_f64() }
+fn throughput(r: &ResultSet) -> f64 {
+    r.ok as f64 / r.dur.as_secs_f64()
+}
 
 fn success_ratio(r: &ResultSet) -> f64 {
-    if r.msgs == 0 { 0.0 } else { r.ok as f64 / r.msgs as f64 }
+    if r.msgs == 0 {
+        0.0
+    } else {
+        r.ok as f64 / r.msgs as f64
+    }
 }
 
 fn median(v: &mut Vec<f64>) -> f64 {
-    if v.is_empty() { return 0.0; }
+    if v.is_empty() {
+        return 0.0;
+    }
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let mid = v.len() / 2;
-    if v.len() % 2 == 0 { (v[mid - 1] + v[mid]) / 2.0 } else { v[mid] }
+    if v.len() % 2 == 0 {
+        (v[mid - 1] + v[mid]) / 2.0
+    } else {
+        v[mid]
+    }
 }
 
 fn print_result(r: &ResultSet) {
@@ -324,5 +402,8 @@ fn print_result(r: &ResultSet) {
     println!("Throughput: {:.1} msg/s", mps);
     println!("Success rate: {:.1}%", ratio * 100.0);
     let pass = mps >= 10_000.0 && ratio >= 0.95;
-    println!("10K threshold: {}", if pass { "ACHIEVED" } else { "NOT MET" });
+    println!(
+        "10K threshold: {}",
+        if pass { "ACHIEVED" } else { "NOT MET" }
+    );
 }

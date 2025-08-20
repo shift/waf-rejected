@@ -1,8 +1,6 @@
-use crate::waf::{WafRule, RequestContext, Decision};
-use regex::Regex;
-use std::collections::HashMap;
+use crate::waf::{Decision, RequestContext, WafRule};
 use once_cell::sync::Lazy;
-use std::sync::Arc;
+use regex::Regex;
 
 /// Advanced content inspection rules for common web attacks (optimized for performance)
 pub struct ContentInspectionRule {
@@ -76,7 +74,6 @@ static COMMON_PATTERNS: Lazy<Vec<ThreatPattern>> = Lazy::new(|| {
             check_headers: false,
             check_body: true,
         },
-        
         // XSS patterns
         ThreatPattern {
             name: "XSS - Script tag".to_string(),
@@ -105,7 +102,6 @@ static COMMON_PATTERNS: Lazy<Vec<ThreatPattern>> = Lazy::new(|| {
             check_headers: false,
             check_body: true,
         },
-        
         // Command Injection patterns
         ThreatPattern {
             name: "Command Injection - Shell commands".to_string(),
@@ -125,7 +121,6 @@ static COMMON_PATTERNS: Lazy<Vec<ThreatPattern>> = Lazy::new(|| {
             check_headers: false,
             check_body: true,
         },
-        
         // Path Traversal patterns
         ThreatPattern {
             name: "Path Traversal - Directory traversal".to_string(),
@@ -145,7 +140,6 @@ static COMMON_PATTERNS: Lazy<Vec<ThreatPattern>> = Lazy::new(|| {
             check_headers: false,
             check_body: true,
         },
-        
         // File Inclusion patterns
         ThreatPattern {
             name: "Remote File Inclusion - HTTP URLs".to_string(),
@@ -165,7 +159,6 @@ static COMMON_PATTERNS: Lazy<Vec<ThreatPattern>> = Lazy::new(|| {
             check_headers: false,
             check_body: true,
         },
-        
         // XXE patterns
         ThreatPattern {
             name: "XXE Attack - External entity".to_string(),
@@ -176,7 +169,6 @@ static COMMON_PATTERNS: Lazy<Vec<ThreatPattern>> = Lazy::new(|| {
             check_headers: false,
             check_body: true,
         },
-        
         // SSRF patterns
         ThreatPattern {
             name: "SSRF - Localhost access".to_string(),
@@ -203,7 +195,7 @@ impl ContentInspectionRule {
     pub fn new(name: &str) -> Self {
         let patterns = COMMON_PATTERNS.clone();
         let (high_priority, low_priority) = Self::categorize_patterns(&patterns);
-        
+
         Self {
             name: name.to_string(),
             enabled: true,
@@ -215,7 +207,7 @@ impl ContentInspectionRule {
 
     pub fn with_custom_patterns(name: &str, patterns: Vec<ThreatPattern>) -> Self {
         let (high_priority, low_priority) = Self::categorize_patterns(&patterns);
-        
+
         Self {
             name: name.to_string(),
             enabled: true,
@@ -247,7 +239,7 @@ impl ContentInspectionRule {
     fn categorize_patterns(patterns: &[ThreatPattern]) -> (Vec<ThreatPattern>, Vec<ThreatPattern>) {
         let mut high_priority = Vec::new();
         let mut low_priority = Vec::new();
-        
+
         for pattern in patterns {
             match pattern.severity {
                 ThreatSeverity::Critical | ThreatSeverity::High => {
@@ -258,7 +250,7 @@ impl ContentInspectionRule {
                 }
             }
         }
-        
+
         (high_priority, low_priority)
     }
 
@@ -285,7 +277,7 @@ impl ContentInspectionRule {
         if let Some(result) = self.fast_check_content(content) {
             return Some(result);
         }
-        
+
         // Then check low-priority patterns
         for pattern in &self.low_priority_patterns {
             if let Some(captures) = pattern.pattern.find(content) {
@@ -328,7 +320,7 @@ impl WafRule for ContentInspectionRule {
 
         // Performance optimization: limit content size to prevent DoS
         const MAX_CONTENT_SIZE: usize = 8192; // 8KB limit for pattern matching
-        
+
         // Check URI path (high priority)
         let uri_path = ctx.uri.path();
         if uri_path.len() <= MAX_CONTENT_SIZE {
@@ -336,8 +328,10 @@ impl WafRule for ContentInspectionRule {
                 if pattern.check_uri {
                     return Decision::Block {
                         status: self.severity_to_status(&pattern.severity),
-                        reason: format!("Content inspection: {} detected in URI: {}", 
-                                      pattern.name, matched),
+                        reason: format!(
+                            "Content inspection: {} detected in URI: {}",
+                            pattern.name, matched
+                        ),
                     };
                 }
             }
@@ -351,8 +345,10 @@ impl WafRule for ContentInspectionRule {
                     if pattern.check_uri {
                         return Decision::Block {
                             status: self.severity_to_status(&pattern.severity),
-                            reason: format!("Content inspection: {} detected in query: {}", 
-                                          pattern.name, matched),
+                            reason: format!(
+                                "Content inspection: {} detected in query: {}",
+                                pattern.name, matched
+                            ),
                         };
                     }
                 }
@@ -364,11 +360,15 @@ impl WafRule for ContentInspectionRule {
             if pattern.check_headers {
                 for (header_name, header_value) in ctx.headers.iter() {
                     if let Ok(header_str) = header_value.to_str() {
-                        if header_str.len() <= MAX_CONTENT_SIZE && pattern.pattern.is_match(header_str) {
+                        if header_str.len() <= MAX_CONTENT_SIZE
+                            && pattern.pattern.is_match(header_str)
+                        {
                             return Decision::Block {
                                 status: self.severity_to_status(&pattern.severity),
-                                reason: format!("Content inspection: {} detected in header {}", 
-                                              pattern.name, header_name),
+                                reason: format!(
+                                    "Content inspection: {} detected in header {}",
+                                    pattern.name, header_name
+                                ),
                             };
                         }
                     }
@@ -378,7 +378,7 @@ impl WafRule for ContentInspectionRule {
 
         // TODO: Check request body when available (with size limits for performance)
         // This requires streaming body inspection during request processing
-        
+
         Decision::Allow
     }
 }
@@ -402,38 +402,42 @@ impl ContentInspectionRuleFactory {
     }
 
     pub fn sql_injection_rule() -> ContentInspectionRule {
-        let patterns = COMMON_PATTERNS.iter()
+        let patterns = COMMON_PATTERNS
+            .iter()
             .filter(|p| matches!(p.attack_type, AttackType::SqlInjection))
             .cloned()
             .collect();
-        
+
         ContentInspectionRule::with_custom_patterns("SQL Injection Detection", patterns)
     }
 
     pub fn xss_rule() -> ContentInspectionRule {
-        let patterns = COMMON_PATTERNS.iter()
+        let patterns = COMMON_PATTERNS
+            .iter()
             .filter(|p| matches!(p.attack_type, AttackType::XssAttack))
             .cloned()
             .collect();
-        
+
         ContentInspectionRule::with_custom_patterns("XSS Detection", patterns)
     }
 
     pub fn command_injection_rule() -> ContentInspectionRule {
-        let patterns = COMMON_PATTERNS.iter()
+        let patterns = COMMON_PATTERNS
+            .iter()
             .filter(|p| matches!(p.attack_type, AttackType::CommandInjection))
             .cloned()
             .collect();
-        
+
         ContentInspectionRule::with_custom_patterns("Command Injection Detection", patterns)
     }
 
     pub fn path_traversal_rule() -> ContentInspectionRule {
-        let patterns = COMMON_PATTERNS.iter()
+        let patterns = COMMON_PATTERNS
+            .iter()
             .filter(|p| matches!(p.attack_type, AttackType::PathTraversal))
             .cloned()
             .collect();
-        
+
         ContentInspectionRule::with_custom_patterns("Path Traversal Detection", patterns)
     }
 
@@ -445,8 +449,8 @@ impl ContentInspectionRuleFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyper::{HeaderMap, Method, Uri};
     use std::str::FromStr;
-    use hyper::{Method, Uri, HeaderMap};
 
     fn create_test_context(uri: &str, headers: Option<HeaderMap>) -> RequestContext {
         RequestContext::new(
@@ -461,7 +465,7 @@ mod tests {
     #[test]
     fn test_sql_injection_detection() {
         let rule = ContentInspectionRuleFactory::sql_injection_rule();
-        
+
         // Test UNION SELECT attack (using + for spaces which should now work with updated regex)
         let ctx = create_test_context("/api/users?id=1+UNION+SELECT+*+FROM+passwords", None);
         match rule.evaluate(&ctx) {
@@ -470,7 +474,7 @@ mod tests {
             }
             _ => panic!("Expected SQL injection to be blocked"),
         }
-        
+
         // Test clean request
         let ctx = create_test_context("/api/users?id=123", None);
         assert_eq!(rule.evaluate(&ctx), Decision::Allow);
@@ -479,7 +483,7 @@ mod tests {
     #[test]
     fn test_xss_detection() {
         let rule = ContentInspectionRuleFactory::xss_rule();
-        
+
         // Test script tag injection (URL encoded, should now work with updated regex)
         let ctx = create_test_context("/search?q=%3Cscript%3Ealert('xss')%3C/script%3E", None);
         match rule.evaluate(&ctx) {
@@ -488,7 +492,7 @@ mod tests {
             }
             _ => panic!("Expected XSS to be blocked"),
         }
-        
+
         // Test javascript protocol
         let ctx = create_test_context("/redirect?url=javascript:alert(1)", None);
         match rule.evaluate(&ctx) {
@@ -502,7 +506,7 @@ mod tests {
     #[test]
     fn test_command_injection_detection() {
         let rule = ContentInspectionRuleFactory::command_injection_rule();
-        
+
         // Test command chaining (should now work with updated regex for + characters)
         let ctx = create_test_context("/exec?cmd=test;cat+/etc/passwd", None);
         match rule.evaluate(&ctx) {
@@ -516,7 +520,7 @@ mod tests {
     #[test]
     fn test_path_traversal_detection() {
         let rule = ContentInspectionRuleFactory::path_traversal_rule();
-        
+
         // Test directory traversal
         let ctx = create_test_context("/file?path=../../../etc/passwd", None);
         match rule.evaluate(&ctx) {
@@ -530,7 +534,7 @@ mod tests {
     #[test]
     fn test_disabled_rule() {
         let rule = ContentInspectionRuleFactory::sql_injection_rule().enabled(false);
-        
+
         let ctx = create_test_context("/api/users?id=1+UNION+SELECT+*+FROM+passwords", None);
         assert_eq!(rule.evaluate(&ctx), Decision::Allow);
     }
@@ -574,7 +578,10 @@ mod tests {
         let rule = ContentInspectionRule::with_custom_patterns("Header Rule", vec![pattern]);
 
         let mut headers = HeaderMap::new();
-        headers.insert("x-custom-header", "<script>alert('xss')</script>".parse().unwrap());
+        headers.insert(
+            "x-custom-header",
+            "<script>alert('xss')</script>".parse().unwrap(),
+        );
         let ctx = create_test_context("/", Some(headers));
 
         match rule.evaluate(&ctx) {
@@ -588,7 +595,7 @@ mod tests {
     #[test]
     fn test_severity_status_mapping() {
         let rule = ContentInspectionRule::new("test");
-        
+
         assert_eq!(rule.severity_to_status(&ThreatSeverity::Low), 400);
         assert_eq!(rule.severity_to_status(&ThreatSeverity::Medium), 403);
         assert_eq!(rule.severity_to_status(&ThreatSeverity::High), 403);

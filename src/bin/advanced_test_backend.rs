@@ -1,12 +1,12 @@
+use http_body_util::{BodyExt, Full};
+use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode, Version};
-use hyper::body::{Incoming, Bytes};
-use http_body_util::{BodyExt, Full};
 use serde_json::json;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::time::{SystemTime, Instant};
+use std::time::{Instant, SystemTime};
 use tokio::net::TcpListener;
 use tokio::time::sleep;
 
@@ -36,26 +36,38 @@ async fn advanced_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>
 
     // SQL Injection Detection
     let uri_str = uri.to_string();
-    if uri_str.contains("'") || uri_str.contains("--") || uri_str.contains("union") || 
-       uri_str.contains("select") || uri_str.contains("1=1") || uri_str.contains("OR") {
+    if uri_str.contains("'")
+        || uri_str.contains("--")
+        || uri_str.contains("union")
+        || uri_str.contains("select")
+        || uri_str.contains("1=1")
+        || uri_str.contains("OR")
+    {
         security_issues.push("SQL_INJECTION_DETECTED");
     }
 
     // XSS Detection
-    if uri_str.contains("<script") || uri_str.contains("javascript:") || 
-       uri_str.contains("onerror") || uri_str.contains("alert(") {
+    if uri_str.contains("<script")
+        || uri_str.contains("javascript:")
+        || uri_str.contains("onerror")
+        || uri_str.contains("alert(")
+    {
         security_issues.push("XSS_DETECTED");
     }
 
     // Path Traversal Detection
-    if uri_str.contains("../") || uri_str.contains("..\\") || 
-       uri_str.contains("/etc/passwd") || uri_str.contains("c:\\windows") {
+    if uri_str.contains("../")
+        || uri_str.contains("..\\")
+        || uri_str.contains("/etc/passwd")
+        || uri_str.contains("c:\\windows")
+    {
         security_issues.push("PATH_TRAVERSAL_DETECTED");
     }
 
     // Zip Bomb / Large Header Detection
     for (key, value) in &headers {
-        if value.len() > 8192 { // 8KB header limit
+        if value.len() > 8192 {
+            // 8KB header limit
             security_issues.push("OVERSIZED_HEADER_DETECTED");
         }
         if key.len() > 256 {
@@ -72,7 +84,7 @@ async fn advanced_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>
     // HTTP Version Testing
     let version_info = match version {
         Version::HTTP_09 => "HTTP/0.9",
-        Version::HTTP_10 => "HTTP/1.0", 
+        Version::HTTP_10 => "HTTP/1.0",
         Version::HTTP_11 => "HTTP/1.1",
         Version::HTTP_2 => "HTTP/2.0",
         Version::HTTP_3 => "HTTP/3.0",
@@ -157,7 +169,7 @@ async fn advanced_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>
                     "http_3": version == Version::HTTP_3,
                 }
             });
-        },
+        }
         "/test/compression" => {
             // Generate large response to test compression
             let large_data: Vec<String> = (0..1000).map(|i| format!("test_data_{}", i)).collect();
@@ -165,7 +177,7 @@ async fn advanced_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>
                 "large_dataset": large_data,
                 "uncompressed_size": serde_json::to_string(&large_data).unwrap().len(),
             });
-        },
+        }
         "/test/slowloris" => {
             // Simulate slow response
             sleep(std::time::Duration::from_secs(2)).await;
@@ -173,7 +185,7 @@ async fn advanced_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>
                 "slow_response": true,
                 "delay_seconds": 2,
             });
-        },
+        }
         "/test/zip-bomb" => {
             // Create a response that would expand significantly when decompressed
             let repeated_data = "A".repeat(10000);
@@ -181,7 +193,7 @@ async fn advanced_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>
                 "repeated_data": repeated_data,
                 "expansion_ratio": "high",
             });
-        },
+        }
         _ => {}
     }
 
@@ -205,13 +217,15 @@ async fn advanced_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>
     // Add headers for protocol testing
     match version {
         Version::HTTP_2 => {
-            response_builder = response_builder
-                .header("X-HTTP2-Features", "multiplexing,server-push,header-compression");
-        },
+            response_builder = response_builder.header(
+                "X-HTTP2-Features",
+                "multiplexing,server-push,header-compression",
+            );
+        }
         Version::HTTP_3 => {
-            response_builder = response_builder
-                .header("X-HTTP3-Features", "quic,0-rtt,connection-migration");
-        },
+            response_builder =
+                response_builder.header("X-HTTP3-Features", "quic,0-rtt,connection-migration");
+        }
         _ => {}
     }
 
@@ -254,7 +268,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!();
 
     let listener = TcpListener::bind(addr).await?;
-    
+
     println!("✅ Advanced Test Backend ready!");
     println!("🔥 Ready for comprehensive WAF security testing");
     println!();

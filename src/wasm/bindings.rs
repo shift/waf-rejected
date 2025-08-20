@@ -1,11 +1,11 @@
 //! WASM Component Bindings
-//! 
+//!
 //! Defines the interface bindings for Go-compiled ModSecurity WASM modules.
 //! This module handles the communication protocol between the Rust host
 //! and the WASM guest modules.
 
-use wasmtime::component::{Component, Linker};
 use anyhow::Result;
+use wasmtime::component::{Component, Linker};
 
 // Note: In production, these would be auto-generated using wit-bindgen
 // For now, we use a simplified interface for the MVP
@@ -142,13 +142,13 @@ pub enum ThreatType {
 pub trait WasmHostFunctions {
     /// Log a security event
     fn log_security_event(&mut self, event: &SecurityEvent) -> Result<()>;
-    
+
     /// Query K/V store for threat intelligence
     fn query_threat_intel(&mut self, ip: &str) -> Result<Vec<ThreatIndicator>>;
-    
+
     /// Update rate limiting counters
     fn update_rate_limit(&mut self, key: &str, increment: u32) -> Result<u32>;
-    
+
     /// Get geographic information for IP
     fn get_geo_info(&mut self, ip: &str) -> Result<GeoInfo>;
 }
@@ -215,16 +215,16 @@ impl ComponentManager {
         let mut config = wasmtime::Config::new();
         config.wasm_component_model(true);
         config.async_support(true);
-        
+
         let engine = wasmtime::Engine::new(&config)?;
         let mut linker = Linker::new(&engine);
-        
+
         // Add host function bindings
         Self::add_host_functions(&mut linker)?;
-        
+
         Ok(Self { engine, linker })
     }
-    
+
     /// Load a WASM component from bytes
     pub fn load_component(&self, bytes: &[u8]) -> Result<Component> {
         Component::new(&self.engine, bytes)
@@ -238,7 +238,7 @@ impl ComponentManager {
         let m = wasmtime::Module::new(&self.engine, bytes)?;
         Ok(LoadedWasm::Module(m))
     }
-    
+
     /// Create an instance of a component
     pub async fn instantiate(
         &self,
@@ -247,22 +247,22 @@ impl ComponentManager {
     ) -> Result<ModSecurityComponent> {
         // Simplified instantiation for MVP
         // In production, this would use the component model
-        
+
         Ok(ModSecurityComponent {
             _component: component.clone(),
         })
     }
-    
+
     fn add_host_functions(linker: &mut Linker<WasmHostContext>) -> Result<()> {
         // Add host function implementations
         // This would bind the actual host functions to the WASM module
-        
+
         // Example binding (simplified):
         // linker.func_wrap("env", "log_security_event", |caller: wasmtime::Caller<'_, WasmHostContext>, event_ptr: u32| -> Result<()> {
         //     // Implementation
         //     Ok(())
         // })?;
-        
+
         Ok(())
     }
 }
@@ -284,23 +284,23 @@ impl std::error::Error for SecurityError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_security_decision_types() {
         let allow = SecurityDecision::Allow;
         assert!(matches!(allow, SecurityDecision::Allow));
-        
+
         let block = SecurityDecision::Block {
             rule_id: "test".to_string(),
             message: "blocked".to_string(),
             severity: Severity::High,
         };
-        
+
         if let SecurityDecision::Block { severity, .. } = block {
             assert_eq!(severity, Severity::High);
         }
     }
-    
+
     #[test]
     fn test_component_manager_creation() {
         let manager = ComponentManager::new();

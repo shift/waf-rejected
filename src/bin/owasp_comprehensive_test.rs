@@ -1,9 +1,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Debug)]
 struct AdvancedTestMetrics {
@@ -12,7 +12,7 @@ struct AdvancedTestMetrics {
     failed_requests: AtomicU64,
     waf_blocks: AtomicU64,
     backend_responses: AtomicU64,
-    
+
     // OWASP CRS Attack Categories
     sql_injection_blocked: AtomicU64,
     xss_blocked: AtomicU64,
@@ -28,7 +28,7 @@ struct AdvancedTestMetrics {
     ldap_blocked: AtomicU64,
     xxe_blocked: AtomicU64,
     ssrf_blocked: AtomicU64,
-    
+
     secret_leakage_filtered: AtomicU64,
     http1_0_requests: AtomicU64,
     http1_1_requests: AtomicU64,
@@ -47,7 +47,7 @@ impl AdvancedTestMetrics {
             failed_requests: AtomicU64::new(0),
             waf_blocks: AtomicU64::new(0),
             backend_responses: AtomicU64::new(0),
-            
+
             // OWASP CRS Attack Categories
             sql_injection_blocked: AtomicU64::new(0),
             xss_blocked: AtomicU64::new(0),
@@ -63,7 +63,7 @@ impl AdvancedTestMetrics {
             ldap_blocked: AtomicU64::new(0),
             xxe_blocked: AtomicU64::new(0),
             ssrf_blocked: AtomicU64::new(0),
-            
+
             secret_leakage_filtered: AtomicU64::new(0),
             http1_0_requests: AtomicU64::new(0),
             http1_1_requests: AtomicU64::new(0),
@@ -75,31 +75,66 @@ impl AdvancedTestMetrics {
         }
     }
 
-    fn record_request(&self, latency_ms: u64, was_blocked: bool, reached_backend: bool, 
-                     attack_type: Option<&str>, http_version: &str, response_body: &str) {
+    fn record_request(
+        &self,
+        latency_ms: u64,
+        was_blocked: bool,
+        reached_backend: bool,
+        attack_type: Option<&str>,
+        http_version: &str,
+        response_body: &str,
+    ) {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
-        
+
         if was_blocked {
             self.waf_blocks.fetch_add(1, Ordering::Relaxed);
             self.failed_requests.fetch_add(1, Ordering::Relaxed);
-            
+
             // Track specific attack types blocked
             if let Some(attack) = attack_type {
                 match attack {
-                    "sql_injection" => { self.sql_injection_blocked.fetch_add(1, Ordering::Relaxed); },
-                    "xss" => { self.xss_blocked.fetch_add(1, Ordering::Relaxed); },
-                    "path_traversal" => { self.path_traversal_blocked.fetch_add(1, Ordering::Relaxed); },
-                    "rfi" => { self.rfi_blocked.fetch_add(1, Ordering::Relaxed); },
-                    "rce" => { self.rce_blocked.fetch_add(1, Ordering::Relaxed); },
-                    "java" => { self.java_blocked.fetch_add(1, Ordering::Relaxed); },
-                    "protocol" => { self.protocol_blocked.fetch_add(1, Ordering::Relaxed); },
-                    "method" => { self.method_blocked.fetch_add(1, Ordering::Relaxed); },
-                    "scanner" => { self.scanner_blocked.fetch_add(1, Ordering::Relaxed); },
-                    "session" => { self.session_blocked.fetch_add(1, Ordering::Relaxed); },
-                    "dos" => { self.dos_blocked.fetch_add(1, Ordering::Relaxed); },
-                    "ldap" => { self.ldap_blocked.fetch_add(1, Ordering::Relaxed); },
-                    "xxe" => { self.xxe_blocked.fetch_add(1, Ordering::Relaxed); },
-                    "ssrf" => { self.ssrf_blocked.fetch_add(1, Ordering::Relaxed); },
+                    "sql_injection" => {
+                        self.sql_injection_blocked.fetch_add(1, Ordering::Relaxed);
+                    }
+                    "xss" => {
+                        self.xss_blocked.fetch_add(1, Ordering::Relaxed);
+                    }
+                    "path_traversal" => {
+                        self.path_traversal_blocked.fetch_add(1, Ordering::Relaxed);
+                    }
+                    "rfi" => {
+                        self.rfi_blocked.fetch_add(1, Ordering::Relaxed);
+                    }
+                    "rce" => {
+                        self.rce_blocked.fetch_add(1, Ordering::Relaxed);
+                    }
+                    "java" => {
+                        self.java_blocked.fetch_add(1, Ordering::Relaxed);
+                    }
+                    "protocol" => {
+                        self.protocol_blocked.fetch_add(1, Ordering::Relaxed);
+                    }
+                    "method" => {
+                        self.method_blocked.fetch_add(1, Ordering::Relaxed);
+                    }
+                    "scanner" => {
+                        self.scanner_blocked.fetch_add(1, Ordering::Relaxed);
+                    }
+                    "session" => {
+                        self.session_blocked.fetch_add(1, Ordering::Relaxed);
+                    }
+                    "dos" => {
+                        self.dos_blocked.fetch_add(1, Ordering::Relaxed);
+                    }
+                    "ldap" => {
+                        self.ldap_blocked.fetch_add(1, Ordering::Relaxed);
+                    }
+                    "xxe" => {
+                        self.xxe_blocked.fetch_add(1, Ordering::Relaxed);
+                    }
+                    "ssrf" => {
+                        self.ssrf_blocked.fetch_add(1, Ordering::Relaxed);
+                    }
                     _ => {}
                 }
             }
@@ -112,9 +147,10 @@ impl AdvancedTestMetrics {
         }
 
         // Check for secret leakage filtering
-        if response_body.contains("SECRETS_LEAKED") || 
-           response_body.contains("database_password") ||
-           response_body.contains("X-Internal-Token") {
+        if response_body.contains("SECRETS_LEAKED")
+            || response_body.contains("database_password")
+            || response_body.contains("X-Internal-Token")
+        {
             // WAF should have filtered this out - this is a failure
         } else if response_body.contains("advanced-test-backend") {
             // Secrets were properly filtered
@@ -123,20 +159,32 @@ impl AdvancedTestMetrics {
 
         // Track HTTP version usage
         match http_version {
-            "HTTP/1.0" => { self.http1_0_requests.fetch_add(1, Ordering::Relaxed); },
-            "HTTP/1.1" => { self.http1_1_requests.fetch_add(1, Ordering::Relaxed); },
-            "HTTP/2" => { self.http2_requests.fetch_add(1, Ordering::Relaxed); },
-            "HTTP/3" => { self.http3_requests.fetch_add(1, Ordering::Relaxed); },
+            "HTTP/1.0" => {
+                self.http1_0_requests.fetch_add(1, Ordering::Relaxed);
+            }
+            "HTTP/1.1" => {
+                self.http1_1_requests.fetch_add(1, Ordering::Relaxed);
+            }
+            "HTTP/2" => {
+                self.http2_requests.fetch_add(1, Ordering::Relaxed);
+            }
+            "HTTP/3" => {
+                self.http3_requests.fetch_add(1, Ordering::Relaxed);
+            }
             _ => {}
         }
 
-        self.total_latency_ms.fetch_add(latency_ms, Ordering::Relaxed);
-        
+        self.total_latency_ms
+            .fetch_add(latency_ms, Ordering::Relaxed);
+
         // Update latency bounds
         let mut current_min = self.min_latency_ms.load(Ordering::Relaxed);
         while latency_ms < current_min {
             match self.min_latency_ms.compare_exchange_weak(
-                current_min, latency_ms, Ordering::Relaxed, Ordering::Relaxed
+                current_min,
+                latency_ms,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
             ) {
                 Ok(_) => break,
                 Err(new_min) => current_min = new_min,
@@ -146,7 +194,10 @@ impl AdvancedTestMetrics {
         let mut current_max = self.max_latency_ms.load(Ordering::Relaxed);
         while latency_ms > current_max {
             match self.max_latency_ms.compare_exchange_weak(
-                current_max, latency_ms, Ordering::Relaxed, Ordering::Relaxed
+                current_max,
+                latency_ms,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
             ) {
                 Ok(_) => break,
                 Err(new_max) => current_max = new_max,
@@ -177,12 +228,12 @@ impl OWASPComprehensiveTestHarness {
 
     async fn start_advanced_backend(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         println!("🚀 Starting Advanced Test Backend...");
-        
+
         let mut backend_cmd = Command::new("./target/release/advanced_test_backend");
         backend_cmd.env("BACKEND_PORT", "3000");
-        
+
         self.backend_process = Some(backend_cmd.spawn()?);
-        
+
         // Wait for backend to be ready
         for attempt in 1..=10 {
             match tokio::net::TcpStream::connect("127.0.0.1:3000").await {
@@ -206,12 +257,12 @@ impl OWASPComprehensiveTestHarness {
 
     async fn start_waf(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         println!("🛡️  Starting WAF-Rejected with OWASP CRS configuration...");
-        
+
         let mut waf_cmd = Command::new("./target/release/waf-ingress");
         waf_cmd.env("WAF_CONFIG_FILE", "config-test");
-        
+
         self.waf_process = Some(waf_cmd.spawn()?);
-        
+
         // Wait for WAF to be ready
         for attempt in 1..=15 {
             match tokio::net::TcpStream::connect("127.0.0.1:8080").await {
@@ -234,31 +285,47 @@ impl OWASPComprehensiveTestHarness {
         Ok(())
     }
 
-    async fn run_owasp_comprehensive_test(&self) -> Result<AdvancedTestMetrics, Box<dyn std::error::Error>> {
+    async fn run_owasp_comprehensive_test(
+        &self,
+    ) -> Result<AdvancedTestMetrics, Box<dyn std::error::Error>> {
         println!("🔒 Running OWASP CRS Comprehensive Security Test Suite");
         println!("====================================================");
 
         let metrics = Arc::new(AdvancedTestMetrics::new());
         let test_cases = self.create_owasp_test_cases();
 
-        println!("🧪 Executing {} OWASP CRS security test cases...", test_cases.len());
+        println!(
+            "🧪 Executing {} OWASP CRS security test cases...",
+            test_cases.len()
+        );
         println!();
 
-        for (i, (test_name, http_request, http_version, attack_type, should_be_blocked)) in test_cases.iter().enumerate() {
+        for (i, (test_name, http_request, http_version, attack_type, should_be_blocked)) in
+            test_cases.iter().enumerate()
+        {
             let test_num = i + 1;
             let total_tests = test_cases.len();
-            
-            print!("[{:2}/{:2}] 🔍 {}: {} ... ", test_num, total_tests, 
-                   attack_type.as_ref().unwrap_or(&"legitimate".to_string()).to_uppercase(),
-                   test_name);
+
+            print!(
+                "[{:2}/{:2}] 🔍 {}: {} ... ",
+                test_num,
+                total_tests,
+                attack_type
+                    .as_ref()
+                    .unwrap_or(&"legitimate".to_string())
+                    .to_uppercase(),
+                test_name
+            );
             std::io::Write::flush(&mut std::io::stdout()).unwrap();
-            
+
             let start = Instant::now();
-            
+
             match tokio::time::timeout(
                 Duration::from_secs(15),
-                self.make_http_request(http_request)
-            ).await {
+                self.make_http_request(http_request),
+            )
+            .await
+            {
                 Ok(Ok((status, response_body))) => {
                     let latency_ms = start.elapsed().as_millis() as u64;
                     let was_blocked = status == 403 || status == 429;
@@ -267,7 +334,9 @@ impl OWASPComprehensiveTestHarness {
                     // Validate test expectations
                     if *should_be_blocked && !was_blocked {
                         println!("❌ FAILURE (Status: {})", status);
-                        println!("   Expected: BLOCKED, Got: ALLOWED - This attack should be stopped!");
+                        println!(
+                            "   Expected: BLOCKED, Got: ALLOWED - This attack should be stopped!"
+                        );
                     } else if *should_be_blocked && was_blocked {
                         println!("✅ SUCCESS (Blocked)");
                     } else if !*should_be_blocked && was_blocked {
@@ -278,29 +347,46 @@ impl OWASPComprehensiveTestHarness {
                     }
 
                     metrics.record_request(
-                        latency_ms, 
-                        was_blocked, 
-                        reached_backend, 
+                        latency_ms,
+                        was_blocked,
+                        reached_backend,
                         attack_type.as_deref(),
                         &http_version,
-                        &response_body
+                        &response_body,
                     );
                 }
                 Ok(Err(e)) => {
                     let latency_ms = start.elapsed().as_millis() as u64;
                     println!("❌ CONNECTION ERROR: {}", e);
-                    metrics.record_request(latency_ms, true, false, attack_type.as_deref(), &http_version, "");
+                    metrics.record_request(
+                        latency_ms,
+                        true,
+                        false,
+                        attack_type.as_deref(),
+                        &http_version,
+                        "",
+                    );
                 }
                 Err(_) => {
                     let latency_ms = start.elapsed().as_millis() as u64;
                     println!("⏱️  TIMEOUT (15s)");
-                    metrics.record_request(latency_ms, true, false, attack_type.as_deref(), &http_version, "");
+                    metrics.record_request(
+                        latency_ms,
+                        true,
+                        false,
+                        attack_type.as_deref(),
+                        &http_version,
+                        "",
+                    );
                 }
             }
 
             // Progress indicator every 10 tests
             if test_num % 10 == 0 && test_num < total_tests {
-                println!("   📊 Progress: {:.1}% complete", (test_num as f64 / total_tests as f64) * 100.0);
+                println!(
+                    "   📊 Progress: {:.1}% complete",
+                    (test_num as f64 / total_tests as f64) * 100.0
+                );
                 println!();
             }
 
@@ -682,30 +768,29 @@ impl OWASPComprehensiveTestHarness {
         ]
     }
 
-    async fn make_http_request(&self, request: &str) -> Result<(u16, String), Box<dyn std::error::Error>> {
+    async fn make_http_request(
+        &self,
+        request: &str,
+    ) -> Result<(u16, String), Box<dyn std::error::Error>> {
         // Add timeout for connection
         let stream = tokio::time::timeout(
             Duration::from_secs(5),
-            tokio::net::TcpStream::connect("127.0.0.1:8080")
-        ).await??;
-        
+            tokio::net::TcpStream::connect("127.0.0.1:8080"),
+        )
+        .await??;
+
         let mut stream = stream;
-        
+
         // Add timeout for writing request
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            stream.write_all(request.as_bytes())
-        ).await??;
-        
+        tokio::time::timeout(Duration::from_secs(2), stream.write_all(request.as_bytes()))
+            .await??;
+
         // Add timeout for reading response
         let mut buffer = vec![0; 16384];
-        let n = tokio::time::timeout(
-            Duration::from_secs(10),
-            stream.read(&mut buffer)
-        ).await??;
-        
+        let n = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buffer)).await??;
+
         let response = String::from_utf8_lossy(&buffer[..n]);
-        
+
         // Parse status code from HTTP response
         let status_code = if let Some(line) = response.lines().next() {
             if let Some(parts) = line.split_whitespace().nth(1) {
@@ -716,7 +801,7 @@ impl OWASPComprehensiveTestHarness {
         } else {
             500
         };
-        
+
         Ok((status_code, response.to_string()))
     }
 
@@ -743,7 +828,7 @@ fn print_owasp_comprehensive_results(metrics: &AdvancedTestMetrics, test_duratio
     let failed = metrics.failed_requests.load(Ordering::Relaxed);
     let waf_blocks = metrics.waf_blocks.load(Ordering::Relaxed);
     let backend_responses = metrics.backend_responses.load(Ordering::Relaxed);
-    
+
     // Load OWASP CRS attack metrics
     let sql_blocked = metrics.sql_injection_blocked.load(Ordering::Relaxed);
     let xss_blocked = metrics.xss_blocked.load(Ordering::Relaxed);
@@ -771,8 +856,16 @@ fn print_owasp_comprehensive_results(metrics: &AdvancedTestMetrics, test_duratio
     let max_latency = metrics.max_latency_ms.load(Ordering::Relaxed);
 
     let rps = total as f64 / test_duration;
-    let avg_latency = if total > 0 { total_latency as f64 / total as f64 } else { 0.0 };
-    let block_rate = if total > 0 { (waf_blocks as f64 / total as f64) * 100.0 } else { 0.0 };
+    let avg_latency = if total > 0 {
+        total_latency as f64 / total as f64
+    } else {
+        0.0
+    };
+    let block_rate = if total > 0 {
+        (waf_blocks as f64 / total as f64) * 100.0
+    } else {
+        0.0
+    };
 
     println!();
     println!("🔒 OWASP CRS COMPREHENSIVE SECURITY TEST RESULTS");
@@ -785,21 +878,43 @@ fn print_owasp_comprehensive_results(metrics: &AdvancedTestMetrics, test_duratio
     println!("   🎭 Backend Responses: {}", backend_responses);
     println!("   ⚡ Requests/Second: {:.0}", rps);
     println!("   📈 Average Latency: {:.2}ms", avg_latency);
-    println!("   ⬇️  Min Latency: {}ms", if min_latency == u64::MAX { 0 } else { min_latency });
+    println!(
+        "   ⬇️  Min Latency: {}ms",
+        if min_latency == u64::MAX {
+            0
+        } else {
+            min_latency
+        }
+    );
     println!("   ⬆️  Max Latency: {}ms", max_latency);
     println!();
-    
+
     println!("🔐 OWASP CRS Security Attack Analysis:");
     println!("   💉 SQL Injection (942xxx) Blocked: {}/6", sql_blocked);
     println!("   🕸️  XSS Attacks (941xxx) Blocked: {}/6", xss_blocked);
-    println!("   📁 Local File Inc. (930xxx) Blocked: {}/3", traversal_blocked);
+    println!(
+        "   📁 Local File Inc. (930xxx) Blocked: {}/3",
+        traversal_blocked
+    );
     println!("   🌐 Remote File Inc. (931xxx) Blocked: {}/3", rfi_blocked);
-    println!("   💻 Remote Code Exec. (932xxx) Blocked: {}/4", rce_blocked);
+    println!(
+        "   💻 Remote Code Exec. (932xxx) Blocked: {}/4",
+        rce_blocked
+    );
     println!("   ☕ Java Attacks (944xxx) Blocked: {}/2", java_blocked);
-    println!("   📋 Protocol Viol. (920xxx) Blocked: {}/3", protocol_blocked);
+    println!(
+        "   📋 Protocol Viol. (920xxx) Blocked: {}/3",
+        protocol_blocked
+    );
     println!("   🔧 Method Policy (911xxx) Blocked: {}/2", method_blocked);
-    println!("   🔍 Scanner Detection (913xxx) Blocked: {}/3", scanner_blocked);
-    println!("   🔐 Session Fixation (943xxx) Blocked: {}/2", session_blocked);
+    println!(
+        "   🔍 Scanner Detection (913xxx) Blocked: {}/3",
+        scanner_blocked
+    );
+    println!(
+        "   🔐 Session Fixation (943xxx) Blocked: {}/2",
+        session_blocked
+    );
     println!("   💥 DoS/Resource Exhaustion Blocked: {}/2", dos_blocked);
     println!("   📖 LDAP Injection Blocked: {}/1", ldap_blocked);
     println!("   📄 XML External Entity Blocked: {}/1", xxe_blocked);
@@ -817,31 +932,54 @@ fn print_owasp_comprehensive_results(metrics: &AdvancedTestMetrics, test_duratio
     // Enhanced Enterprise OWASP CRS scoring - comprehensive attack coverage
     // Count actual malicious test cases from our comprehensive OWASP test suite
     let total_attacks_in_suite = 38; // Count of attack test cases
-    let total_attacks_blocked = sql_blocked + xss_blocked + traversal_blocked + rfi_blocked + 
-                               rce_blocked + java_blocked + protocol_blocked + method_blocked +
-                               scanner_blocked + session_blocked + dos_blocked + ldap_blocked +
-                               xxe_blocked + ssrf_blocked;
-    
+    let total_attacks_blocked = sql_blocked
+        + xss_blocked
+        + traversal_blocked
+        + rfi_blocked
+        + rce_blocked
+        + java_blocked
+        + protocol_blocked
+        + method_blocked
+        + scanner_blocked
+        + session_blocked
+        + dos_blocked
+        + ldap_blocked
+        + xxe_blocked
+        + ssrf_blocked;
+
     // Enhanced scoring: Give credit for legitimate traffic passing through + attack blocking
     let _legitimate_requests_passed = backend_responses;
     let legitimate_expected = total - total_attacks_in_suite; // Expected legitimate traffic
-    
+
     // Calculate comprehensive security score
-    let attack_blocking_score = if total_attacks_in_suite > 0 { 
-        (total_attacks_blocked as f64 / total_attacks_in_suite as f64) * 100.0 
-    } else { 100.0 };
-    
+    let attack_blocking_score = if total_attacks_in_suite > 0 {
+        (total_attacks_blocked as f64 / total_attacks_in_suite as f64) * 100.0
+    } else {
+        100.0
+    };
+
     let legitimate_pass_score = if legitimate_expected > 0 {
         (backend_responses as f64 / legitimate_expected as f64) * 100.0
-    } else { 100.0 };
-    
+    } else {
+        100.0
+    };
+
     // Weighted average: 80% attack blocking + 20% legitimate traffic handling
     let security_score = (attack_blocking_score * 0.8) + (legitimate_pass_score * 0.2);
-    
-    println!("🏆 OWASP CRS Security Effectiveness Score: {:.1}%", security_score);
-    println!("   📊 Attack Blocking: {:.1}% ({}/{} OWASP attacks blocked)", attack_blocking_score, total_attacks_blocked, total_attacks_in_suite);
-    println!("   🎯 Legitimate Traffic: {:.1}% ({}/{} requests reached backend)", legitimate_pass_score, backend_responses, legitimate_expected);
-    
+
+    println!(
+        "🏆 OWASP CRS Security Effectiveness Score: {:.1}%",
+        security_score
+    );
+    println!(
+        "   📊 Attack Blocking: {:.1}% ({}/{} OWASP attacks blocked)",
+        attack_blocking_score, total_attacks_blocked, total_attacks_in_suite
+    );
+    println!(
+        "   🎯 Legitimate Traffic: {:.1}% ({}/{} requests reached backend)",
+        legitimate_pass_score, backend_responses, legitimate_expected
+    );
+
     if security_score >= 98.0 {
         println!("   🥇 EXCELLENT - Enterprise-grade OWASP CRS compliance (98%+)");
         println!("   ✅ Meets PCI-DSS, SOX, HIPAA enterprise security standards");
@@ -869,7 +1007,7 @@ fn print_owasp_comprehensive_results(metrics: &AdvancedTestMetrics, test_duratio
     // Detailed attack category analysis
     println!();
     println!("📋 OWASP CRS Category Coverage Analysis:");
-    
+
     let category_scores = vec![
         ("SQL Injection (942xxx)", sql_blocked, 6),
         ("XSS Attacks (941xxx)", xss_blocked, 6),
@@ -888,7 +1026,11 @@ fn print_owasp_comprehensive_results(metrics: &AdvancedTestMetrics, test_duratio
     ];
 
     for (category, blocked, total) in category_scores {
-        let percentage = if total > 0 { (blocked as f64 / total as f64) * 100.0 } else { 0.0 };
+        let percentage = if total > 0 {
+            (blocked as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        };
         let status = if percentage >= 100.0 {
             "🟢 PERFECT"
         } else if percentage >= 80.0 {
@@ -898,7 +1040,10 @@ fn print_owasp_comprehensive_results(metrics: &AdvancedTestMetrics, test_duratio
         } else {
             "🔴 POOR"
         };
-        println!("   {} {}: {:.0}% ({}/{})", status, category, percentage, blocked, total);
+        println!(
+            "   {} {}: {:.0}% ({}/{})",
+            status, category, percentage, blocked, total
+        );
     }
 }
 
@@ -913,7 +1058,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build services
     println!("🔨 Building OWASP test services...");
     let build_output = Command::new("cargo")
-        .args(&["build", "--release", "--bin", "advanced_test_backend", "--bin", "waf-ingress"])
+        .args(&[
+            "build",
+            "--release",
+            "--bin",
+            "advanced_test_backend",
+            "--bin",
+            "waf-ingress",
+        ])
         .output()
         .await?;
 

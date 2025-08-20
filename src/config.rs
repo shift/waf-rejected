@@ -6,22 +6,22 @@ use tracing::info;
 pub struct Config {
     /// Address to bind the server to
     pub bind_addr: SocketAddr,
-    
+
     /// Upstream URI to proxy requests to
     pub upstream_uri: String,
-    
+
     /// Proxy configuration
     pub proxy: ProxyConfig,
-    
+
     /// Server configuration
     pub server: ServerConfig,
-    
+
     /// Logging configuration
     pub logging: LoggingConfig,
-    
+
     /// WAF configuration
     pub waf: WafConfig,
-    
+
     // Security module configurations
     pub security: SecurityConfig,
 }
@@ -30,13 +30,13 @@ pub struct Config {
 pub struct ProxyConfig {
     /// Upstream server URL
     pub upstream_url: String,
-    
+
     /// Proxy bind address
     pub bind_addr: String,
-    
+
     /// Request timeout in seconds
     pub timeout_seconds: u64,
-    
+
     /// Maximum request size in bytes
     pub max_request_size: usize,
 }
@@ -45,22 +45,22 @@ pub struct ProxyConfig {
 pub struct ServerConfig {
     /// Maximum number of concurrent connections
     pub max_connections: usize,
-    
+
     /// Request timeout in seconds
     pub request_timeout_secs: u64,
-    
+
     /// Keep-alive timeout in seconds
     pub keep_alive_timeout_secs: u64,
-    
+
     /// Enable HTTP/2 support
     pub enable_http2: bool,
-    
+
     /// Enable HTTP/3 support (QUIC)
     pub enable_http3: bool,
-    
+
     /// Supported HTTP versions (1.0, 1.1, 2, 3)
     pub supported_http_versions: Vec<String>,
-    
+
     /// Maximum request body size in bytes
     pub max_body_size: usize,
 }
@@ -69,7 +69,7 @@ pub struct ServerConfig {
 pub struct LoggingConfig {
     /// Log level (trace, debug, info, warn, error)
     pub level: String,
-    
+
     /// Enable JSON formatted logs
     pub json_format: bool,
 }
@@ -78,25 +78,25 @@ pub struct LoggingConfig {
 pub struct WafConfig {
     /// Enable WAF functionality
     pub enabled: bool,
-    
+
     /// Fail mode: "closed" (block on errors) or "open" (allow on errors)
     pub fail_mode: String,
-    
+
     /// Connection timeout for upstream in milliseconds
     pub upstream_timeout_ms: u64,
-    
+
     /// Rate limiting configuration
     pub rate_limit: RateLimitConfig,
-    
+
     /// Security event logging configuration
     pub security_events: SecurityEventsConfig,
-    
+
     /// Content inspection configuration
     pub content_inspection: ContentInspectionConfig,
-    
+
     /// Geographic blocking configuration
     pub geo_blocking: GeoBlockingConfig,
-    
+
     /// WASM ModSecurity configuration
     #[cfg(feature = "wasm-waf")]
     pub wasm: WasmConfig,
@@ -106,19 +106,19 @@ pub struct WafConfig {
 pub struct RateLimitConfig {
     /// Enable per-IP rate limiting
     pub per_ip_enabled: bool,
-    
+
     /// Maximum requests per IP per window
     pub per_ip_max_requests: u32,
-    
+
     /// Rate limiting window size in seconds
     pub per_ip_window_secs: u64,
-    
+
     /// Enable global rate limiting
     pub global_enabled: bool,
-    
+
     /// Maximum requests globally per window
     pub global_max_requests: u32,
-    
+
     /// Global rate limiting window size in seconds
     pub global_window_secs: u64,
 }
@@ -127,31 +127,31 @@ pub struct RateLimitConfig {
 pub struct SecurityEventsConfig {
     /// Enable security event logging
     pub enabled: bool,
-    
+
     /// Log format (json, cef, plain)
     pub format: String,
-    
+
     /// Minimum threat level to log (Low, Medium, High, Critical)
     pub min_threat_level: String,
-    
+
     /// Enable CEF format for SIEM integration
     pub enable_cef: bool,
-    
+
     /// CEF exporter configuration
     pub cef_output_file: Option<String>,
     pub cef_device_vendor: Option<String>,
     pub cef_device_product: Option<String>,
     pub cef_device_version: Option<String>,
-    
+
     /// Enable OpenTelemetry integration
     pub enable_otel: bool,
-    
+
     /// OpenTelemetry configuration
     pub otel_service_name: Option<String>,
     pub otel_service_version: Option<String>,
     pub otel_export_traces: Option<bool>,
     pub otel_export_logs: Option<bool>,
-    
+
     /// Sled database persistence configuration
     pub enable_sled: bool,
     pub sled_db_path: Option<String>,
@@ -163,16 +163,16 @@ pub struct SecurityEventsConfig {
 pub struct ContentInspectionConfig {
     /// Enable content inspection
     pub enabled: bool,
-    
+
     /// Inspect request headers
     pub inspect_headers: bool,
-    
+
     /// Inspect request body
     pub inspect_body: bool,
-    
+
     /// Maximum body size to inspect (bytes)
     pub max_body_size: usize,
-    
+
     /// Threat patterns to detect
     pub threat_patterns: Vec<String>,
 }
@@ -181,19 +181,19 @@ pub struct ContentInspectionConfig {
 pub struct GeoBlockingConfig {
     /// Enable geographic blocking
     pub enabled: bool,
-    
+
     /// Blocked country codes (ISO 3166-1 alpha-2)
     pub blocked_countries: Vec<String>,
-    
+
     /// Blocked regions/states
     pub blocked_regions: Vec<String>,
-    
+
     /// Block known Tor exit nodes
     pub block_tor: bool,
-    
+
     /// Block known VPN providers
     pub block_vpn: bool,
-    
+
     /// Block datacenter/hosting IPs
     pub block_datacenter: bool,
 }
@@ -204,25 +204,25 @@ pub struct GeoBlockingConfig {
 pub struct WasmConfig {
     /// Enable WASM ModSecurity engine
     pub enabled: bool,
-    
+
     /// Path to the WASM module file
     pub module_path: String,
-    
+
     /// Memory limit for WASM instances (bytes)
     pub memory_limit: usize,
-    
+
     /// Execution timeout (milliseconds)
     pub timeout_ms: u64,
-    
+
     /// Enable debug mode
     pub debug: bool,
-    
+
     /// Number of WASM instances to pool
     pub instance_pool_size: usize,
-    
+
     /// Enable hot reloading of WASM modules
     pub hot_reload: bool,
-    
+
     /// Rules configuration file
     pub rules_config: String,
 }
@@ -231,10 +231,10 @@ pub struct WasmConfig {
 pub struct SecurityConfig {
     /// Security events configuration
     pub events: SecurityEventsConfig,
-    
+
     /// Content inspection configuration
     pub content_inspection: ContentInspectionConfig,
-    
+
     /// Geographic blocking configuration  
     pub geo_blocking: GeoBlockingConfig,
 }
@@ -274,7 +274,7 @@ impl Default for ServerConfig {
             enable_http3: true,
             supported_http_versions: vec![
                 "1.0".to_string(),
-                "1.1".to_string(), 
+                "1.1".to_string(),
                 "2".to_string(),
                 "3".to_string(),
             ],
@@ -297,7 +297,7 @@ impl Default for WafConfig {
         Self {
             enabled: true,
             fail_mode: "closed".to_string(), // Default to fail-closed (secure)
-            upstream_timeout_ms: 5000, // 5 second timeout
+            upstream_timeout_ms: 5000,       // 5 second timeout
             rate_limit: RateLimitConfig::default(),
             security_events: SecurityEventsConfig::default(),
             content_inspection: ContentInspectionConfig::default(),
@@ -365,7 +365,7 @@ impl Default for ContentInspectionConfig {
 impl Default for GeoBlockingConfig {
     fn default() -> Self {
         Self {
-            enabled: false, // Disabled by default
+            enabled: false,            // Disabled by default
             blocked_countries: vec![], // Empty by default
             blocked_regions: vec![],
             block_tor: true,
@@ -411,7 +411,7 @@ impl Config {
             .add_source(
                 config::Environment::with_prefix("WAF")
                     .prefix_separator("_")
-                    .separator("__")
+                    .separator("__"),
             );
 
         // Try to load from config file if it exists
@@ -421,14 +421,15 @@ impl Config {
         }
 
         let config: Config = settings.build()?.try_deserialize()?;
-        
+
         Ok(config)
     }
-    
+
     /// Get the upstream URI as a hyper::Uri
-    #[cfg_attr(not(test), allow(dead_code))]  // Used in tests and future API compatibility
+    #[cfg_attr(not(test), allow(dead_code))] // Used in tests and future API compatibility
     pub fn upstream_uri(&self) -> anyhow::Result<http::Uri> {
-        self.upstream_uri.parse()
+        self.upstream_uri
+            .parse()
             .map_err(|e| anyhow::anyhow!("Invalid upstream URI '{}': {}", self.upstream_uri, e))
     }
 }
@@ -454,7 +455,7 @@ mod tests {
         assert!(config.upstream_uri.starts_with("http://"));
         assert!(config.server.max_connections > 0);
     }
-    
+
     #[test]
     fn test_upstream_uri_parsing() {
         let config = Config::default();

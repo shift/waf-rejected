@@ -1,13 +1,11 @@
 //! Common Event Format (CEF) Exporter
-//! 
+//!
 //! CEF (Common Event Format) is a standard format used by ArcSight and many SIEM systems.
 //! Format: CEF:Version|Device Vendor|Device Product|Device Version|Device Event Class ID|Name|Severity|[Extension]
 
-use super::{SecurityEventExporter, ExportResult};
+use super::{ExportResult, SecurityEventExporter};
 use crate::waf::security_events::{SecurityEvent, ThreatLevel, WafDecision};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
-use std::collections::HashMap;
 use std::fmt::Write;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
@@ -40,7 +38,7 @@ impl CefExporter {
     /// Format security event as CEF string
     fn format_cef(&self, event: &SecurityEvent) -> String {
         let mut cef = String::new();
-        
+
         // CEF Header: CEF:Version|Device Vendor|Device Product|Device Version|Device Event Class ID|Name|Severity
         write!(
             &mut cef,
@@ -51,7 +49,8 @@ impl CefExporter {
             self.get_event_class_id(&event.decision, &event.threat_level),
             self.get_event_name(&event.decision, &event.threat_level),
             self.get_cef_severity(&event.threat_level)
-        ).unwrap();
+        )
+        .unwrap();
 
         // CEF Extensions
         let extensions = self.build_extensions(event);
@@ -64,12 +63,16 @@ impl CefExporter {
     }
 
     /// Get CEF event class ID based on decision and threat level
-    fn get_event_class_id(&self, decision: &WafDecision, threat_level: &ThreatLevel) -> &'static str {
+    fn get_event_class_id(
+        &self,
+        decision: &WafDecision,
+        threat_level: &ThreatLevel,
+    ) -> &'static str {
         match decision {
             WafDecision::Allow => "WAF_ALLOW",
             WafDecision::Block => match threat_level {
                 ThreatLevel::Critical => "WAF_BLOCK_CRITICAL",
-                ThreatLevel::High => "WAF_BLOCK_HIGH", 
+                ThreatLevel::High => "WAF_BLOCK_HIGH",
                 ThreatLevel::Medium => "WAF_BLOCK_MEDIUM",
                 ThreatLevel::Low => "WAF_BLOCK_LOW",
             },
@@ -106,7 +109,10 @@ impl CefExporter {
         extensions.push(format!("rt={}", event.timestamp.timestamp_millis()));
         extensions.push(format!("src={}", event.client_ip));
         extensions.push(format!("spt={}", event.client_port.unwrap_or(0)));
-        extensions.push(format!("dst={}", event.server_ip.as_deref().unwrap_or("unknown")));
+        extensions.push(format!(
+            "dst={}",
+            event.server_ip.as_deref().unwrap_or("unknown")
+        ));
         extensions.push(format!("dpt={}", event.server_port.unwrap_or(80)));
         extensions.push(format!("requestMethod={}", event.method));
         extensions.push(format!("requestURL={}", event.path));
@@ -114,7 +120,10 @@ impl CefExporter {
 
         // User agent (escape special characters)
         if let Some(user_agent) = &event.user_agent {
-            extensions.push(format!("requestClientApplication={}", self.escape_cef_value(user_agent)));
+            extensions.push(format!(
+                "requestClientApplication={}",
+                self.escape_cef_value(user_agent)
+            ));
         }
 
         // Request size
@@ -139,7 +148,7 @@ impl CefExporter {
 
         // Threat information
         extensions.push(format!("threatLevel={}", event.threat_level));
-        
+
         if !event.triggered_rules.is_empty() {
             let rules = event.triggered_rules.join(",");
             extensions.push(format!("triggeredRules={}", self.escape_cef_value(&rules)));
@@ -165,8 +174,9 @@ impl CefExporter {
 
         // Custom fields
         for (key, value) in &event.custom_fields {
-            extensions.push(format!("{}={}", 
-                self.sanitize_field_name(key), 
+            extensions.push(format!(
+                "{}={}",
+                self.sanitize_field_name(key),
                 self.escape_cef_value(value)
             ));
         }
@@ -177,16 +187,22 @@ impl CefExporter {
     /// Escape CEF special characters in field values
     fn escape_cef_value(&self, value: &str) -> String {
         value
-            .replace('\\', "\\\\")  // Backslash must be first
-            .replace('=', "\\=")    // Equals sign
-            .replace('\n', "\\n")   // Newline
-            .replace('\r', "\\r")   // Carriage return
+            .replace('\\', "\\\\") // Backslash must be first
+            .replace('=', "\\=") // Equals sign
+            .replace('\n', "\\n") // Newline
+            .replace('\r', "\\r") // Carriage return
     }
 
     /// Sanitize field names for CEF compliance
     fn sanitize_field_name(&self, name: &str) -> String {
         name.chars()
-            .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect()
     }
 
@@ -202,11 +218,13 @@ impl CefExporter {
                     .open(file_path)
                     .await
                     .map_err(|e| format!("Failed to open CEF log file {}: {}", file_path, e))?;
-                
-                file.write_all(log_line.as_bytes()).await
+
+                file.write_all(log_line.as_bytes())
+                    .await
                     .map_err(|e| format!("Failed to write CEF log: {}", e))?;
-                
-                file.flush().await
+
+                file.flush()
+                    .await
                     .map_err(|e| format!("Failed to flush CEF log: {}", e))?;
             }
             None => {
@@ -223,11 +241,11 @@ impl CefExporter {
 impl SecurityEventExporter for CefExporter {
     async fn export_event(&self, event: &SecurityEvent) -> ExportResult {
         let cef_line = self.format_cef(event);
-        
+
         debug!("Exporting CEF event: {}", cef_line);
-        
+
         self.write_cef_log(&cef_line).await?;
-        
+
         Ok(())
     }
 
@@ -251,7 +269,10 @@ impl SecurityEventExporter for CefExporter {
             match OpenOptions::new().append(true).open(file_path).await {
                 Ok(_) => true,
                 Err(e) => {
-                    error!("CEF exporter health check failed for file {}: {}", file_path, e);
+                    error!(
+                        "CEF exporter health check failed for file {}: {}",
+                        file_path, e
+                    );
                     false
                 }
             }
@@ -270,10 +291,10 @@ mod tests {
     #[test]
     fn test_cef_formatting() {
         let exporter = CefExporter::new(None, None, None, None);
-        
+
         let mut custom_fields = HashMap::new();
         custom_fields.insert("attack_type".to_string(), "sql_injection".to_string());
-        
+
         let event = SecurityEvent {
             id: uuid::Uuid::new_v4(),
             timestamp: Utc::now(),
@@ -300,7 +321,7 @@ mod tests {
         };
 
         let cef = exporter.format_cef(&event);
-        
+
         assert!(cef.starts_with("CEF:1|WAF-Rejected|Security WAF|1.0.0|WAF_BLOCK_HIGH|"));
         assert!(cef.contains("src=192.168.1.100"));
         assert!(cef.contains("requestMethod=POST"));

@@ -135,155 +135,221 @@ fn test_protocol_security(protocol: &str) -> ProtocolSecurityResults {
 
 fn test_http1_security() -> HashMap<String, AttackResult> {
     HashMap::from([
-        ("SQL Injection".to_string(), AttackResult {
-            category: "SQL Injection".to_string(),
-            tests_run: 25,
-            attacks_blocked: 22,
-            effectiveness_percent: 88.0,
-        }),
-        ("Cross-Site Scripting".to_string(), AttackResult {
-            category: "Cross-Site Scripting".to_string(),
-            tests_run: 20,
-            attacks_blocked: 18,
-            effectiveness_percent: 90.0,
-        }),
-        ("Remote Code Execution".to_string(), AttackResult {
-            category: "Remote Code Execution".to_string(),
-            tests_run: 15,
-            attacks_blocked: 13,
-            effectiveness_percent: 86.7,
-        }),
-        ("Local File Inclusion".to_string(), AttackResult {
-            category: "Local File Inclusion".to_string(),
-            tests_run: 12,
-            attacks_blocked: 10,
-            effectiveness_percent: 83.3,
-        }),
-        ("Request Smuggling".to_string(), AttackResult {
-            category: "Request Smuggling".to_string(),
-            tests_run: 10,
-            attacks_blocked: 6,
-            effectiveness_percent: 60.0,
-        }),
-        ("Scanner Detection".to_string(), AttackResult {
-            category: "Scanner Detection".to_string(),
-            tests_run: 8,
-            attacks_blocked: 7,
-            effectiveness_percent: 87.5,
-        }),
+        (
+            "SQL Injection".to_string(),
+            AttackResult {
+                category: "SQL Injection".to_string(),
+                tests_run: 25,
+                attacks_blocked: 22,
+                effectiveness_percent: 88.0,
+            },
+        ),
+        (
+            "Cross-Site Scripting".to_string(),
+            AttackResult {
+                category: "Cross-Site Scripting".to_string(),
+                tests_run: 20,
+                attacks_blocked: 18,
+                effectiveness_percent: 90.0,
+            },
+        ),
+        (
+            "Remote Code Execution".to_string(),
+            AttackResult {
+                category: "Remote Code Execution".to_string(),
+                tests_run: 15,
+                attacks_blocked: 13,
+                effectiveness_percent: 86.7,
+            },
+        ),
+        (
+            "Local File Inclusion".to_string(),
+            AttackResult {
+                category: "Local File Inclusion".to_string(),
+                tests_run: 12,
+                attacks_blocked: 10,
+                effectiveness_percent: 83.3,
+            },
+        ),
+        (
+            "Request Smuggling".to_string(),
+            AttackResult {
+                category: "Request Smuggling".to_string(),
+                tests_run: 10,
+                attacks_blocked: 6,
+                effectiveness_percent: 60.0,
+            },
+        ),
+        (
+            "Scanner Detection".to_string(),
+            AttackResult {
+                category: "Scanner Detection".to_string(),
+                tests_run: 8,
+                attacks_blocked: 7,
+                effectiveness_percent: 87.5,
+            },
+        ),
     ])
 }
 
 fn test_http2_security() -> HashMap<String, AttackResult> {
     HashMap::from([
-        ("SQL Injection".to_string(), AttackResult {
-            category: "SQL Injection".to_string(),
-            tests_run: 25,
-            attacks_blocked: 24,
-            effectiveness_percent: 96.0,
-        }),
-        ("Cross-Site Scripting".to_string(), AttackResult {
-            category: "Cross-Site Scripting".to_string(),
-            tests_run: 20,
-            attacks_blocked: 19,
-            effectiveness_percent: 95.0,
-        }),
-        ("Remote Code Execution".to_string(), AttackResult {
-            category: "Remote Code Execution".to_string(),
-            tests_run: 15,
-            attacks_blocked: 14,
-            effectiveness_percent: 93.3,
-        }),
-        ("Local File Inclusion".to_string(), AttackResult {
-            category: "Local File Inclusion".to_string(),
-            tests_run: 12,
-            attacks_blocked: 11,
-            effectiveness_percent: 91.7,
-        }),
-        ("Stream Confusion".to_string(), AttackResult {
-            category: "Stream Confusion".to_string(),
-            tests_run: 8,
-            attacks_blocked: 7,
-            effectiveness_percent: 87.5,
-        }),
-        ("HPACK Bomb".to_string(), AttackResult {
-            category: "HPACK Bomb".to_string(),
-            tests_run: 6,
-            attacks_blocked: 5,
-            effectiveness_percent: 83.3,
-        }),
-        ("Rapid Reset Attack".to_string(), AttackResult {
-            category: "Rapid Reset Attack".to_string(),
-            tests_run: 5,
-            attacks_blocked: 5,
-            effectiveness_percent: 100.0,
-        }),
-        ("Scanner Detection".to_string(), AttackResult {
-            category: "Scanner Detection".to_string(),
-            tests_run: 8,
-            attacks_blocked: 8,
-            effectiveness_percent: 100.0,
-        }),
+        (
+            "SQL Injection".to_string(),
+            AttackResult {
+                category: "SQL Injection".to_string(),
+                tests_run: 25,
+                attacks_blocked: 24,
+                effectiveness_percent: 96.0,
+            },
+        ),
+        (
+            "Cross-Site Scripting".to_string(),
+            AttackResult {
+                category: "Cross-Site Scripting".to_string(),
+                tests_run: 20,
+                attacks_blocked: 19,
+                effectiveness_percent: 95.0,
+            },
+        ),
+        (
+            "Remote Code Execution".to_string(),
+            AttackResult {
+                category: "Remote Code Execution".to_string(),
+                tests_run: 15,
+                attacks_blocked: 14,
+                effectiveness_percent: 93.3,
+            },
+        ),
+        (
+            "Local File Inclusion".to_string(),
+            AttackResult {
+                category: "Local File Inclusion".to_string(),
+                tests_run: 12,
+                attacks_blocked: 11,
+                effectiveness_percent: 91.7,
+            },
+        ),
+        (
+            "Stream Confusion".to_string(),
+            AttackResult {
+                category: "Stream Confusion".to_string(),
+                tests_run: 8,
+                attacks_blocked: 7,
+                effectiveness_percent: 87.5,
+            },
+        ),
+        (
+            "HPACK Bomb".to_string(),
+            AttackResult {
+                category: "HPACK Bomb".to_string(),
+                tests_run: 6,
+                attacks_blocked: 5,
+                effectiveness_percent: 83.3,
+            },
+        ),
+        (
+            "Rapid Reset Attack".to_string(),
+            AttackResult {
+                category: "Rapid Reset Attack".to_string(),
+                tests_run: 5,
+                attacks_blocked: 5,
+                effectiveness_percent: 100.0,
+            },
+        ),
+        (
+            "Scanner Detection".to_string(),
+            AttackResult {
+                category: "Scanner Detection".to_string(),
+                tests_run: 8,
+                attacks_blocked: 8,
+                effectiveness_percent: 100.0,
+            },
+        ),
     ])
 }
 
 fn test_http3_security() -> HashMap<String, AttackResult> {
     HashMap::from([
-        ("SQL Injection".to_string(), AttackResult {
-            category: "SQL Injection".to_string(),
-            tests_run: 25,
-            attacks_blocked: 23,
-            effectiveness_percent: 92.0,
-        }),
-        ("Cross-Site Scripting".to_string(), AttackResult {
-            category: "Cross-Site Scripting".to_string(),
-            tests_run: 20,
-            attacks_blocked: 19,
-            effectiveness_percent: 95.0,
-        }),
-        ("Remote Code Execution".to_string(), AttackResult {
-            category: "Remote Code Execution".to_string(),
-            tests_run: 15,
-            attacks_blocked: 15,
-            effectiveness_percent: 100.0,
-        }),
-        ("Local File Inclusion".to_string(), AttackResult {
-            category: "Local File Inclusion".to_string(),
-            tests_run: 12,
-            attacks_blocked: 11,
-            effectiveness_percent: 91.7,
-        }),
-        ("0-RTT Replay Attack".to_string(), AttackResult {
-            category: "0-RTT Replay Attack".to_string(),
-            tests_run: 10,
-            attacks_blocked: 7,
-            effectiveness_percent: 70.0,
-        }),
-        ("Connection Migration Attack".to_string(), AttackResult {
-            category: "Connection Migration Attack".to_string(),
-            tests_run: 8,
-            attacks_blocked: 7,
-            effectiveness_percent: 87.5,
-        }),
-        ("UDP Amplification".to_string(), AttackResult {
-            category: "UDP Amplification".to_string(),
-            tests_run: 6,
-            attacks_blocked: 5,
-            effectiveness_percent: 83.3,
-        }),
-        ("Scanner Detection".to_string(), AttackResult {
-            category: "Scanner Detection".to_string(),
-            tests_run: 8,
-            attacks_blocked: 8,
-            effectiveness_percent: 100.0,
-        }),
+        (
+            "SQL Injection".to_string(),
+            AttackResult {
+                category: "SQL Injection".to_string(),
+                tests_run: 25,
+                attacks_blocked: 23,
+                effectiveness_percent: 92.0,
+            },
+        ),
+        (
+            "Cross-Site Scripting".to_string(),
+            AttackResult {
+                category: "Cross-Site Scripting".to_string(),
+                tests_run: 20,
+                attacks_blocked: 19,
+                effectiveness_percent: 95.0,
+            },
+        ),
+        (
+            "Remote Code Execution".to_string(),
+            AttackResult {
+                category: "Remote Code Execution".to_string(),
+                tests_run: 15,
+                attacks_blocked: 15,
+                effectiveness_percent: 100.0,
+            },
+        ),
+        (
+            "Local File Inclusion".to_string(),
+            AttackResult {
+                category: "Local File Inclusion".to_string(),
+                tests_run: 12,
+                attacks_blocked: 11,
+                effectiveness_percent: 91.7,
+            },
+        ),
+        (
+            "0-RTT Replay Attack".to_string(),
+            AttackResult {
+                category: "0-RTT Replay Attack".to_string(),
+                tests_run: 10,
+                attacks_blocked: 7,
+                effectiveness_percent: 70.0,
+            },
+        ),
+        (
+            "Connection Migration Attack".to_string(),
+            AttackResult {
+                category: "Connection Migration Attack".to_string(),
+                tests_run: 8,
+                attacks_blocked: 7,
+                effectiveness_percent: 87.5,
+            },
+        ),
+        (
+            "UDP Amplification".to_string(),
+            AttackResult {
+                category: "UDP Amplification".to_string(),
+                tests_run: 6,
+                attacks_blocked: 5,
+                effectiveness_percent: 83.3,
+            },
+        ),
+        (
+            "Scanner Detection".to_string(),
+            AttackResult {
+                category: "Scanner Detection".to_string(),
+                tests_run: 8,
+                attacks_blocked: 8,
+                effectiveness_percent: 100.0,
+            },
+        ),
     ])
 }
 
 fn calculate_security_score(attack_categories: &HashMap<String, AttackResult>) -> f64 {
     let total_tests: usize = attack_categories.values().map(|r| r.tests_run).sum();
     let total_blocked: usize = attack_categories.values().map(|r| r.attacks_blocked).sum();
-    
+
     if total_tests > 0 {
         (total_blocked as f64 / total_tests as f64) * 100.0
     } else {
@@ -359,13 +425,17 @@ fn get_protocol_characteristics(protocol: &str) -> (Vec<String>, Vec<String>) {
     }
 }
 
-fn analyze_cross_protocol_security(results: &HashMap<String, ProtocolSecurityResults>) -> CrossProtocolAnalysis {
+fn analyze_cross_protocol_security(
+    results: &HashMap<String, ProtocolSecurityResults>,
+) -> CrossProtocolAnalysis {
     // Calculate security consistency across protocols
     let security_scores: Vec<f64> = results.values().map(|r| r.security_score).collect();
     let mean_security = security_scores.iter().sum::<f64>() / security_scores.len() as f64;
-    let variance = security_scores.iter()
+    let variance = security_scores
+        .iter()
         .map(|score| (score - mean_security).powi(2))
-        .sum::<f64>() / security_scores.len() as f64;
+        .sum::<f64>()
+        / security_scores.len() as f64;
     let security_consistency = 1.0 - (variance.sqrt() / mean_security).min(1.0);
 
     // Performance comparison
@@ -380,7 +450,9 @@ fn analyze_cross_protocol_security(results: &HashMap<String, ProtocolSecurityRes
         .max_by(|(_, a), (_, b)| {
             let score_a = (a.security_score + a.performance_score + a.compliance_score) / 3.0;
             let score_b = (b.security_score + b.performance_score + b.compliance_score) / 3.0;
-            score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
+            score_a
+                .partial_cmp(&score_b)
+                .unwrap_or(std::cmp::Ordering::Equal)
         })
         .map(|(protocol, _)| protocol.clone())
         .unwrap_or_else(|| "Unknown".to_string());
@@ -428,7 +500,7 @@ fn calculate_overall_score(results: &HashMap<String, ProtocolSecurityResults>) -
         .values()
         .map(|r| (r.security_score + r.performance_score + r.compliance_score) / 3.0)
         .sum();
-    
+
     total_score / results.len() as f64
 }
 
@@ -470,28 +542,25 @@ fn generate_recommendations(
 
     // HTTP/3 specific recommendations if it exists
     if results.contains_key("HTTP/3") {
+        recommendations
+            .push("🚀 Consider prioritizing HTTP/3 deployment for modern clients".to_string());
         recommendations.push(
-            "🚀 Consider prioritizing HTTP/3 deployment for modern clients".to_string()
-        );
-        recommendations.push(
-            "🔒 Implement additional 0-RTT replay protection for HTTP/3 endpoints".to_string()
+            "🔒 Implement additional 0-RTT replay protection for HTTP/3 endpoints".to_string(),
         );
     }
 
     // HTTP/2 specific recommendations
     if results.contains_key("HTTP/2") {
-        recommendations.push(
-            "⚡ Monitor HTTP/2 stream proliferation and implement proper limits".to_string()
-        );
+        recommendations
+            .push("⚡ Monitor HTTP/2 stream proliferation and implement proper limits".to_string());
     }
 
     // General recommendations
+    recommendations
+        .push("🛡️ Deploy adaptive protocol selection based on security requirements".to_string());
+
     recommendations.push(
-        "🛡️ Deploy adaptive protocol selection based on security requirements".to_string()
-    );
-    
-    recommendations.push(
-        "📊 Implement continuous monitoring for protocol-specific attack patterns".to_string()
+        "📊 Implement continuous monitoring for protocol-specific attack patterns".to_string(),
     );
 
     recommendations
@@ -507,7 +576,8 @@ fn print_results(results: &MultiProtocolTestResults) {
     println!("📊 Protocol Security Scores:");
     for protocol in &results.protocols_tested {
         if let Some(result) = results.protocol_results.get(protocol) {
-            println!("  {}: {:.1}% (Security: {:.1}%, Performance: {:.1}%, Compliance: {:.1}%)",
+            println!(
+                "  {}: {:.1}% (Security: {:.1}%, Performance: {:.1}%, Compliance: {:.1}%)",
                 protocol,
                 (result.security_score + result.performance_score + result.compliance_score) / 3.0,
                 result.security_score,
@@ -520,8 +590,14 @@ fn print_results(results: &MultiProtocolTestResults) {
 
     // Cross-protocol analysis
     println!("🔍 Cross-Protocol Analysis:");
-    println!("  Best Overall Protocol: {}", results.cross_protocol_analysis.best_overall_protocol);
-    println!("  Security Consistency: {:.1}%", results.cross_protocol_analysis.security_consistency);
+    println!(
+        "  Best Overall Protocol: {}",
+        results.cross_protocol_analysis.best_overall_protocol
+    );
+    println!(
+        "  Security Consistency: {:.1}%",
+        results.cross_protocol_analysis.security_consistency
+    );
     println!("  Overall Score: {:.1}%", results.overall_score);
     println!();
 
@@ -538,7 +614,8 @@ fn print_results(results: &MultiProtocolTestResults) {
                 } else {
                     "❌"
                 };
-                println!("    {} {}: {:.1}% ({}/{} attacks blocked)",
+                println!(
+                    "    {} {}: {:.1}% ({}/{} attacks blocked)",
                     status,
                     attack_type,
                     attack_result.effectiveness_percent,
@@ -587,6 +664,9 @@ fn print_results(results: &MultiProtocolTestResults) {
         _ => "D (Needs Improvement)",
     };
 
-    println!("🎖️  Final Assessment: {:.1}% ({})", results.overall_score, grade);
+    println!(
+        "🎖️  Final Assessment: {:.1}% ({})",
+        results.overall_score, grade
+    );
     println!("⏱️  Execution Time: {:.2}s", results.execution_time_seconds);
 }

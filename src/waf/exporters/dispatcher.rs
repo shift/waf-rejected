@@ -1,9 +1,9 @@
 //! Exporter Dispatcher
-//! 
+//!
 //! This module provides a dispatcher that can send security events to multiple
 //! exporters simultaneously with async handling and error resilience.
 
-use super::{SecurityEventExporter, ExportResult};
+use super::{ExportResult, SecurityEventExporter};
 use crate::waf::security_events::SecurityEvent;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -47,13 +47,13 @@ impl ExporterDispatcher {
     /// Check health of all exporters
     pub async fn health_check_all(&self) -> Vec<(String, bool)> {
         let mut results = Vec::new();
-        
+
         for exporter in &self.exporters {
             let name = exporter.name().to_string();
             let healthy = exporter.health_check().await;
             results.push((name, healthy));
         }
-        
+
         results
     }
 
@@ -65,12 +65,12 @@ impl ExporterDispatcher {
         }
 
         let mut join_set = JoinSet::new();
-        
+
         // Spawn tasks for each exporter
         for exporter in &self.exporters {
             let exporter_clone = Arc::clone(exporter);
             let event_clone = event.clone();
-            
+
             join_set.spawn(async move {
                 let name = exporter_clone.name();
                 match exporter_clone.export_event(&event_clone).await {
@@ -79,7 +79,10 @@ impl ExporterDispatcher {
                         Ok(name)
                     }
                     Err(e) => {
-                        error!("Failed to export event {} to {}: {}", event_clone.id, name, e);
+                        error!(
+                            "Failed to export event {} to {}: {}",
+                            event_clone.id, name, e
+                        );
                         Err((name, e))
                     }
                 }
@@ -89,7 +92,7 @@ impl ExporterDispatcher {
         // Collect results
         let mut successful_exports = Vec::new();
         let mut failed_exports = Vec::new();
-        
+
         while let Some(result) = join_set.join_next().await {
             match result {
                 Ok(Ok(exporter_name)) => {
@@ -111,7 +114,10 @@ impl ExporterDispatcher {
                 let error_msg = format!(
                     "Export failed for {} exporters: {:?}",
                     failed_exports.len(),
-                    failed_exports.iter().map(|(name, _)| name).collect::<Vec<_>>()
+                    failed_exports
+                        .iter()
+                        .map(|(name, _)| name)
+                        .collect::<Vec<_>>()
                 );
                 return Err(error_msg.into());
             } else {
@@ -120,7 +126,10 @@ impl ExporterDispatcher {
                     failed_exports.len(),
                     self.exporters.len(),
                     event.id,
-                    failed_exports.iter().map(|(name, _)| name).collect::<Vec<_>>()
+                    failed_exports
+                        .iter()
+                        .map(|(name, _)| name)
+                        .collect::<Vec<_>>()
                 );
             }
         }
@@ -143,21 +152,30 @@ impl ExporterDispatcher {
         }
 
         let mut join_set = JoinSet::new();
-        
+
         // Spawn batch tasks for each exporter
         for exporter in &self.exporters {
             let exporter_clone = Arc::clone(exporter);
             let events_clone = events.to_vec();
-            
+
             join_set.spawn(async move {
                 let name = exporter_clone.name();
                 match exporter_clone.export_batch(&events_clone).await {
                     Ok(()) => {
-                        debug!("Successfully exported {} events to {}", events_clone.len(), name);
+                        debug!(
+                            "Successfully exported {} events to {}",
+                            events_clone.len(),
+                            name
+                        );
                         Ok(name)
                     }
                     Err(e) => {
-                        error!("Failed to export {} events to {}: {}", events_clone.len(), name, e);
+                        error!(
+                            "Failed to export {} events to {}: {}",
+                            events_clone.len(),
+                            name,
+                            e
+                        );
                         Err((name, e))
                     }
                 }
@@ -167,7 +185,7 @@ impl ExporterDispatcher {
         // Collect results
         let mut successful_exports = Vec::new();
         let mut failed_exports = Vec::new();
-        
+
         while let Some(result) = join_set.join_next().await {
             match result {
                 Ok(Ok(exporter_name)) => {
@@ -189,7 +207,10 @@ impl ExporterDispatcher {
                 let error_msg = format!(
                     "Batch export failed for {} exporters: {:?}",
                     failed_exports.len(),
-                    failed_exports.iter().map(|(name, _)| name).collect::<Vec<_>>()
+                    failed_exports
+                        .iter()
+                        .map(|(name, _)| name)
+                        .collect::<Vec<_>>()
                 );
                 return Err(error_msg.into());
             } else {
@@ -198,7 +219,10 @@ impl ExporterDispatcher {
                     failed_exports.len(),
                     self.exporters.len(),
                     events.len(),
-                    failed_exports.iter().map(|(name, _)| name).collect::<Vec<_>>()
+                    failed_exports
+                        .iter()
+                        .map(|(name, _)| name)
+                        .collect::<Vec<_>>()
                 );
             }
         }
@@ -230,11 +254,11 @@ impl SecurityEventExporter for ExporterDispatcher {
         }
 
         let mut join_set = JoinSet::new();
-        
+
         // Flush all exporters in parallel
         for exporter in &self.exporters {
             let exporter_clone = Arc::clone(exporter);
-            
+
             join_set.spawn(async move {
                 let name = exporter_clone.name();
                 match exporter_clone.flush().await {
@@ -252,7 +276,7 @@ impl SecurityEventExporter for ExporterDispatcher {
 
         let mut successful_flushes = Vec::new();
         let mut failed_flushes = Vec::new();
-        
+
         while let Some(result) = join_set.join_next().await {
             match result {
                 Ok(Ok(exporter_name)) => {
@@ -273,7 +297,10 @@ impl SecurityEventExporter for ExporterDispatcher {
                 let error_msg = format!(
                     "Flush failed for {} exporters: {:?}",
                     failed_flushes.len(),
-                    failed_flushes.iter().map(|(name, _)| name).collect::<Vec<_>>()
+                    failed_flushes
+                        .iter()
+                        .map(|(name, _)| name)
+                        .collect::<Vec<_>>()
                 );
                 return Err(error_msg.into());
             } else {
@@ -281,12 +308,19 @@ impl SecurityEventExporter for ExporterDispatcher {
                     "Flush failed for {} out of {} exporters: {:?}",
                     failed_flushes.len(),
                     self.exporters.len(),
-                    failed_flushes.iter().map(|(name, _)| name).collect::<Vec<_>>()
+                    failed_flushes
+                        .iter()
+                        .map(|(name, _)| name)
+                        .collect::<Vec<_>>()
                 );
             }
         }
 
-        debug!("Flushed {} exporters successfully: {:?}", successful_flushes.len(), successful_flushes);
+        debug!(
+            "Flushed {} exporters successfully: {:?}",
+            successful_flushes.len(),
+            successful_flushes
+        );
         Ok(())
     }
 
@@ -300,8 +334,11 @@ impl SecurityEventExporter for ExporterDispatcher {
         }
 
         let health_results = self.health_check_all().await;
-        let healthy_count = health_results.iter().filter(|(_, healthy)| *healthy).count();
-        
+        let healthy_count = health_results
+            .iter()
+            .filter(|(_, healthy)| *healthy)
+            .count();
+
         // Consider healthy if at least one exporter is healthy
         healthy_count > 0
     }
@@ -339,7 +376,7 @@ mod tests {
     impl SecurityEventExporter for MockExporter {
         async fn export_event(&self, _event: &SecurityEvent) -> ExportResult {
             self.export_count.fetch_add(1, Ordering::Relaxed);
-            
+
             if self.should_fail {
                 Err(format!("{} exporter failed", self.name).into())
             } else {
@@ -359,34 +396,34 @@ mod tests {
     #[tokio::test]
     async fn test_dispatcher_success() {
         let mut dispatcher = ExporterDispatcher::new(false);
-        
+
         let mock1 = MockExporter::new("Mock1", false);
         let mock2 = MockExporter::new("Mock2", false);
-        
+
         dispatcher.add_exporter(mock1);
         dispatcher.add_exporter(mock2);
-        
+
         assert_eq!(dispatcher.exporter_count(), 2);
-        
+
         let event = create_test_event();
         let result = dispatcher.export_event(&event).await;
-        
+
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn test_dispatcher_partial_failure() {
         let mut dispatcher = ExporterDispatcher::new(false); // Don't fail fast
-        
+
         let mock1 = MockExporter::new("Mock1", false);
         let mock2 = MockExporter::new("Mock2", true); // This will fail
-        
+
         dispatcher.add_exporter(mock1);
         dispatcher.add_exporter(mock2);
-        
+
         let event = create_test_event();
         let result = dispatcher.export_event(&event).await;
-        
+
         // Should succeed because we don't fail fast
         assert!(result.is_ok());
     }
@@ -394,16 +431,16 @@ mod tests {
     #[tokio::test]
     async fn test_dispatcher_fail_fast() {
         let mut dispatcher = ExporterDispatcher::new(true); // Fail fast
-        
+
         let mock1 = MockExporter::new("Mock1", false);
         let mock2 = MockExporter::new("Mock2", true); // This will fail
-        
+
         dispatcher.add_exporter(mock1);
         dispatcher.add_exporter(mock2);
-        
+
         let event = create_test_event();
         let result = dispatcher.export_event(&event).await;
-        
+
         // Should fail because we fail fast
         assert!(result.is_err());
     }
