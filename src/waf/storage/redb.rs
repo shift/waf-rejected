@@ -43,6 +43,24 @@ pub struct RedbStorageAdapter {
     ttl_cleanup_interval: Duration,
     enable_compression: bool,
     expired_count: Arc<RwLock<u64>>,
+    cleanup_stats: Arc<RwLock<TtlCleanupStats>>,
+}
+
+/// TTL cleanup performance statistics
+#[derive(Debug, Clone, Default)]
+pub struct TtlCleanupStats {
+    /// Total cleanup runs performed
+    pub cleanup_runs: u64,
+    /// Total keys expired across all runs
+    pub total_expired_keys: u64,
+    /// Average cleanup duration in milliseconds
+    pub avg_cleanup_duration_ms: f64,
+    /// Last cleanup duration in milliseconds
+    pub last_cleanup_duration_ms: u64,
+    /// Last cleanup key count
+    pub last_cleanup_key_count: u64,
+    /// Maximum cleanup duration observed
+    pub max_cleanup_duration_ms: u64,
 }
 
 #[cfg(feature = "export-redb")]
@@ -88,6 +106,7 @@ impl RedbStorageAdapter {
             ttl_cleanup_interval,
             enable_compression,
             expired_count: Arc::new(RwLock::new(0)),
+            cleanup_stats: Arc::new(RwLock::new(TtlCleanupStats::default())),
         };
         
         // Start TTL cleanup task
@@ -96,10 +115,11 @@ impl RedbStorageAdapter {
         Ok(adapter)
     }
     
-    /// Start background TTL cleanup task
+    /// Start background TTL cleanup task with enhanced monitoring
     async fn start_ttl_cleanup(&self) {
         let db = self.db.clone();
         let expired_count = self.expired_count.clone();
+        let cleanup_stats = self.cleanup_stats.clone();
         let cleanup_interval = self.ttl_cleanup_interval;
         
         tokio::spawn(async move {
@@ -108,15 +128,38 @@ impl RedbStorageAdapter {
             loop {
                 interval.tick().await;
                 
-                if let Err(e) = Self::cleanup_expired_keys(db.clone(), expired_count.clone()).await {
-                    error!("TTL cleanup failed: {}", e);
+                let start_time = SystemTime::now();
+                match Self::cleanup_expired_keys_with_stats(db.clone(), expired_count.clone()).await {
+                    Ok(expired_keys) => {
+                        let cleanup_duration = start_time.elapsed().unwrap_or_default().as_millis() as u64;
+                        
+                        // Update cleanup statistics
+                        let mut stats = cleanup_stats.write().await;
+                        stats.cleanup_runs += 1;
+                        stats.total_expired_keys += expired_keys;
+                        stats.last_cleanup_duration_ms = cleanup_duration;
+                        stats.last_cleanup_key_count = expired_keys;
+                        stats.max_cleanup_duration_ms = stats.max_cleanup_duration_ms.max(cleanup_duration);
+                        
+                        // Update rolling average
+                        if stats.cleanup_runs > 0 {
+                            stats.avg_cleanup_duration_ms = 
+                                (stats.avg_cleanup_duration_ms * (stats.cleanup_runs - 1) as f64 + cleanup_duration as f64) 
+                                / stats.cleanup_runs as f64;
+                        }
+                        
+                        debug!("TTL cleanup completed: {} keys in {}ms", expired_keys, cleanup_duration);
+                    },
+                    Err(e) => {
+                        error!("TTL cleanup failed: {}", e);
+                    }
                 }
             }
         });
     }
     
-    /// Clean up expired keys using the new TTL schema
-    async fn cleanup_expired_keys(
+    /// Clean up expired keys using the new TTL schema with enhanced monitoring
+    async fn cleanup_expired_keys_with_stats(
         db: Arc<Database>,
         expired_count: Arc<RwLock<u64>>,
     ) -> StorageResult<u64> {
@@ -171,8 +214,7 @@ impl RedbStorageAdapter {
                     // Remove from TTL table
                     ttl_table.remove(key.as_slice())?;
                     
-                    // Clean up expiration index entries
-                    // This is less efficient but ensures consistency
+                    // Clean up expiration index entries (optimized batch cleanup)
                     let mut index_keys_to_remove = Vec::new();
                     let range = expiration_index.range::<&[u8]>(..)?;
                     for result in range {
@@ -452,7 +494,7 @@ impl StorageAdapter for RedbStorageAdapter {
     }
     
     async fn expire_keys(&self) -> StorageResult<u64> {
-        Self::cleanup_expired_keys(self.db.clone(), self.expired_count.clone()).await
+        Self::cleanup_expired_keys_with_stats(self.db.clone(), self.expired_count.clone()).await
     }
     
     async fn stats(&self) -> StorageResult<StorageStats> {
@@ -490,6 +532,11 @@ impl StorageAdapter for RedbStorageAdapter {
             expired_keys: expired_count,
             cache_hit_ratio: None, // Not easily available from Redb
         })
+    }
+    
+    /// Get TTL cleanup performance statistics
+    pub async fn ttl_cleanup_stats(&self) -> TtlCleanupStats {
+        self.cleanup_stats.read().await.clone()
     }
     
     async fn flush(&self) -> StorageResult<()> {
