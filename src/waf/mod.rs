@@ -7,6 +7,7 @@ pub mod proxy;
 pub mod rate_limit;
 pub mod rules;
 pub mod security_events;
+pub mod storage;
 
 use bytes::Bytes;
 use hyper::{HeaderMap, Method, Uri};
