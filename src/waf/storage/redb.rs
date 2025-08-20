@@ -27,7 +27,14 @@ use tracing::{debug, error};
 const DATA_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("data");
 
 #[cfg(feature = "export-redb")]
-const EXPIRATION_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("expirations");
+const TTL_TABLE: TableDefinition<&[u8], u64> = TableDefinition::new("ttl_metadata");
+// Key: same as data key, Value: expiration_timestamp_ms
+// Simple 1:1 mapping for TTL metadata
+
+#[cfg(feature = "export-redb")]
+const EXPIRATION_INDEX: TableDefinition<u64, &[u8]> = TableDefinition::new("expiration_index");
+// Key: composite key (expiration_timestamp_ms + key_hash), Value: original_key
+// This allows efficient time-based cleanup while avoiding collisions
 
 #[cfg(feature = "export-redb")]
 /// Redb storage adapter
@@ -61,7 +68,8 @@ impl RedbStorageAdapter {
                 // Initialize tables
                 let write_txn = db.begin_write()?;
                 write_txn.open_table(DATA_TABLE)?;
-                write_txn.open_table(EXPIRATION_TABLE)?;
+                write_txn.open_table(TTL_TABLE)?;
+                write_txn.open_table(EXPIRATION_INDEX)?;
                 write_txn.commit()?;
                 
                 Ok(db)
@@ -107,7 +115,7 @@ impl RedbStorageAdapter {
         });
     }
     
-    /// Clean up expired keys
+    /// Clean up expired keys using the new TTL schema
     async fn cleanup_expired_keys(
         db: Arc<Database>,
         expired_count: Arc<RwLock<u64>>,
@@ -118,17 +126,19 @@ impl RedbStorageAdapter {
             .as_millis() as u64;
         
         let db_clone = db.clone();
-        let expired_keys = task::spawn_blocking(move || -> Result<Vec<(u64, Vec<u8>)>, redb::Error> {
+        let expired_keys = task::spawn_blocking(move || -> Result<Vec<Vec<u8>>, redb::Error> {
             let read_txn = db_clone.begin_read()?;
-            let expiration_table = read_txn.open_table(EXPIRATION_TABLE)?;
+            let ttl_table = read_txn.open_table(TTL_TABLE)?;
             
             let mut expired = Vec::new();
             
-            // Collect all expired keys with their expiry times
-            let range = expiration_table.range::<u64>(..=now)?;
+            // Scan TTL table for expired keys
+            let range = ttl_table.range::<&[u8]>(..)?;
             for result in range {
-                let (expiry_time, key) = result?;
-                expired.push((expiry_time.value(), key.value().to_vec()));
+                let (key, expiry_time) = result?;
+                if expiry_time.value() <= now {
+                    expired.push(key.value().to_vec());
+                }
             }
             
             Ok(expired)
@@ -151,11 +161,30 @@ impl RedbStorageAdapter {
             let write_txn = db_clone.begin_write()?;
             {
                 let mut data_table = write_txn.open_table(DATA_TABLE)?;
-                let mut expiration_table = write_txn.open_table(EXPIRATION_TABLE)?;
+                let mut ttl_table = write_txn.open_table(TTL_TABLE)?;
+                let mut expiration_index = write_txn.open_table(EXPIRATION_INDEX)?;
                 
-                for (expiry_time, key) in &expired_keys {
+                for key in &expired_keys {
+                    // Remove from data table
                     data_table.remove(key.as_slice())?;
-                    expiration_table.remove(*expiry_time)?;
+                    
+                    // Remove from TTL table
+                    ttl_table.remove(key.as_slice())?;
+                    
+                    // Clean up expiration index entries
+                    // This is less efficient but ensures consistency
+                    let mut index_keys_to_remove = Vec::new();
+                    let range = expiration_index.range::<&[u8]>(..)?;
+                    for result in range {
+                        let (index_key, indexed_key) = result?;
+                        if indexed_key.value() == key.as_slice() {
+                            index_keys_to_remove.push(index_key.value().to_vec());
+                        }
+                    }
+                    
+                    for index_key in index_keys_to_remove {
+                        expiration_index.remove(index_key.as_slice())?;
+                    }
                 }
             }
             write_txn.commit()?;
@@ -208,14 +237,31 @@ impl StorageAdapter for RedbStorageAdapter {
         
         let result = match consistency {
             ReadConsistency::Strong => {
-                // Strong consistency - standard read transaction with durability guarantees
+                // Strong consistency - use a full read transaction with TTL checking
                 task::spawn_blocking(move || -> Result<Option<Vec<u8>>, redb::Error> {
                     let read_txn = db.begin_read()?;
-                    let table = read_txn.open_table(DATA_TABLE)?;
+                    let data_table = read_txn.open_table(DATA_TABLE)?;
+                    let ttl_table = read_txn.open_table(TTL_TABLE)?;
                     
-                    match table.get(key.as_slice())? {
-                        Some(value) => Ok(Some(value.value().to_vec())),
-                        None => Ok(None),
+                    // Check if key exists
+                    if let Some(value_guard) = data_table.get(key.as_slice())? {
+                        // Check TTL if it exists
+                        if let Some(expiry_guard) = ttl_table.get(key.as_slice())? {
+                            let expiry_time = expiry_guard.value();
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as u64;
+                            
+                            if now >= expiry_time {
+                                // Key has expired
+                                return Ok(None);
+                            }
+                        }
+                        
+                        Ok(Some(value_guard.value().to_vec()))
+                    } else {
+                        Ok(None)
                     }
                 })
                 .await
@@ -227,17 +273,31 @@ impl StorageAdapter for RedbStorageAdapter {
                 })?
             },
             ReadConsistency::Eventual => {
-                // Eventual consistency - optimized read with potential for slightly stale data
-                // This provides better performance by allowing the database more flexibility
+                // Eventual consistency - optimized read-only access with TTL checking
                 task::spawn_blocking(move || -> Result<Option<Vec<u8>>, redb::Error> {
                     let read_txn = db.begin_read()?;
-                    let table = read_txn.open_table(DATA_TABLE)?;
+                    let data_table = read_txn.open_table(DATA_TABLE)?;
+                    let ttl_table = read_txn.open_table(TTL_TABLE)?;
                     
-                    // Use the same read mechanism but signal that we can tolerate eventual consistency
-                    // In the context of embedded databases, this primarily affects performance optimizations
-                    match table.get(key.as_slice())? {
-                        Some(value) => Ok(Some(value.value().to_vec())),
-                        None => Ok(None),
+                    // Check if key exists
+                    if let Some(value_guard) = data_table.get(key.as_slice())? {
+                        // Check TTL if it exists
+                        if let Some(expiry_guard) = ttl_table.get(key.as_slice())? {
+                            let expiry_time = expiry_guard.value();
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as u64;
+                            
+                            if now >= expiry_time {
+                                // Key has expired
+                                return Ok(None);
+                            }
+                        }
+                        
+                        Ok(Some(value_guard.value().to_vec()))
+                    } else {
+                        Ok(None)
                     }
                 })
                 .await
@@ -266,6 +326,10 @@ impl StorageAdapter for RedbStorageAdapter {
             let write_txn = db.begin_write()?;
             {
                 let mut data_table = write_txn.open_table(DATA_TABLE)?;
+                let mut ttl_table = write_txn.open_table(TTL_TABLE)?;
+                let mut expiration_index = write_txn.open_table(EXPIRATION_INDEX)?;
+                
+                // Store the data
                 data_table.insert(key.as_slice(), value.as_slice())?;
                 
                 // Handle TTL if specified
@@ -276,8 +340,21 @@ impl StorageAdapter for RedbStorageAdapter {
                         .as_millis() as u64
                         + duration.as_millis() as u64;
                     
-                    let mut expiration_table = write_txn.open_table(EXPIRATION_TABLE)?;
-                    expiration_table.insert(expires_at, key.as_slice())?;
+                    // Store TTL metadata
+                    ttl_table.insert(key.as_slice(), expires_at)?;
+                    
+                    // Create expiration index key (timestamp + key length + first 8 bytes of key to avoid collisions)
+                    let mut index_key = Vec::with_capacity(8 + 4 + 8);
+                    index_key.extend_from_slice(&expires_at.to_be_bytes());
+                    index_key.extend_from_slice(&(key.len() as u32).to_be_bytes());
+                    index_key.extend_from_slice(&key[..std::cmp::min(key.len(), 8)]);
+                    
+                    expiration_index.insert(index_key.as_slice(), key.as_slice())?;
+                } else {
+                    // Remove any existing TTL metadata if no TTL is set
+                    ttl_table.remove(key.as_slice())?;
+                    // Note: We don't clean up the expiration index here for performance
+                    // It will be cleaned up during the next expiration cleanup
                 }
             }
             write_txn.commit()?;
@@ -302,8 +379,21 @@ impl StorageAdapter for RedbStorageAdapter {
             let write_txn = db.begin_write()?;
             let existed = {
                 let mut data_table = write_txn.open_table(DATA_TABLE)?;
+                let mut ttl_table = write_txn.open_table(TTL_TABLE)?;
+                
                 let existed = data_table.get(key.as_slice())?.is_some();
-                data_table.remove(key.as_slice())?;
+                
+                if existed {
+                    // Remove data
+                    data_table.remove(key.as_slice())?;
+                    
+                    // Remove TTL metadata if it exists
+                    ttl_table.remove(key.as_slice())?;
+                    
+                    // Note: We don't clean up the expiration index here for performance
+                    // The cleanup process will handle stale entries
+                }
+                
                 existed
             };
             write_txn.commit()?;
@@ -326,8 +416,29 @@ impl StorageAdapter for RedbStorageAdapter {
         
         let exists = task::spawn_blocking(move || -> Result<bool, redb::Error> {
             let read_txn = db.begin_read()?;
-            let table = read_txn.open_table(DATA_TABLE)?;
-            Ok(table.get(key.as_slice())?.is_some())
+            let data_table = read_txn.open_table(DATA_TABLE)?;
+            let ttl_table = read_txn.open_table(TTL_TABLE)?;
+            
+            // Check if key exists in data table
+            if data_table.get(key.as_slice())?.is_some() {
+                // Check TTL if it exists
+                if let Some(expiry_guard) = ttl_table.get(key.as_slice())? {
+                    let expiry_time = expiry_guard.value();
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64;
+                    
+                    if now >= expiry_time {
+                        // Key has expired
+                        return Ok(false);
+                    }
+                }
+                
+                Ok(true)
+            } else {
+                Ok(false)
+            }
         })
         .await
         .map_err(|e| StorageError::DatabaseError {
