@@ -210,23 +210,45 @@ impl SledStorageAdapter {
 #[cfg(feature = "export-sled")]
 #[async_trait]
 impl StorageAdapter for SledStorageAdapter {
-    async fn get(&self, key: &[u8], _consistency: ReadConsistency) -> StorageResult<Option<Vec<u8>>> {
+    async fn get(&self, key: &[u8], consistency: ReadConsistency) -> StorageResult<Option<Vec<u8>>> {
         let data_tree = self.data_tree.clone();
         let key = key.to_vec();
         
-        let result = task::spawn_blocking(move || -> Result<Option<Vec<u8>>, sled::Error> {
-            match data_tree.get(&key)? {
-                Some(value) => Ok(Some(value.to_vec())),
-                None => Ok(None),
+        let result = match consistency {
+            ReadConsistency::Strong => {
+                // Strong consistency - include explicit flush to ensure durability
+                task::spawn_blocking(move || -> Result<Option<Vec<u8>>, sled::Error> {
+                    data_tree.flush()?; // Ensure all pending writes are visible
+                    match data_tree.get(&key)? {
+                        Some(value) => Ok(Some(value.to_vec())),
+                        None => Ok(None),
+                    }
+                })
+                .await
+                .map_err(|e| StorageError::DatabaseError {
+                    message: format!("Failed to spawn strong consistency get task: {}", e),
+                })?
+                .map_err(|e| StorageError::DatabaseError {
+                    message: format!("Sled strong consistency get error: {}", e),
+                })?
+            },
+            ReadConsistency::Eventual => {
+                // Eventual consistency - skip flush for better performance
+                task::spawn_blocking(move || -> Result<Option<Vec<u8>>, sled::Error> {
+                    match data_tree.get(&key)? {
+                        Some(value) => Ok(Some(value.to_vec())),
+                        None => Ok(None),
+                    }
+                })
+                .await
+                .map_err(|e| StorageError::DatabaseError {
+                    message: format!("Failed to spawn eventual consistency get task: {}", e),
+                })?
+                .map_err(|e| StorageError::DatabaseError {
+                    message: format!("Sled eventual consistency get error: {}", e),
+                })?
             }
-        })
-        .await
-        .map_err(|e| StorageError::DatabaseError {
-            message: format!("Failed to spawn get task: {}", e),
-        })?
-        .map_err(|e| StorageError::DatabaseError {
-            message: format!("Sled get error: {}", e),
-        })?;
+        };
         
         if let Some(data) = result {
             Ok(Some(self.decompress_if_enabled(&data)))

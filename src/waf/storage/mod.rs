@@ -236,4 +236,27 @@ mod tests {
     fn test_read_consistency_default() {
         assert_eq!(ReadConsistency::default(), ReadConsistency::Strong);
     }
+    
+    #[tokio::test]
+    async fn test_follower_reads_basic() {
+        // Test that both consistency levels work with in-memory storage
+        let adapter = crate::waf::storage::memory::MemoryStorageAdapter::new(
+            None,
+            Duration::from_secs(60)
+        ).await.unwrap();
+        
+        // Set a value
+        adapter.set(b"test_key", b"test_value", None).await.unwrap();
+        
+        // Test strong consistency read
+        let strong_result = adapter.get(b"test_key", ReadConsistency::Strong).await.unwrap();
+        assert_eq!(strong_result, Some(b"test_value".to_vec()));
+        
+        // Test eventual consistency read
+        let eventual_result = adapter.get(b"test_key", ReadConsistency::Eventual).await.unwrap();
+        assert_eq!(eventual_result, Some(b"test_value".to_vec()));
+        
+        // Both should return the same result for in-memory storage
+        assert_eq!(strong_result, eventual_result);
+    }
 }

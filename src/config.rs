@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::time::Duration;
 use tracing::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +22,9 @@ pub struct Config {
 
     /// WAF configuration
     pub waf: WafConfig,
+
+    /// Storage configuration
+    pub storage: StorageConfig,
 
     // Security module configurations
     pub security: SecurityConfig,
@@ -239,6 +243,31 @@ pub struct SecurityConfig {
     pub geo_blocking: GeoBlockingConfig,
 }
 
+/// Storage configuration for WAF data persistence
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageConfig {
+    /// Storage backend type ("sled", "redb", "memory")
+    pub backend: String,
+
+    /// Database path
+    pub path: String,
+
+    /// Enable follower reads for better performance
+    pub enable_follower_reads: bool,
+
+    /// TTL cleanup interval in seconds
+    pub ttl_cleanup_interval_secs: u64,
+
+    /// Enable compression for stored values
+    pub enable_compression: bool,
+
+    /// Cache size for redb backend (in bytes)
+    pub cache_size: Option<usize>,
+
+    /// Max size for in-memory backend (number of entries)
+    pub max_memory_entries: Option<usize>,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -248,6 +277,7 @@ impl Default for Config {
             server: ServerConfig::default(),
             logging: LoggingConfig::default(),
             waf: WafConfig::default(),
+            storage: StorageConfig::default(),
             security: SecurityConfig::default(),
         }
     }
@@ -397,6 +427,47 @@ impl Default for WasmConfig {
             instance_pool_size: 10,
             hot_reload: true,
             rules_config: "rules/coraza.conf".to_string(),
+        }
+    }
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            backend: "redb".to_string(),
+            path: "./data/waf.redb".to_string(),
+            enable_follower_reads: true,
+            ttl_cleanup_interval_secs: 60,
+            enable_compression: false,
+            cache_size: Some(16 * 1024 * 1024), // 16MB default cache
+            max_memory_entries: None,
+        }
+    }
+}
+
+impl StorageConfig {
+    /// Convert to waf storage configuration
+    pub fn to_waf_storage_config(&self) -> crate::waf::storage::StorageConfig {
+        let backend = match self.backend.as_str() {
+            "sled" => crate::waf::storage::StorageBackend::Sled {
+                path: self.path.clone(),
+                temporary: false,
+            },
+            "redb" => crate::waf::storage::StorageBackend::Redb {
+                path: self.path.clone(),
+                cache_size: self.cache_size,
+            },
+            "memory" => crate::waf::storage::StorageBackend::Memory {
+                max_size: self.max_memory_entries,
+            },
+            _ => crate::waf::storage::StorageBackend::default(),
+        };
+
+        crate::waf::storage::StorageConfig {
+            backend,
+            enable_follower_reads: self.enable_follower_reads,
+            ttl_cleanup_interval: Duration::from_secs(self.ttl_cleanup_interval_secs),
+            enable_compression: self.enable_compression,
         }
     }
 }

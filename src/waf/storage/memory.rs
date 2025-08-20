@@ -99,21 +99,62 @@ impl MemoryStorageAdapter {
 
 #[async_trait]
 impl StorageAdapter for MemoryStorageAdapter {
-    async fn get(&self, key: &[u8], _consistency: ReadConsistency) -> StorageResult<Option<Vec<u8>>> {
-        let data = self.data.read().await;
+    async fn get(&self, key: &[u8], consistency: ReadConsistency) -> StorageResult<Option<Vec<u8>>> {
+        // For memory storage, consistency level doesn't affect the implementation much
+        // since all data is immediately available. We'll use different lock strategies for performance.
         
-        if let Some(entry) = data.get(key) {
-            // Check if entry has expired
-            if let Some(expires_at) = entry.expires_at {
-                if SystemTime::now() >= expires_at {
-                    // Entry has expired, return None
-                    return Ok(None);
+        match consistency {
+            ReadConsistency::Strong => {
+                // Strong consistency - full read lock, ensures complete consistency
+                let data = self.data.read().await;
+                
+                if let Some(entry) = data.get(key) {
+                    // Check if entry has expired
+                    if let Some(expires_at) = entry.expires_at {
+                        if SystemTime::now() >= expires_at {
+                            // Entry has expired, return None
+                            return Ok(None);
+                        }
+                    }
+                    
+                    Ok(Some(entry.value.clone()))
+                } else {
+                    Ok(None)
+                }
+            },
+            ReadConsistency::Eventual => {
+                // Eventual consistency - optimized read that can potentially
+                // use try_read for better concurrency
+                match self.data.try_read() {
+                    Ok(data) => {
+                        if let Some(entry) = data.get(key) {
+                            // Check if entry has expired
+                            if let Some(expires_at) = entry.expires_at {
+                                if SystemTime::now() >= expires_at {
+                                    return Ok(None);
+                                }
+                            }
+                            Ok(Some(entry.value.clone()))
+                        } else {
+                            Ok(None)
+                        }
+                    },
+                    Err(_) => {
+                        // If try_read fails, fall back to regular read
+                        let data = self.data.read().await;
+                        if let Some(entry) = data.get(key) {
+                            if let Some(expires_at) = entry.expires_at {
+                                if SystemTime::now() >= expires_at {
+                                    return Ok(None);
+                                }
+                            }
+                            Ok(Some(entry.value.clone()))
+                        } else {
+                            Ok(None)
+                        }
+                    }
                 }
             }
-            
-            Ok(Some(entry.value.clone()))
-        } else {
-            Ok(None)
         }
     }
     
