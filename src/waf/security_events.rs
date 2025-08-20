@@ -15,12 +15,6 @@ use super::exporters::OpenTelemetryExporter;
 #[cfg(feature = "export-sled")]
 use super::exporters::SledExporter;
 
-#[cfg(feature = "export-otel")]
-use super::exporters::OpenTelemetryExporter;
-
-#[cfg(feature = "export-sled")]
-use super::exporters::SledExporter;
-
 /// Enhanced security event structure for comprehensive logging and export
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecurityEvent {
