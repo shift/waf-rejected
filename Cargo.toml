@@ -25,6 +25,14 @@ required-features = ["export-sled"]
 name = "storage_adapter_test"
 path = "src/bin/storage_adapter_test.rs"
 
+[[bin]]
+name = "io_performance_test"
+path = "src/bin/io_performance_test.rs"
+
+[[bin]]
+name = "network_io_performance_test" 
+path = "src/bin/network_io_performance_test.rs"
+
 [dependencies]
 # Async runtime and HTTP
 tokio = { version = "1.0", features = ["full"] }
@@ -127,6 +135,9 @@ sled = { version = "0.34", optional = true }
 # High-performance embedded database (Phase 2)
 redb = { version = "3.0", optional = true }
 
+# High-performance I/O with io_uring (Linux only)
+tokio-uring = { version = "0.5", optional = true }
+
 # CLI utilities
 clap = { version = "4.0", features = ["derive"] }
 
@@ -186,6 +197,8 @@ export-system = ["sled", "opentelemetry", "opentelemetry_sdk"]
 export-otel = ["opentelemetry", "opentelemetry_sdk"]
 export-sled = ["sled"]
 export-redb = ["redb"]
+# I/O optimization features
+io-uring = ["tokio-uring"]
 # AI/ML threat detection features (simplified)
 ai-threat-detection = ["polars", "smartcore", "ndarray", "rand_distr"]
 
