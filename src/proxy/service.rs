@@ -12,12 +12,14 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use tokio::net::TcpListener;
+use tokio_rustls::server::TlsStream;
 use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::error::WafError;
 use crate::proxy::buffer_pool::BufferPool;
 use crate::proxy::websocket::WebSocketHandler;
+use crate::waf::tls_config::TlsManager;
 use crate::waf::{Decision, RequestContext, WafEngine};
 
 #[cfg(feature = "webtransport")]
@@ -38,6 +40,7 @@ pub struct WafProxyService {
     websocket_handler: WebSocketHandler,
     #[cfg(feature = "webtransport")]
     webtransport_handler: WebTransportHandler,
+    tls_manager: Option<Arc<TlsManager>>,
 }
 
 impl WafProxyService {
@@ -84,17 +87,29 @@ impl WafProxyService {
         let webtransport_handler =
             WebTransportHandler::new(Arc::clone(&waf_engine), Arc::clone(&config_arc));
 
+        let tls_manager = if config_arc.server.tls.enabled {
+            let manager = TlsManager::new(config_arc.server.tls.clone())?;
+            Some(Arc::new(manager))
+        } else {
+            None
+        };
+
         info!(
             "WAF Proxy Service initialized with {} rules",
             waf_engine.rule_count()
         );
         info!("Upstream target: {} (optimized HTTP client)", upstream_uri);
         info!(
-            "Protocol support: HTTP/1.0-3, WebSocket{}",
+            "Protocol support: HTTP/1.0-3, WebSocket{}, TLS: {}",
             if cfg!(feature = "webtransport") {
                 ", WebTransport"
             } else {
                 ""
+            },
+            if tls_manager.is_some() {
+                "enabled"
+            } else {
+                "disabled"
             }
         );
 
@@ -107,6 +122,7 @@ impl WafProxyService {
             websocket_handler,
             #[cfg(feature = "webtransport")]
             webtransport_handler,
+            tls_manager,
         })
     }
 
@@ -123,9 +139,14 @@ impl WafProxyService {
 
         info!("🚀 WAF Proxy Server started successfully on {}", bind_addr);
         info!("📊 Performance optimizations: connection pooling, async processing, rule caching");
+        if self.tls_manager.is_some() {
+            info!("🔒 TLS enabled - all connections require TLS 1.2+");
+        } else {
+            warn!("⚠️  TLS disabled - connections are unencrypted (not recommended for production)");
+        }
 
         loop {
-            let (stream, _) = listener
+            let (tcp_stream, remote_addr) = listener
                 .accept()
                 .await
                 .map_err(|e| WafError::internal(format!("Failed to accept connection: {}", e)))?;
@@ -135,63 +156,142 @@ impl WafProxyService {
             let upstream_uri = self.upstream_uri.clone();
             let config = Arc::clone(&self.config);
             let buffer_pool = Arc::clone(&self.buffer_pool);
+            let tls_manager = self.tls_manager.clone();
 
-            // Spawn each connection handler with multi-protocol support
             tokio::task::spawn(async move {
-                // Try HTTP/2 first if enabled, fallback to HTTP/1.1
-                if config.server.enable_http2 {
-                    // Attempt HTTP/2 connection
-                    let http2_result =
-                        hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                            .keep_alive_interval(Some(Duration::from_secs(30)))
-                            .keep_alive_timeout(Duration::from_secs(10))
-                            .serve_connection(
-                                hyper_util::rt::TokioIo::new(stream),
-                                service_fn(move |req| {
-                                    Self::handle_request(
-                                        req,
-                                        Arc::clone(&waf_engine),
-                                        upstream_client.clone(),
-                                        upstream_uri.clone(),
-                                        Arc::clone(&config),
-                                        Arc::clone(&buffer_pool),
-                                    )
-                                }),
+                if let Some(tls_mgr) = tls_manager {
+                    match tls_mgr.accept(tcp_stream).await {
+                        Ok(tls_stream) => {
+                            if let Err(e) = Self::handle_tls_connection(
+                                tls_stream,
+                                waf_engine,
+                                upstream_client,
+                                upstream_uri,
+                                config,
+                                buffer_pool,
                             )
-                            .await;
-
-                    // If HTTP/2 fails, fallback to HTTP/1.1
-                    if let Err(e) = http2_result {
-                        debug!("HTTP/2 connection failed, falling back to HTTP/1.1: {}", e);
-
-                        // Create new stream (original was consumed)
-                        // Note: In production, we'd handle this more elegantly
-                        return;
+                            .await
+                            {
+                                error!("TLS connection error from {}: {}", remote_addr, e);
+                            }
+                        }
+                        Err(e) => {
+                            error!("TLS handshake failed from {}: {}", remote_addr, e);
+                        }
                     }
                 } else {
-                    // HTTP/1.1 with HTTP/1.0 compatibility
-                    if let Err(e) = hyper::server::conn::http1::Builder::new()
-                        .keep_alive(true)
-                        .pipeline_flush(true)
-                        .serve_connection(
-                            hyper_util::rt::TokioIo::new(stream),
-                            service_fn(move |req| {
-                                Self::handle_request(
-                                    req,
-                                    Arc::clone(&waf_engine),
-                                    upstream_client.clone(),
-                                    upstream_uri.clone(),
-                                    Arc::clone(&config),
-                                    Arc::clone(&buffer_pool),
-                                )
-                            }),
-                        )
-                        .await
+                    if let Err(e) = Self::handle_plaintext_connection(
+                        tcp_stream,
+                        waf_engine,
+                        upstream_client,
+                        upstream_uri,
+                        config,
+                        buffer_pool,
+                    )
+                    .await
                     {
-                        error!("Error serving HTTP/1.x connection: {}", e);
+                        error!("Connection error from {}: {}", remote_addr, e);
                     }
                 }
             });
+        }
+    }
+
+    async fn handle_tls_connection(
+        stream: TlsStream<tokio::net::TcpStream>,
+        waf_engine: Arc<WafEngine>,
+        upstream_client: Client<HttpConnector, Full<Bytes>>,
+        upstream_uri: Uri,
+        config: Arc<Config>,
+        buffer_pool: Arc<BufferPool>,
+    ) -> Result<(), WafError> {
+        if config.server.enable_http2 {
+            hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .keep_alive_interval(Some(Duration::from_secs(30)))
+                .keep_alive_timeout(Duration::from_secs(10))
+                .serve_connection(
+                    hyper_util::rt::TokioIo::new(stream),
+                    service_fn(move |req| {
+                        Self::handle_request(
+                            req,
+                            Arc::clone(&waf_engine),
+                            upstream_client.clone(),
+                            upstream_uri.clone(),
+                            Arc::clone(&config),
+                            Arc::clone(&buffer_pool),
+                        )
+                    }),
+                )
+                .await
+                .map_err(|e| WafError::NetworkError(format!("HTTP/2 TLS connection error: {}", e)))
+        } else {
+            hyper::server::conn::http1::Builder::new()
+                .keep_alive(true)
+                .pipeline_flush(true)
+                .serve_connection(
+                    hyper_util::rt::TokioIo::new(stream),
+                    service_fn(move |req| {
+                        Self::handle_request(
+                            req,
+                            Arc::clone(&waf_engine),
+                            upstream_client.clone(),
+                            upstream_uri.clone(),
+                            Arc::clone(&config),
+                            Arc::clone(&buffer_pool),
+                        )
+                    }),
+                )
+                .await
+                .map_err(|e| WafError::NetworkError(format!("HTTP/1.1 TLS connection error: {}", e)))
+        }
+    }
+
+    async fn handle_plaintext_connection(
+        stream: tokio::net::TcpStream,
+        waf_engine: Arc<WafEngine>,
+        upstream_client: Client<HttpConnector, Full<Bytes>>,
+        upstream_uri: Uri,
+        config: Arc<Config>,
+        buffer_pool: Arc<BufferPool>,
+    ) -> Result<(), WafError> {
+        if config.server.enable_http2 {
+            hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .keep_alive_interval(Some(Duration::from_secs(30)))
+                .keep_alive_timeout(Duration::from_secs(10))
+                .serve_connection(
+                    hyper_util::rt::TokioIo::new(stream),
+                    service_fn(move |req| {
+                        Self::handle_request(
+                            req,
+                            Arc::clone(&waf_engine),
+                            upstream_client.clone(),
+                            upstream_uri.clone(),
+                            Arc::clone(&config),
+                            Arc::clone(&buffer_pool),
+                        )
+                    }),
+                )
+                .await
+                .map_err(|e| WafError::NetworkError(format!("HTTP/2 connection error: {}", e)))
+        } else {
+            hyper::server::conn::http1::Builder::new()
+                .keep_alive(true)
+                .pipeline_flush(true)
+                .serve_connection(
+                    hyper_util::rt::TokioIo::new(stream),
+                    service_fn(move |req| {
+                        Self::handle_request(
+                            req,
+                            Arc::clone(&waf_engine),
+                            upstream_client.clone(),
+                            upstream_uri.clone(),
+                            Arc::clone(&config),
+                            Arc::clone(&buffer_pool),
+                        )
+                    }),
+                )
+                .await
+                .map_err(|e| WafError::NetworkError(format!("HTTP/1.1 connection error: {}", e)))
         }
     }
 

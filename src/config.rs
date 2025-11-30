@@ -67,6 +67,36 @@ pub struct ServerConfig {
 
     /// Maximum request body size in bytes
     pub max_body_size: usize,
+
+    /// TLS configuration
+    pub tls: TlsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsConfig {
+    /// Enable TLS/SSL
+    pub enabled: bool,
+
+    /// Path to TLS certificate file (PEM format)
+    pub cert_path: String,
+
+    /// Path to TLS private key file (PEM format)
+    pub key_path: String,
+
+    /// Minimum TLS version (1.2 or 1.3)
+    pub min_version: String,
+
+    /// Maximum TLS version (1.2 or 1.3)
+    pub max_version: String,
+
+    /// ALPN protocols (e.g., ["h2", "http/1.1"])
+    pub alpn_protocols: Vec<String>,
+
+    /// Require client certificate authentication
+    pub require_client_cert: bool,
+
+    /// Path to client CA certificate file (PEM format)
+    pub client_ca_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -309,6 +339,22 @@ impl Default for ServerConfig {
                 "3".to_string(),
             ],
             max_body_size: 10 * 1024 * 1024, // 10MB
+            tls: TlsConfig::default(),
+        }
+    }
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cert_path: "/etc/waf/certs/server.crt".to_string(),
+            key_path: "/etc/waf/certs/server.key".to_string(),
+            min_version: "1.2".to_string(),
+            max_version: "1.3".to_string(),
+            alpn_protocols: vec!["h2".to_string(), "http/1.1".to_string()],
+            require_client_cert: false,
+            client_ca_path: None,
         }
     }
 }
