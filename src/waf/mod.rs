@@ -10,6 +10,7 @@ pub mod rules;
 pub mod security_events;
 pub mod simd_ops;
 pub mod storage;
+pub mod tls_config;
 
 use bytes::Bytes;
 use hyper::{HeaderMap, Method, Uri};
