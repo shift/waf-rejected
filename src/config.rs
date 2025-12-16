@@ -271,7 +271,7 @@ pub struct SecurityConfig {
 
     /// Geographic blocking configuration  
     pub geo_blocking: GeoBlockingConfig,
-    
+
     /// Authentication configuration
     pub auth: crate::waf::auth::AuthConfig,
 }
