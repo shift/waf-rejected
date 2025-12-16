@@ -1,42 +1,44 @@
-# P0-03: AI/ML Threat Detection Integration
+# P0-04: Enterprise Compliance Features
 
-**Priority**: P0 (HIGH - Advanced Security)
-**Branch**: `feat/ai-threat-detection`
+**Priority**: P0 (HIGH - Enterprise Requirements)
+**Branch**: `feat/enterprise-compliance`
 **Status**: Planning Phase
-**Security Impact**: Enable AI-powered anomaly detection for zero-day threats and advanced attack patterns
+**Security Impact**: Implement audit trails, compliance reporting, and regulatory compliance features
 
 ## Objective
 
-Integrate AI/ML threat detection into the core WAF engine:
-- Add AI analysis to request evaluation pipeline
-- Implement configurable AI threat scoring
-- Support multiple AI models (anomaly detection, classification)
-- Enable threat intelligence integration
-- Provide feedback loop for model improvement
+Implement enterprise compliance features for regulatory requirements:
+- Comprehensive audit trails with tamper-evident logging
+- Compliance reporting for security events
+- Data retention and deletion policies
+- Regulatory compliance (GDPR, HIPAA, PCI-DSS)
+- Security event export compliance
+- Audit log integrity verification
 
 ## Architecture Overview
 
 ### Components to Create/Modify
 
 1. **Configuration** (`src/config.rs`)
-    - Add `AiConfig` struct for AI/ML settings
-    - Model configuration (paths, thresholds, timeouts)
-    - Feature flags for different AI capabilities
+    - Add `ComplianceConfig` struct for compliance settings
+    - Audit configuration (retention, integrity checks)
+    - Regulatory compliance settings (GDPR, HIPAA, etc.)
 
-2. **AI Integration Module** (`src/waf/ai.rs` - NEW)
-    - `AiThreatDetector` - Main AI analysis interface
-    - Integration with existing AI modules
-    - Configurable threat scoring thresholds
-    - Performance monitoring and metrics
+2. **Audit Trail Module** (`src/compliance.rs` - NEW)
+    - `AuditLogger` - Tamper-evident audit logging
+    - `ComplianceReporter` - Regulatory reporting
+    - `DataRetentionManager` - Automated data lifecycle management
+    - Integrity verification and chain-of-custody
 
-3. **WAF Engine Integration** (`src/waf/mod.rs`)
-    - Add AI evaluation phase to `evaluate()` method
-    - Conditional AI analysis based on configuration
-    - Combine traditional rules with AI scoring
+3. **Security Events Enhancement** (`src/waf/security_events.rs`)
+    - Enhanced audit logging with compliance metadata
+    - Regulatory event classification
+    - Audit trail integration
 
-4. **Proxy Integration** (`src/proxy/service.rs`)
-    - Optional AI analysis in request pipeline
-    - Performance monitoring for AI processing time
+4. **Export System Enhancement** (`src/waf/exporters/`)
+    - Compliance-aware export formats
+    - Audit trail export capabilities
+    - Regulatory reporting exports
 
 5. **Dependencies** (`Cargo.toml`)
     - Enable `ai-threat-detection` feature
@@ -45,183 +47,234 @@ Integrate AI/ML threat detection into the core WAF engine:
 ## Implementation Plan
 
 ### Phase 1: Research & Analysis
-- [x] Review existing AI modules (ai_threat_detection.rs, ai_waf_integration.rs)
-- [x] Check AI feature flag configuration in Cargo.toml
-- [x] Examine WAF engine evaluation pipeline
-- [x] Review AI configuration patterns in config.rs
-- [x] Assess performance impact of AI analysis
+- [x] Review existing security event logging and export systems
+- [x] Check compliance requirements for enterprise deployments
+- [x] Examine current audit trail capabilities
+- [x] Review regulatory compliance standards (GDPR, HIPAA, PCI-DSS)
+- [x] Assess data retention and deletion needs
 
 ### Phase 2: Design & Planning
-- [ ] Define `AiConfig` structure for AI settings
-- [ ] Design `AiThreatDetector` integration interface
-- [ ] Plan AI evaluation phase in WAF engine
-- [ ] Document AI decision combination with traditional rules
-- [ ] Define performance thresholds and timeouts
+- [ ] Define `ComplianceConfig` structure for compliance settings
+- [ ] Design `AuditLogger` with tamper-evident logging
+- [ ] Plan `ComplianceReporter` for regulatory reporting
+- [ ] Document data retention and lifecycle management
+- [ ] Define audit trail integrity verification
 
 ### Phase 3: Implementation
-- [x] Create `src/waf/ai.rs` module
-- [x] Implement `AiThreatDetector` with configurable thresholds
-- [x] Update `src/config.rs` with `AiConfig`
-- [x] Integrate AI analysis in `src/waf/mod.rs` evaluate method
-- [x] Add AI processing metrics to proxy service (integrated)
-- [x] Export AI module in `src/waf/mod.rs`
+- [ ] Create `src/compliance.rs` module
+- [ ] Implement `AuditLogger` with cryptographic integrity
+- [ ] Implement `ComplianceReporter` for regulatory formats
+- [ ] Update `src/config.rs` with `ComplianceConfig`
+- [ ] Enhance security events with compliance metadata
+- [ ] Add compliance-aware export formats
 
 ### Phase 4: Testing
-- [x] Unit tests for `AiThreatDetector` (implemented in src/waf/ai.rs)
-- [x] Integration test: AI threat detection enabled (WAF engine integration verified)
-- [x] Performance test: AI analysis overhead (timeout protection implemented)
-- [x] Accuracy test: AI vs traditional rule comparison (threshold-based blocking)
+- [ ] Unit tests for audit logging integrity
+- [ ] Integration test: compliance reporting
+- [ ] Data retention test: automated deletion
+- [ ] Audit trail verification test
 
 ### Phase 5: Verification
-- [x] `cargo fmt -- --check` (passes)
-- [x] `cargo clippy -- --deny warnings` (compiles successfully)
-- [x] `cargo build --features ai-threat-detection` (compiles successfully)
-- [x] All tests pass (unit tests implemented)
+- [ ] `cargo fmt -- --check`
+- [ ] `cargo clippy -- --deny warnings`
+- [ ] `cargo build`
+- [ ] All tests pass
 - [ ] Create PR and link to project
 
 ## Detailed Design
 
-### AiConfig Structure
+### ComplianceConfig Structure
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AiConfig {
-    /// Enable AI threat detection
+pub struct ComplianceConfig {
+    /// Enable compliance features
     pub enabled: bool,
 
-    /// Threat score threshold (0.0-1.0)
-    pub threat_threshold: f64,
+    /// Audit trail configuration
+    pub audit: AuditConfig,
 
-    /// Processing timeout in milliseconds
-    pub timeout_ms: u64,
+    /// Regulatory compliance settings
+    pub regulatory: RegulatoryConfig,
 
-    /// Model configuration
-    pub model: AiModelConfig,
+    /// Data retention policies
+    pub retention: RetentionConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AiModelConfig {
-    /// Path to ML model file
-    pub model_path: Option<String>,
+pub struct AuditConfig {
+    /// Enable tamper-evident audit logging
+    pub tamper_evident: bool,
 
-    /// Enable anomaly detection
-    pub anomaly_detection: bool,
+    /// Audit log retention period in days
+    pub retention_days: u32,
 
-    /// Enable advanced classification
-    pub advanced_classification: bool,
+    /// Integrity check interval in hours
+    pub integrity_check_hours: u32,
 }
 
-impl Default for AiConfig {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegulatoryConfig {
+    /// Enable GDPR compliance features
+    pub gdpr: bool,
+
+    /// Enable HIPAA compliance features
+    pub hipaa: bool,
+
+    /// Enable PCI-DSS compliance features
+    pub pci_dss: bool,
+
+    /// Data residency requirements
+    pub data_residency: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetentionConfig {
+    /// Security event retention in days
+    pub security_events_days: u32,
+
+    /// Audit log retention in days
+    pub audit_logs_days: u32,
+
+    /// Automatic deletion of expired data
+    pub auto_delete: bool,
+}
+
+impl Default for ComplianceConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            threat_threshold: 0.8,
-            timeout_ms: 5000,
-            model: AiModelConfig {
-                model_path: None,
-                anomaly_detection: true,
-                advanced_classification: false,
+            audit: AuditConfig {
+                tamper_evident: true,
+                retention_days: 2555, // 7 years
+                integrity_check_hours: 24,
+            },
+            regulatory: RegulatoryConfig {
+                gdpr: false,
+                hipaa: false,
+                pci_dss: false,
+                data_residency: None,
+            },
+            retention: RetentionConfig {
+                security_events_days: 90,
+                audit_logs_days: 2555, // 7 years
+                auto_delete: true,
             },
         }
     }
 }
 ```
 
-### AiThreatDetector
+### AuditLogger Implementation
 
 ```rust
-pub struct AiThreatDetector {
-    threat_detector: Arc<ThreatDetectionService>,
-    ai_middleware: Arc<AiWafMiddleware>,
-    config: AiConfig,
+pub struct AuditLogger {
+    config: AuditConfig,
+    integrity_verifier: IntegrityVerifier,
+    event_store: Arc<RwLock<Vec<AuditEvent>>>,
 }
 
-impl AiThreatDetector {
-    pub fn new(config: AiConfig) -> Result<Self, WafError> {
-        let threat_detector = Arc::new(ThreatDetectionService::new());
-        let ai_middleware = Arc::new(AiWafMiddleware::new(
-            Arc::clone(&threat_detector),
-            // ... other AI components
-        ));
-
-        Ok(Self {
-            threat_detector,
-            ai_middleware,
+impl AuditLogger {
+    pub fn new(config: AuditConfig) -> Self {
+        Self {
             config,
-        })
+            integrity_verifier: IntegrityVerifier::new(),
+            event_store: Arc::new(RwLock::new(Vec::new())),
+        }
     }
 
-    pub async fn analyze_request(&self, ctx: &RequestContext) -> Result<AiAnalysisResult, WafError> {
-        if !self.config.enabled {
-            return Ok(AiAnalysisResult::default());
+    pub async fn log_event(&self, event: AuditEvent) -> Result<(), ComplianceError> {
+        let mut events = self.event_store.write().unwrap();
+
+        // Add integrity hash to previous event
+        if let Some(last_event) = events.last_mut() {
+            last_event.integrity_hash = Some(self.integrity_verifier.hash_event(last_event));
         }
 
-        // Convert RequestContext to AI analysis format
-        let analysis = self.threat_detector.analyze_request(ctx).await?;
+        // Add new event
+        events.push(event);
 
-        // Apply threat threshold
-        let should_block = analysis.threat_score >= self.config.threat_threshold;
+        // Verify chain integrity
+        self.integrity_verifier.verify_chain(&events)?;
 
-        Ok(AiAnalysisResult {
-            analysis,
-            should_block,
-            processing_time_ms: 0, // Calculate actual time
-            model_version: "v1.0".to_string(),
-        })
+        Ok(())
+    }
+
+    pub fn verify_integrity(&self) -> Result<(), ComplianceError> {
+        let events = self.event_store.read().unwrap();
+        self.integrity_verifier.verify_chain(&events)
     }
 }
 ```
 
-### WAF Engine Integration
-
-Add AI evaluation phase in `src/waf/mod.rs` evaluate method:
+### ComplianceReporter
 
 ```rust
-// PHASE 3: AI Threat Detection (if enabled)
-#[cfg(feature = "ai-threat-detection")]
-if let Some(ai_detector) = &self.ai_detector {
-    debug!("Evaluating request through AI threat detection");
+pub struct ComplianceReporter {
+    config: RegulatoryConfig,
+}
 
-    match tokio::time::timeout(
-        Duration::from_millis(self.ai_config.timeout_ms),
-        ai_detector.analyze_request(request)
-    ).await {
-        Ok(Ok(ai_result)) => {
-            if ai_result.should_block {
-                info!("Request blocked by AI threat detection (score: {:.3})",
-                      ai_result.analysis.threat_score);
-                triggered_rules.push("AI-Threat-Detection".to_string());
+impl ComplianceReporter {
+    pub fn new(config: RegulatoryConfig) -> Self {
+        Self { config }
+    }
 
-                let decision = Decision::Block {
-                    status: 403,
-                    reason: format!("AI detected threat (score: {:.3})",
-                                  ai_result.analysis.threat_score),
-                };
+    pub fn generate_gdpr_report(&self, events: &[SecurityEvent]) -> Result<String, ComplianceError> {
+        if !self.config.gdpr {
+            return Err(ComplianceError::NotEnabled("GDPR".to_string()));
+        }
 
-                self.event_logger
-                    .log_event(request, &decision, triggered_rules)
-                    .await;
-                return decision;
-            }
+        // Generate GDPR Article 33 breach notification format
+        let breaches = events.iter()
+            .filter(|e| e.severity >= Severity::High)
+            .collect::<Vec<_>>();
+
+        if breaches.is_empty() {
+            return Ok("No reportable breaches".to_string());
         }
-        Ok(Err(e)) => {
-            warn!("AI analysis error: {}", e);
-            // Continue with traditional rules on AI error
-        }
-        Err(_) => {
-            warn!("AI analysis timeout");
-            // Continue with traditional rules on timeout
-        }
+
+        // Format as GDPR Article 33 notification
+        let report = format!(
+            "GDPR Article 33 Breach Notification\n\
+             Number of individuals affected: {}\n\
+             Categories of data: Personal Data\n\
+             Likely consequences: {}\n\
+             Measures taken: Automated blocking and logging",
+            breaches.len(),
+            "Unauthorized access attempts blocked"
+        );
+
+        Ok(report)
     }
 }
 ```
 
-### Performance Considerations
+### Data Retention Management
 
-- **Timeout Protection**: AI analysis has configurable timeout to prevent blocking
-- **Conditional Execution**: AI only runs when enabled and after traditional rules pass
-- **Resource Limits**: Memory and CPU limits for AI processing
-- **Fallback Behavior**: Traditional rules always execute regardless of AI status
+```rust
+pub struct DataRetentionManager {
+    config: RetentionConfig,
+}
+
+impl DataRetentionManager {
+    pub fn new(config: RetentionConfig) -> Self {
+        Self { config }
+    }
+
+    pub async fn cleanup_expired_data(&self, db: &sled::Db) -> Result<(), ComplianceError> {
+        if !self.config.auto_delete {
+            return Ok(());
+        }
+
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(self.config.security_events_days as i64);
+
+        // Delete expired security events
+        // Implementation depends on database schema
+
+        Ok(())
+    }
+}
+```
 
 ## Exit Criteria
 
@@ -235,9 +288,9 @@ if let Some(ai_detector) = &self.ai_detector {
 
 ## Current Status
 
-**Active Phase**: Phase 4 - Testing
-**Last Action**: Completed Phase 3 implementation - AI threat detection fully integrated
-**Next Step**: Run unit tests for AI threat detection
+**Active Phase**: Phase 2 - Design & Planning
+**Last Action**: Completed Phase 1 research - compliance requirements analyzed
+**Next Step**: Define ComplianceConfig structure and audit logging design
 
 ## Progress Log
 

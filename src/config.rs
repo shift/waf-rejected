@@ -270,6 +270,84 @@ impl Default for AiConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComplianceConfig {
+    /// Enable compliance features
+    pub enabled: bool,
+
+    /// Audit trail configuration
+    pub audit: AuditConfig,
+
+    /// Regulatory compliance settings
+    pub regulatory: RegulatoryConfig,
+
+    /// Data retention policies
+    pub retention: RetentionConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditConfig {
+    /// Enable tamper-evident audit logging
+    pub tamper_evident: bool,
+
+    /// Audit log retention period in days
+    pub retention_days: u32,
+
+    /// Integrity check interval in hours
+    pub integrity_check_hours: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegulatoryConfig {
+    /// Enable GDPR compliance features
+    pub gdpr: bool,
+
+    /// Enable HIPAA compliance features
+    pub hipaa: bool,
+
+    /// Enable PCI-DSS compliance features
+    pub pci_dss: bool,
+
+    /// Data residency requirements
+    pub data_residency: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetentionConfig {
+    /// Security event retention in days
+    pub security_events_days: u32,
+
+    /// Audit log retention in days
+    pub audit_logs_days: u32,
+
+    /// Automatic deletion of expired data
+    pub auto_delete: bool,
+}
+
+impl Default for ComplianceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            audit: AuditConfig {
+                tamper_evident: true,
+                retention_days: 2555, // 7 years
+                integrity_check_hours: 24,
+            },
+            regulatory: RegulatoryConfig {
+                gdpr: false,
+                hipaa: false,
+                pci_dss: false,
+                data_residency: None,
+            },
+            retention: RetentionConfig {
+                security_events_days: 90,
+                audit_logs_days: 2555, // 7 years
+                auto_delete: true,
+            },
+        }
+    }
+}
+
 pub struct SecurityConfig {
     /// Security events configuration
     pub events: SecurityEventsConfig,
@@ -285,6 +363,9 @@ pub struct SecurityConfig {
 
     /// AI threat detection configuration
     pub ai: AiConfig,
+
+    /// Enterprise compliance configuration
+    pub compliance: ComplianceConfig,
 }
 
 impl Default for Config {
@@ -431,6 +512,7 @@ impl Default for SecurityConfig {
             geo_blocking: GeoBlockingConfig::default(),
             auth: crate::waf::auth::AuthConfig::default(),
             ai: AiConfig::default(),
+            compliance: ComplianceConfig::default(),
         }
     }
 }
