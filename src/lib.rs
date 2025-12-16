@@ -15,6 +15,9 @@ pub mod waf;
 #[cfg(test)]
 pub mod performance_validation;
 
+// Compliance and security modules
+pub mod compliance;
+
 // Legacy AI modules (kept for compatibility)
 pub mod advanced_ai_waf_integration;
 pub mod advanced_ml_models;
