@@ -11,7 +11,6 @@ pub mod error;
 pub mod health;
 pub mod proxy;
 pub mod waf;
-
 // Performance validation module for optimizations
 #[cfg(test)]
 pub mod performance_validation;

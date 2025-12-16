@@ -82,6 +82,7 @@ target/doc/
 # Phase 4 Demo Files (generated)
 phase4_demo
 phase4_demo.rs
+distri-kv/
 
 .tmp
 target

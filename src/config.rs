@@ -25,7 +25,6 @@ pub struct Config {
 
     /// Storage configuration
     pub storage: StorageConfig,
-
     // Security module configurations
     pub security: SecurityConfig,
 }
@@ -262,6 +261,126 @@ pub struct WasmConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiConfig {
+    /// Enable AI threat detection
+    pub enabled: bool,
+
+    /// Threat score threshold (0.0-1.0)
+    pub threat_threshold: f64,
+
+    /// Processing timeout in milliseconds
+    pub timeout_ms: u64,
+
+    /// Model configuration
+    pub model: AiModelConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiModelConfig {
+    /// Path to ML model file
+    pub model_path: Option<String>,
+
+    /// Enable anomaly detection
+    pub anomaly_detection: bool,
+
+    /// Enable advanced classification
+    pub advanced_classification: bool,
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            threat_threshold: 0.8,
+            timeout_ms: 5000,
+            model: AiModelConfig {
+                model_path: None,
+                anomaly_detection: true,
+                advanced_classification: false,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComplianceConfig {
+    /// Enable compliance features
+    pub enabled: bool,
+
+    /// Audit trail configuration
+    pub audit: AuditConfig,
+
+    /// Regulatory compliance settings
+    pub regulatory: RegulatoryConfig,
+
+    /// Data retention policies
+    pub retention: RetentionConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditConfig {
+    /// Enable tamper-evident audit logging
+    pub tamper_evident: bool,
+
+    /// Audit log retention period in days
+    pub retention_days: u32,
+
+    /// Integrity check interval in hours
+    pub integrity_check_hours: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegulatoryConfig {
+    /// Enable GDPR compliance features
+    pub gdpr: bool,
+
+    /// Enable HIPAA compliance features
+    pub hipaa: bool,
+
+    /// Enable PCI-DSS compliance features
+    pub pci_dss: bool,
+
+    /// Data residency requirements
+    pub data_residency: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetentionConfig {
+    /// Security event retention in days
+    pub security_events_days: u32,
+
+    /// Audit log retention in days
+    pub audit_logs_days: u32,
+
+    /// Automatic deletion of expired data
+    pub auto_delete: bool,
+}
+
+impl Default for ComplianceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            audit: AuditConfig {
+                tamper_evident: true,
+                retention_days: 2555, // 7 years
+                integrity_check_hours: 24,
+            },
+            regulatory: RegulatoryConfig {
+                gdpr: false,
+                hipaa: false,
+                pci_dss: false,
+                data_residency: None,
+            },
+            retention: RetentionConfig {
+                security_events_days: 90,
+                audit_logs_days: 2555, // 7 years
+                auto_delete: true,
+            },
+        }
+    }
+}
+
 pub struct SecurityConfig {
     /// Security events configuration
     pub events: SecurityEventsConfig,
@@ -269,36 +388,17 @@ pub struct SecurityConfig {
     /// Content inspection configuration
     pub content_inspection: ContentInspectionConfig,
 
-    /// Geographic blocking configuration  
+    /// Geographic blocking configuration
     pub geo_blocking: GeoBlockingConfig,
 
     /// Authentication configuration
     pub auth: crate::waf::auth::AuthConfig,
+    /// AI threat detection configuration
+    pub ai: AiConfig,
+
+    /// Enterprise compliance configuration
+    pub compliance: ComplianceConfig,
 }
-
-/// Storage configuration for WAF data persistence
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StorageConfig {
-    /// Storage backend type ("sled", "redb", "memory")
-    pub backend: String,
-
-    /// Database path
-    pub path: String,
-
-    /// Enable follower reads for better performance
-    pub enable_follower_reads: bool,
-
-    /// TTL cleanup interval in seconds
-    pub ttl_cleanup_interval_secs: u64,
-
-    /// Enable compression for stored values
-    pub enable_compression: bool,
-
-    /// Cache size for redb backend (in bytes)
-    pub cache_size: Option<usize>,
-
-    /// Max size for in-memory backend (number of entries)
-    pub max_memory_entries: Option<usize>,
 }
 
 impl Default for Config {
@@ -461,6 +561,8 @@ impl Default for SecurityConfig {
             content_inspection: ContentInspectionConfig::default(),
             geo_blocking: GeoBlockingConfig::default(),
             auth: crate::waf::auth::AuthConfig::default(),
+            ai: AiConfig::default(),
+            compliance: ComplianceConfig::default(),
         }
     }
 }

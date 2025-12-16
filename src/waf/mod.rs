@@ -1,3 +1,6 @@
+<<<<<<< HEAD
+pub mod ai;
+pub mod auth;
 pub mod content_inspection;
 pub mod exporters;
 pub mod geoip;
@@ -114,6 +117,8 @@ pub struct WafEngine {
     geoip_service: Arc<GeoIpService>,
     #[cfg(feature = "wasm-waf")]
     wasm_engine: Option<Arc<WasmEngine>>,
+    #[cfg(feature = "ai-threat-detection")]
+    ai_detector: Option<Arc<ai::AiThreatDetector>>,
 }
 
 impl Default for WafEngine {
@@ -130,6 +135,8 @@ impl Clone for WafEngine {
             geoip_service: Arc::clone(&self.geoip_service),
             #[cfg(feature = "wasm-waf")]
             wasm_engine: self.wasm_engine.clone(),
+            #[cfg(feature = "ai-threat-detection")]
+            ai_detector: self.ai_detector.clone(),
         }
     }
 }
@@ -152,6 +159,8 @@ impl WafEngine {
             geoip_service: Arc::new(GeoIpService::new()),
             #[cfg(feature = "wasm-waf")]
             wasm_engine: Self::initialize_wasm_engine(config),
+            #[cfg(feature = "ai-threat-detection")]
+            ai_detector: Self::initialize_ai_detector(config),
         };
 
         // Add default rules based on configuration
@@ -187,6 +196,27 @@ impl WafEngine {
             }
             Err(e) => {
                 warn!("❌ Failed to initialize WASM engine: {}", e);
+                None
+            }
+        }
+    }
+
+    #[cfg(feature = "ai-threat-detection")]
+    fn initialize_ai_detector(config: &Config) -> Option<Arc<ai::AiThreatDetector>> {
+        if !config.security.ai.enabled {
+            info!("AI threat detection disabled in configuration");
+            return None;
+        }
+
+        info!("Initializing AI threat detection engine");
+
+        match ai::AiThreatDetector::new(config.security.ai.clone()) {
+            Ok(detector) => {
+                info!("✅ AI threat detection engine initialized successfully");
+                Some(Arc::new(detector))
+            }
+            Err(e) => {
+                warn!("❌ Failed to initialize AI threat detection: {}", e);
                 None
             }
         }
@@ -346,7 +376,41 @@ impl WafEngine {
             }
         }
 
-        // PHASE 2: Traditional rule evaluation
+        // PHASE 2: AI Threat Detection (if enabled)
+        #[cfg(feature = "ai-threat-detection")]
+        if let Some(ai_detector) = &self.ai_detector {
+            debug!("Evaluating request through AI threat detection");
+
+            match ai_detector.analyze_request(request).await {
+                Ok(ai_result) => {
+                    if ai_result.should_block {
+                        info!("Request blocked by AI threat detection (score: {:.3})",
+                              ai_result.analysis.threat_score);
+                        triggered_rules.push("AI-Threat-Detection".to_string());
+
+                        let decision = Decision::Block {
+                            status: 403,
+                            reason: format!("AI detected threat (score: {:.3})",
+                                          ai_result.analysis.threat_score),
+                        };
+
+                        self.event_logger
+                            .log_event(request, &decision, triggered_rules)
+                            .await;
+                        return decision;
+                    } else {
+                        debug!("AI analysis passed (score: {:.3})",
+                               ai_result.analysis.threat_score);
+                    }
+                }
+                Err(e) => {
+                    warn!("AI analysis error: {}", e);
+                    // Continue with traditional rules on AI error (fail-open for AI)
+                }
+            }
+        }
+
+        // PHASE 3: Traditional rule evaluation
         {
             let rules = self.rules.read().unwrap();
             rules_count = rules.len();
