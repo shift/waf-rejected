@@ -1,17 +1,12 @@
-use std::task::{Context, Poll};
-use std::net::SocketAddr;
-use std::str::FromStr;
-use hyper::{Request, Response, StatusCode};
-use hyper::body::Incoming;
-use http_body_util::{Full, BodyExt, combinators::BoxBody};
-use bytes::Bytes;
-use tower::{Layer, Service, ServiceBuilder};
-use tower::util::ServiceExt;
+use crate::error::WafError;
+use crate::waf::{Decision, RequestContext, WafEngine};
 use futures::future::BoxFuture;
-use http::{Method, Uri, HeaderMap};
-use std::net::IpAddr;
-use crate::waf::{WafEngine, RequestContext, Decision};
-use crate::error::{WafError, Result};
+use http_body_util::BodyExt;
+use hyper::Request;
+use std::net::SocketAddr;
+use std::task::{Context, Poll};
+use tower::util::ServiceExt;
+use tower::{Layer, Service};
 
 /// WAF middleware layer for Tower
 #[derive(Clone)]
@@ -55,15 +50,13 @@ where
     type Future = BoxFuture<'static, std::result::Result<Self::Response, Self::Error>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
-        self.inner
-            .poll_ready(cx)
-            .map_err(Into::into)
+        self.inner.poll_ready(cx).map_err(Into::into)
     }
 
     fn call(&mut self, req: Request<B>) -> Self::Future {
         let engine = self.engine.clone();
         let mut inner = self.inner.clone();
-        
+
         Box::pin(async move {
             // Extract request context for WAF evaluation
             let context = create_request_context(&req).await;
@@ -92,7 +85,7 @@ async fn create_request_context<B>(req: &Request<B>) -> RequestContext {
     let method = req.method().clone();
     let uri = req.uri().clone();
     let headers = req.headers().clone();
-    
+
     RequestContext::new(client_ip, method, uri, headers, None)
 }
 
@@ -108,7 +101,7 @@ fn extract_client_ip<B>(req: &Request<B>) -> Option<std::net::IpAddr> {
             }
         }
     }
-    
+
     // 2. Check X-Real-IP header
     if let Some(real_ip) = req.headers().get("x-real-ip") {
         if let Ok(header_value) = real_ip.to_str() {
@@ -129,14 +122,14 @@ fn extract_client_ip<B>(req: &Request<B>) -> Option<std::net::IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::waf::{rules::IpRule, WafEngine};
     use std::str::FromStr;
-    use crate::waf::{WafEngine, rules::IpRule};
 
     #[tokio::test]
     async fn test_waf_middleware_basic() {
         // Simple test to verify WAF engine basic functionality
         let engine = WafEngine::new();
-        
+
         let ctx = RequestContext::new(
             std::net::IpAddr::from_str("192.168.1.100").unwrap(),
             http::Method::GET,
@@ -144,7 +137,7 @@ mod tests {
             http::HeaderMap::new(),
             None,
         );
-        
+
         let result = engine.evaluate(&ctx).await;
         assert!(matches!(result, Decision::Allow));
     }
@@ -153,12 +146,13 @@ mod tests {
     async fn test_waf_engine_basic_functionality() {
         // Test the core WAF engine functionality
         let mut engine = WafEngine::new();
-        
+
         // Add a simple IP blocking rule
         let ip_rule = IpRule::new("test_block_rule")
-            .block_ip_str("192.168.1.100").unwrap();
+            .block_ip_str("192.168.1.100")
+            .unwrap();
         engine.add_rule(ip_rule);
-        
+
         // Create a test context
         let ctx = RequestContext::new(
             std::net::IpAddr::from_str("192.168.1.100").unwrap(),
@@ -167,18 +161,18 @@ mod tests {
             http::HeaderMap::new(),
             None,
         );
-        
+
         // Test that the engine correctly processes the request
         let result = engine.evaluate(&ctx).await;
         // Just test that it returns a result - the exact decision depends on rule implementation
         assert!(matches!(result, Decision::Block { .. }) || matches!(result, Decision::Allow));
     }
 
-    #[tokio::test] 
+    #[tokio::test]
     async fn test_waf_engine_allow() {
         // Test that non-blocked requests are allowed
         let engine = WafEngine::new();
-        
+
         let ctx = RequestContext::new(
             std::net::IpAddr::from_str("192.168.1.200").unwrap(),
             http::Method::GET,
@@ -186,7 +180,7 @@ mod tests {
             http::HeaderMap::new(),
             None,
         );
-        
+
         let result = engine.evaluate(&ctx).await;
         assert!(matches!(result, Decision::Allow));
     }
@@ -197,7 +191,7 @@ mod tests {
         let ip_str = "192.168.1.100";
         let parsed: std::result::Result<IpAddr, _> = ip_str.parse();
         assert!(parsed.is_ok());
-        
+
         let ip = parsed.unwrap();
         assert_eq!(ip.to_string(), "192.168.1.100");
     }

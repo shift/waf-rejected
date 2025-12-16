@@ -1,12 +1,11 @@
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 pub mod engine;
 pub mod transaction;
 
 pub use engine::ModSecurityEngine;
-pub use transaction::{Transaction, Intervention};
+pub use transaction::{Intervention, Transaction};
 
 // Type alias for ModSecurity results
 pub type Result<T> = std::result::Result<T, ModSecurityError>;
@@ -68,29 +67,31 @@ impl RuleSet {
             enabled: true,
         }
     }
-    
+
     pub fn load_from_file(&mut self, path: &str) -> Result<usize> {
         // Basic file loading implementation
         self.rules.push(format!("Rule from file: {}", path));
         Ok(1) // Return count of rules loaded
     }
-    
+
     pub fn load_from_directory(path: &str) -> Result<Self> {
         let mut rule_set = Self::new();
-        rule_set.rules.push(format!("Rules from directory: {}", path));
+        rule_set
+            .rules
+            .push(format!("Rules from directory: {}", path));
         Ok(rule_set)
     }
-    
+
     pub fn get_engine(&self) -> Arc<Self> {
         // Return a reference to self wrapped in Arc
         // In a real implementation, this would return the actual ModSecurity engine
         Arc::new(self.clone())
     }
-    
+
     pub fn rule_count(&self) -> usize {
         self.rules.len()
     }
-    
+
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
     }

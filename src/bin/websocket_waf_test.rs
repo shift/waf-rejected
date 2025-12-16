@@ -1,31 +1,55 @@
 use anyhow::Result;
+use futures_util::{SinkExt, StreamExt};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
-use futures_util::{StreamExt, SinkExt};
 use tracing::{debug, error, info, warn};
 
 /// WebSocket attack patterns to test WAF detection
 const WEBSOCKET_ATTACK_PATTERNS: &[(&str, &str, bool)] = &[
     // (name, payload, should_be_blocked)
     ("sql_injection_basic", "' OR 1=1 --", true),
-    ("sql_injection_union", "UNION SELECT password FROM users", true),
+    (
+        "sql_injection_union",
+        "UNION SELECT password FROM users",
+        true,
+    ),
     ("xss_script", "<script>alert('xss')</script>", true),
-    ("xss_event_handler", "<img src=x onerror=alert('xss')>", true),
+    (
+        "xss_event_handler",
+        "<img src=x onerror=alert('xss')>",
+        true,
+    ),
     ("lfi_basic", "../../../etc/passwd", true),
     ("lfi_null_byte", "../../../etc/passwd%00", true),
     ("rce_command", "cat /etc/passwd", true),
     ("rce_system", "system('cat /etc/passwd')", true),
-    ("xxe_attack", "<!DOCTYPE foo [<!ELEMENT foo ANY ><!ENTITY xxe SYSTEM \"file:///etc/passwd\" >]>", true),
+    (
+        "xxe_attack",
+        "<!DOCTYPE foo [<!ELEMENT foo ANY ><!ENTITY xxe SYSTEM \"file:///etc/passwd\" >]>",
+        true,
+    ),
     ("ldap_injection", ")(|(objectClass=*))", true),
     ("command_injection", "; cat /etc/passwd", true),
     ("path_traversal", "....//....//....//etc/passwd", true),
-    ("malicious_json", "{\"eval\": \"require('child_process').exec('rm -rf /')\"}", true),
+    (
+        "malicious_json",
+        "{\"eval\": \"require('child_process').exec('rm -rf /')\"}",
+        true,
+    ),
     ("binary_exploit", "NOP_NOP_NOP_NOP_XOR_EAX_PUSH_EAX", true),
-    ("legitimate_message", "Hello, this is a normal WebSocket message", false),
-    ("json_data", "{\"user\": \"alice\", \"message\": \"hello world\"}", false),
+    (
+        "legitimate_message",
+        "Hello, this is a normal WebSocket message",
+        false,
+    ),
+    (
+        "json_data",
+        "{\"user\": \"alice\", \"message\": \"hello world\"}",
+        false,
+    ),
     ("empty_message", "", false),
     ("ping_pong", "ping", false),
     ("chat_message", "User: How are you today?", false),
@@ -75,7 +99,9 @@ async fn handle_websocket_connection(stream: TcpStream) -> Result<()> {
             Message::Text(text) => {
                 debug!("Received text: {}", text);
                 // Echo back the message
-                ws_sender.send(Message::Text(format!("Echo: {}", text))).await?;
+                ws_sender
+                    .send(Message::Text(format!("Echo: {}", text)))
+                    .await?;
             }
             Message::Binary(data) => {
                 debug!("Received binary data: {} bytes", data.len());
@@ -118,11 +144,19 @@ async fn test_websocket_waf() -> Result<WebSocketTestSummary> {
     let mut results = Vec::new();
     let echo_url = format!("ws://127.0.0.1:{}", echo_port);
 
-    info!("Testing {} attack patterns against WebSocket WAF", WEBSOCKET_ATTACK_PATTERNS.len());
+    info!(
+        "Testing {} attack patterns against WebSocket WAF",
+        WEBSOCKET_ATTACK_PATTERNS.len()
+    );
 
     for (i, &(name, payload, expected_blocked)) in WEBSOCKET_ATTACK_PATTERNS.iter().enumerate() {
-        info!("Test {}/{}: {}", i + 1, WEBSOCKET_ATTACK_PATTERNS.len(), name);
-        
+        info!(
+            "Test {}/{}: {}",
+            i + 1,
+            WEBSOCKET_ATTACK_PATTERNS.len(),
+            name
+        );
+
         let result = test_websocket_payload(&echo_url, name, payload, expected_blocked).await;
         results.push(result);
 
@@ -132,7 +166,7 @@ async fn test_websocket_waf() -> Result<WebSocketTestSummary> {
 
     let summary = calculate_summary(results, start_time.elapsed());
     print_detailed_results(&summary);
-    
+
     Ok(summary)
 }
 
@@ -143,7 +177,7 @@ async fn test_websocket_payload(
     expected_blocked: bool,
 ) -> WebSocketTestResult {
     let start = Instant::now();
-    
+
     // For this test, we'll simulate WAF behavior by connecting directly
     // In a real scenario, this would go through the WAF proxy
     match timeout(Duration::from_secs(5), connect_to_websocket(url, payload)).await {
@@ -203,7 +237,10 @@ async fn connect_to_websocket(url: &str, payload: &str) -> Result<bool> {
     }
 }
 
-fn calculate_summary(results: Vec<WebSocketTestResult>, total_duration: Duration) -> WebSocketTestSummary {
+fn calculate_summary(
+    results: Vec<WebSocketTestResult>,
+    total_duration: Duration,
+) -> WebSocketTestSummary {
     let total_tests = results.len();
     let mut passed = 0;
     let mut blocked_correctly = 0;
@@ -214,7 +251,7 @@ fn calculate_summary(results: Vec<WebSocketTestResult>, total_duration: Duration
 
     for result in &results {
         total_response_time += result.response_time;
-        
+
         if result.expected_blocked == result.was_blocked {
             passed += 1;
             if result.was_blocked {
@@ -253,8 +290,16 @@ fn print_detailed_results(summary: &WebSocketTestSummary) {
     println!("\n🎯 WebSocket WAF Test Results");
     println!("=============================");
     println!("Total Tests: {}", summary.total_tests);
-    println!("Passed: {} ({:.1}%)", summary.passed, (summary.passed as f64 / summary.total_tests as f64) * 100.0);
-    println!("Failed: {} ({:.1}%)", summary.failed, (summary.failed as f64 / summary.total_tests as f64) * 100.0);
+    println!(
+        "Passed: {} ({:.1}%)",
+        summary.passed,
+        (summary.passed as f64 / summary.total_tests as f64) * 100.0
+    );
+    println!(
+        "Failed: {} ({:.1}%)",
+        summary.failed,
+        (summary.failed as f64 / summary.total_tests as f64) * 100.0
+    );
     println!();
     println!("🛡️  Security Metrics:");
     println!("  Correctly Blocked: {}", summary.blocked_correctly);
@@ -263,8 +308,14 @@ fn print_detailed_results(summary: &WebSocketTestSummary) {
     println!("  False Negatives: {}", summary.false_negatives);
     println!();
     println!("⚡ Performance:");
-    println!("  Average Response Time: {:.2}ms", summary.avg_response_time.as_secs_f64() * 1000.0);
-    println!("  Total Duration: {:.2}s", summary.total_duration.as_secs_f64());
+    println!(
+        "  Average Response Time: {:.2}ms",
+        summary.avg_response_time.as_secs_f64() * 1000.0
+    );
+    println!(
+        "  Total Duration: {:.2}s",
+        summary.total_duration.as_secs_f64()
+    );
 
     let security_score = if summary.total_tests > 0 {
         (summary.passed as f64 / summary.total_tests as f64) * 100.0
@@ -273,16 +324,16 @@ fn print_detailed_results(summary: &WebSocketTestSummary) {
     };
 
     println!("\n🎖️  Overall Security Score: {:.1}%", security_score);
-    
+
     let grade = match security_score as u8 {
         90..=100 => "A+ (Excellent)",
         80..=89 => "A (Very Good)",
         70..=79 => "B (Good)",
         60..=69 => "C (Acceptable)",
         50..=59 => "D (Poor)",
-        _ => "F (Failing)"
+        _ => "F (Failing)",
     };
-    
+
     println!("🏆 Grade: {}", grade);
 }
 

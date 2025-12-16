@@ -1,14 +1,19 @@
+<<<<<<< HEAD
 pub mod ai;
 pub mod auth;
 pub mod content_inspection;
 pub mod exporters;
 pub mod geoip;
+pub mod io;
 pub mod middleware;
 #[path = "proxy_fixed.rs"]
 pub mod proxy;
 pub mod rate_limit;
 pub mod rules;
 pub mod security_events;
+pub mod simd_ops;
+pub mod storage;
+pub mod tls_config;
 
 use bytes::Bytes;
 use hyper::{HeaderMap, Method, Uri};
@@ -175,11 +180,13 @@ impl WafEngine {
 
         let wasm_config = crate::wasm::WasmEngineConfig {
             module_path: config.waf.wasm.module_path.clone(),
-            memory_limit: config.waf.wasm.memory_limit,
+            memory_limit_mb: config.waf.wasm.memory_limit,
             timeout_ms: config.waf.wasm.timeout_ms,
             debug: config.waf.wasm.debug,
             instance_pool_size: config.waf.wasm.instance_pool_size,
             hot_reload: config.waf.wasm.hot_reload,
+            enable_memory_mapping: true,
+            enable_shared_memory: true,
         };
 
         match WasmEngine::new(wasm_config) {
@@ -252,7 +259,7 @@ impl WafEngine {
 
         // PHASE 1: WASM ModSecurity evaluation (if enabled) - Skip for fast path
         #[cfg(feature = "wasm-waf")]
-        if let Some(wasm_engine) = &self.wasm_engine {
+        if let Some(_wasm_engine) = &self.wasm_engine {
             debug!("Skipping WASM evaluation for fast path (performance optimization)");
         }
 
@@ -358,6 +365,9 @@ impl WafEngine {
                             debug!("Request allowed by WASM ModSecurity engine, continuing with traditional rules");
                         }
                     }
+
+                    // Re-export performance optimization modules
+                    pub use simd_ops::{fast_pattern_search, contains_sql_injection_patterns, contains_xss_patterns};
                 }
                 Err(e) => {
                     warn!("WASM ModSecurity engine error: {}", e);

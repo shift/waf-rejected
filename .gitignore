@@ -77,8 +77,12 @@ result-*
 # Documentation Build
 book/
 target/doc/
+.docs-cache/
 
 # Phase 4 Demo Files (generated)
 phase4_demo
 phase4_demo.rs
 distri-kv/
+
+.tmp
+target

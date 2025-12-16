@@ -1,5 +1,5 @@
 //! Security Event Export System
-//! 
+//!
 //! This module provides comprehensive export capabilities for security events,
 //! supporting multiple output formats and destinations.
 
@@ -34,7 +34,7 @@ pub type ExportResult = Result<(), Box<dyn Error + Send + Sync>>;
 pub trait SecurityEventExporter: Send + Sync {
     /// Export a single security event
     async fn export_event(&self, event: &SecurityEvent) -> ExportResult;
-    
+
     /// Export multiple security events in batch
     async fn export_batch(&self, events: &[SecurityEvent]) -> ExportResult {
         for event in events {
@@ -42,15 +42,15 @@ pub trait SecurityEventExporter: Send + Sync {
         }
         Ok(())
     }
-    
+
     /// Flush any pending exports
     async fn flush(&self) -> ExportResult {
         Ok(())
     }
-    
+
     /// Get exporter name for logging
     fn name(&self) -> &'static str;
-    
+
     /// Check if exporter is healthy/available
     async fn health_check(&self) -> bool {
         true

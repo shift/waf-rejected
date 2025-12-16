@@ -11,6 +11,9 @@ pub mod error;
 pub mod health;
 pub mod proxy;
 pub mod waf;
+// Performance validation module for optimizations
+#[cfg(test)]
+pub mod performance_validation;
 
 // Legacy AI modules (kept for compatibility)
 pub mod advanced_ai_waf_integration;
@@ -30,7 +33,7 @@ pub mod wasm;
 pub use config::Config;
 pub use error::WafError;
 pub use health::HealthService;
-pub use proxy::WafProxyService;
+pub use proxy::{BufferPool, WafProxyService};
 pub use waf::{Decision, RequestContext, WafEngine};
 
 // Legacy re-exports for compatibility

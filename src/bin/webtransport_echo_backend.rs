@@ -9,7 +9,9 @@ use web_transport_quinn as wtq;
 // Simple Rust WebTransport echo backend: echoes bidi/unidi streams and datagrams
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .init();
 
     let bind: SocketAddr = std::env::var("WT_BACKEND_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:4444".to_string())
@@ -23,7 +25,10 @@ async fn main() -> Result<()> {
         .with_congestion_control(wtq::CongestionControl::Throughput)
         .with_certificate(certs, key)?;
 
-    info!("WebTransport echo backend listening on {} (HTTP/3/QUIC)", bind);
+    info!(
+        "WebTransport echo backend listening on {} (HTTP/3/QUIC)",
+        bind
+    );
 
     let mut tasks = JoinSet::new();
     loop {
@@ -43,9 +48,14 @@ async fn main() -> Result<()> {
                                         let mut buf = vec![0u8; 16 * 1024];
                                         loop {
                                             match recv.read(&mut buf).await {
-                                                Ok(None) | Err(_) => { let _ = send.finish(); break; }
+                                                Ok(None) | Err(_) => {
+                                                    let _ = send.finish();
+                                                    break;
+                                                }
                                                 Ok(Some(n)) => {
-                                                    if send.write_all(&buf[..n]).await.is_err() { break; }
+                                                    if send.write_all(&buf[..n]).await.is_err() {
+                                                        break;
+                                                    }
                                                 }
                                             }
                                         }
@@ -77,7 +87,9 @@ async fn main() -> Result<()> {
                             tokio::spawn(async move {
                                 loop {
                                     match s3.read_datagram().await {
-                                        Ok(d) => { let _ = s3.send_datagram(d); }
+                                        Ok(d) => {
+                                            let _ = s3.send_datagram(d);
+                                        }
                                         Err(_) => break,
                                     }
                                 }
@@ -97,7 +109,9 @@ fn self_signed_cert() -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'st
 
     let mut params = CertificateParams::default();
     params.alg = &rcgen::PKCS_ECDSA_P256_SHA256;
-    params.distinguished_name.push(rcgen::DnType::CommonName, "waf-rejected WT backend");
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "waf-rejected WT backend");
     params.subject_alt_names = vec![
         SanType::DnsName("localhost".to_string()),
         SanType::IpAddress("127.0.0.1".parse().unwrap()),

@@ -344,6 +344,51 @@ If blocked after independent debugging attempts:
 4. **Document blocker**: In the PR body, state the blocker, provide the full error log, and detail the debugging steps you have already taken.  
 5. **Never simplify requirements** - if security requirements seem complex, that's intentional.
 
+## **Distri-KV Collaboration Context**
+
+### **Active Collaboration**
+
+We are currently collaborating with the **distri-kv** project (distributed key-value store with Raft consensus) on advanced distributed security capabilities. This collaboration involves sharing technical expertise and potentially adapting our WAF security innovations for distributed systems.
+
+### **Key Collaboration Areas**
+
+1. **🎯 Distributed Security Event Correlation Engine** (CRITICAL PRIORITY)
+   - **Vision**: Distributed security event correlation system leveraging distri-kv's Multi-Raft architecture
+   - **Goal**: Real-time, cluster-wide threat detection and response
+   - **Integration**: WAF nodes sharing threat intelligence through distributed consensus
+   - **Performance Target**: Sub-millisecond security event processing
+
+2. **Storage Architecture Exchange**
+   - **Our Contribution**: Storage adapter system, TTL management, performance optimizations
+   - **Their Contribution**: Distributed consensus patterns, Multi-Raft architecture
+   - **Mutual Benefit**: Enhanced storage backends and distributed coordination
+
+3. **I/O Performance Optimization**
+   - **Our Expertise**: io_uring integration, zero-copy networking, sub-millisecond latency
+   - **Their Need**: High-performance distributed node communication
+   - **Collaboration Opportunity**: Distributed security fabric with coordinated defense
+
+### **Collaboration Documents**
+
+- **`Requests_For_WAF-Rejected.md`**: Detailed requests from distri-kv team for specific code components
+- **`WAF_CODE_REQUEST.md`**: Formal code sharing request and collaboration proposal
+- **Distri-KV Repository**: Available upon request for technical review
+
+### **Technical Alignment**
+
+The collaboration creates synergy between:
+- **WAF-Rejected**: Single-node security expertise, performance optimization, threat detection
+- **Distri-KV**: Distributed consensus, Multi-Raft architecture, cluster coordination
+- **Combined Result**: Next-generation distributed security platform
+
+### **Agent Responsibilities**
+
+When working on collaboration-related tasks:
+- **Review collaboration documents** in repository root for context
+- **Consider distributed implications** of security features
+- **Document integration opportunities** in relevant sections
+- **Maintain security-first approach** while enabling distributed capabilities
+
 ## Development Environment
 
 - All building and testing is to be done via the `nix` command. Remember this environment is sandboxed from the network.

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::time::Duration;
 use tracing::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +23,8 @@ pub struct Config {
     /// WAF configuration
     pub waf: WafConfig,
 
+    /// Storage configuration
+    pub storage: StorageConfig,
     // Security module configurations
     pub security: SecurityConfig,
 }
@@ -63,6 +66,36 @@ pub struct ServerConfig {
 
     /// Maximum request body size in bytes
     pub max_body_size: usize,
+
+    /// TLS configuration
+    pub tls: TlsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsConfig {
+    /// Enable TLS/SSL
+    pub enabled: bool,
+
+    /// Path to TLS certificate file (PEM format)
+    pub cert_path: String,
+
+    /// Path to TLS private key file (PEM format)
+    pub key_path: String,
+
+    /// Minimum TLS version (1.2 or 1.3)
+    pub min_version: String,
+
+    /// Maximum TLS version (1.2 or 1.3)
+    pub max_version: String,
+
+    /// ALPN protocols (e.g., ["h2", "http/1.1"])
+    pub alpn_protocols: Vec<String>,
+
+    /// Require client certificate authentication
+    pub require_client_cert: bool,
+
+    /// Path to client CA certificate file (PEM format)
+    pub client_ca_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -360,12 +393,12 @@ pub struct SecurityConfig {
 
     /// Authentication configuration
     pub auth: crate::waf::auth::AuthConfig,
-
     /// AI threat detection configuration
     pub ai: AiConfig,
 
     /// Enterprise compliance configuration
     pub compliance: ComplianceConfig,
+}
 }
 
 impl Default for Config {
@@ -377,6 +410,7 @@ impl Default for Config {
             server: ServerConfig::default(),
             logging: LoggingConfig::default(),
             waf: WafConfig::default(),
+            storage: StorageConfig::default(),
             security: SecurityConfig::default(),
         }
     }
@@ -408,6 +442,22 @@ impl Default for ServerConfig {
                 "3".to_string(),
             ],
             max_body_size: 10 * 1024 * 1024, // 10MB
+            tls: TlsConfig::default(),
+        }
+    }
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cert_path: "/etc/waf/certs/server.crt".to_string(),
+            key_path: "/etc/waf/certs/server.key".to_string(),
+            min_version: "1.2".to_string(),
+            max_version: "1.3".to_string(),
+            alpn_protocols: vec!["h2".to_string(), "http/1.1".to_string()],
+            require_client_cert: false,
+            client_ca_path: None,
         }
     }
 }
@@ -529,6 +579,47 @@ impl Default for WasmConfig {
             instance_pool_size: 10,
             hot_reload: true,
             rules_config: "rules/coraza.conf".to_string(),
+        }
+    }
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            backend: "redb".to_string(),
+            path: "./data/waf.redb".to_string(),
+            enable_follower_reads: true,
+            ttl_cleanup_interval_secs: 60,
+            enable_compression: false,
+            cache_size: Some(16 * 1024 * 1024), // 16MB default cache
+            max_memory_entries: None,
+        }
+    }
+}
+
+impl StorageConfig {
+    /// Convert to waf storage configuration
+    pub fn to_waf_storage_config(&self) -> crate::waf::storage::StorageConfig {
+        let backend = match self.backend.as_str() {
+            "sled" => crate::waf::storage::StorageBackend::Sled {
+                path: self.path.clone(),
+                temporary: false,
+            },
+            "redb" => crate::waf::storage::StorageBackend::Redb {
+                path: self.path.clone(),
+                cache_size: self.cache_size,
+            },
+            "memory" => crate::waf::storage::StorageBackend::Memory {
+                max_size: self.max_memory_entries,
+            },
+            _ => crate::waf::storage::StorageBackend::default(),
+        };
+
+        crate::waf::storage::StorageConfig {
+            backend,
+            enable_follower_reads: self.enable_follower_reads,
+            ttl_cleanup_interval: Duration::from_secs(self.ttl_cleanup_interval_secs),
+            enable_compression: self.enable_compression,
         }
     }
 }

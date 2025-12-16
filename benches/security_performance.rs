@@ -1,8 +1,8 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
-use std::sync::Arc;
-use tokio::runtime::Runtime;
-use std::time::Duration;
 use chrono::Utc;
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::runtime::Runtime;
 
 /// Mock security event for benchmarking
 #[derive(Debug, Clone)]
@@ -28,12 +28,13 @@ impl SecurityEventLogger {
             events_processed: std::sync::atomic::AtomicU64::new(0),
         }
     }
-    
+
     pub async fn log_event(&self, event: SecurityEvent) -> Result<(), String> {
         // Fast in-memory logging without unnecessary yields
         // In a real implementation, this would write to a circular buffer or channel
-        
-        self.events_processed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        self.events_processed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 }
@@ -47,16 +48,17 @@ impl ContentInspectionRule {
     pub fn new() -> Self {
         // Pre-compile common attack patterns
         let patterns = vec![
-            regex::Regex::new(r"(?i)(?:union|select|insert|update|delete|drop|create|alter)\s").unwrap(),
+            regex::Regex::new(r"(?i)(?:union|select|insert|update|delete|drop|create|alter)\s")
+                .unwrap(),
             regex::Regex::new(r"(?i)<script[^>]*>.*?</script>").unwrap(),
             regex::Regex::new(r"(?i)javascript:").unwrap(),
             regex::Regex::new(r"(?i)(?:\.\./|\.\.\\){2,}").unwrap(),
             regex::Regex::new(r"(?i)(?:eval|system|exec|shell_exec)\s*\(").unwrap(),
         ];
-        
+
         Self { patterns }
     }
-    
+
     pub async fn inspect(&self, content: &str) -> bool {
         // Fast synchronous regex matching - no need for async here
         for pattern in &self.patterns {
@@ -79,19 +81,19 @@ impl GeoBlockingRule {
         blocked_countries.insert("CN".to_string());
         blocked_countries.insert("RU".to_string());
         blocked_countries.insert("IR".to_string());
-        
+
         Self { blocked_countries }
     }
-    
+
     pub async fn check_ip(&self, ip: &str) -> bool {
         // Fast hash-based lookup - no need for async yield here
         let country_code = match ip {
             ip if ip.starts_with("114.") => "CN", // Chinese IP range
-            ip if ip.starts_with("77.") => "RU",  // Russian IP range  
+            ip if ip.starts_with("77.") => "RU",  // Russian IP range
             ip if ip.starts_with("5.") => "IR",   // Iranian IP range
-            _ => "US", // Default to US
+            _ => "US",                            // Default to US
         };
-        
+
         self.blocked_countries.contains(country_code)
     }
 }
@@ -100,10 +102,10 @@ impl GeoBlockingRule {
 fn bench_security_event_logging(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let logger = Arc::new(SecurityEventLogger::new());
-    
+
     let mut group = c.benchmark_group("security_event_logging");
     group.measurement_time(Duration::from_secs(10));
-    
+
     // Test event generation latency
     group.bench_function("event_generation", |b| {
         b.iter(|| {
@@ -120,7 +122,7 @@ fn bench_security_event_logging(c: &mut Criterion) {
             black_box(event);
         })
     });
-    
+
     // Test event logging throughput
     group.bench_function("event_logging", |b| {
         b.to_async(&rt).iter(|| async {
@@ -137,7 +139,7 @@ fn bench_security_event_logging(c: &mut Criterion) {
             logger.log_event(black_box(event)).await.unwrap();
         })
     });
-    
+
     // Test high-throughput logging (batch operations)
     for batch_size in [100, 1000].iter() {
         group.bench_with_input(
@@ -162,30 +164,38 @@ fn bench_security_event_logging(c: &mut Criterion) {
             },
         );
     }
-    
+
     group.finish();
 }
 
 /// Performance benchmark for Content Inspection Engine
 fn bench_content_inspection(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    
+
     let mut group = c.benchmark_group("content_inspection");
     group.measurement_time(Duration::from_secs(10));
-    
+
     // Create test payloads of different sizes
     let small_payload = "SELECT * FROM users WHERE id = 1";
-    let medium_payload = format!("SELECT * FROM users WHERE name = '{}' AND active = 1", "x".repeat(1000));
-    let large_payload = format!("SELECT * FROM users WHERE description = '{}' ORDER BY created_at", "x".repeat(100000));
+    let medium_payload = format!(
+        "SELECT * FROM users WHERE name = '{}' AND active = 1",
+        "x".repeat(1000)
+    );
+    let large_payload = format!(
+        "SELECT * FROM users WHERE description = '{}' ORDER BY created_at",
+        "x".repeat(100000)
+    );
     // Create reusable rule instance to avoid regex recompilation
     let rule = Arc::new(ContentInspectionRule::new());
-    
+
     // Test SQL injection detection on different payload sizes
     for (name, payload) in [
         ("small", small_payload.as_ref()),
-        ("medium", medium_payload.as_ref()), 
+        ("medium", medium_payload.as_ref()),
         ("large", large_payload.as_ref()),
-    ].iter() {
+    ]
+    .iter()
+    {
         let rule_clone = rule.clone();
         group.bench_with_input(
             BenchmarkId::new("sql_injection_detection", name),
@@ -198,7 +208,7 @@ fn bench_content_inspection(c: &mut Criterion) {
             },
         );
     }
-    
+
     // Test XSS detection performance
     let xss_payloads = vec![
         "<script>alert('xss')</script>",
@@ -206,7 +216,7 @@ fn bench_content_inspection(c: &mut Criterion) {
         "<img src=x onerror=alert('xss')>",
         "<svg onload=alert('xss')>",
     ];
-    
+
     let rule_clone = rule.clone();
     group.bench_function("xss_detection_multiple", |b| {
         b.to_async(&rt).iter(|| async {
@@ -216,7 +226,7 @@ fn bench_content_inspection(c: &mut Criterion) {
             }
         })
     });
-    
+
     // Test pattern compilation performance
     group.bench_function("pattern_compilation", |b| {
         b.iter(|| {
@@ -224,36 +234,36 @@ fn bench_content_inspection(c: &mut Criterion) {
             black_box(rule);
         })
     });
-    
+
     group.finish();
 }
 
 /// Performance benchmark for Geographic IP Blocking
 fn bench_geoip_blocking(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    
+
     let mut group = c.benchmark_group("geoip_blocking");
     group.measurement_time(Duration::from_secs(10));
-    
+
     // Test IP lookup performance
     let test_ips = vec![
-        "8.8.8.8",           // Google DNS (US)
-        "1.1.1.1",           // Cloudflare (US)
-        "77.88.8.8",         // Yandex (RU)
-        "114.114.114.114",   // 114DNS (CN)
+        "8.8.8.8",         // Google DNS (US)
+        "1.1.1.1",         // Cloudflare (US)
+        "77.88.8.8",       // Yandex (RU)
+        "114.114.114.114", // 114DNS (CN)
     ];
-    
+
     group.bench_function("ip_lookup_single", |b| {
         b.to_async(&rt).iter(|| async {
             let rule = GeoBlockingRule::new();
-            
+
             for ip in &test_ips {
                 let result = rule.check_ip(ip).await;
                 black_box(result);
             }
         })
     });
-    
+
     // Test bulk IP lookup performance
     for batch_size in [100, 1000].iter() {
         group.bench_with_input(
@@ -262,16 +272,17 @@ fn bench_geoip_blocking(c: &mut Criterion) {
             |b, &size| {
                 b.to_async(&rt).iter(|| async {
                     let rule = GeoBlockingRule::new();
-                    
+
                     for i in 0..size {
                         // Generate diverse IP addresses for testing
-                        let ip = format!("{}.{}.{}.{}", 
+                        let ip = format!(
+                            "{}.{}.{}.{}",
                             (i % 223) + 1,
                             (i % 255),
                             (i % 255),
                             (i % 254) + 1
                         );
-                        
+
                         let result = rule.check_ip(&ip).await;
                         black_box(result);
                     }
@@ -279,17 +290,17 @@ fn bench_geoip_blocking(c: &mut Criterion) {
             },
         );
     }
-    
+
     group.finish();
 }
 
 /// Integrated performance test simulating realistic WAF processing
 fn bench_integrated_waf_processing(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    
+
     let mut group = c.benchmark_group("integrated_waf");
     group.measurement_time(Duration::from_secs(15));
-    
+
     // Test complete WAF pipeline with all security modules
     group.bench_function("full_pipeline", |b| {
         b.to_async(&rt).iter(|| async {
@@ -297,15 +308,15 @@ fn bench_integrated_waf_processing(c: &mut Criterion) {
             let event_logger = Arc::new(SecurityEventLogger::new());
             let content_rule = ContentInspectionRule::new();
             let geo_rule = GeoBlockingRule::new();
-            
+
             // Simulate malicious request
             let source_ip = "114.114.114.114"; // Chinese IP
             let request_content = "q=<script>alert('xss')</script> AND 1=1";
-            
+
             // Run all security checks
             let geo_blocked = geo_rule.check_ip(source_ip).await;
             let content_threat = content_rule.inspect(request_content).await;
-            
+
             // Log security events
             if geo_blocked {
                 let event = SecurityEvent {
@@ -320,7 +331,7 @@ fn bench_integrated_waf_processing(c: &mut Criterion) {
                 };
                 event_logger.log_event(event).await.unwrap();
             }
-            
+
             if content_threat {
                 let event = SecurityEvent {
                     timestamp: Utc::now(),
@@ -334,11 +345,11 @@ fn bench_integrated_waf_processing(c: &mut Criterion) {
                 };
                 event_logger.log_event(event).await.unwrap();
             }
-            
+
             black_box((geo_blocked, content_threat));
         })
     });
-    
+
     group.finish();
 }
 

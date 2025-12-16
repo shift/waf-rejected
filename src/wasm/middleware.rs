@@ -1,23 +1,23 @@
 //! WASM Middleware Integration
-//! 
+//!
 //! Tower middleware that integrates the WASM ModSecurity engine
 //! into the HTTP request processing pipeline.
 
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::pin::Pin;
-use std::future::Future;
-use std::collections::HashMap;
 
-use tower::{Layer, Service};
+use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
-use bytes::Bytes;
+use tower::{Layer, Service};
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
-use crate::wasm::{WasmEngine, WasmRequestContext, SecurityMetadata, SecurityDecision};
 use crate::wasm::context::RateLimitContext;
+use crate::wasm::{SecurityDecision, SecurityMetadata, WasmEngine, WasmRequestContext};
 
 /// WASM middleware layer
 #[derive(Clone)]
@@ -90,7 +90,8 @@ where
             }
 
             // Extract client IP (simplified - in production would handle X-Forwarded-For, etc.)
-            let client_ip = parts.headers
+            let client_ip = parts
+                .headers
                 .get("x-forwarded-for")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("127.0.0.1")
@@ -139,11 +140,16 @@ where
                     let response = Response::builder()
                         .status(StatusCode::FORBIDDEN)
                         .header("Content-Type", "text/plain")
-                        .body(Full::new(Bytes::from(format!("Request blocked by WAF: {}", message))))
+                        .body(Full::new(Bytes::from(format!(
+                            "Request blocked by WAF: {}",
+                            message
+                        ))))
                         .unwrap();
                     return Ok(response);
                 }
-                SecurityDecision::Log { rule_id, message, .. } => {
+                SecurityDecision::Log {
+                    rule_id, message, ..
+                } => {
                     warn!("WAF Rule {} triggered: {}", rule_id, message);
                     // Log but allow - continue processing
                 }
@@ -166,7 +172,7 @@ where
 
             match inner.call(new_request).await {
                 Ok(response) => Ok(response),
-                Err(e) => Err(e.into())
+                Err(e) => Err(e.into()),
             }
         })
     }

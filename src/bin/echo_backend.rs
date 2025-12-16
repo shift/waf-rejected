@@ -1,13 +1,13 @@
+use http_body_util::{BodyExt, Full};
+use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-use hyper::body::{Incoming, Bytes};
-use http_body_util::{BodyExt, Full};
 use serde_json::json;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::time::SystemTime;
-use tokio::time::Instant;
 use tokio::net::TcpListener;
+use tokio::time::Instant;
 
 /// Simple echo backend service for WAF testing
 /// Returns request details and performance metrics
@@ -86,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!();
 
     let listener = TcpListener::bind(addr).await?;
-    
+
     println!("✅ Echo Backend ready for WAF testing!");
     println!("🔥 Send requests to test the full WAF → Backend pipeline");
     println!();

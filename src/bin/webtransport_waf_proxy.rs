@@ -3,16 +3,18 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
-use tracing::{info, warn, debug};
+use tracing::{debug, info, warn};
 use web_transport_quinn as wtq;
 
-use waf_ingress::waf::{Decision, RequestContext, WafEngine};
 use waf_ingress::config::Config;
+use waf_ingress::waf::{Decision, RequestContext, WafEngine};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // Lower log level to minimize overhead during perf runs
-    tracing_subscriber::fmt().with_max_level(tracing::Level::WARN).init();
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .init();
 
     // Load config and WAF
     let config = Config::default();
@@ -75,8 +77,13 @@ async fn main() -> Result<()> {
                                                 let mut buf = vec![0u8; 16 * 1024];
                                                 loop {
                                                     match recv.read(&mut buf).await {
-                                                        Ok(None) | Err(_) => { let _ = send.finish(); break; }
-                                                        Ok(Some(n)) => { let _ = send.write_all(&buf[..n]).await; }
+                                                        Ok(None) | Err(_) => {
+                                                            let _ = send.finish();
+                                                            break;
+                                                        }
+                                                        Ok(Some(n)) => {
+                                                            let _ = send.write_all(&buf[..n]).await;
+                                                        }
                                                     }
                                                 }
                                             });
@@ -87,7 +94,9 @@ async fn main() -> Result<()> {
                                     tokio::spawn(async move {
                                         loop {
                                             match s2.read_datagram().await {
-                                                Ok(d) => { let _ = s2.send_datagram(d); }
+                                                Ok(d) => {
+                                                    let _ = s2.send_datagram(d);
+                                                }
                                                 Err(_) => break,
                                             }
                                         }
@@ -117,7 +126,9 @@ fn self_signed_cert() -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'st
 
     let mut params = CertificateParams::default();
     params.alg = &rcgen::PKCS_ECDSA_P256_SHA256;
-    params.distinguished_name.push(rcgen::DnType::CommonName, "waf-rejected WT WAF");
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "waf-rejected WT WAF");
     params.subject_alt_names = vec![
         SanType::DnsName("localhost".to_string()),
         SanType::IpAddress("127.0.0.1".parse().unwrap()),
