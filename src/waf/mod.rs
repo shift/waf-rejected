@@ -7,6 +7,7 @@ pub mod security_events;
 pub mod content_inspection;
 pub mod geoip;
 pub mod exporters;
+pub mod auth;
 
 use std::net::IpAddr;
 use std::time::Instant;

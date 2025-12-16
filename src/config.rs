@@ -237,6 +237,9 @@ pub struct SecurityConfig {
     
     /// Geographic blocking configuration  
     pub geo_blocking: GeoBlockingConfig,
+    
+    /// Authentication configuration
+    pub auth: crate::waf::auth::AuthConfig,
 }
 
 impl Default for Config {
@@ -381,6 +384,7 @@ impl Default for SecurityConfig {
             events: SecurityEventsConfig::default(),
             content_inspection: ContentInspectionConfig::default(),
             geo_blocking: GeoBlockingConfig::default(),
+            auth: crate::waf::auth::AuthConfig::default(),
         }
     }
 }

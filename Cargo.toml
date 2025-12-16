@@ -111,7 +111,9 @@ rcgen = { version = "0.12", optional = true }
 
 # WebSocket handshake dependencies
 sha1 = "0.10"
+sha2 = "0.10"
 base64 = "0.22"
+hex = "0.4"
 
 # OpenTelemetry dependencies for security event export (simplified)
 opentelemetry = { version = "0.20", optional = true }

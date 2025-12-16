@@ -22,6 +22,7 @@ use tower::limit::ConcurrencyLimitLayer;
 use quinn::{Endpoint, ServerConfig as QuinnServerConfig};
 
 use crate::waf::{WafEngine, RequestContext, Decision};
+use crate::waf::auth::ApiKeyValidator;
 use crate::error::WafError;
 use crate::config::Config;
 use crate::proxy::websocket::{WebSocketHandler};
@@ -43,6 +44,7 @@ pub struct WafProxyService {
     websocket_handler: WebSocketHandler,
     #[cfg(feature = "webtransport")]
     webtransport_handler: WebTransportHandler,
+    auth_validator: Option<Arc<ApiKeyValidator>>,
 }
 
 impl WafProxyService {
@@ -77,6 +79,28 @@ impl WafProxyService {
         #[cfg(feature = "webtransport")]
         let webtransport_handler = WebTransportHandler::new(Arc::clone(&waf_engine), Arc::clone(&config_arc));
         
+        let auth_validator = if config_arc.security.auth.enabled {
+            use sha2::Digest;
+            let hashed_keys: Vec<String> = config_arc.security.auth.api_keys.iter()
+                .map(|key| {
+                    let mut hasher = sha2::Sha256::new();
+                    hasher.update(key.as_bytes());
+                    hex::encode(hasher.finalize())
+                })
+                .collect();
+            
+            let store = Arc::new(crate::waf::auth::InMemoryKeyStore::new(hashed_keys));
+            let validator = crate::waf::auth::ApiKeyValidator::new(
+                store as Arc<dyn crate::waf::auth::ApiKeyStore>,
+                config_arc.security.auth.clone()
+            );
+            info!("API key authentication enabled with {} keys", config_arc.security.auth.api_keys.len());
+            Some(Arc::new(validator))
+        } else {
+            info!("API key authentication disabled");
+            None
+        };
+        
         info!("WAF Proxy Service initialized with {} rules", waf_engine.rule_count());
         info!("Upstream target: {} (optimized HTTP client)", upstream_uri);
         info!("Protocol support: HTTP/1.0-3, WebSocket{}", 
@@ -90,6 +114,7 @@ impl WafProxyService {
             websocket_handler,
             #[cfg(feature = "webtransport")]
             webtransport_handler,
+            auth_validator,
         })
     }
     
@@ -111,6 +136,7 @@ impl WafProxyService {
             let upstream_client = self.upstream_client.clone();
             let upstream_uri = self.upstream_uri.clone();
             let config = Arc::clone(&self.config);
+            let auth_validator = self.auth_validator.clone();
             
             // Spawn each connection handler with multi-protocol support
             tokio::task::spawn(async move {
@@ -129,6 +155,7 @@ impl WafProxyService {
                                     upstream_client.clone(),
                                     upstream_uri.clone(),
                                     Arc::clone(&config),
+                                    auth_validator.clone(),
                                 )
                             })
                         )
@@ -156,6 +183,7 @@ impl WafProxyService {
                                     upstream_client.clone(),
                                     upstream_uri.clone(),
                                     Arc::clone(&config),
+                                    auth_validator.clone(),
                                 )
                             })
                         )
@@ -175,6 +203,7 @@ impl WafProxyService {
         upstream_client: Client<HttpConnector, Full<Bytes>>,
         upstream_uri: Uri,
         config: Arc<Config>,
+        auth_validator: Option<Arc<ApiKeyValidator>>,
     ) -> Result<Response<Full<Bytes>>, Infallible> {
         let start_time = Instant::now();
         
@@ -244,7 +273,7 @@ impl WafProxyService {
         match decision {
             Decision::Allow => {
                 debug!("WAF allowed request, forwarding to upstream with HTTP/{}", http_version);
-                Self::forward_to_upstream_with_protocol(req, upstream_client, upstream_uri, start_time, &http_version).await
+                Self::forward_to_upstream_with_protocol(req, upstream_client, upstream_uri, start_time, &http_version, auth_validator).await
             }
             Decision::Block { status, reason } => {
                 warn!("WAF blocked request: {} (status: {})", reason, status);
@@ -311,6 +340,7 @@ impl WafProxyService {
         upstream_uri: Uri,
         start_time: Instant,
         http_version: &str,
+        auth_validator: Option<Arc<ApiKeyValidator>>,
     ) -> Result<Response<Full<Bytes>>, Infallible> {
         // Extract request parts
         let (parts, body) = req.into_parts();
@@ -336,6 +366,20 @@ impl WafProxyService {
                 ));
             }
         };
+        
+        if let Some(validator) = auth_validator {
+            let is_https = parts.uri.scheme_str() == Some("https");
+            if let Err(e) = validator.validate_request(&parts.headers, is_https) {
+                warn!("Authentication failed: {}", e);
+                return Ok(Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header("content-type", "text/plain")
+                    .header("www-authenticate", "API-Key")
+                    .header("x-waf-decision", "auth-failed")
+                    .body(Full::new(Bytes::from("Authentication required")))
+                    .unwrap());
+            }
+        }
         
         // Optimized URI rewriting with protocol version awareness
         let upstream_path_and_query = parts.uri.path_and_query()
