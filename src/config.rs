@@ -228,6 +228,48 @@ pub struct WasmConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiConfig {
+    /// Enable AI threat detection
+    pub enabled: bool,
+
+    /// Threat score threshold (0.0-1.0)
+    pub threat_threshold: f64,
+
+    /// Processing timeout in milliseconds
+    pub timeout_ms: u64,
+
+    /// Model configuration
+    pub model: AiModelConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiModelConfig {
+    /// Path to ML model file
+    pub model_path: Option<String>,
+
+    /// Enable anomaly detection
+    pub anomaly_detection: bool,
+
+    /// Enable advanced classification
+    pub advanced_classification: bool,
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            threat_threshold: 0.8,
+            timeout_ms: 5000,
+            model: AiModelConfig {
+                model_path: None,
+                anomaly_detection: true,
+                advanced_classification: false,
+            },
+        }
+    }
+}
+
 pub struct SecurityConfig {
     /// Security events configuration
     pub events: SecurityEventsConfig,
@@ -235,11 +277,14 @@ pub struct SecurityConfig {
     /// Content inspection configuration
     pub content_inspection: ContentInspectionConfig,
 
-    /// Geographic blocking configuration  
+    /// Geographic blocking configuration
     pub geo_blocking: GeoBlockingConfig,
 
     /// Authentication configuration
     pub auth: crate::waf::auth::AuthConfig,
+
+    /// AI threat detection configuration
+    pub ai: AiConfig,
 }
 
 impl Default for Config {
@@ -385,6 +430,7 @@ impl Default for SecurityConfig {
             content_inspection: ContentInspectionConfig::default(),
             geo_blocking: GeoBlockingConfig::default(),
             auth: crate::waf::auth::AuthConfig::default(),
+            ai: AiConfig::default(),
         }
     }
 }
