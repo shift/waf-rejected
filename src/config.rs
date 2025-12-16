@@ -399,7 +399,6 @@ pub struct SecurityConfig {
     /// Enterprise compliance configuration
     pub compliance: ComplianceConfig,
 }
-}
 
 impl Default for Config {
     fn default() -> Self {
