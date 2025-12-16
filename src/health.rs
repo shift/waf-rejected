@@ -1,15 +1,13 @@
+use bytes::Bytes;
+use http_body_util::Full;
+use hyper::body::Incoming;
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use hyper::{Request, Response, StatusCode, Method};
-use hyper::body::Incoming;
-use hyper::service::service_fn;
-use hyper_util::rt::TokioExecutor;
-use http_body_util::Full;
 use tokio::net::TcpListener;
-use bytes::Bytes;
 use tracing::{error, info};
 
 use crate::error::WafError;
@@ -41,24 +39,29 @@ impl HealthService {
             start_time: Instant::now(),
         }
     }
-    
+
     pub async fn start(&self, bind_addr: SocketAddr) -> Result<(), WafError> {
         info!("Starting health monitoring service on {}", bind_addr);
-        
-        let listener = TcpListener::bind(bind_addr).await
-            .map_err(|e| WafError::internal(format!("Failed to bind health service to {}: {}", bind_addr, e)))?;
-        
+
+        let listener = TcpListener::bind(bind_addr).await.map_err(|e| {
+            WafError::internal(format!(
+                "Failed to bind health service to {}: {}",
+                bind_addr, e
+            ))
+        })?;
+
         let start_time = self.start_time;
-        
+
         loop {
-            let (stream, _) = listener.accept().await
-                .map_err(|e| WafError::internal(format!("Failed to accept health check connection: {}", e)))?;
-            
+            let (stream, _) = listener.accept().await.map_err(|e| {
+                WafError::internal(format!("Failed to accept health check connection: {}", e))
+            })?;
+
             tokio::task::spawn(async move {
                 if let Err(e) = hyper::server::conn::http1::Builder::new()
                     .serve_connection(
                         hyper_util::rt::TokioIo::new(stream),
-                        service_fn(move |req| Self::handle_health_request(req, start_time))
+                        service_fn(move |req| Self::handle_health_request(req, start_time)),
                     )
                     .await
                 {
@@ -67,7 +70,7 @@ impl HealthService {
             });
         }
     }
-    
+
     async fn handle_health_request(
         req: Request<Incoming>,
         start_time: Instant,
@@ -79,18 +82,19 @@ impl HealthService {
                 .body(Full::new(Bytes::from("Method not allowed")))
                 .unwrap());
         }
-        
+
         match req.uri().path() {
             "/health" => {
                 let health_status = Self::get_health_status(start_time);
-                let json = serde_json::to_string(&health_status).unwrap_or_else(|_| "{}".to_string());
-                
+                let json =
+                    serde_json::to_string(&health_status).unwrap_or_else(|_| "{}".to_string());
+
                 let status_code = if health_status.is_healthy() {
                     StatusCode::OK
                 } else {
                     StatusCode::SERVICE_UNAVAILABLE
                 };
-                
+
                 Ok(Response::builder()
                     .status(status_code)
                     .header("content-type", "application/json")
@@ -98,47 +102,50 @@ impl HealthService {
                     .body(Full::new(Bytes::from(json)))
                     .unwrap())
             }
-            "/health/ready" => {
-                Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "text/plain")
-                    .body(Full::new(Bytes::from("ready")))
-                    .unwrap())
-            }
-            "/health/live" => {
-                Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "text/plain")
-                    .body(Full::new(Bytes::from("live")))
-                    .unwrap())
-            }
-            _ => {
-                Ok(Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .body(Full::new(Bytes::from("Not found")))
-                    .unwrap())
-            }
+            "/health/ready" => Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/plain")
+                .body(Full::new(Bytes::from("ready")))
+                .unwrap()),
+            "/health/live" => Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/plain")
+                .body(Full::new(Bytes::from("live")))
+                .unwrap()),
+            _ => Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Full::new(Bytes::from("Not found")))
+                .unwrap()),
         }
     }
-    
+
     fn get_health_status(start_time: Instant) -> HealthStatus {
         let uptime_secs = start_time.elapsed().as_secs();
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
         let mut components = HashMap::new();
-        
-        components.insert("waf_engine".to_string(), ComponentHealth {
-            status: "healthy".to_string(),
-            last_check: now,
-            details: Some("Core WAF engine operational".to_string()),
-        });
-        
-        components.insert("proxy_service".to_string(), ComponentHealth {
-            status: "healthy".to_string(),
-            last_check: now,
-            details: Some("Reverse proxy service operational".to_string()),
-        });
-        
+
+        components.insert(
+            "waf_engine".to_string(),
+            ComponentHealth {
+                status: "healthy".to_string(),
+                last_check: now,
+                details: Some("Core WAF engine operational".to_string()),
+            },
+        );
+
+        components.insert(
+            "proxy_service".to_string(),
+            ComponentHealth {
+                status: "healthy".to_string(),
+                last_check: now,
+                details: Some("Reverse proxy service operational".to_string()),
+            },
+        );
+
         HealthStatus {
             status: "healthy".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -151,19 +158,25 @@ impl HealthService {
 impl HealthStatus {
     pub fn new() -> Self {
         let mut components = HashMap::new();
-        
-        components.insert("waf_engine".to_string(), ComponentHealth {
-            status: "healthy".to_string(),
-            last_check: chrono::Utc::now().timestamp() as u64,
-            details: None,
-        });
-        
-        components.insert("ai_models".to_string(), ComponentHealth {
-            status: "healthy".to_string(),
-            last_check: chrono::Utc::now().timestamp() as u64,
-            details: None,
-        });
-        
+
+        components.insert(
+            "waf_engine".to_string(),
+            ComponentHealth {
+                status: "healthy".to_string(),
+                last_check: chrono::Utc::now().timestamp() as u64,
+                details: None,
+            },
+        );
+
+        components.insert(
+            "ai_models".to_string(),
+            ComponentHealth {
+                status: "healthy".to_string(),
+                last_check: chrono::Utc::now().timestamp() as u64,
+                details: None,
+            },
+        );
+
         Self {
             status: "healthy".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -171,9 +184,8 @@ impl HealthStatus {
             components,
         }
     }
-    
+
     pub fn is_healthy(&self) -> bool {
-        self.status == "healthy" && 
-        self.components.values().all(|c| c.status == "healthy")
+        self.status == "healthy" && self.components.values().all(|c| c.status == "healthy")
     }
 }

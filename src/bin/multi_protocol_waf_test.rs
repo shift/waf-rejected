@@ -110,10 +110,10 @@ pub struct ProtocolTestResult {
 pub struct ProtocolMetrics {
     pub connection_establishment_ms: u64,
     pub tls_handshake_ms: Option<u64>,
-    pub stream_count: Option<u32>, // HTTP/2 specific
-    pub frames_sent: Option<u32>,   // HTTP/2 specific
-    pub frames_received: Option<u32>, // HTTP/2 specific
-    pub quic_rtt_ms: Option<u64>,   // HTTP/3 specific
+    pub stream_count: Option<u32>,     // HTTP/2 specific
+    pub frames_sent: Option<u32>,      // HTTP/2 specific
+    pub frames_received: Option<u32>,  // HTTP/2 specific
+    pub quic_rtt_ms: Option<u64>,      // HTTP/3 specific
     pub packet_loss_rate: Option<f64>, // HTTP/3 specific
     pub migration_events: Option<u32>, // HTTP/3 specific
 }
@@ -242,7 +242,8 @@ impl MultiProtocolWafTester {
         }
 
         // Perform cross-protocol analysis
-        let cross_protocol_analysis = self.analyze_cross_protocol_consistency(&results_by_protocol)?;
+        let cross_protocol_analysis =
+            self.analyze_cross_protocol_consistency(&results_by_protocol)?;
         let performance_comparison = self.compare_protocol_performance(&results_by_protocol)?;
         let security_analysis = self.analyze_security_consistency(&results_by_protocol)?;
 
@@ -256,7 +257,7 @@ impl MultiProtocolWafTester {
         };
 
         self.print_comprehensive_summary(&results, start_time.elapsed())?;
-        
+
         Ok(results)
     }
 
@@ -271,7 +272,9 @@ impl MultiProtocolWafTester {
         println!("  Running {} test cases...", self.test_cases.len());
 
         // Run tests with concurrency control
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(self.config.max_concurrent_requests));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(
+            self.config.max_concurrent_requests,
+        ));
         let mut handles = Vec::new();
 
         for (i, test_case) in self.test_cases.iter().enumerate() {
@@ -290,7 +293,11 @@ impl MultiProtocolWafTester {
 
             // Progress indicator
             if (i + 1) % 10 == 0 {
-                print!("    Progress: {}/{} tests completed\r", i + 1, self.test_cases.len());
+                print!(
+                    "    Progress: {}/{} tests completed\r",
+                    i + 1,
+                    self.test_cases.len()
+                );
             }
         }
 
@@ -307,16 +314,23 @@ impl MultiProtocolWafTester {
             }
         }
 
-        println!("    Progress: {}/{} tests completed ✓", self.test_cases.len(), self.test_cases.len());
+        println!(
+            "    Progress: {}/{} tests completed ✓",
+            self.test_cases.len(),
+            self.test_cases.len()
+        );
 
         // Calculate statistics
         let stats = self.calculate_protocol_statistics(&test_results, &response_times, &protocol);
-        
+
         Ok(stats)
     }
 
     /// Create appropriate HTTP client for the protocol
-    async fn create_protocol_client(&self, protocol: &HttpProtocol) -> Result<Arc<dyn HttpClient + Send + Sync>> {
+    async fn create_protocol_client(
+        &self,
+        protocol: &HttpProtocol,
+    ) -> Result<Arc<dyn HttpClient + Send + Sync>> {
         match protocol {
             HttpProtocol::Http11 => {
                 let client = Http11Client::new(&self.config).await?;
@@ -345,7 +359,8 @@ impl MultiProtocolWafTester {
         let request_result = timeout(
             Duration::from_secs(config.timeout_seconds),
             client.execute_request(&test_case),
-        ).await;
+        )
+        .await;
 
         let response_time_ms = start_time.elapsed().as_millis() as u64;
 
@@ -370,32 +385,28 @@ impl MultiProtocolWafTester {
                     protocol_specific_metrics: response.metrics,
                 })
             }
-            Ok(Err(e)) => {
-                Ok(ProtocolTestResult {
-                    test_case: test_case.name.clone(),
-                    protocol: protocol.to_string().to_string(),
-                    success: false,
-                    blocked: false,
-                    response_status: 0,
-                    response_time_ms,
-                    error: Some(e.to_string()),
-                    response_headers: HashMap::new(),
-                    protocol_specific_metrics: ProtocolMetrics::default(),
-                })
-            }
-            Err(_) => {
-                Ok(ProtocolTestResult {
-                    test_case: test_case.name.clone(),
-                    protocol: protocol.to_string().to_string(),
-                    success: false,
-                    blocked: false,
-                    response_status: 0,
-                    response_time_ms,
-                    error: Some("Request timeout".to_string()),
-                    response_headers: HashMap::new(),
-                    protocol_specific_metrics: ProtocolMetrics::default(),
-                })
-            }
+            Ok(Err(e)) => Ok(ProtocolTestResult {
+                test_case: test_case.name.clone(),
+                protocol: protocol.to_string().to_string(),
+                success: false,
+                blocked: false,
+                response_status: 0,
+                response_time_ms,
+                error: Some(e.to_string()),
+                response_headers: HashMap::new(),
+                protocol_specific_metrics: ProtocolMetrics::default(),
+            }),
+            Err(_) => Ok(ProtocolTestResult {
+                test_case: test_case.name.clone(),
+                protocol: protocol.to_string().to_string(),
+                success: false,
+                blocked: false,
+                response_status: 0,
+                response_time_ms,
+                error: Some("Request timeout".to_string()),
+                response_headers: HashMap::new(),
+                protocol_specific_metrics: ProtocolMetrics::default(),
+            }),
         }
     }
 
@@ -409,15 +420,17 @@ impl MultiProtocolWafTester {
         let total_tests = results.len();
         let tests_passed = results.iter().filter(|r| r.success).count();
         let tests_failed = total_tests - tests_passed;
-        
+
         let attacks_blocked = results.iter().filter(|r| r.blocked).count();
         let attacks_allowed = total_tests - attacks_blocked;
-        
+
         // Calculate false positives and negatives
-        let false_positives = results.iter()
+        let false_positives = results
+            .iter()
             .filter(|r| !r.success && r.blocked && !self.is_attack_test(&r.test_case))
             .count();
-        let false_negatives = results.iter()
+        let false_negatives = results
+            .iter()
             .filter(|r| !r.success && !r.blocked && self.is_attack_test(&r.test_case))
             .count();
 
@@ -425,7 +438,7 @@ impl MultiProtocolWafTester {
         let sorted_times: Vec<u64> = response_times.to_vec();
         let mut sorted_times = sorted_times;
         sorted_times.sort();
-        
+
         let avg_response_time = if !sorted_times.is_empty() {
             sorted_times.iter().sum::<u64>() as f64 / sorted_times.len() as f64
         } else {
@@ -456,18 +469,28 @@ impl MultiProtocolWafTester {
         let mut protocol_stats = HashMap::new();
         match protocol {
             HttpProtocol::Http2 => {
-                let avg_streams = results.iter()
+                let avg_streams = results
+                    .iter()
                     .filter_map(|r| r.protocol_specific_metrics.stream_count)
                     .map(|s| s as f64)
-                    .sum::<f64>() / results.len() as f64;
-                protocol_stats.insert("average_streams".to_string(), serde_json::json!(avg_streams));
+                    .sum::<f64>()
+                    / results.len() as f64;
+                protocol_stats.insert(
+                    "average_streams".to_string(),
+                    serde_json::json!(avg_streams),
+                );
             }
             HttpProtocol::Http3 => {
-                let avg_rtt = results.iter()
+                let avg_rtt = results
+                    .iter()
                     .filter_map(|r| r.protocol_specific_metrics.quic_rtt_ms)
                     .map(|rtt| rtt as f64)
-                    .sum::<f64>() / results.len() as f64;
-                protocol_stats.insert("average_quic_rtt_ms".to_string(), serde_json::json!(avg_rtt));
+                    .sum::<f64>()
+                    / results.len() as f64;
+                protocol_stats.insert(
+                    "average_quic_rtt_ms".to_string(),
+                    serde_json::json!(avg_rtt),
+                );
             }
             _ => {}
         }
@@ -492,12 +515,24 @@ impl MultiProtocolWafTester {
     /// Check if a test case represents an attack
     fn is_attack_test(&self, test_name: &str) -> bool {
         let attack_keywords = [
-            "sql_injection", "xss", "rce", "lfi", "rfi", "xxe", "ssrf",
-            "scanner", "attack", "exploit", "injection", "script",
+            "sql_injection",
+            "xss",
+            "rce",
+            "lfi",
+            "rfi",
+            "xxe",
+            "ssrf",
+            "scanner",
+            "attack",
+            "exploit",
+            "injection",
+            "script",
         ];
-        
+
         let test_lower = test_name.to_lowercase();
-        attack_keywords.iter().any(|keyword| test_lower.contains(keyword))
+        attack_keywords
+            .iter()
+            .any(|keyword| test_lower.contains(keyword))
     }
 
     /// Analyze consistency across protocols
@@ -512,29 +547,43 @@ impl MultiProtocolWafTester {
         // Compare results across protocols for each test case
         for test_case in &self.test_cases {
             let mut protocol_responses = HashMap::new();
-            
+
             for (protocol, protocol_results) in results {
                 // Find this test case's result
                 // This is simplified - in real implementation, you'd need to track individual test results
-                let blocked_rate = protocol_results.attacks_blocked as f64 / protocol_results.total_tests as f64;
-                protocol_responses.insert(protocol.clone(), format!("blocked_rate: {:.2}", blocked_rate));
+                let blocked_rate =
+                    protocol_results.attacks_blocked as f64 / protocol_results.total_tests as f64;
+                protocol_responses.insert(
+                    protocol.clone(),
+                    format!("blocked_rate: {:.2}", blocked_rate),
+                );
             }
 
             // Check for significant differences between protocols
-            let rates: Vec<f64> = protocol_responses.values()
+            let rates: Vec<f64> = protocol_responses
+                .values()
                 .filter_map(|v| v.split(": ").nth(1)?.parse().ok())
                 .collect();
-                
+
             if !rates.is_empty() {
                 let min_rate = rates.iter().fold(f64::INFINITY, |a, &b| a.min(b));
                 let max_rate = rates.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-                
-                if (max_rate - min_rate) > 0.2 { // 20% difference threshold
+
+                if (max_rate - min_rate) > 0.2 {
+                    // 20% difference threshold
                     inconsistent_behaviors.push(InconsistentBehavior {
                         test_case: test_case.name.clone(),
-                        description: format!("Significant variation in blocking rates: {:.2} - {:.2}", min_rate, max_rate),
+                        description: format!(
+                            "Significant variation in blocking rates: {:.2} - {:.2}",
+                            min_rate, max_rate
+                        ),
                         protocol_responses: protocol_responses.clone(),
-                        severity: if (max_rate - min_rate) > 0.5 { "HIGH" } else { "MEDIUM" }.to_string(),
+                        severity: if (max_rate - min_rate) > 0.5 {
+                            "HIGH"
+                        } else {
+                            "MEDIUM"
+                        }
+                        .to_string(),
                     });
                 }
             }
@@ -543,13 +592,19 @@ impl MultiProtocolWafTester {
         // Identify protocol-specific vulnerabilities
         for (protocol, protocol_result) in results {
             let mut vulnerabilities = Vec::new();
-            
+
             if protocol_result.false_negatives > 0 {
-                vulnerabilities.push(format!("High false negative rate: {}", protocol_result.false_negatives));
+                vulnerabilities.push(format!(
+                    "High false negative rate: {}",
+                    protocol_result.false_negatives
+                ));
             }
-            
+
             if protocol_result.connection_success_rate < 0.95 {
-                vulnerabilities.push(format!("Low connection success rate: {:.2}", protocol_result.connection_success_rate));
+                vulnerabilities.push(format!(
+                    "Low connection success rate: {:.2}",
+                    protocol_result.connection_success_rate
+                ));
             }
 
             if !vulnerabilities.is_empty() {
@@ -559,13 +614,15 @@ impl MultiProtocolWafTester {
 
         // Identify coverage gaps
         if results.len() < 3 {
-            coverage_gaps.push("Not all HTTP protocols tested (HTTP/1.1, HTTP/2, HTTP/3)".to_string());
+            coverage_gaps
+                .push("Not all HTTP protocols tested (HTTP/1.1, HTTP/2, HTTP/3)".to_string());
         }
 
         let consistency_score = if inconsistent_behaviors.is_empty() {
             1.0
         } else {
-            let high_severity_count = inconsistent_behaviors.iter()
+            let high_severity_count = inconsistent_behaviors
+                .iter()
                 .filter(|b| b.severity == "HIGH")
                 .count();
             1.0 - (high_severity_count as f64 * 0.3 + inconsistent_behaviors.len() as f64 * 0.1)
@@ -588,20 +645,31 @@ impl MultiProtocolWafTester {
         let mut throughput_comparison = HashMap::new();
         let mut resource_usage = HashMap::new();
 
-        let fastest_protocol = results.iter()
-            .min_by(|a, b| a.1.average_response_time_ms.partial_cmp(&b.1.average_response_time_ms).unwrap())
+        let fastest_protocol = results
+            .iter()
+            .min_by(|a, b| {
+                a.1.average_response_time_ms
+                    .partial_cmp(&b.1.average_response_time_ms)
+                    .unwrap()
+            })
             .map(|(k, _)| k.clone())
             .unwrap_or_default();
 
-        let slowest_protocol = results.iter()
-            .max_by(|a, b| a.1.average_response_time_ms.partial_cmp(&b.1.average_response_time_ms).unwrap())
+        let slowest_protocol = results
+            .iter()
+            .max_by(|a, b| {
+                a.1.average_response_time_ms
+                    .partial_cmp(&b.1.average_response_time_ms)
+                    .unwrap()
+            })
             .map(|(k, _)| k.clone())
             .unwrap_or_default();
 
         // Calculate performance ratios relative to fastest
         if let Some(fastest_result) = results.get(&fastest_protocol) {
             for (protocol, result) in results {
-                let ratio = result.average_response_time_ms / fastest_result.average_response_time_ms;
+                let ratio =
+                    result.average_response_time_ms / fastest_result.average_response_time_ms;
                 performance_ratios.insert(protocol.clone(), ratio);
 
                 // Estimated throughput (requests per second)
@@ -609,27 +677,30 @@ impl MultiProtocolWafTester {
                 throughput_comparison.insert(protocol.clone(), throughput);
 
                 // Mock resource usage data (in real implementation, collect from system metrics)
-                resource_usage.insert(protocol.clone(), ResourceUsage {
-                    cpu_usage_percent: match protocol.as_str() {
-                        "HTTP/1.1" => 15.0,
-                        "HTTP/2" => 25.0,
-                        "HTTP/3" => 35.0,
-                        _ => 20.0,
+                resource_usage.insert(
+                    protocol.clone(),
+                    ResourceUsage {
+                        cpu_usage_percent: match protocol.as_str() {
+                            "HTTP/1.1" => 15.0,
+                            "HTTP/2" => 25.0,
+                            "HTTP/3" => 35.0,
+                            _ => 20.0,
+                        },
+                        memory_usage_mb: match protocol.as_str() {
+                            "HTTP/1.1" => 128.0,
+                            "HTTP/2" => 256.0,
+                            "HTTP/3" => 384.0,
+                            _ => 200.0,
+                        },
+                        network_bandwidth_mbps: throughput * 0.001, // Rough estimate
+                        connection_overhead_bytes: match protocol.as_str() {
+                            "HTTP/1.1" => 512,
+                            "HTTP/2" => 1024,
+                            "HTTP/3" => 2048,
+                            _ => 1000,
+                        },
                     },
-                    memory_usage_mb: match protocol.as_str() {
-                        "HTTP/1.1" => 128.0,
-                        "HTTP/2" => 256.0,
-                        "HTTP/3" => 384.0,
-                        _ => 200.0,
-                    },
-                    network_bandwidth_mbps: throughput * 0.001, // Rough estimate
-                    connection_overhead_bytes: match protocol.as_str() {
-                        "HTTP/1.1" => 512,
-                        "HTTP/2" => 1024,
-                        "HTTP/3" => 2048,
-                        _ => 1000,
-                    },
-                });
+                );
             }
         }
 
@@ -653,33 +724,39 @@ impl MultiProtocolWafTester {
 
         // Calculate attack detection consistency for each attack type
         let attack_types = ["sql_injection", "xss", "rce", "lfi", "scanner"];
-        
+
         for attack_type in &attack_types {
             let mut detection_rates = Vec::new();
-            
+
             for (protocol, result) in results {
                 let detection_rate = result.attacks_blocked as f64 / result.total_tests as f64;
                 detection_rates.push(detection_rate);
             }
-            
+
             if !detection_rates.is_empty() {
                 let avg_rate = detection_rates.iter().sum::<f64>() / detection_rates.len() as f64;
-                let variance = detection_rates.iter()
+                let variance = detection_rates
+                    .iter()
                     .map(|rate| (rate - avg_rate).powi(2))
-                    .sum::<f64>() / detection_rates.len() as f64;
+                    .sum::<f64>()
+                    / detection_rates.len() as f64;
                 let consistency = 1.0 - variance.sqrt();
-                
+
                 attack_detection_consistency.insert(attack_type.to_string(), consistency);
             }
         }
 
         // Identify potential protocol-specific bypasses
         for (protocol, result) in results {
-            if result.false_negatives > result.total_tests / 10 { // More than 10% false negatives
+            if result.false_negatives > result.total_tests / 10 {
+                // More than 10% false negatives
                 protocol_bypasses.push(ProtocolBypass {
                     protocol: protocol.clone(),
                     attack_type: "Various".to_string(),
-                    description: format!("High false negative rate ({}) may indicate protocol-specific bypasses", result.false_negatives),
+                    description: format!(
+                        "High false negative rate ({}) may indicate protocol-specific bypasses",
+                        result.false_negatives
+                    ),
                     exploitation_difficulty: "Medium".to_string(),
                     mitigation: "Review protocol-specific parsing and validation rules".to_string(),
                 });
@@ -687,22 +764,30 @@ impl MultiProtocolWafTester {
         }
 
         // Generate security recommendations
-        let overall_consistency: f64 = attack_detection_consistency.values().sum::<f64>() / attack_detection_consistency.len() as f64;
-        
+        let overall_consistency: f64 = attack_detection_consistency.values().sum::<f64>()
+            / attack_detection_consistency.len() as f64;
+
         if overall_consistency < 0.8 {
             security_recommendations.push("Implement protocol-agnostic security rules".to_string());
-            security_recommendations.push("Review and standardize attack detection across all HTTP versions".to_string());
+            security_recommendations.push(
+                "Review and standardize attack detection across all HTTP versions".to_string(),
+            );
         }
 
         if protocol_bypasses.len() > 0 {
-            security_recommendations.push("Conduct protocol-specific penetration testing".to_string());
-            security_recommendations.push("Implement additional validation layers for vulnerable protocols".to_string());
+            security_recommendations
+                .push("Conduct protocol-specific penetration testing".to_string());
+            security_recommendations.push(
+                "Implement additional validation layers for vulnerable protocols".to_string(),
+            );
         }
 
         // Add HTTP/3 specific recommendations
         if results.contains_key("HTTP/3") {
-            security_recommendations.push("Ensure QUIC-specific attack vectors are covered".to_string());
-            security_recommendations.push("Implement connection migration attack protections".to_string());
+            security_recommendations
+                .push("Ensure QUIC-specific attack vectors are covered".to_string());
+            security_recommendations
+                .push("Implement connection migration attack protections".to_string());
         }
 
         Ok(SecurityConsistencyAnalysis {
@@ -714,7 +799,11 @@ impl MultiProtocolWafTester {
     }
 
     /// Print comprehensive test summary
-    fn print_comprehensive_summary(&self, results: &MultiProtocolTestResults, duration: Duration) -> Result<()> {
+    fn print_comprehensive_summary(
+        &self,
+        results: &MultiProtocolTestResults,
+        duration: Duration,
+    ) -> Result<()> {
         println!("🎯 Multi-Protocol WAF Test Results Summary");
         println!("==========================================");
         println!("Total execution time: {:.2}s", duration.as_secs_f64());
@@ -727,35 +816,66 @@ impl MultiProtocolWafTester {
         for (protocol, result) in &results.results_by_protocol {
             let success_rate = result.tests_passed as f64 / result.total_tests as f64 * 100.0;
             let block_rate = result.attacks_blocked as f64 / result.total_tests as f64 * 100.0;
-            
+
             println!("  {}:", protocol);
-            println!("    ✅ Success Rate: {:.1}% ({}/{})", success_rate, result.tests_passed, result.total_tests);
-            println!("    🛡️  Block Rate: {:.1}% ({}/{})", block_rate, result.attacks_blocked, result.total_tests);
+            println!(
+                "    ✅ Success Rate: {:.1}% ({}/{})",
+                success_rate, result.tests_passed, result.total_tests
+            );
+            println!(
+                "    🛡️  Block Rate: {:.1}% ({}/{})",
+                block_rate, result.attacks_blocked, result.total_tests
+            );
             println!("    🚨 False Positives: {}", result.false_positives);
             println!("    ⚠️  False Negatives: {}", result.false_negatives);
-            println!("    ⚡ Avg Response Time: {:.1}ms", result.average_response_time_ms);
-            println!("    🔗 Connection Success: {:.1}%", result.connection_success_rate * 100.0);
+            println!(
+                "    ⚡ Avg Response Time: {:.1}ms",
+                result.average_response_time_ms
+            );
+            println!(
+                "    🔗 Connection Success: {:.1}%",
+                result.connection_success_rate * 100.0
+            );
             println!();
         }
 
         // Cross-protocol analysis
         println!("🔄 Cross-Protocol Analysis:");
-        println!("  Consistency Score: {:.1}%", results.cross_protocol_analysis.consistency_score * 100.0);
-        println!("  Inconsistent Behaviors: {}", results.cross_protocol_analysis.inconsistent_behaviors.len());
-        
-        if !results.cross_protocol_analysis.inconsistent_behaviors.is_empty() {
+        println!(
+            "  Consistency Score: {:.1}%",
+            results.cross_protocol_analysis.consistency_score * 100.0
+        );
+        println!(
+            "  Inconsistent Behaviors: {}",
+            results.cross_protocol_analysis.inconsistent_behaviors.len()
+        );
+
+        if !results
+            .cross_protocol_analysis
+            .inconsistent_behaviors
+            .is_empty()
+        {
             println!("    Inconsistencies:");
             for behavior in &results.cross_protocol_analysis.inconsistent_behaviors {
-                println!("      - {} [{}]: {}", behavior.test_case, behavior.severity, behavior.description);
+                println!(
+                    "      - {} [{}]: {}",
+                    behavior.test_case, behavior.severity, behavior.description
+                );
             }
         }
         println!();
 
         // Performance comparison
         println!("🏃 Performance Comparison:");
-        println!("  Fastest Protocol: {}", results.performance_comparison.fastest_protocol);
-        println!("  Slowest Protocol: {}", results.performance_comparison.slowest_protocol);
-        
+        println!(
+            "  Fastest Protocol: {}",
+            results.performance_comparison.fastest_protocol
+        );
+        println!(
+            "  Slowest Protocol: {}",
+            results.performance_comparison.slowest_protocol
+        );
+
         println!("  Throughput Comparison:");
         for (protocol, throughput) in &results.performance_comparison.throughput_comparison {
             println!("    {}: {:.1} req/s", protocol, throughput);
@@ -764,30 +884,58 @@ impl MultiProtocolWafTester {
         println!("  Resource Usage:");
         for (protocol, usage) in &results.performance_comparison.resource_usage {
             println!("    {}:", protocol);
-            println!("      CPU: {:.1}%, Memory: {:.1}MB, Bandwidth: {:.1}Mbps",
-                usage.cpu_usage_percent, usage.memory_usage_mb, usage.network_bandwidth_mbps);
+            println!(
+                "      CPU: {:.1}%, Memory: {:.1}MB, Bandwidth: {:.1}Mbps",
+                usage.cpu_usage_percent, usage.memory_usage_mb, usage.network_bandwidth_mbps
+            );
         }
         println!();
 
         // Security analysis
         println!("🔒 Security Consistency Analysis:");
-        println!("  Overall Security Score: {:.1}%", results.security_consistency_analysis.overall_consistency_score * 100.0);
-        
+        println!(
+            "  Overall Security Score: {:.1}%",
+            results
+                .security_consistency_analysis
+                .overall_consistency_score
+                * 100.0
+        );
+
         println!("  Attack Detection Consistency:");
-        for (attack_type, consistency) in &results.security_consistency_analysis.attack_detection_consistency {
+        for (attack_type, consistency) in &results
+            .security_consistency_analysis
+            .attack_detection_consistency
+        {
             println!("    {}: {:.1}%", attack_type, consistency * 100.0);
         }
 
-        if !results.security_consistency_analysis.protocol_specific_bypasses.is_empty() {
+        if !results
+            .security_consistency_analysis
+            .protocol_specific_bypasses
+            .is_empty()
+        {
             println!("  Protocol-Specific Bypasses:");
-            for bypass in &results.security_consistency_analysis.protocol_specific_bypasses {
-                println!("    {} ({}): {}", bypass.protocol, bypass.attack_type, bypass.description);
+            for bypass in &results
+                .security_consistency_analysis
+                .protocol_specific_bypasses
+            {
+                println!(
+                    "    {} ({}): {}",
+                    bypass.protocol, bypass.attack_type, bypass.description
+                );
             }
         }
 
-        if !results.security_consistency_analysis.security_recommendations.is_empty() {
+        if !results
+            .security_consistency_analysis
+            .security_recommendations
+            .is_empty()
+        {
             println!("  Security Recommendations:");
-            for recommendation in &results.security_consistency_analysis.security_recommendations {
+            for recommendation in &results
+                .security_consistency_analysis
+                .security_recommendations
+            {
                 println!("    • {}", recommendation);
             }
         }
@@ -795,11 +943,13 @@ impl MultiProtocolWafTester {
         // Overall assessment
         println!();
         println!("🎖️  Overall Assessment:");
-        let overall_score = (
-            results.cross_protocol_analysis.consistency_score +
-            results.security_consistency_analysis.overall_consistency_score
-        ) / 2.0 * 100.0;
-        
+        let overall_score = (results.cross_protocol_analysis.consistency_score
+            + results
+                .security_consistency_analysis
+                .overall_consistency_score)
+            / 2.0
+            * 100.0;
+
         let grade = match overall_score {
             90.0..=100.0 => "A+ (Excellent)",
             80.0..=89.9 => "A (Very Good)",
@@ -808,7 +958,10 @@ impl MultiProtocolWafTester {
             _ => "D (Needs Improvement)",
         };
 
-        println!("  Multi-Protocol Security Score: {:.1}% ({})", overall_score, grade);
+        println!(
+            "  Multi-Protocol Security Score: {:.1}% ({})",
+            overall_score, grade
+        );
 
         Ok(())
     }
@@ -853,7 +1006,7 @@ impl MultiProtocolWafTester {
                 owasp_rule_id: Some("942200".to_string()),
                 cve_references: vec![],
             },
-            
+
             // XSS Tests
             ProtocolTestCase {
                 name: "xss_reflected_basic".to_string(),
@@ -1118,17 +1271,17 @@ impl Http11Client {
 impl HttpClient for Http11Client {
     async fn execute_request(&self, test_case: &ProtocolTestCase) -> Result<HttpResponse> {
         let start_time = Instant::now();
-        
+
         let url = format!("{}{}", self.base_url, test_case.path);
         let method = reqwest::Method::from_bytes(test_case.method.as_bytes())?;
-        
+
         let mut request = self.client.request(method, &url);
-        
+
         // Add headers
         for (key, value) in &test_case.headers {
             request = request.header(key, value);
         }
-        
+
         // Add body if present
         if !test_case.body.is_empty() {
             request = request.body(test_case.body.clone());
@@ -1137,16 +1290,16 @@ impl HttpClient for Http11Client {
         let connection_start = Instant::now();
         let response = request.send().await?;
         let connection_time = connection_start.elapsed().as_millis() as u64;
-        
+
         let status_code = response.status().as_u16();
         let mut headers = HashMap::new();
-        
+
         for (key, value) in response.headers().iter() {
             headers.insert(key.to_string(), value.to_str().unwrap_or("").to_string());
         }
-        
+
         let body = response.text().await.unwrap_or_default();
-        
+
         Ok(HttpResponse {
             status_code,
             headers,
@@ -1184,17 +1337,17 @@ impl Http2Client {
 impl HttpClient for Http2Client {
     async fn execute_request(&self, test_case: &ProtocolTestCase) -> Result<HttpResponse> {
         let start_time = Instant::now();
-        
+
         let url = format!("{}{}", self.base_url, test_case.path);
         let method = reqwest::Method::from_bytes(test_case.method.as_bytes())?;
-        
+
         let mut request = self.client.request(method, &url);
-        
+
         // Add headers
         for (key, value) in &test_case.headers {
             request = request.header(key, value);
         }
-        
+
         // Add body if present
         if !test_case.body.is_empty() {
             request = request.body(test_case.body.clone());
@@ -1203,16 +1356,16 @@ impl HttpClient for Http2Client {
         let connection_start = Instant::now();
         let response = request.send().await?;
         let connection_time = connection_start.elapsed().as_millis() as u64;
-        
+
         let status_code = response.status().as_u16();
         let mut headers = HashMap::new();
-        
+
         for (key, value) in response.headers().iter() {
             headers.insert(key.to_string(), value.to_str().unwrap_or("").to_string());
         }
-        
+
         let body = response.text().await.unwrap_or_default();
-        
+
         Ok(HttpResponse {
             status_code,
             headers,
@@ -1220,9 +1373,9 @@ impl HttpClient for Http2Client {
             metrics: ProtocolMetrics {
                 connection_establishment_ms: connection_time,
                 tls_handshake_ms: Some(connection_time / 4), // HTTP/2 has better TLS reuse
-                stream_count: Some(1), // Single stream for this request
-                frames_sent: Some(3),  // Estimated: HEADERS, DATA, END_STREAM
-                frames_received: Some(2), // Estimated: HEADERS, DATA
+                stream_count: Some(1),                       // Single stream for this request
+                frames_sent: Some(3),                        // Estimated: HEADERS, DATA, END_STREAM
+                frames_received: Some(2),                    // Estimated: HEADERS, DATA
                 ..Default::default()
             },
         })
@@ -1250,7 +1403,7 @@ impl HttpClient for Http3Client {
     async fn execute_request(&self, test_case: &ProtocolTestCase) -> Result<HttpResponse> {
         // Mock HTTP/3 implementation
         // In reality, you'd use a QUIC/HTTP3 client like quinn + h3
-        
+
         // For now, simulate HTTP/3 behavior with fallback to HTTP/2
         let client = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
@@ -1260,14 +1413,14 @@ impl HttpClient for Http3Client {
         let start_time = Instant::now();
         let url = format!("{}{}", self.base_url, test_case.path);
         let method = reqwest::Method::from_bytes(test_case.method.as_bytes())?;
-        
+
         let mut request = client.request(method, &url);
-        
+
         // Add headers (HTTP/3 uses QPACK compression)
         for (key, value) in &test_case.headers {
             request = request.header(key, value);
         }
-        
+
         // Add body if present
         if !test_case.body.is_empty() {
             request = request.body(test_case.body.clone());
@@ -1276,16 +1429,16 @@ impl HttpClient for Http3Client {
         let connection_start = Instant::now();
         let response = request.send().await?;
         let connection_time = connection_start.elapsed().as_millis() as u64;
-        
+
         let status_code = response.status().as_u16();
         let mut headers = HashMap::new();
-        
+
         for (key, value) in response.headers().iter() {
             headers.insert(key.to_string(), value.to_str().unwrap_or("").to_string());
         }
-        
+
         let body = response.text().await.unwrap_or_default();
-        
+
         Ok(HttpResponse {
             status_code,
             headers,
@@ -1293,9 +1446,9 @@ impl HttpClient for Http3Client {
             metrics: ProtocolMetrics {
                 connection_establishment_ms: connection_time,
                 tls_handshake_ms: Some(connection_time / 6), // HTTP/3 0-RTT can be faster
-                quic_rtt_ms: Some(50), // Mock QUIC RTT
-                packet_loss_rate: Some(0.01), // Mock 1% packet loss
-                migration_events: Some(0), // No connection migration in this test
+                quic_rtt_ms: Some(50),                       // Mock QUIC RTT
+                packet_loss_rate: Some(0.01),                // Mock 1% packet loss
+                migration_events: Some(0),                   // No connection migration in this test
                 ..Default::default()
             },
         })
@@ -1315,7 +1468,7 @@ async fn main() -> Result<()> {
             // Save results to file
             let results_json = serde_json::to_string_pretty(&results)?;
             tokio::fs::write("multi_protocol_test_results.json", results_json).await?;
-            
+
             println!("✅ Multi-protocol testing completed successfully!");
             println!("📄 Detailed results saved to: multi_protocol_test_results.json");
         }
@@ -1337,9 +1490,10 @@ mod tests {
         let test_cases = MultiProtocolWafTester::create_comprehensive_test_cases();
         assert!(!test_cases.is_empty());
         assert!(test_cases.len() >= 15); // Should have comprehensive coverage
-        
+
         // Verify we have different attack categories
-        let categories: std::collections::HashSet<_> = test_cases.iter()
+        let categories: std::collections::HashSet<_> = test_cases
+            .iter()
             .map(|tc| tc.attack_category.as_str())
             .collect();
         assert!(categories.contains("sql_injection"));

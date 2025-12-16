@@ -1,34 +1,31 @@
 // Phase 4: AI-WAF Integration with Advanced Optimization
 // Seamless integration of optimized AI models with WAF middleware
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::collections::HashMap;
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
-use crate::ai_threat_detection::{ThreatDetectionService, RequestFeatures, ThreatAnalysis};
 use crate::ai_optimization_engine::{
-    AiOptimizationEngine, OptimizedThreatAnalysis, DashboardInsights,
-    TrainingSample, ThreatExplanation
+    AiOptimizationEngine, DashboardInsights, OptimizedThreatAnalysis, TrainingSample,
 };
+use crate::ai_threat_detection::{RequestFeatures, ThreatAnalysis, ThreatDetectionService};
 
 /// Advanced AI-WAF integration with Phase 4 optimizations
 #[derive(Debug, Clone)]
 pub struct AdvancedAiWafIntegration {
     /// Core threat detection service
     core_detector: Arc<ThreatDetectionService>,
-    
+
     /// AI optimization engine with Phase 4 features
     optimization_engine: Arc<AiOptimizationEngine>,
-    
+
     /// Real-time learning coordinator
     learning_coordinator: Arc<RealTimeLearningCoordinator>,
-    
+
     /// Adaptive response orchestrator
     response_orchestrator: Arc<AdaptiveResponseOrchestrator>,
-    
+
     /// Enterprise monitoring hub
     monitoring_hub: Arc<EnterpriseMonitoringHub>,
 }
@@ -37,11 +34,13 @@ impl AdvancedAiWafIntegration {
     pub fn new() -> Self {
         let core_detector = Arc::new(ThreatDetectionService::new());
         let optimization_engine = Arc::new(AiOptimizationEngine::new());
-        
+
         Self {
             core_detector,
             optimization_engine: optimization_engine.clone(),
-            learning_coordinator: Arc::new(RealTimeLearningCoordinator::new(optimization_engine.clone())),
+            learning_coordinator: Arc::new(RealTimeLearningCoordinator::new(
+                optimization_engine.clone(),
+            )),
             response_orchestrator: Arc::new(AdaptiveResponseOrchestrator::new()),
             monitoring_hub: Arc::new(EnterpriseMonitoringHub::new()),
         }
@@ -50,36 +49,47 @@ impl AdvancedAiWafIntegration {
     /// Enhanced threat analysis with Phase 4 optimizations
     pub async fn analyze_threat_optimized(
         &self,
-        request_data: &RequestAnalysisData
+        request_data: &RequestAnalysisData,
     ) -> Result<EnhancedThreatResponse> {
         let start_time = SystemTime::now();
 
         // Extract features using core detection
         let features = self.extract_enhanced_features(request_data).await?;
-        
+
         // Perform optimized AI analysis
-        let optimized_analysis = self.optimization_engine
-            .analyze_with_optimization(&features).await?;
-        
+        let optimized_analysis = self
+            .optimization_engine
+            .analyze_with_optimization(&features)
+            .await?;
+
         // Generate adaptive response based on context
-        let adaptive_response = self.response_orchestrator
-            .generate_adaptive_response(&optimized_analysis, request_data).await?;
-        
+        let adaptive_response = self
+            .response_orchestrator
+            .generate_adaptive_response(&optimized_analysis, request_data)
+            .await?;
+
         // Update real-time learning models
         self.learning_coordinator
-            .learn_from_interaction(&optimized_analysis, &adaptive_response).await?;
-        
+            .learn_from_interaction(&optimized_analysis, &adaptive_response)
+            .await?;
+
         // Record monitoring metrics
         let processing_time = start_time.elapsed().unwrap_or_default();
         self.monitoring_hub
-            .record_analysis_metrics(&optimized_analysis, processing_time).await?;
+            .record_analysis_metrics(&optimized_analysis, processing_time)
+            .await?;
 
-        let recommendations = self.generate_mitigation_recommendations(&adaptive_response).await?;
-        
+        let recommendations = self
+            .generate_mitigation_recommendations(&adaptive_response)
+            .await?;
+
         // Create base ThreatAnalysis
         let base_analysis = crate::ai_threat_detection::ThreatAnalysis {
             request_id: features.request_id.clone(),
-            timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
             anomaly_score: 0.5,
             business_context: crate::ai_threat_detection::BusinessContext::default(),
             threat_categories: Vec::new(),
@@ -88,7 +98,7 @@ impl AdvancedAiWafIntegration {
             confidence: 0.8,
             processing_time_ms: processing_time.as_millis() as f32,
         };
-        
+
         // Convert to OptimizedThreatAnalysis
         let optimized_analysis = crate::ai_optimization_engine::OptimizedThreatAnalysis {
             base_analysis,
@@ -132,7 +142,7 @@ impl AdvancedAiWafIntegration {
                 optimization_level: crate::ai_optimization_engine::OptimizationLevel::Advanced,
             },
         };
-        
+
         // Create enhanced threat response
         let processing_time = start_time.elapsed().unwrap_or_default();
         let enhanced_response = EnhancedThreatResponse {
@@ -152,7 +162,7 @@ impl AdvancedAiWafIntegration {
                 "Update threat intelligence".to_string(),
             ],
         };
-        
+
         Ok(enhanced_response)
     }
 
@@ -161,7 +171,11 @@ impl AdvancedAiWafIntegration {
         let mut status = InitializationStatus::default();
 
         // Initialize distributed training
-        match self.optimization_engine.initialize_distributed_training().await {
+        match self
+            .optimization_engine
+            .initialize_distributed_training()
+            .await
+        {
             Ok(_) => {
                 status.distributed_training = ComponentStatus::Active;
                 println!("✅ Distributed training pipeline initialized");
@@ -173,7 +187,11 @@ impl AdvancedAiWafIntegration {
         }
 
         // Initialize real-time learning
-        match self.learning_coordinator.initialize_learning_systems().await {
+        match self
+            .learning_coordinator
+            .initialize_learning_systems()
+            .await
+        {
             Ok(_) => {
                 status.real_time_learning = ComponentStatus::Active;
                 println!("✅ Real-time learning systems active");
@@ -197,7 +215,11 @@ impl AdvancedAiWafIntegration {
         }
 
         // Initialize adaptive response system
-        match self.response_orchestrator.initialize_response_systems().await {
+        match self
+            .response_orchestrator
+            .initialize_response_systems()
+            .await
+        {
             Ok(_) => {
                 status.adaptive_response = ComponentStatus::Active;
                 println!("✅ Adaptive response orchestrator ready");
@@ -213,7 +235,10 @@ impl AdvancedAiWafIntegration {
             &status.real_time_learning,
             &status.enterprise_monitoring,
             &status.adaptive_response,
-        ].iter().all(|s| matches!(s, ComponentStatus::Active)) {
+        ]
+        .iter()
+        .all(|s| matches!(s, ComponentStatus::Active))
+        {
             OverallStatus::FullyOperational
         } else {
             OverallStatus::PartiallyOperational
@@ -224,17 +249,13 @@ impl AdvancedAiWafIntegration {
 
     /// Get comprehensive enterprise insights
     pub async fn get_enterprise_insights(&self) -> Result<ComprehensiveInsights> {
-        let dashboard_insights = self.optimization_engine
-            .get_dashboard_insights().await?;
-        
-        let learning_metrics = self.learning_coordinator
-            .get_learning_metrics().await?;
-        
-        let response_analytics = self.response_orchestrator
-            .get_response_analytics().await?;
-        
-        let monitoring_summary = self.monitoring_hub
-            .get_monitoring_summary().await?;
+        let dashboard_insights = self.optimization_engine.get_dashboard_insights().await?;
+
+        let learning_metrics = self.learning_coordinator.get_learning_metrics().await?;
+
+        let response_analytics = self.response_orchestrator.get_response_analytics().await?;
+
+        let monitoring_summary = self.monitoring_hub.get_monitoring_summary().await?;
 
         Ok(ComprehensiveInsights {
             dashboard_insights,
@@ -249,20 +270,25 @@ impl AdvancedAiWafIntegration {
     pub async fn update_models_with_feedback(&self, feedback: &[ThreatFeedback]) -> Result<()> {
         // Convert feedback to training samples
         let training_samples = self.convert_feedback_to_samples(feedback).await?;
-        
+
         // Update models using distributed training
         self.optimization_engine
-            .update_models_distributed(&training_samples).await?;
-        
+            .update_models_distributed(&training_samples)
+            .await?;
+
         // Update real-time learning models
         self.learning_coordinator
-            .incorporate_feedback(feedback).await?;
-        
+            .incorporate_feedback(feedback)
+            .await?;
+
         Ok(())
     }
 
     // Private helper methods
-    async fn extract_enhanced_features(&self, data: &RequestAnalysisData) -> Result<RequestFeatures> {
+    async fn extract_enhanced_features(
+        &self,
+        data: &RequestAnalysisData,
+    ) -> Result<RequestFeatures> {
         // Use core detector for feature extraction with enhancements
         let mut features = RequestFeatures {
             method: data.method.clone(),
@@ -270,28 +296,31 @@ impl AdvancedAiWafIntegration {
             header_count: data.headers.len() as u32,
             body_size: data.content_length.unwrap_or(0),
             entropy_score: self.calculate_payload_entropy(&data.body),
-            base64_ratio: 0.0, // TODO: implement
-            sql_keywords_count: 0, // TODO: implement
-            xss_keywords_count: 0, // TODO: implement 
-            shell_keywords_count: 0, // TODO: implement
-            user_agent_entropy: 0.0, // TODO: implement
-            is_known_scanner: false, // TODO: implement
+            base64_ratio: 0.0,             // TODO: implement
+            sql_keywords_count: 0,         // TODO: implement
+            xss_keywords_count: 0,         // TODO: implement
+            shell_keywords_count: 0,       // TODO: implement
+            user_agent_entropy: 0.0,       // TODO: implement
+            is_known_scanner: false,       // TODO: implement
             browser_automation_score: 0.0, // TODO: implement
-            contains_credit_cards: false, // TODO: implement
-            contains_ssn: false, // TODO: implement
-            contains_email: false, // TODO: implement
-            contains_phone: false, // TODO: implement
+            contains_credit_cards: false,  // TODO: implement
+            contains_ssn: false,           // TODO: implement
+            contains_email: false,         // TODO: implement
+            contains_phone: false,         // TODO: implement
             requests_per_minute: data.request_rate.unwrap_or(0.0),
             requests_per_hour: data.request_rate.unwrap_or(0.0) * 60.0,
             client_ip: data.client_ip.clone(),
-            user_agent: data.user_agent.clone().unwrap_or_else(|| "unknown".to_string()),
+            user_agent: data
+                .user_agent
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
             path: data.path.clone(),
             query_string: data.query_params.clone().unwrap_or_else(|| "".to_string()),
-            referer: "".to_string(), // TODO: extract from headers
+            referer: "".to_string(),      // TODO: extract from headers
             content_type: "".to_string(), // TODO: extract from headers
-            accept: "".to_string(), // TODO: extract from headers
-            is_business_hours: true, // TODO: implement proper business hours check
-            contains_pii: false, // TODO: implement
+            accept: "".to_string(),       // TODO: extract from headers
+            is_business_hours: true,      // TODO: implement proper business hours check
+            contains_pii: false,          // TODO: implement
             geographic_score: 0.0,
             reputation_score: data.ip_reputation.unwrap_or(0.0),
             behavioral_score: 0.0,
@@ -300,16 +329,23 @@ impl AdvancedAiWafIntegration {
             client_ip_parsed: data.client_ip.parse().ok(),
             timestamp: data.timestamp.duration_since(UNIX_EPOCH).unwrap().as_secs(),
             session_id: data.session_id.clone(),
-            is_encrypted: false, // TODO: detect encryption
-            contains_financial_data: false, // TODO: implement
-            contains_healthcare_data: false, // TODO: implement
+            is_encrypted: false,                    // TODO: detect encryption
+            contains_financial_data: false,         // TODO: implement
+            contains_healthcare_data: false,        // TODO: implement
             regulatory_zone: "unknown".to_string(), // TODO: implement
-            headers: data.headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            headers: data
+                .headers
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
             request_body: data.body.clone(),
         };
 
         // Enhanced feature extraction with context
-        features.geographic_score = self.assess_geographic_risk(&data.client_ip).await?.unwrap_or(0.0);
+        features.geographic_score = self
+            .assess_geographic_risk(&data.client_ip)
+            .await?
+            .unwrap_or(0.0);
         features.behavioral_score = self.detect_behavioral_anomalies(data).await?.unwrap_or(0.0);
 
         Ok(features)
@@ -317,28 +353,48 @@ impl AdvancedAiWafIntegration {
 
     async fn extract_suspicious_keywords(&self, body: &str) -> Result<Vec<String>> {
         let keywords = vec![
-            "script", "eval", "onload", "onerror", "iframe", "object", "embed",
-            "select", "union", "drop", "delete", "insert", "update", "exec",
-            "../", "..\\", "passwd", "shadow", "/etc/", "cmd.exe", "powershell"
+            "script",
+            "eval",
+            "onload",
+            "onerror",
+            "iframe",
+            "object",
+            "embed",
+            "select",
+            "union",
+            "drop",
+            "delete",
+            "insert",
+            "update",
+            "exec",
+            "../",
+            "..\\",
+            "passwd",
+            "shadow",
+            "/etc/",
+            "cmd.exe",
+            "powershell",
         ];
-        
+
         let found: Vec<String> = keywords
             .iter()
             .filter(|&keyword| body.to_lowercase().contains(keyword))
             .map(|&s| s.to_string())
             .collect();
-            
+
         Ok(found)
     }
 
     fn calculate_payload_entropy(&self, payload: &str) -> f32 {
-        if payload.is_empty() { return 0.0; }
-        
+        if payload.is_empty() {
+            return 0.0;
+        }
+
         let mut char_counts = std::collections::HashMap::new();
         for ch in payload.chars() {
             *char_counts.entry(ch).or_insert(0) += 1;
         }
-        
+
         let len = payload.len() as f32;
         char_counts
             .values()
@@ -354,7 +410,10 @@ impl AdvancedAiWafIntegration {
         Ok(Some(0.3))
     }
 
-    async fn detect_behavioral_anomalies(&self, _data: &RequestAnalysisData) -> Result<Option<f32>> {
+    async fn detect_behavioral_anomalies(
+        &self,
+        _data: &RequestAnalysisData,
+    ) -> Result<Option<f32>> {
         // Simulate behavioral anomaly detection
         Ok(Some(0.2))
     }
@@ -365,16 +424,19 @@ impl AdvancedAiWafIntegration {
     }
 
     async fn generate_analyst_explanation(&self, _features: &RequestFeatures) -> Result<String> {
-        Ok("Advanced AI analysis completed with Phase 4 optimizations. \
-            Multiple detection layers activated with high confidence scoring.".to_string())
+        Ok(
+            "Advanced AI analysis completed with Phase 4 optimizations. \
+            Multiple detection layers activated with high confidence scoring."
+                .to_string(),
+        )
     }
 
     async fn generate_mitigation_recommendations(
-        &self, 
-        response: &AdaptiveResponse
+        &self,
+        response: &AdaptiveResponse,
     ) -> Result<Vec<String>> {
         let mut recommendations = Vec::new();
-        
+
         match response.action {
             ResponseAction::Block => {
                 recommendations.push("Request blocked due to high threat score".to_string());
@@ -392,13 +454,16 @@ impl AdvancedAiWafIntegration {
                 recommendations.push("Request allowed with minimal risk".to_string());
             }
         }
-        
+
         Ok(recommendations)
     }
 
-    async fn convert_feedback_to_samples(&self, feedback: &[ThreatFeedback]) -> Result<Vec<TrainingSample>> {
+    async fn convert_feedback_to_samples(
+        &self,
+        feedback: &[ThreatFeedback],
+    ) -> Result<Vec<TrainingSample>> {
         let mut samples = Vec::new();
-        
+
         for fb in feedback {
             samples.push(TrainingSample {
                 features: fb.original_features.clone(),
@@ -406,7 +471,7 @@ impl AdvancedAiWafIntegration {
                 weight: fb.confidence,
             });
         }
-        
+
         Ok(samples)
     }
 
@@ -418,7 +483,10 @@ impl AdvancedAiWafIntegration {
                 ("Distributed Training".to_string(), 0.95),
                 ("Real-time Learning".to_string(), 0.97),
                 ("Monitoring Systems".to_string(), 0.99),
-            ].iter().cloned().collect(),
+            ]
+            .iter()
+            .cloned()
+            .collect(),
             uptime_percentage: 99.95,
             last_maintenance: "2024-01-15T10:30:00Z".to_string(),
         })
@@ -453,7 +521,7 @@ impl RealTimeLearningCoordinator {
     pub async fn learn_from_interaction(
         &self,
         analysis: &OptimizedThreatAnalysis,
-        response: &AdaptiveResponse
+        response: &AdaptiveResponse,
     ) -> Result<()> {
         let event = LearningEvent {
             timestamp: SystemTime::now(),
@@ -519,15 +587,19 @@ impl AdaptiveResponseOrchestrator {
     pub async fn generate_adaptive_response(
         &self,
         analysis: &OptimizedThreatAnalysis,
-        request_data: &RequestAnalysisData
+        request_data: &RequestAnalysisData,
     ) -> Result<AdaptiveResponse> {
         // Analyze response context
-        let context = self.context_analyzer
-            .analyze_response_context(analysis, request_data).await?;
+        let context = self
+            .context_analyzer
+            .analyze_response_context(analysis, request_data)
+            .await?;
 
         // Select optimal response strategy
-        let strategy = self.response_strategies
-            .select_optimal_strategy(&context).await?;
+        let strategy = self
+            .response_strategies
+            .select_optimal_strategy(&context)
+            .await?;
 
         // Generate adaptive response
         let action = self.determine_response_action(&analysis.base_analysis, &context)?;
@@ -558,7 +630,10 @@ impl AdaptiveResponseOrchestrator {
                 ("Challenge".to_string(), 8234),
                 ("Monitor".to_string(), 15678),
                 ("Allow".to_string(), 9255),
-            ].iter().cloned().collect(),
+            ]
+            .iter()
+            .cloned()
+            .collect(),
             average_effectiveness: 0.87,
             false_positive_reduction: 0.35,
             response_time_improvement: 0.42,
@@ -568,11 +643,13 @@ impl AdaptiveResponseOrchestrator {
     fn determine_response_action(
         &self,
         analysis: &ThreatAnalysis,
-        context: &ResponseContext
+        context: &ResponseContext,
     ) -> Result<ResponseAction> {
         let risk_score = analysis.overall_risk_score;
         let confidence = analysis.confidence;
-        let is_critical_asset = context.factors.get("critical_asset")
+        let is_critical_asset = context
+            .factors
+            .get("critical_asset")
             .and_then(|v| v.parse::<bool>().ok())
             .unwrap_or(false);
 
@@ -585,7 +662,11 @@ impl AdaptiveResponseOrchestrator {
         })
     }
 
-    fn calculate_response_confidence(&self, analysis: &ThreatAnalysis, strategy: &ResponseStrategy) -> f32 {
+    fn calculate_response_confidence(
+        &self,
+        analysis: &ThreatAnalysis,
+        strategy: &ResponseStrategy,
+    ) -> f32 {
         (analysis.confidence + strategy.confidence_factor) / 2.0
     }
 
@@ -609,7 +690,7 @@ impl AdaptiveResponseOrchestrator {
     async fn generate_mitigation_steps(
         &self,
         action: &ResponseAction,
-        _context: &ResponseContext
+        _context: &ResponseContext,
     ) -> Result<Vec<MitigationStep>> {
         let steps = match action {
             ResponseAction::Block => vec![
@@ -653,13 +734,11 @@ impl AdaptiveResponseOrchestrator {
                     estimated_time: Duration::from_millis(50),
                 },
             ],
-            ResponseAction::Allow => vec![
-                MitigationStep {
-                    step: "Standard request processing".to_string(),
-                    priority: 1,
-                    estimated_time: Duration::from_millis(1),
-                },
-            ],
+            ResponseAction::Allow => vec![MitigationStep {
+                step: "Standard request processing".to_string(),
+                priority: 1,
+                estimated_time: Duration::from_millis(1),
+            }],
         };
 
         Ok(steps)
@@ -693,14 +772,16 @@ impl EnterpriseMonitoringHub {
     pub async fn record_analysis_metrics(
         &self,
         analysis: &OptimizedThreatAnalysis,
-        processing_time: Duration
+        processing_time: Duration,
     ) -> Result<()> {
-        self.metrics_collector.record_metrics(&AnalysisMetrics {
-            processing_time_ms: processing_time.as_millis() as u32,
-            risk_score: analysis.base_analysis.overall_risk_score,
-            confidence: analysis.base_analysis.confidence,
-            optimization_level: analysis.optimization_metrics.optimization_level.clone(),
-        }).await
+        self.metrics_collector
+            .record_metrics(&AnalysisMetrics {
+                processing_time_ms: processing_time.as_millis() as u32,
+                risk_score: analysis.base_analysis.overall_risk_score,
+                confidence: analysis.base_analysis.confidence,
+                optimization_level: analysis.optimization_metrics.optimization_level.clone(),
+            })
+            .await
     }
 
     pub async fn get_monitoring_summary(&self) -> Result<MonitoringSummary> {
@@ -891,25 +972,44 @@ pub struct MonitoringSummary {
 #[derive(Debug)]
 pub struct ContinuousModelUpdater;
 impl ContinuousModelUpdater {
-    pub fn new() -> Self { Self }
-    pub async fn start_continuous_updates(&self) -> Result<()> { Ok(()) }
-    pub async fn process_learning_batch(&self, _events: &[LearningEvent]) -> Result<()> { Ok(()) }
+    pub fn new() -> Self {
+        Self
+    }
+    pub async fn start_continuous_updates(&self) -> Result<()> {
+        Ok(())
+    }
+    pub async fn process_learning_batch(&self, _events: &[LearningEvent]) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
 pub struct FeedbackProcessor;
 impl FeedbackProcessor {
-    pub fn new() -> Self { Self }
-    pub async fn initialize_feedback_loop(&self) -> Result<()> { Ok(()) }
-    pub async fn process_feedback(&self, _feedback: &[ThreatFeedback]) -> Result<()> { Ok(()) }
+    pub fn new() -> Self {
+        Self
+    }
+    pub async fn initialize_feedback_loop(&self) -> Result<()> {
+        Ok(())
+    }
+    pub async fn process_feedback(&self, _feedback: &[ThreatFeedback]) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
 pub struct ResponseStrategyManager;
 impl ResponseStrategyManager {
-    pub fn new() -> Self { Self }
-    pub async fn load_strategies(&self) -> Result<()> { Ok(()) }
-    pub async fn select_optimal_strategy(&self, _context: &ResponseContext) -> Result<ResponseStrategy> {
+    pub fn new() -> Self {
+        Self
+    }
+    pub async fn load_strategies(&self) -> Result<()> {
+        Ok(())
+    }
+    pub async fn select_optimal_strategy(
+        &self,
+        _context: &ResponseContext,
+    ) -> Result<ResponseStrategy> {
         Ok(ResponseStrategy {
             name: "adaptive_blocking".to_string(),
             confidence_factor: 0.9,
@@ -921,18 +1021,25 @@ impl ResponseStrategyManager {
 #[derive(Debug)]
 pub struct ResponseContextAnalyzer;
 impl ResponseContextAnalyzer {
-    pub fn new() -> Self { Self }
-    pub async fn initialize_context_models(&self) -> Result<()> { Ok(()) }
+    pub fn new() -> Self {
+        Self
+    }
+    pub async fn initialize_context_models(&self) -> Result<()> {
+        Ok(())
+    }
     pub async fn analyze_response_context(
         &self,
         _analysis: &OptimizedThreatAnalysis,
-        _data: &RequestAnalysisData
+        _data: &RequestAnalysisData,
     ) -> Result<ResponseContext> {
         Ok(ResponseContext {
             factors: [
                 ("critical_asset".to_string(), "false".to_string()),
                 ("high_risk_ip".to_string(), "false".to_string()),
-            ].iter().cloned().collect(),
+            ]
+            .iter()
+            .cloned()
+            .collect(),
             risk_level: "medium".to_string(),
             business_impact: 0.5,
         })
@@ -942,31 +1049,51 @@ impl ResponseContextAnalyzer {
 #[derive(Debug)]
 pub struct EffectivenessTracker;
 impl EffectivenessTracker {
-    pub fn new() -> Self { Self }
-    pub async fn start_tracking(&self) -> Result<()> { Ok(()) }
-    pub async fn track_response(&self, _response: &AdaptiveResponse) -> Result<()> { Ok(()) }
+    pub fn new() -> Self {
+        Self
+    }
+    pub async fn start_tracking(&self) -> Result<()> {
+        Ok(())
+    }
+    pub async fn track_response(&self, _response: &AdaptiveResponse) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
 pub struct MetricsCollector;
 impl MetricsCollector {
-    pub fn new() -> Self { Self }
-    pub async fn start_collection(&self) -> Result<()> { Ok(()) }
-    pub async fn record_metrics(&self, _metrics: &AnalysisMetrics) -> Result<()> { Ok(()) }
+    pub fn new() -> Self {
+        Self
+    }
+    pub async fn start_collection(&self) -> Result<()> {
+        Ok(())
+    }
+    pub async fn record_metrics(&self, _metrics: &AnalysisMetrics) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
 pub struct AlertManager;
 impl AlertManager {
-    pub fn new() -> Self { Self }
-    pub async fn initialize_alerting(&self) -> Result<()> { Ok(()) }
+    pub fn new() -> Self {
+        Self
+    }
+    pub async fn initialize_alerting(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
 pub struct DashboardRenderer;
 impl DashboardRenderer {
-    pub fn new() -> Self { Self }
-    pub async fn setup_dashboards(&self) -> Result<()> { Ok(()) }
+    pub fn new() -> Self {
+        Self
+    }
+    pub async fn setup_dashboards(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -976,12 +1103,15 @@ mod tests {
     #[tokio::test]
     async fn test_advanced_ai_waf_integration() {
         let integration = AdvancedAiWafIntegration::new();
-        
+
         let request_data = RequestAnalysisData {
             method: "POST".to_string(),
             path: "/api/login".to_string(),
             query_params: None,
-            headers: [("User-Agent".to_string(), "TestAgent".to_string())].iter().cloned().collect(),
+            headers: [("User-Agent".to_string(), "TestAgent".to_string())]
+                .iter()
+                .cloned()
+                .collect(),
             body: "username=admin&password=test".to_string(),
             client_ip: "192.168.1.100".to_string(),
             user_agent: Some("TestAgent".to_string()),
@@ -994,7 +1124,7 @@ mod tests {
 
         let result = integration.analyze_threat_optimized(&request_data).await;
         assert!(result.is_ok());
-        
+
         let response = result.unwrap();
         assert!(response.processing_time_ms < 1000);
         assert!(!response.explanation.is_empty());
@@ -1005,10 +1135,10 @@ mod tests {
     async fn test_phase4_initialization() {
         let integration = AdvancedAiWafIntegration::new();
         let status = integration.initialize_phase4_systems().await;
-        
+
         assert!(status.is_ok());
         let init_status = status.unwrap();
-        
+
         // Should have attempted to initialize all components
         assert!(matches!(
             init_status.overall_status,
@@ -1020,26 +1150,32 @@ mod tests {
     async fn test_enterprise_insights_generation() {
         let integration = AdvancedAiWafIntegration::new();
         let insights = integration.get_enterprise_insights().await;
-        
+
         assert!(insights.is_ok());
         let comprehensive_insights = insights.unwrap();
-        
-        assert!(comprehensive_insights.monitoring_summary.total_requests_processed > 0);
-        assert!(!comprehensive_insights.system_health.overall_status.is_empty());
+
+        assert!(
+            comprehensive_insights
+                .monitoring_summary
+                .total_requests_processed
+                > 0
+        );
+        assert!(!comprehensive_insights
+            .system_health
+            .overall_status
+            .is_empty());
     }
 
     #[tokio::test]
     async fn test_feedback_processing() {
         let integration = AdvancedAiWafIntegration::new();
-        
-        let feedback = vec![
-            ThreatFeedback {
-                original_features: RequestFeatures::default(),
-                was_threat: true,
-                confidence: 0.9,
-                analyst_notes: "Confirmed SQL injection attempt".to_string(),
-            }
-        ];
+
+        let feedback = vec![ThreatFeedback {
+            original_features: RequestFeatures::default(),
+            was_threat: true,
+            confidence: 0.9,
+            analyst_notes: "Confirmed SQL injection attempt".to_string(),
+        }];
 
         let result = integration.update_models_with_feedback(&feedback).await;
         assert!(result.is_ok());
@@ -1048,7 +1184,7 @@ mod tests {
     #[tokio::test]
     async fn test_adaptive_response_generation() {
         let orchestrator = AdaptiveResponseOrchestrator::new();
-        
+
         let analysis = OptimizedThreatAnalysis {
             base_analysis: ThreatAnalysis {
                 overall_risk_score: 0.8,
@@ -1111,12 +1247,17 @@ mod tests {
             timestamp: SystemTime::now(),
         };
 
-        let response = orchestrator.generate_adaptive_response(&analysis, &request_data).await;
+        let response = orchestrator
+            .generate_adaptive_response(&analysis, &request_data)
+            .await;
         assert!(response.is_ok());
-        
+
         let adaptive_response = response.unwrap();
         // With high risk score (0.8), should result in some blocking action
-        assert!(matches!(adaptive_response.action, ResponseAction::Block | ResponseAction::Challenge | ResponseAction::Monitor));
+        assert!(matches!(
+            adaptive_response.action,
+            ResponseAction::Block | ResponseAction::Challenge | ResponseAction::Monitor
+        ));
         assert!(adaptive_response.confidence > 0.0);
         assert!(!adaptive_response.mitigation_steps.is_empty());
     }

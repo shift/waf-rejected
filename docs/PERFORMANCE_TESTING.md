@@ -1,8 +1,14 @@
-# WAF Security Modules Performance Testing Framework
+# WAF Performance Testing Framework
 
-This comprehensive performance testing framework validates that all WAF security modules meet their performance requirements before being marked as production-ready.
+This comprehensive performance testing framework validates that all WAF security modules and performance optimizations meet their requirements before being marked as production-ready.
 
 ## 🎯 Performance Requirements
+
+### Phase 3 Optimizations: Buffer Pool & SIMD
+- **Buffer Pool Latency**: <100μs for buffer allocation/deallocation
+- **Buffer Pool Throughput**: >100K operations/sec sustained
+- **SIMD Pattern Matching**: <50ns per pattern match (AVX2/AVX-512)
+- **Memory Allocation Reduction**: >99% reduction in malloc/free calls
 
 ### Security Event Logging System
 - **Event Generation Latency**: <100μs per event
@@ -24,7 +30,14 @@ This comprehensive performance testing framework validates that all WAF security
 
 ## 🧪 Testing Framework Components
 
-### 1. Benchmark Suite (`benches/security_performance.rs`)
+### 1. Performance Validation Suite (`src/performance_validation.rs`)
+Comprehensive performance tests for Phase 3 optimizations:
+- **Buffer Pool Performance**: Allocation/deallocation latency and throughput
+- **SIMD Operations**: Pattern matching performance across CPU feature sets
+- **Memory Efficiency**: Allocation reduction metrics and memory usage
+- **Integration Testing**: End-to-end performance with buffer pool + SIMD
+
+### 2. Benchmark Suite (`benches/security_performance.rs`)
 Comprehensive Rust benchmarks using Criterion.rs for:
 - **Security Event Logging**: Latency and throughput testing
 - **Content Inspection**: Pattern matching performance across payload sizes  
@@ -32,12 +45,12 @@ Comprehensive Rust benchmarks using Criterion.rs for:
 - **Integrated Pipeline**: Complete WAF processing performance
 - **Memory Usage**: Resource scaling and usage analysis
 
-### 2. Performance Test Scripts
+### 3. Performance Test Scripts
 - **`scripts/performance_test.sh`**: Complete testing suite with system profiling
 - **`scripts/quick_perf_test.sh`**: Fast validation for CI/CD pipelines
 - **`config/performance_testing.toml`**: Configuration and requirements
 
-### 3. Load Testing Integration
+### 4. Load Testing Integration
 - **wrk Integration**: HTTP load testing for realistic traffic simulation
 - **System Profiling**: CPU profiling with `perf`, memory analysis with `valgrind`
 - **Concurrent Testing**: Multi-threaded performance validation
@@ -69,6 +82,15 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 ### Run Individual Benchmarks
 ```bash
+# Phase 3 Performance Validation
+nix develop -c cargo test --release performance_validation -- --nocapture
+
+# Buffer Pool Performance
+cargo bench --bench security_performance --features performance-testing -- buffer_pool
+
+# SIMD Operations Performance  
+cargo bench --bench security_performance --features performance-testing -- simd_operations
+
 # Security Event Logging only
 cargo bench --bench security_performance --features performance-testing -- security_event_logging
 

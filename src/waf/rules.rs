@@ -1,10 +1,10 @@
-use crate::waf::{WafRule, RequestContext, Decision};
 use crate::config::Config;
-use hyper::{Method, HeaderMap};
+use crate::waf::{Decision, RequestContext, WafRule};
+use hyper::Method;
+use regex::Regex;
 use std::collections::HashSet;
 use std::net::IpAddr;
-use tracing::{debug, warn};
-use regex::Regex;
+use tracing::debug;
 
 /// Rule for checking request size limits
 pub struct RequestSizeRule {
@@ -21,7 +21,7 @@ impl RequestSizeRule {
             enabled: true,
         }
     }
-    
+
     pub fn disabled(mut self) -> Self {
         self.enabled = false;
         self
@@ -38,7 +38,10 @@ impl WafRule for RequestSizeRule {
             if body_size > self.max_size {
                 return Decision::Block {
                     status: 413,
-                    reason: format!("Request body size {} exceeds limit {}", body_size, self.max_size),
+                    reason: format!(
+                        "Request body size {} exceeds limit {}",
+                        body_size, self.max_size
+                    ),
                 };
             }
         }
@@ -62,19 +65,19 @@ impl MethodRule {
         let mut blocked_methods = HashSet::new();
         blocked_methods.insert(Method::TRACE);
         blocked_methods.insert(Method::CONNECT);
-        
+
         Self {
             name: name.to_string(),
             blocked_methods,
             enabled: true,
         }
     }
-    
+
     pub fn block_method(mut self, method: Method) -> Self {
         self.blocked_methods.insert(method);
         self
     }
-    
+
     pub fn disabled(mut self) -> Self {
         self.enabled = false;
         self
@@ -118,17 +121,17 @@ impl HeaderRule {
             enabled: true,
         }
     }
-    
+
     pub fn require_header(mut self, header: &str) -> Self {
         self.required_headers.push(header.to_lowercase());
         self
     }
-    
+
     pub fn forbid_header(mut self, header: &str) -> Self {
         self.forbidden_headers.push(header.to_lowercase());
         self
     }
-    
+
     pub fn disabled(mut self) -> Self {
         self.enabled = false;
         self
@@ -150,7 +153,7 @@ impl WafRule for HeaderRule {
                 };
             }
         }
-        
+
         // Check for required headers
         for required in &self.required_headers {
             if !ctx.headers.contains_key(required) {
@@ -160,7 +163,7 @@ impl WafRule for HeaderRule {
                 };
             }
         }
-        
+
         Decision::Allow
     }
 
@@ -190,14 +193,14 @@ impl SqlInjectionRule {
             Regex::new(r"'.*(\bor\b|\band\b).*'").unwrap(),
             Regex::new(r"(?i)\b(exec|execute)\b").unwrap(),
         ];
-        
+
         Self {
             name: name.to_string(),
             patterns,
             enabled: true,
         }
     }
-    
+
     pub fn disabled(mut self) -> Self {
         self.enabled = false;
         self
@@ -211,17 +214,20 @@ impl WafRule for SqlInjectionRule {
 
     fn evaluate(&self, ctx: &RequestContext) -> Decision {
         let uri_str = ctx.uri.to_string();
-        
+
         // Check URI for SQL injection patterns
         for pattern in &self.patterns {
             if pattern.is_match(&uri_str) {
                 return Decision::Block {
                     status: 403,
-                    reason: format!("SQL injection pattern detected in URI: {}", pattern.as_str()),
+                    reason: format!(
+                        "SQL injection pattern detected in URI: {}",
+                        pattern.as_str()
+                    ),
                 };
             }
         }
-        
+
         // Check headers for SQL injection patterns
         for (name, value) in ctx.headers.iter() {
             if let Ok(value_str) = value.to_str() {
@@ -229,14 +235,17 @@ impl WafRule for SqlInjectionRule {
                     if pattern.is_match(value_str) {
                         return Decision::Block {
                             status: 403,
-                            reason: format!("SQL injection pattern detected in header '{}': {}", 
-                                name.as_str(), pattern.as_str()),
+                            reason: format!(
+                                "SQL injection pattern detected in header '{}': {}",
+                                name.as_str(),
+                                pattern.as_str()
+                            ),
                         };
                     }
                 }
             }
         }
-        
+
         // Check body if present
         if let Some(ref body) = ctx.body {
             if let Ok(body_str) = std::str::from_utf8(body) {
@@ -244,13 +253,16 @@ impl WafRule for SqlInjectionRule {
                     if pattern.is_match(body_str) {
                         return Decision::Block {
                             status: 403,
-                            reason: format!("SQL injection pattern detected in body: {}", pattern.as_str()),
+                            reason: format!(
+                                "SQL injection pattern detected in body: {}",
+                                pattern.as_str()
+                            ),
                         };
                     }
                 }
             }
         }
-        
+
         Decision::Allow
     }
 
@@ -280,14 +292,14 @@ impl XssRule {
             Regex::new(r"(?i)vbscript:").unwrap(),
             Regex::new(r"(?i)(<|%3C)meta[^>%]*http-equiv").unwrap(),
         ];
-        
+
         Self {
             name: name.to_string(),
             patterns,
             enabled: true,
         }
     }
-    
+
     pub fn disabled(mut self) -> Self {
         self.enabled = false;
         self
@@ -301,7 +313,7 @@ impl WafRule for XssRule {
 
     fn evaluate(&self, ctx: &RequestContext) -> Decision {
         let uri_str = ctx.uri.to_string();
-        
+
         // Check URI for XSS patterns
         for pattern in &self.patterns {
             if pattern.is_match(&uri_str) {
@@ -311,7 +323,7 @@ impl WafRule for XssRule {
                 };
             }
         }
-        
+
         // Check headers for XSS patterns
         for (name, value) in ctx.headers.iter() {
             if let Ok(value_str) = value.to_str() {
@@ -319,14 +331,17 @@ impl WafRule for XssRule {
                     if pattern.is_match(value_str) {
                         return Decision::Block {
                             status: 403,
-                            reason: format!("XSS pattern detected in header '{}': {}", 
-                                name.as_str(), pattern.as_str()),
+                            reason: format!(
+                                "XSS pattern detected in header '{}': {}",
+                                name.as_str(),
+                                pattern.as_str()
+                            ),
                         };
                     }
                 }
             }
         }
-        
+
         // Check body if present
         if let Some(ref body) = ctx.body {
             if let Ok(body_str) = std::str::from_utf8(body) {
@@ -340,7 +355,7 @@ impl WafRule for XssRule {
                 }
             }
         }
-        
+
         Decision::Allow
     }
 
@@ -355,25 +370,25 @@ pub struct WafRuleFactory;
 impl WafRuleFactory {
     pub fn create_basic_rules(config: &Config) -> Vec<Box<dyn WafRule>> {
         let mut rules: Vec<Box<dyn WafRule>> = Vec::new();
-        
+
         // Request size rule
         rules.push(Box::new(RequestSizeRule::new(
             "max_body_size",
             config.server.max_body_size,
         )));
-        
+
         // Method blocking rule
         rules.push(Box::new(MethodRule::new("blocked_methods")));
-        
+
         // Security headers rule
         rules.push(Box::new(HeaderRule::new("security_headers")));
-        
+
         // SQL injection detection
         rules.push(Box::new(SqlInjectionRule::new("sql_injection_detection")));
-        
+
         // XSS detection
         rules.push(Box::new(XssRule::new("xss_detection")));
-        
+
         debug!("Created {} basic WAF rules", rules.len());
         rules
     }
@@ -396,23 +411,23 @@ impl IpRule {
             enabled: true,
         }
     }
-    
+
     pub fn block_ip(mut self, ip: IpAddr) -> Self {
         self.blocked_ips.insert(ip);
         self
     }
-    
+
     pub fn block_ip_str(mut self, ip_str: &str) -> Result<Self, std::net::AddrParseError> {
         let ip: IpAddr = ip_str.parse()?;
         self.blocked_ips.insert(ip);
         Ok(self)
     }
-    
+
     pub fn allow_ip(mut self, ip: IpAddr) -> Self {
         self.allowed_ips.insert(ip);
         self
     }
-    
+
     pub fn allow_ip_str(mut self, ip_str: &str) -> Result<Self, std::net::AddrParseError> {
         let ip: IpAddr = ip_str.parse()?;
         self.allowed_ips.insert(ip);
@@ -437,7 +452,7 @@ impl WafRule for IpRule {
                 reason: format!("IP {} is blocked", ctx.client_ip),
             };
         }
-        
+
         // If there's an allow list and IP is not in it, block
         if !self.allowed_ips.is_empty() && !self.allowed_ips.contains(&ctx.client_ip) {
             return Decision::Block {
@@ -445,7 +460,7 @@ impl WafRule for IpRule {
                 reason: format!("IP {} is not in allow list", ctx.client_ip),
             };
         }
-        
+
         Decision::Allow
     }
 }
@@ -453,10 +468,10 @@ impl WafRule for IpRule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::str::FromStr;
-    use std::net::IpAddr;
     use hyper::{Method, Uri};
-    
+    use std::net::IpAddr;
+    use std::str::FromStr;
+
     fn create_test_context() -> RequestContext {
         RequestContext::new(
             IpAddr::from_str("192.168.1.100").unwrap(),
@@ -466,12 +481,12 @@ mod tests {
             Some(1000),
         )
     }
-    
+
     #[test]
     fn test_request_size_rule() {
         let rule = RequestSizeRule::new("test", 500);
         let ctx = create_test_context();
-        
+
         match rule.evaluate(&ctx) {
             Decision::Block { status, reason } => {
                 assert_eq!(status, 413);
@@ -480,12 +495,12 @@ mod tests {
             _ => panic!("Expected Block decision"),
         }
     }
-    
+
     #[test]
     fn test_method_rule() {
         let rule = MethodRule::new("test").block_method(Method::GET);
         let ctx = create_test_context();
-        
+
         match rule.evaluate(&ctx) {
             Decision::Block { status, reason } => {
                 assert_eq!(status, 405);
@@ -494,13 +509,13 @@ mod tests {
             _ => panic!("Expected Block decision"),
         }
     }
-    
+
     #[test]
     fn test_sql_injection_rule() {
         let rule = SqlInjectionRule::new("test");
         let mut ctx = create_test_context();
         ctx.uri = Uri::from_str("/test?id=1+OR+1=1").unwrap();
-        
+
         match rule.evaluate(&ctx) {
             Decision::Block { status, reason } => {
                 assert_eq!(status, 403);
@@ -509,13 +524,13 @@ mod tests {
             _ => panic!("Expected Block decision"),
         }
     }
-    
+
     #[test]
     fn test_xss_rule() {
         let rule = XssRule::new("test");
         let mut ctx = create_test_context();
         ctx.uri = Uri::from_str("/test?script=%3Cscript%3Ealert('xss')%3C/script%3E").unwrap();
-        
+
         match rule.evaluate(&ctx) {
             Decision::Block { status, reason } => {
                 assert_eq!(status, 403);

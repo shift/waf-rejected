@@ -1,15 +1,15 @@
 //! WASM Streaming Support
-//! 
+//!
 //! Provides streaming request processing capabilities for large payloads
 //! through the WASM ModSecurity engine.
 
+use bytes::Bytes;
+use futures::Stream;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use futures::Stream;
-use bytes::Bytes;
 use tracing::debug;
 
-use crate::wasm::{WasmEngine, WasmRequestContext, SecurityDecision};
+use crate::wasm::{SecurityDecision, WasmEngine, WasmRequestContext};
 
 /// Streaming WASM processor for large requests
 pub struct WasmStreamProcessor {
@@ -27,31 +27,41 @@ impl WasmStreamProcessor {
     ) -> Self {
         // Clear body for streaming mode
         context.body = None;
-        
+
         Self {
             engine,
             context,
             chunk_size,
         }
     }
-    
+
     /// Process request headers before streaming body
     pub async fn process_headers(&self) -> Result<SecurityDecision, crate::wasm::WasmError> {
         debug!("Processing headers through WASM engine");
-        
+
         let header_context = self.context.clone();
-        self.engine.process_request(header_context).await
+        self.engine
+            .process_request(header_context)
+            .await
             .map_err(|e| crate::wasm::WasmError::SecurityProcessing(e.into()))
     }
-    
+
     /// Process a chunk of request body
-    pub async fn process_chunk(&self, chunk: &[u8]) -> Result<SecurityDecision, crate::wasm::WasmError> {
-        debug!("Processing body chunk of {} bytes through WASM engine", chunk.len());
-        
+    pub async fn process_chunk(
+        &self,
+        chunk: &[u8],
+    ) -> Result<SecurityDecision, crate::wasm::WasmError> {
+        debug!(
+            "Processing body chunk of {} bytes through WASM engine",
+            chunk.len()
+        );
+
         let mut chunk_context = self.context.clone();
         chunk_context.body = Some(chunk.to_vec());
-        
-        self.engine.process_request(chunk_context).await
+
+        self.engine
+            .process_request(chunk_context)
+            .await
             .map_err(|e| crate::wasm::WasmError::SecurityProcessing(e.into()))
     }
 }
@@ -83,23 +93,23 @@ where
     S: Stream<Item = Result<Bytes, Box<dyn std::error::Error + Send + Sync>>> + Unpin,
 {
     type Item = Result<(Bytes, Option<SecurityDecision>), Box<dyn std::error::Error + Send + Sync>>;
-    
+
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if self.processing_complete {
             return Poll::Ready(None);
         }
-        
+
         match Pin::new(&mut self.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(bytes))) => {
                 // Add to buffer
                 self.buffer.extend_from_slice(&bytes);
-                
+
                 // Process if buffer is large enough or this is the final chunk
                 if self.buffer.len() >= self.processor.chunk_size {
                     let chunk_size = self.processor.chunk_size;
                     let chunk = self.buffer.split_off(chunk_size);
                     let remaining = std::mem::replace(&mut self.buffer, chunk);
-                    
+
                     // In a real implementation, we'd need to make this async
                     // For now, return the bytes with a placeholder decision
                     let decision = Some(SecurityDecision::Allow);
@@ -131,14 +141,14 @@ mod tests {
     use super::*;
     use futures::stream;
     use std::sync::Arc;
-    
+
     #[tokio::test]
     async fn test_stream_processor_creation() {
         let config = crate::wasm::WasmEngineConfig::default();
         if let Ok(engine) = crate::wasm::WasmEngine::new(config) {
             let context = crate::wasm::WasmRequestContext::default();
             let processor = WasmStreamProcessor::new(Arc::new(engine), context, 1024);
-            
+
             assert_eq!(processor.chunk_size, 1024);
         }
     }

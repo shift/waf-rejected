@@ -1,7 +1,7 @@
-use std::net::IpAddr;
-use std::collections::HashMap;
+use crate::waf::{Decision, RequestContext, WafRule};
 use once_cell::sync::Lazy;
-use crate::waf::{WafRule, RequestContext, Decision};
+use std::collections::HashMap;
+use std::net::IpAddr;
 
 /// Geographic information for an IP address
 #[derive(Debug, Clone)]
@@ -37,39 +37,45 @@ impl GeoIpService {
     /// TODO: Replace with actual MaxMind database loading
     fn init_test_data() -> HashMap<IpAddr, GeoInfo> {
         let mut cache = HashMap::new();
-        
+
         // Add some test data for common IP ranges
         if let Ok(ip) = "8.8.8.8".parse() {
-            cache.insert(ip, GeoInfo {
-                country_code: "US".to_string(),
-                country_name: "United States".to_string(),
-                region: "California".to_string(),
-                city: "Mountain View".to_string(),
-                latitude: 37.4056,
-                longitude: -122.0775,
-                is_tor_exit: false,
-                is_vpn: false,
-                is_datacenter: true,
-                asn: 15169,
-                asn_org: "Google LLC".to_string(),
-            });
+            cache.insert(
+                ip,
+                GeoInfo {
+                    country_code: "US".to_string(),
+                    country_name: "United States".to_string(),
+                    region: "California".to_string(),
+                    city: "Mountain View".to_string(),
+                    latitude: 37.4056,
+                    longitude: -122.0775,
+                    is_tor_exit: false,
+                    is_vpn: false,
+                    is_datacenter: true,
+                    asn: 15169,
+                    asn_org: "Google LLC".to_string(),
+                },
+            );
         }
 
         // Add a known bad IP for testing
         if let Ok(ip) = "192.0.2.1".parse() {
-            cache.insert(ip, GeoInfo {
-                country_code: "XX".to_string(),
-                country_name: "Unknown".to_string(),
-                region: "Unknown".to_string(),
-                city: "Unknown".to_string(),
-                latitude: 0.0,
-                longitude: 0.0,
-                is_tor_exit: true,  // Mark as Tor for testing
-                is_vpn: false,
-                is_datacenter: false,
-                asn: 0,
-                asn_org: "Unknown".to_string(),
-            });
+            cache.insert(
+                ip,
+                GeoInfo {
+                    country_code: "XX".to_string(),
+                    country_name: "Unknown".to_string(),
+                    region: "Unknown".to_string(),
+                    city: "Unknown".to_string(),
+                    latitude: 0.0,
+                    longitude: 0.0,
+                    is_tor_exit: true, // Mark as Tor for testing
+                    is_vpn: false,
+                    is_datacenter: false,
+                    asn: 0,
+                    asn_org: "Unknown".to_string(),
+                },
+            );
         }
 
         cache
@@ -118,7 +124,7 @@ impl Default for GeoIpService {
 }
 
 /// Global GeoIP service instance
-static GEOIP_SERVICE: Lazy<std::sync::Mutex<GeoIpService>> = 
+static GEOIP_SERVICE: Lazy<std::sync::Mutex<GeoIpService>> =
     Lazy::new(|| std::sync::Mutex::new(GeoIpService::new()));
 
 /// Get the global GeoIP service instance
@@ -171,9 +177,10 @@ impl GeoBlockingRule {
 
     pub fn allow_only_countries(mut self, country_codes: Vec<&str>) -> Self {
         self.allowed_countries = Some(
-            country_codes.into_iter()
+            country_codes
+                .into_iter()
                 .map(|c| c.to_uppercase())
-                .collect()
+                .collect(),
         );
         self
     }
@@ -214,7 +221,8 @@ impl WafRule for GeoBlockingRule {
         }
 
         let geo_service = geoip_service().lock().unwrap();
-        let geo_info = geo_service.lookup(&ctx.client_ip)
+        let geo_info = geo_service
+            .lookup(&ctx.client_ip)
             .cloned()
             .unwrap_or_else(|| geo_service.default_geo_info());
 
@@ -223,8 +231,10 @@ impl WafRule for GeoBlockingRule {
             if !allowed.contains(&geo_info.country_code) {
                 return Decision::Block {
                     status: 403,
-                    reason: format!("Geographic blocking: Country {} not in allowed list", 
-                                  geo_info.country_code),
+                    reason: format!(
+                        "Geographic blocking: Country {} not in allowed list",
+                        geo_info.country_code
+                    ),
                 };
             }
         }
@@ -233,8 +243,10 @@ impl WafRule for GeoBlockingRule {
         if self.blocked_countries.contains(&geo_info.country_code) {
             return Decision::Block {
                 status: 403,
-                reason: format!("Geographic blocking: Country {} is blocked", 
-                              geo_info.country_code),
+                reason: format!(
+                    "Geographic blocking: Country {} is blocked",
+                    geo_info.country_code
+                ),
             };
         }
 
@@ -242,8 +254,7 @@ impl WafRule for GeoBlockingRule {
         if self.blocked_regions.contains(&geo_info.region) {
             return Decision::Block {
                 status: 403,
-                reason: format!("Geographic blocking: Region {} is blocked", 
-                              geo_info.region),
+                reason: format!("Geographic blocking: Region {} is blocked", geo_info.region),
             };
         }
 
@@ -267,8 +278,10 @@ impl WafRule for GeoBlockingRule {
         if self.block_datacenter && geo_info.is_datacenter {
             return Decision::Block {
                 status: 403,
-                reason: format!("Geographic blocking: Datacenter IP from {} blocked", 
-                              geo_info.asn_org),
+                reason: format!(
+                    "Geographic blocking: Datacenter IP from {} blocked",
+                    geo_info.asn_org
+                ),
             };
         }
 
@@ -281,24 +294,27 @@ pub struct GeoBlockingRuleFactory;
 
 impl GeoBlockingRuleFactory {
     /// Create a country blocking rule
-    pub fn create_country_rule(country_code: &str, _geoip_service: std::sync::Arc<GeoIpService>) -> GeoBlockingRule {
+    pub fn create_country_rule(
+        country_code: &str,
+        _geoip_service: std::sync::Arc<GeoIpService>,
+    ) -> GeoBlockingRule {
         GeoBlockingRule::new(&format!("Block Country {}", country_code))
             .block_countries(vec![country_code])
     }
 
     /// Create a Tor blocking rule
-    pub fn create_tor_blocking_rule(_geoip_service: std::sync::Arc<GeoIpService>) -> GeoBlockingRule {
-        GeoBlockingRule::new("Block Tor Traffic")
-            .block_tor(true)
+    pub fn create_tor_blocking_rule(
+        _geoip_service: std::sync::Arc<GeoIpService>,
+    ) -> GeoBlockingRule {
+        GeoBlockingRule::new("Block Tor Traffic").block_tor(true)
     }
 
     /// Block high-risk countries commonly associated with malicious traffic
     pub fn high_risk_countries_rule() -> GeoBlockingRule {
-        GeoBlockingRule::new("High Risk Countries")
-            .block_countries(vec![
-                // Note: These are examples - adjust based on your actual risk assessment
-                "CN", "RU", "KP", "IR",  // Common high-risk countries
-            ])
+        GeoBlockingRule::new("High Risk Countries").block_countries(vec![
+            // Note: These are examples - adjust based on your actual risk assessment
+            "CN", "RU", "KP", "IR", // Common high-risk countries
+        ])
     }
 
     /// Block Tor and VPN traffic
@@ -310,22 +326,20 @@ impl GeoBlockingRuleFactory {
 
     /// Block datacenter traffic to prevent bot attacks
     pub fn datacenter_blocking_rule() -> GeoBlockingRule {
-        GeoBlockingRule::new("Block Datacenter Traffic")
-            .block_datacenter(true)
+        GeoBlockingRule::new("Block Datacenter Traffic").block_datacenter(true)
     }
 
     /// Allow only specific countries (for region-specific applications)
     pub fn country_allowlist_rule(allowed_countries: Vec<&str>) -> GeoBlockingRule {
-        GeoBlockingRule::new("Country Allowlist")
-            .allow_only_countries(allowed_countries)
+        GeoBlockingRule::new("Country Allowlist").allow_only_countries(allowed_countries)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyper::{HeaderMap, Method, Uri};
     use std::str::FromStr;
-    use hyper::{Method, Uri, HeaderMap};
 
     fn create_test_context(ip: &str) -> RequestContext {
         RequestContext::new(
@@ -340,7 +354,7 @@ mod tests {
     #[test]
     fn test_geoip_service_lookup() {
         let service = GeoIpService::new();
-        
+
         // Test known IP
         let ip: IpAddr = "8.8.8.8".parse().unwrap();
         if let Some(info) = service.lookup(&ip) {
@@ -373,8 +387,7 @@ mod tests {
 
     #[test]
     fn test_tor_blocking() {
-        let rule = GeoBlockingRule::new("Tor Block Test")
-            .block_tor(true);
+        let rule = GeoBlockingRule::new("Tor Block Test").block_tor(true);
 
         // Test Tor exit node (using our test data)
         let ctx = create_test_context("192.0.2.1");
@@ -392,8 +405,7 @@ mod tests {
 
     #[test]
     fn test_datacenter_blocking() {
-        let rule = GeoBlockingRule::new("Datacenter Block Test")
-            .block_datacenter(true);
+        let rule = GeoBlockingRule::new("Datacenter Block Test").block_datacenter(true);
 
         // Test datacenter IP (Google)
         let ctx = create_test_context("8.8.8.8");
@@ -407,8 +419,8 @@ mod tests {
 
     #[test]
     fn test_country_allowlist() {
-        let rule = GeoBlockingRule::new("Allowlist Test")
-            .allow_only_countries(vec!["US", "CA", "GB"]);
+        let rule =
+            GeoBlockingRule::new("Allowlist Test").allow_only_countries(vec!["US", "CA", "GB"]);
 
         // Test allowed country
         let ctx = create_test_context("8.8.8.8");
@@ -438,7 +450,7 @@ mod tests {
     #[test]
     fn test_geoip_cache_update() {
         let mut service = GeoIpService::new();
-        
+
         let test_ip: IpAddr = "203.0.113.200".parse().unwrap();
         let test_info = GeoInfo {
             country_code: "FR".to_string(),
@@ -455,7 +467,7 @@ mod tests {
         };
 
         service.update_cache(test_ip, test_info);
-        
+
         if let Some(cached_info) = service.lookup(&test_ip) {
             assert_eq!(cached_info.country_code, "FR");
             assert_eq!(cached_info.city, "Paris");
@@ -484,7 +496,7 @@ mod tests {
     fn test_default_geo_info() {
         let service = GeoIpService::new();
         let default_info = service.default_geo_info();
-        
+
         assert_eq!(default_info.country_code, "XX");
         assert_eq!(default_info.country_name, "Unknown");
         assert!(!default_info.is_tor_exit);

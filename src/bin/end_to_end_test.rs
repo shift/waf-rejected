@@ -33,7 +33,7 @@ impl TestMetrics {
 
     fn record_request(&self, latency_ms: u64, was_blocked: bool, reached_backend: bool) {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
-        
+
         if was_blocked {
             self.waf_blocks.fetch_add(1, Ordering::Relaxed);
             self.failed_requests.fetch_add(1, Ordering::Relaxed);
@@ -45,16 +45,17 @@ impl TestMetrics {
             self.backend_responses.fetch_add(1, Ordering::Relaxed);
         }
 
-        self.total_latency_ms.fetch_add(latency_ms, Ordering::Relaxed);
-        
+        self.total_latency_ms
+            .fetch_add(latency_ms, Ordering::Relaxed);
+
         // Update min latency
         let mut current_min = self.min_latency_ms.load(Ordering::Relaxed);
         while latency_ms < current_min {
             match self.min_latency_ms.compare_exchange_weak(
-                current_min, 
-                latency_ms, 
-                Ordering::Relaxed, 
-                Ordering::Relaxed
+                current_min,
+                latency_ms,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
             ) {
                 Ok(_) => break,
                 Err(new_min) => current_min = new_min,
@@ -65,10 +66,10 @@ impl TestMetrics {
         let mut current_max = self.max_latency_ms.load(Ordering::Relaxed);
         while latency_ms > current_max {
             match self.max_latency_ms.compare_exchange_weak(
-                current_max, 
-                latency_ms, 
-                Ordering::Relaxed, 
-                Ordering::Relaxed
+                current_max,
+                latency_ms,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
             ) {
                 Ok(_) => break,
                 Err(new_max) => current_max = new_max,
@@ -98,12 +99,12 @@ impl EndToEndTestHarness {
 
     async fn start_backend(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         println!("🚀 Starting Echo Backend Service...");
-        
+
         let mut backend_cmd = Command::new("./target/release/echo_backend");
         backend_cmd.env("BACKEND_PORT", "3000");
-        
+
         self.backend_process = Some(backend_cmd.spawn()?);
-        
+
         // Wait for backend to be ready
         for attempt in 1..=10 {
             // Simple TCP connection check instead of HTTP
@@ -129,12 +130,12 @@ impl EndToEndTestHarness {
 
     async fn start_waf(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         println!("🛡️  Starting WAF-Rejected...");
-        
+
         let mut waf_cmd = Command::new("./target/release/waf-ingress");
         waf_cmd.env("WAF_CONFIG_FILE", "config-test");
-        
+
         self.waf_process = Some(waf_cmd.spawn()?);
-        
+
         // Wait for WAF to be ready
         for attempt in 1..=15 {
             match tokio::net::TcpStream::connect("127.0.0.1:8080").await {
@@ -157,7 +158,12 @@ impl EndToEndTestHarness {
         Ok(())
     }
 
-    async fn run_load_test(&self, concurrent_users: usize, requests_per_user: usize, test_name: &str) -> Result<TestMetrics, Box<dyn std::error::Error>> {
+    async fn run_load_test(
+        &self,
+        concurrent_users: usize,
+        requests_per_user: usize,
+        test_name: &str,
+    ) -> Result<TestMetrics, Box<dyn std::error::Error>> {
         println!("🔥 Running Load Test: {}", test_name);
         println!("   👥 Concurrent Users: {}", concurrent_users);
         println!("   📨 Requests per User: {}", requests_per_user);
@@ -195,16 +201,16 @@ impl EndToEndTestHarness {
                     let (http_request, _should_be_blocked) = &payloads[payload_idx];
 
                     let start = Instant::now();
-                    
+
                     // Make raw HTTP request
                     let result = Self::make_http_request(http_request).await;
                     let latency_ms = start.elapsed().as_millis() as u64;
-                    
+
                     match result {
                         Ok((status, response_body)) => {
                             let was_blocked = status == 403 || status == 429;
                             let reached_backend = response_body.contains("echo-backend");
-                            
+
                             metrics.record_request(latency_ms, was_blocked, reached_backend);
                         }
                         Err(_) => {
@@ -223,21 +229,24 @@ impl EndToEndTestHarness {
         }
 
         let total_duration = test_start.elapsed();
-        println!("✅ Load test completed in {:.2}s", total_duration.as_secs_f64());
+        println!(
+            "✅ Load test completed in {:.2}s",
+            total_duration.as_secs_f64()
+        );
 
         Ok(Arc::try_unwrap(metrics).unwrap())
     }
 
     async fn make_http_request(request: &str) -> Result<(u16, String), Box<dyn std::error::Error>> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        
+
         let mut stream = tokio::net::TcpStream::connect("127.0.0.1:8080").await?;
         stream.write_all(request.as_bytes()).await?;
-        
+
         let mut buffer = vec![0; 4096];
         let n = stream.read(&mut buffer).await?;
         let response = String::from_utf8_lossy(&buffer[..n]);
-        
+
         // Parse status code from HTTP response
         let status_code = if let Some(line) = response.lines().next() {
             if let Some(parts) = line.split_whitespace().nth(1) {
@@ -248,7 +257,7 @@ impl EndToEndTestHarness {
         } else {
             500
         };
-        
+
         Ok((status_code, response.to_string()))
     }
 
@@ -292,9 +301,21 @@ fn print_test_results(metrics: &TestMetrics, test_name: &str, duration_secs: f64
     let max_latency = metrics.max_latency_ms.load(Ordering::Relaxed);
 
     let rps = total as f64 / duration_secs;
-    let avg_latency = if total > 0 { total_latency as f64 / total as f64 } else { 0.0 };
-    let success_rate = if total > 0 { (successful as f64 / total as f64) * 100.0 } else { 0.0 };
-    let waf_block_rate = if total > 0 { (waf_blocks as f64 / total as f64) * 100.0 } else { 0.0 };
+    let avg_latency = if total > 0 {
+        total_latency as f64 / total as f64
+    } else {
+        0.0
+    };
+    let success_rate = if total > 0 {
+        (successful as f64 / total as f64) * 100.0
+    } else {
+        0.0
+    };
+    let waf_block_rate = if total > 0 {
+        (waf_blocks as f64 / total as f64) * 100.0
+    } else {
+        0.0
+    };
 
     println!();
     println!("📊 {} Results:", test_name);
@@ -306,7 +327,14 @@ fn print_test_results(metrics: &TestMetrics, test_name: &str, duration_secs: f64
     println!("🎭 Backend Responses: {}", backend_responses);
     println!("⚡ Requests/Second: {:.0}", rps);
     println!("📈 Average Latency: {:.2}ms", avg_latency);
-    println!("⬇️  Min Latency: {}ms", if min_latency == u64::MAX { 0 } else { min_latency });
+    println!(
+        "⬇️  Min Latency: {}ms",
+        if min_latency == u64::MAX {
+            0
+        } else {
+            min_latency
+        }
+    );
     println!("⬆️  Max Latency: {}ms", max_latency);
     println!();
 }
@@ -322,7 +350,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build services first
     println!("🔨 Building test services...");
     let build_output = Command::new("cargo")
-        .args(&["build", "--release", "--bin", "echo_backend", "--bin", "waf-ingress"])
+        .args(&[
+            "build",
+            "--release",
+            "--bin",
+            "echo_backend",
+            "--bin",
+            "waf-ingress",
+        ])
         .output()
         .await?;
 
@@ -358,12 +393,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for (concurrent_users, requests_per_user, test_name) in test_levels {
         let test_start = Instant::now();
-        
-        match harness.run_load_test(concurrent_users, requests_per_user, test_name).await {
+
+        match harness
+            .run_load_test(concurrent_users, requests_per_user, test_name)
+            .await
+        {
             Ok(metrics) => {
                 let duration = test_start.elapsed().as_secs_f64();
                 print_test_results(&metrics, test_name, duration);
-                
+
                 let total = metrics.total_requests.load(Ordering::Relaxed);
                 let rps = total as f64 / duration;
                 all_results.push((test_name, rps, concurrent_users));
@@ -383,7 +421,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("===================================");
     let mut max_rps = 0.0;
     let mut max_test = "";
-    
+
     for (test_name, rps, users) in &all_results {
         println!("🔥 {}: {:.0} RPS ({} users)", test_name, rps, users);
         if *rps > max_rps {
@@ -391,7 +429,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_test = test_name;
         }
     }
-    
+
     println!();
     println!("🎯 PEAK END-TO-END PERFORMANCE:");
     println!("   Test: {}", max_test);

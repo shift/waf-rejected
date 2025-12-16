@@ -1,9 +1,9 @@
 //! OpenTelemetry (OTel) Exporter for Security Events
-//! 
+//!
 //! This module provides OpenTelemetry integration for security events, enabling
 //! export to observability platforms like Jaeger, Zipkin, and cloud providers.
 
-use super::{SecurityEventExporter, ExportResult};
+use super::{ExportResult, SecurityEventExporter};
 use crate::waf::security_events::{SecurityEvent, ThreatLevel, WafDecision};
 use async_trait::async_trait;
 use opentelemetry::trace::{SpanBuilder, SpanKind, Status, TraceContextExt, Tracer};
@@ -47,7 +47,7 @@ impl OtelExporter {
     /// Export security event as OpenTelemetry span
     async fn export_as_span(&self, event: &SecurityEvent) -> ExportResult {
         let span_name = format!("waf_security_event_{}", event.decision);
-        
+
         let mut span_builder = SpanBuilder::from_name(span_name)
             .with_kind(SpanKind::Server)
             .with_start_time(self.timestamp_to_system_time(event.timestamp))
@@ -61,12 +61,15 @@ impl OtelExporter {
             WafDecision::Monitor => Status::Ok,
         };
 
-        let span = self.tracer.build_with_context(span_builder, &Context::current());
+        let span = self
+            .tracer
+            .build_with_context(span_builder, &Context::current());
         span.set_status(span_status);
 
         // Add events to span for significant security events
         if !event.triggered_rules.is_empty() {
-            let rule_attributes: Vec<KeyValue> = event.triggered_rules
+            let rule_attributes: Vec<KeyValue> = event
+                .triggered_rules
                 .iter()
                 .enumerate()
                 .map(|(i, rule)| KeyValue::new(format!("rule.{}", i), rule.clone()))
@@ -86,10 +89,10 @@ impl OtelExporter {
     async fn export_as_log(&self, event: &SecurityEvent) -> ExportResult {
         // For now, use structured tracing instead of OpenTelemetry logs API
         // This provides similar functionality with better compatibility
-        
+
         let attributes = self.build_log_attributes(event);
         let severity = self.get_log_severity_text(&event.threat_level);
-        
+
         match severity {
             "INFO" => {
                 tracing::info!(
@@ -101,7 +104,7 @@ impl OtelExporter {
                     method = %event.method,
                     "Security event logged via OpenTelemetry"
                 );
-            },
+            }
             "WARN" => {
                 tracing::warn!(
                     event_id = %event.id,
@@ -113,7 +116,7 @@ impl OtelExporter {
                     triggered_rules = ?event.triggered_rules,
                     "Security event logged via OpenTelemetry"
                 );
-            },
+            }
             "ERROR" | "FATAL" => {
                 tracing::error!(
                     event_id = %event.id,
@@ -125,7 +128,7 @@ impl OtelExporter {
                     triggered_rules = ?event.triggered_rules,
                     "Security event logged via OpenTelemetry"
                 );
-            },
+            }
             _ => {
                 tracing::debug!(
                     event_id = %event.id,
@@ -146,12 +149,10 @@ impl OtelExporter {
             // Service identification
             KeyValue::new("service.name", self.service_name.clone()),
             KeyValue::new("service.version", self.service_version.clone()),
-            
             // Security event attributes
             KeyValue::new("security.event.id", event.id.to_string()),
             KeyValue::new("security.decision", event.decision.to_string()),
             KeyValue::new("security.threat_level", event.threat_level.to_string()),
-            
             // HTTP attributes (following OpenTelemetry semantic conventions)
             KeyValue::new("http.method", event.method.clone()),
             KeyValue::new("http.target", event.path.clone()),
@@ -210,28 +211,31 @@ impl OtelExporter {
         // Security-specific attributes
         if !event.triggered_rules.is_empty() {
             attributes.push(KeyValue::new(
-                "security.rules_triggered_count", 
-                event.triggered_rules.len() as i64
+                "security.rules_triggered_count",
+                event.triggered_rules.len() as i64,
             ));
-            
+
             // Add individual rules as separate attributes (limited to avoid too many attributes)
             for (i, rule) in event.triggered_rules.iter().take(10).enumerate() {
-                attributes.push(KeyValue::new(
-                    format!("security.rule.{}", i), 
-                    rule.clone()
-                ));
+                attributes.push(KeyValue::new(format!("security.rule.{}", i), rule.clone()));
             }
         }
 
         // Performance attributes
         if let Some(duration) = event.processing_time_ms {
-            attributes.push(KeyValue::new("security.processing_time_ms", duration as f64));
+            attributes.push(KeyValue::new(
+                "security.processing_time_ms",
+                duration as f64,
+            ));
         }
 
         // Custom fields (limited to avoid attribute explosion)
         for (key, value) in event.custom_fields.iter().take(20) {
             let sanitized_key = self.sanitize_attribute_key(key);
-            attributes.push(KeyValue::new(format!("custom.{}", sanitized_key), value.clone()));
+            attributes.push(KeyValue::new(
+                format!("custom.{}", sanitized_key),
+                value.clone(),
+            ));
         }
 
         attributes
@@ -245,15 +249,16 @@ impl OtelExporter {
 
     /// Convert chrono DateTime to SystemTime for OpenTelemetry
     fn timestamp_to_system_time(&self, timestamp: chrono::DateTime<chrono::Utc>) -> SystemTime {
-        UNIX_EPOCH + Duration::from_secs(timestamp.timestamp() as u64) 
-                  + Duration::from_nanos(timestamp.timestamp_subsec_nanos() as u64)
+        UNIX_EPOCH
+            + Duration::from_secs(timestamp.timestamp() as u64)
+            + Duration::from_nanos(timestamp.timestamp_subsec_nanos() as u64)
     }
 
     /// Get log severity text from threat level
     fn get_log_severity_text(&self, threat_level: &ThreatLevel) -> &'static str {
         match threat_level {
             ThreatLevel::Low => "INFO",
-            ThreatLevel::Medium => "WARN", 
+            ThreatLevel::Medium => "WARN",
             ThreatLevel::High => "ERROR",
             ThreatLevel::Critical => "FATAL",
         }
@@ -262,7 +267,13 @@ impl OtelExporter {
     /// Sanitize attribute keys to comply with OpenTelemetry naming conventions
     fn sanitize_attribute_key(&self, key: &str) -> String {
         key.chars()
-            .map(|c| if c.is_alphanumeric() || c == '_' || c == '.' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '_' || c == '.' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect::<String>()
             .to_lowercase()
     }
@@ -290,7 +301,13 @@ impl SecurityEventExporter for OtelExporter {
         }
 
         // Return error if all exports failed
-        if !results.is_empty() && results.len() == [self.export_traces, self.export_logs].iter().filter(|&&x| x).count() {
+        if !results.is_empty()
+            && results.len()
+                == [self.export_traces, self.export_logs]
+                    .iter()
+                    .filter(|&&x| x)
+                    .count()
+        {
             return Err(format!("All OTel exports failed: {:?}", results).into());
         }
 
@@ -312,7 +329,11 @@ impl SecurityEventExporter for OtelExporter {
         }
 
         if failed_count > 0 {
-            warn!("Failed to export {} out of {} security events to OTel", failed_count, events.len());
+            warn!(
+                "Failed to export {} out of {} security events to OTel",
+                failed_count,
+                events.len()
+            );
         }
 
         Ok(())
@@ -350,7 +371,7 @@ mod tests {
             true,
             true,
         );
-        
+
         let event = SecurityEvent {
             id: uuid::Uuid::new_v4(),
             timestamp: chrono::Utc::now(),
@@ -384,7 +405,7 @@ mod tests {
     #[test]
     fn test_attribute_sanitization() {
         let exporter = OtelExporter::new(None, None, true, true);
-        
+
         let sanitized = exporter.sanitize_attribute_key("Test-Key With Spaces!");
         assert_eq!(sanitized, "test_key_with_spaces_");
     }
