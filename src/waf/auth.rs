@@ -1,8 +1,15 @@
+use crate::error::WafError;
+use hyper::HeaderMap;
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
-use hyper::HeaderMap;
-use sha2::{Sha256, Digest};
-use crate::error::WafError;
+
+/// Rate limiting configuration per API key
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RateLimitConfig {
+    /// Requests per minute per key
+    pub requests_per_minute: u32,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AuthConfig {
@@ -10,6 +17,8 @@ pub struct AuthConfig {
     pub api_keys: Vec<String>,
     pub header_name: String,
     pub require_https: bool,
+    /// Per-API-key rate limiting
+    pub rate_limit: Option<RateLimitConfig>,
 }
 
 impl Default for AuthConfig {
@@ -19,6 +28,7 @@ impl Default for AuthConfig {
             api_keys: vec![],
             header_name: "X-API-Key".to_string(),
             require_https: true,
+            rate_limit: None,
         }
     }
 }
@@ -40,7 +50,7 @@ impl InMemoryKeyStore {
             keys: Arc::new(RwLock::new(hashed_keys.into_iter().collect())),
         }
     }
-    
+
     fn hash_key(key: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(key.as_bytes());
@@ -53,16 +63,16 @@ impl ApiKeyStore for InMemoryKeyStore {
         let key_hash = Self::hash_key(key);
         self.keys.read().unwrap().contains(&key_hash)
     }
-    
+
     fn add_key(&mut self, key: String) {
         let key_hash = Self::hash_key(&key);
         self.keys.write().unwrap().insert(key_hash);
     }
-    
+
     fn remove_key(&mut self, key_hash: &str) -> bool {
         self.keys.write().unwrap().remove(key_hash)
     }
-    
+
     fn list_keys(&self) -> Vec<String> {
         self.keys.read().unwrap().iter().cloned().collect()
     }
@@ -77,31 +87,27 @@ impl ApiKeyValidator {
     pub fn new(store: Arc<dyn ApiKeyStore>, config: AuthConfig) -> Self {
         Self { store, config }
     }
-    
+
     pub fn validate_request(&self, headers: &HeaderMap, is_https: bool) -> Result<(), WafError> {
         if !self.config.enabled {
             return Ok(());
         }
-        
+
         if self.config.require_https && !is_https {
             return Err(WafError::AuthError(
-                "HTTPS required for API key authentication".to_string()
+                "HTTPS required for API key authentication".to_string(),
             ));
         }
-        
+
         let api_key = headers
             .get(&self.config.header_name)
             .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| WafError::AuthError(
-                "Missing API key header".to_string()
-            ))?;
-        
+            .ok_or_else(|| WafError::AuthError("Missing API key header".to_string()))?;
+
         if !self.store.validate(api_key) {
-            return Err(WafError::AuthError(
-                "Invalid API key".to_string()
-            ));
+            return Err(WafError::AuthError("Invalid API key".to_string()));
         }
-        
+
         Ok(())
     }
 }
@@ -115,7 +121,7 @@ mod tests {
         let key = "test-api-key-12345";
         let hash1 = InMemoryKeyStore::hash_key(key);
         let hash2 = InMemoryKeyStore::hash_key(key);
-        
+
         assert_eq!(hash1, hash2);
         assert_eq!(hash1.len(), 64);
     }
@@ -125,7 +131,7 @@ mod tests {
         let key = "test-key";
         let hashed = InMemoryKeyStore::hash_key(key);
         let store = InMemoryKeyStore::new(vec![hashed]);
-        
+
         assert!(store.validate(key));
         assert!(!store.validate("wrong-key"));
     }
@@ -138,7 +144,7 @@ mod tests {
             ..Default::default()
         };
         let validator = ApiKeyValidator::new(store, config);
-        
+
         let headers = HeaderMap::new();
         assert!(validator.validate_request(&headers, true).is_ok());
     }
@@ -151,7 +157,7 @@ mod tests {
             ..Default::default()
         };
         let validator = ApiKeyValidator::new(store, config);
-        
+
         let headers = HeaderMap::new();
         assert!(validator.validate_request(&headers, true).is_err());
     }
@@ -166,10 +172,10 @@ mod tests {
             ..Default::default()
         };
         let validator = ApiKeyValidator::new(store, config);
-        
+
         let mut headers = HeaderMap::new();
         headers.insert("X-API-Key", key.parse().unwrap());
-        
+
         assert!(validator.validate_request(&headers, true).is_ok());
     }
 
@@ -184,10 +190,10 @@ mod tests {
             ..Default::default()
         };
         let validator = ApiKeyValidator::new(store, config);
-        
+
         let mut headers = HeaderMap::new();
         headers.insert("X-API-Key", key.parse().unwrap());
-        
+
         assert!(validator.validate_request(&headers, false).is_err());
         assert!(validator.validate_request(&headers, true).is_ok());
     }
