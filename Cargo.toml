@@ -207,6 +207,8 @@ export-redb = ["redb"]
 io-uring = ["tokio-uring"]
 # AI/ML threat detection features (simplified)
 ai-threat-detection = ["polars", "smartcore", "ndarray", "rand_distr"]
+# Compliance features
+compliance = ["sled", "chrono"]
 
 # Security modules performance benchmarks
 [[bench]]

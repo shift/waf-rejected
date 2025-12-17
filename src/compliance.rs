@@ -4,6 +4,9 @@ use std::sync::{Arc, RwLock};
 use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
 
+#[cfg(feature = "sled")]
+use sled;
+
 use crate::config::{AuditConfig, RegulatoryConfig, RetentionConfig};
 use crate::error::WafError;
 

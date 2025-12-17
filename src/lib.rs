@@ -16,6 +16,7 @@ pub mod waf;
 pub mod performance_validation;
 
 // Compliance and security modules
+#[cfg(feature = "compliance")]
 pub mod compliance;
 
 // Legacy AI modules (kept for compatibility)
