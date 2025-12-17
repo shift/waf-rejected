@@ -190,16 +190,16 @@ mod tests {
         
         // Read file
         let read_data = handler.read_file(&test_file).await?;
-        assert_eq!(read_data, test_data);
-        
+        assert_eq!(read_data.as_ref(), test_data);
+
         // Append to file
         let append_data = b" More data!";
         handler.append_file(&test_file, append_data).await?;
-        
+
         // Verify appended content
         let final_data = handler.read_file(&test_file).await?;
-        let expected = [test_data, append_data].concat();
-        assert_eq!(final_data, expected.as_slice());
+        let expected = [test_data.as_slice(), append_data].concat();
+        assert_eq!(final_data.as_ref(), expected.as_slice());
         
         // Delete file
         handler.delete_file(&test_file).await?;

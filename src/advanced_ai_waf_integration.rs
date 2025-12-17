@@ -79,7 +79,7 @@ impl AdvancedAiWafIntegration {
             .record_analysis_metrics(&optimized_analysis, processing_time)
             .await?;
 
-        let recommendations = self
+        let _recommendations = self
             .generate_mitigation_recommendations(&adaptive_response)
             .await?;
 
@@ -1099,6 +1099,7 @@ impl DashboardRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai_optimization_engine::ThreatExplanation;
 
     #[tokio::test]
     async fn test_advanced_ai_waf_integration() {

@@ -841,7 +841,7 @@ impl WasmEngine {
         std::fs::create_dir_all(module_dir).context("Failed to create module directory")?;
 
         // Create a minimal WASM module (placeholder)
-        let mock_wasm = include_bytes!("../resources/mock_modsecurity.wasm");
+        let mock_wasm = b"dummy wasm module";
         std::fs::write(&self.config.module_path, mock_wasm)
             .context("Failed to write mock WASM module")?;
 

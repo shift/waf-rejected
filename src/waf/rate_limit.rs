@@ -155,7 +155,7 @@ impl WafRule for GlobalRateLimiter {
         &self.name
     }
 
-    fn evaluate(&self, ctx: &RequestContext) -> Decision {
+    fn evaluate(&self, _ctx: &RequestContext) -> Decision {
         let mut bucket = self.bucket.write().unwrap();
 
         if bucket.try_consume(1) {

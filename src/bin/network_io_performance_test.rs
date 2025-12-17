@@ -284,7 +284,7 @@ mod tests {
         
         // Test read_stream
         let read_result = handler.read_stream(&mut mock_stream).await?;
-        assert_eq!(read_result, test_data);
+        assert_eq!(read_result.as_ref(), test_data);
         
         // Test write_stream
         handler.write_stream(&mut mock_stream, test_data).await?;

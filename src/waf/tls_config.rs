@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor as TokioTlsAcceptor;
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 
 pub struct TlsManager {
     acceptor: Option<TokioTlsAcceptor>,
@@ -44,12 +44,12 @@ impl TlsManager {
             server_config.alpn_protocols = alpn;
         }
 
-        let min_version = parse_tls_version(&config.min_version)?;
-        let max_version = parse_tls_version(&config.max_version)?;
+        let _min_version = parse_tls_version(&config.min_version)?;
+        let _max_version = parse_tls_version(&config.max_version)?;
 
-        server_config.versions = vec![min_version, max_version]
-            .into_iter()
-            .collect();
+        // server_config.versions = vec![min_version, max_version]
+        //     .into_iter()
+        //     .collect();
 
         let acceptor = TokioTlsAcceptor::from(Arc::new(server_config));
 

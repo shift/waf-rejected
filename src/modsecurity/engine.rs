@@ -164,7 +164,7 @@ impl ModSecurityEngine {
         let (tx, rx) = mpsc::channel();
         let rules_path = self.config.rules_path.clone();
         let rules_arc = Arc::clone(&self.rules);
-        let config = self.config.clone();
+        let _config = self.config.clone();
 
         let mut watcher = notify::recommended_watcher(tx).map_err(|e| {
             ModSecurityError::EngineInit(format!("Failed to create file watcher: {}", e))

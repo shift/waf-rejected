@@ -468,7 +468,7 @@ impl WafRule for IpRule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyper::{Method, Uri};
+    use hyper::{HeaderMap, Method, Uri};
     use std::net::IpAddr;
     use std::str::FromStr;
 

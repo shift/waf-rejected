@@ -92,9 +92,8 @@ impl Default for AIConfig {
 }
 
 impl AiWafMiddleware {
-    pub async fn new() -> Result<Self> {
-        let mut threat_intelligence = ThreatIntelligenceEngine::new();
-        threat_intelligence.initialize().await?;
+    pub fn new() -> Result<Self> {
+        let threat_intelligence = ThreatIntelligenceEngine::new();
 
         Ok(Self {
             threat_detector: Arc::new(ThreatDetectionService::new()),

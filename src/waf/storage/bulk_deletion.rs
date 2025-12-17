@@ -3,7 +3,7 @@
 //! Advanced bulk deletion strategies and optimizations for TTL cleanup
 //! operations in the WAF-Rejected storage system.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 use std::sync::Arc;
 use std::collections::HashMap;
 use tokio::sync::RwLock;

@@ -243,7 +243,7 @@ impl ComponentManager {
     pub async fn instantiate(
         &self,
         component: &Component,
-        store: &mut wasmtime::Store<WasmHostContext>,
+        _store: &mut wasmtime::Store<WasmHostContext>,
     ) -> Result<ModSecurityComponent> {
         // Simplified instantiation for MVP
         // In production, this would use the component model
@@ -253,7 +253,7 @@ impl ComponentManager {
         })
     }
 
-    fn add_host_functions(linker: &mut Linker<WasmHostContext>) -> Result<()> {
+    fn add_host_functions(_linker: &mut Linker<WasmHostContext>) -> Result<()> {
         // Add host function implementations
         // This would bind the actual host functions to the WASM module
 
