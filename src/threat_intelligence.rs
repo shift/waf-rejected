@@ -620,7 +620,7 @@ impl ThreatIntelligenceEngine {
         }
     }
 
-    fn parse_recorded_future_data(data: &str) -> Result<ParsedThreatData> {
+    fn parse_recorded_future_data(_data: &str) -> Result<ParsedThreatData> {
         // Implementation for Recorded Future API response parsing
         let parsed = ParsedThreatData {
             indicators: Vec::new(),
@@ -632,7 +632,7 @@ impl ThreatIntelligenceEngine {
         Ok(parsed)
     }
 
-    fn parse_virustotal_data(data: &str) -> Result<ParsedThreatData> {
+    fn parse_virustotal_data(_data: &str) -> Result<ParsedThreatData> {
         // Implementation for VirusTotal API response parsing
         let parsed = ParsedThreatData {
             indicators: Vec::new(),
@@ -644,7 +644,7 @@ impl ThreatIntelligenceEngine {
         Ok(parsed)
     }
 
-    fn parse_misp_data(data: &str) -> Result<ParsedThreatData> {
+    fn parse_misp_data(_data: &str) -> Result<ParsedThreatData> {
         // Implementation for MISP feed parsing
         let parsed = ParsedThreatData {
             indicators: Vec::new(),
@@ -656,7 +656,7 @@ impl ThreatIntelligenceEngine {
         Ok(parsed)
     }
 
-    fn parse_stix_data(data: &str) -> Result<ParsedThreatData> {
+    fn parse_stix_data(_data: &str) -> Result<ParsedThreatData> {
         // Implementation for STIX/TAXII feed parsing
         let parsed = ParsedThreatData {
             indicators: Vec::new(),
@@ -668,7 +668,7 @@ impl ThreatIntelligenceEngine {
         Ok(parsed)
     }
 
-    fn parse_custom_data(data: &str) -> Result<ParsedThreatData> {
+    fn parse_custom_data(_data: &str) -> Result<ParsedThreatData> {
         // Implementation for custom feed parsing
         let parsed = ParsedThreatData {
             indicators: Vec::new(),
@@ -727,7 +727,7 @@ impl ThreatIntelligenceEngine {
             let matches = match indicator.indicator_type {
                 IndicatorType::IpAddress => {
                     if let Ok(ip) = indicator.value.parse::<IpAddr>() {
-                        if let Some(client_ip) = features.client_ip_parsed {
+                        if let Some(_client_ip) = features.client_ip_parsed {
                             features.client_ip_parsed == Some(ip)
                         } else {
                             false
@@ -1127,12 +1127,12 @@ impl ZeroDayDetector {
         Ok(detections)
     }
 
-    fn is_statistical_anomaly(&self, features: &RequestFeatures) -> bool {
+    fn is_statistical_anomaly(&self, _features: &RequestFeatures) -> bool {
         // TODO: Implement statistical anomaly detection logic
         false
     }
 
-    fn is_behavioral_anomaly(&self, features: &RequestFeatures) -> bool {
+    fn is_behavioral_anomaly(&self, _features: &RequestFeatures) -> bool {
         // TODO: Implement behavioral anomaly detection logic
         false
     }
@@ -1167,7 +1167,7 @@ impl AdaptiveRuleEngine {
         Ok(triggered_rules)
     }
 
-    fn rule_matches(&self, rule: &AdaptiveRule, features: &RequestFeatures) -> bool {
+    fn rule_matches(&self, _rule: &AdaptiveRule, _features: &RequestFeatures) -> bool {
         // TODO: Implement rule matching logic
         false
     }

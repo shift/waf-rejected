@@ -3,6 +3,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tracing::info;
 
+use crate::waf::storage::StorageConfig as WafStorageConfig;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Address to bind the server to
@@ -27,6 +29,58 @@ pub struct Config {
     pub storage: StorageConfig,
     // Security module configurations
     pub security: SecurityConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageConfig {
+    pub backend: String,
+    pub path: String,
+    pub enable_follower_reads: bool,
+    pub ttl_cleanup_interval: Duration,
+    pub enable_compression: bool,
+    pub cache_size: Option<usize>,
+    pub max_memory_entries: Option<usize>,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            backend: "redb".to_string(),
+            path: "./data/waf.redb".to_string(),
+            enable_follower_reads: true,
+            ttl_cleanup_interval: Duration::from_secs(60),
+            enable_compression: false,
+            cache_size: Some(16 * 1024 * 1024), // 16MB default cache
+            max_memory_entries: None,
+        }
+    }
+}
+
+impl StorageConfig {
+    /// Convert to waf storage configuration
+    pub fn to_waf_storage_config(&self) -> WafStorageConfig {
+        let backend = match self.backend.as_str() {
+            "sled" => crate::waf::storage::StorageBackend::Sled {
+                path: self.path.clone(),
+                temporary: false,
+            },
+            "redb" => crate::waf::storage::StorageBackend::Redb {
+                path: self.path.clone(),
+                cache_size: self.cache_size,
+            },
+            "memory" => crate::waf::storage::StorageBackend::Memory {
+                max_size: self.max_memory_entries,
+            },
+            _ => crate::waf::storage::StorageBackend::default(),
+        };
+
+        WafStorageConfig {
+            backend,
+            enable_follower_reads: self.enable_follower_reads,
+            ttl_cleanup_interval: self.ttl_cleanup_interval,
+            enable_compression: self.enable_compression,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,7 +315,6 @@ pub struct WasmConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiConfig {
     /// Enable AI threat detection
     pub enabled: bool,
@@ -381,6 +434,7 @@ impl Default for ComplianceConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecurityConfig {
     /// Security events configuration
     pub events: SecurityEventsConfig,
@@ -398,7 +452,6 @@ pub struct SecurityConfig {
 
     /// Enterprise compliance configuration
     pub compliance: ComplianceConfig,
-}
 }
 
 impl Default for Config {
@@ -583,46 +636,7 @@ impl Default for WasmConfig {
     }
 }
 
-impl Default for StorageConfig {
-    fn default() -> Self {
-        Self {
-            backend: "redb".to_string(),
-            path: "./data/waf.redb".to_string(),
-            enable_follower_reads: true,
-            ttl_cleanup_interval_secs: 60,
-            enable_compression: false,
-            cache_size: Some(16 * 1024 * 1024), // 16MB default cache
-            max_memory_entries: None,
-        }
-    }
-}
 
-impl StorageConfig {
-    /// Convert to waf storage configuration
-    pub fn to_waf_storage_config(&self) -> crate::waf::storage::StorageConfig {
-        let backend = match self.backend.as_str() {
-            "sled" => crate::waf::storage::StorageBackend::Sled {
-                path: self.path.clone(),
-                temporary: false,
-            },
-            "redb" => crate::waf::storage::StorageBackend::Redb {
-                path: self.path.clone(),
-                cache_size: self.cache_size,
-            },
-            "memory" => crate::waf::storage::StorageBackend::Memory {
-                max_size: self.max_memory_entries,
-            },
-            _ => crate::waf::storage::StorageBackend::default(),
-        };
-
-        crate::waf::storage::StorageConfig {
-            backend,
-            enable_follower_reads: self.enable_follower_reads,
-            ttl_cleanup_interval: Duration::from_secs(self.ttl_cleanup_interval_secs),
-            enable_compression: self.enable_compression,
-        }
-    }
-}
 
 impl Config {
     /// Load configuration from environment variables and config file

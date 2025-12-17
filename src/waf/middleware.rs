@@ -1,11 +1,9 @@
 use crate::error::WafError;
 use crate::waf::{Decision, RequestContext, WafEngine};
 use futures::future::BoxFuture;
-use http_body_util::BodyExt;
 use hyper::Request;
 use std::net::SocketAddr;
 use std::task::{Context, Poll};
-use tower::util::ServiceExt;
 use tower::{Layer, Service};
 
 /// WAF middleware layer for Tower
@@ -123,6 +121,7 @@ fn extract_client_ip<B>(req: &Request<B>) -> Option<std::net::IpAddr> {
 mod tests {
     use super::*;
     use crate::waf::{rules::IpRule, WafEngine};
+    use std::net::IpAddr;
     use std::str::FromStr;
 
     #[tokio::test]

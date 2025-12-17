@@ -286,6 +286,7 @@ impl SecurityEventExporter for CefExporter {
 mod tests {
     use super::*;
     use crate::waf::security_events::ThreatLevel;
+    use chrono::Utc;
     use std::collections::HashMap;
 
     #[test]

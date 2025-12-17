@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 pub mod ai;
 pub mod auth;
 pub mod content_inspection;
@@ -367,7 +366,6 @@ impl WafEngine {
                     }
 
                     // Re-export performance optimization modules
-                    pub use simd_ops::{fast_pattern_search, contains_sql_injection_patterns, contains_xss_patterns};
                 }
                 Err(e) => {
                     warn!("WASM ModSecurity engine error: {}", e);

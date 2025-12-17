@@ -425,7 +425,7 @@ impl SecurityEventLogger {
     /// Get recent events from Sled database if available
     pub async fn get_recent_events(
         &self,
-        limit: usize,
+        _limit: usize,
     ) -> Result<Vec<SecurityEvent>, Box<dyn std::error::Error + Send + Sync>> {
         // This is a simple implementation - in a real system you'd want to track which exporter is Sled
         // For now, return an error indicating this feature needs the specific Sled instance

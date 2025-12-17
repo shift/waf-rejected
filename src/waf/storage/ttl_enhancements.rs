@@ -3,10 +3,10 @@
 //! Advanced TTL expiration strategies and bulk optimization enhancements
 //! for the WAF-Rejected storage system.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn, error};
+use tracing::info;
 
 /// Enhanced TTL cleanup configuration
 #[derive(Debug, Clone)]

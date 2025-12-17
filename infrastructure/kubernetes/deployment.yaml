@@ -1,0 +1,108 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: waf-rejected
+  namespace: security
+  labels:
+    app: waf-rejected
+    version: v0.1.0
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: waf-rejected
+  template:
+    metadata:
+      labels:
+        app: waf-rejected
+        version: v0.1.0
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 2000
+      containers:
+      - name: waf-ingress
+        image: waf-rejected:v0.1.0
+        imagePullPolicy: Always
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+        - name: metrics
+          containerPort: 9090
+          protocol: TCP
+        env:
+        - name: RUST_LOG
+          value: "waf_ingress=info,security=warn"
+        - name: CONFIG_PATH
+          value: "/config/production.toml"
+        - name: OTEL_SERVICE_NAME
+          value: "waf-rejected"
+        - name: OTEL_TRACES_ENDPOINT
+          value: "http://opentelemetry-collector:4318/v1/traces"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "500m"
+          limits:
+            memory: "1Gi"
+            cpu: "2000m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: http
+            scheme: HTTP
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: config-volume
+          mountPath: /config
+          readOnly: true
+        - name: logs-volume
+          mountPath: /var/log/waf
+        - name: audit-volume
+          mountPath: /var/audit
+      volumes:
+      - name: config-volume
+        configMap:
+          name: waf-rejected-config
+      - name: logs-volume
+        emptyDir: {}
+      - name: audit-volume
+        emptyDir: {}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - waf-rejected
+              topologyKey: kubernetes.io/hostname

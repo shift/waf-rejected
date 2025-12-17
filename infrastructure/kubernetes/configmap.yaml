@@ -1,0 +1,64 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: waf-rejected-config
+  namespace: security
+data:
+  production.toml: |
+    # WAF-Rejected Production Configuration
+
+    [server]
+    bind_addr = "0.0.0.0:8080"
+    max_connections = 10000
+    request_timeout_secs = 30
+    keep_alive_timeout_secs = 90
+    enable_http2 = true
+    enable_http3 = true
+    supported_http_versions = ["1.0", "1.1", "2", "3"]
+
+    [proxy]
+    upstream_url = "http://backend-service:8080"
+    bind_addr = "0.0.0.0:8080"
+    timeout_seconds = 30
+    max_request_size = 10485760  # 10MB
+
+    [logging]
+    level = "INFO"
+    format = "json"
+    enable_otel = true
+    otel_service_name = "waf-rejected"
+    otel_service_version = "0.1.0"
+
+    [waf]
+    enable_wasm = true
+    wasm_module_path = "/config/coraza.wasm"
+    wasm_memory_limit = 16777216  # 16MB
+    wasm_timeout_ms = 100
+
+    [security.events]
+    enable_cef = true
+    enable_otel = true
+    enable_sled = true
+    sled_db_path = "/var/log/waf/security.db"
+    sled_max_events = 1000000
+    sled_compress = true
+
+    [security.auth]
+    enabled = true
+    header_name = "X-API-Key"
+    require_https = true
+    # API keys configured via secrets
+
+    [security.ai]
+    enabled = true
+    threat_threshold = 0.8
+    timeout_ms = 5000
+
+    [security.compliance]
+    enabled = true
+    audit.tamper_evident = true
+    audit.retention_days = 2555
+    regulatory.gdpr = true
+    regulatory.pci_dss = true
+    retention.security_events_days = 90
+    retention.audit_logs_days = 2555

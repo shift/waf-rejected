@@ -229,7 +229,7 @@ impl ModelInferenceOptimizer {
         format!("model_{}", features.body_size / 1000)
     }
 
-    async fn create_optimized_model(&self, model_key: &str) -> Result<OptimizedModel> {
+    async fn create_optimized_model(&self, _model_key: &str) -> Result<OptimizedModel> {
         // Create base model
         let base_weights = self.generate_base_weights().await?;
 
@@ -944,7 +944,7 @@ impl HardwareAccelerationManager {
     pub async fn execute_inference(
         &self,
         _model: &OptimizedModel,
-        features: &RequestFeatures,
+        _features: &RequestFeatures,
     ) -> Result<InferenceResult> {
         // High-performance inference simulation
         Ok(InferenceResult {
@@ -1027,7 +1027,7 @@ impl FederatedLearningCoordinator {
 }
 
 impl LimeEngine {
-    pub async fn explain_decision(&self, analysis: &ThreatAnalysis) -> Result<LimeExplanation> {
+    pub async fn explain_decision(&self, _analysis: &ThreatAnalysis) -> Result<LimeExplanation> {
         Ok(LimeExplanation {
             feature_contributions: [
                 ("request_size".to_string(), 0.3),

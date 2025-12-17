@@ -898,7 +898,7 @@ impl AdvancedThreatClassifier {
 
     async fn update_model_weights(&mut self, feedback: &ThreatFeedback) -> Result<()> {
         // Simple online learning weight updates
-        let learning_rate = 0.01;
+        let _learning_rate = 0.01;
 
         match feedback.feedback_type {
             FeedbackType::FalsePositive => {

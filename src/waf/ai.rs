@@ -1,6 +1,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::Utc;
+use hyper::Request;
+
 use crate::config::AiConfig;
 use crate::error::WafError;
 use crate::waf::RequestContext;
@@ -15,7 +18,7 @@ pub struct AiAnalysisResult {
     pub should_block: bool,
 
     /// Processing time in milliseconds
-    pub processing_time_ms: u128,
+    pub processing_time_ms: f32,
 
     /// Model version used for analysis
     pub model_version: String,
@@ -24,15 +27,9 @@ pub struct AiAnalysisResult {
 impl Default for AiAnalysisResult {
     fn default() -> Self {
         Self {
-            analysis: crate::ai_threat_detection::ThreatAnalysis {
-                threat_score: 0.0,
-                threat_categories: vec![],
-                confidence: 0.0,
-                processing_time_ms: 0,
-                model_version: "disabled".to_string(),
-            },
+            analysis: crate::ai_threat_detection::ThreatAnalysis::default(),
             should_block: false,
-            processing_time_ms: 0,
+            processing_time_ms: 0.0,
             model_version: "disabled".to_string(),
         }
     }
@@ -57,17 +54,7 @@ impl AiThreatDetector {
         let threat_detector = Arc::new(crate::ai_threat_detection::ThreatDetectionService::new());
 
         // Initialize the AI WAF middleware
-        let ai_middleware = Arc::new(crate::ai_waf_integration::AiWafMiddleware::new(
-            Arc::clone(&threat_detector),
-            Arc::new(crate::advanced_ml_models::AdvancedThreatClassifier::new()),
-            Arc::new(crate::threat_intelligence::ThreatIntelligenceEngine::new()),
-            crate::ai_waf_integration::AIConfig {
-                enabled: config.enabled,
-                threat_threshold: config.threat_threshold,
-                timeout_ms: config.timeout_ms,
-                model_path: config.model.model_path.clone(),
-            },
-        ));
+        let ai_middleware = Arc::new(crate::ai_waf_integration::AiWafMiddleware::new()?);
 
         Ok(Self {
             threat_detector,
@@ -84,48 +71,41 @@ impl AiThreatDetector {
 
         let start_time = Instant::now();
 
-        // Convert WAF RequestContext to AI analysis format
-        let ai_request = self.convert_to_ai_request(ctx);
+        // Construct HTTP request from context
+        let mut req_builder = Request::builder()
+            .method(ctx.method.clone())
+            .uri(ctx.uri.clone());
+
+        for (key, value) in &ctx.headers {
+            req_builder = req_builder.header(key, value);
+        }
+
+        let body_bytes = ctx.body.as_ref().map(|b| b.as_ref()).unwrap_or(&[]);
+        let req = req_builder.body(body_bytes.to_vec()).unwrap();
 
         // Perform AI analysis with timeout
         let analysis_result = tokio::time::timeout(
             Duration::from_millis(self.config.timeout_ms),
-            self.ai_middleware.analyze_request(&ai_request)
+            self.ai_middleware.analyze_request(&req, body_bytes)
         ).await
-        .map_err(|_| WafError::Internal("AI analysis timeout".to_string()))?
-        .map_err(|e| WafError::Internal(format!("AI analysis error: {}", e)))?;
+        .map_err(|_| WafError::internal("AI analysis timeout".to_string()))?
+        .map_err(|e| WafError::internal(format!("AI analysis error: {}", e)))?;
 
         let processing_time = start_time.elapsed().as_millis();
 
         // Determine if request should be blocked based on threat threshold
         let should_block = analysis_result.should_block
-            && analysis_result.analysis.threat_score >= self.config.threat_threshold;
+            && analysis_result.analysis.overall_risk_score >= self.config.threat_threshold as f32;
 
         Ok(AiAnalysisResult {
             analysis: analysis_result.analysis,
             should_block,
-            processing_time_ms: processing_time,
+            processing_time_ms: processing_time as f32,
             model_version: analysis_result.model_version,
         })
     }
 
-    /// Convert WAF RequestContext to AI analysis format
-    fn convert_to_ai_request(&self, ctx: &RequestContext) -> crate::ai_threat_detection::RequestContext {
-        // Convert headers to the format expected by AI analysis
-        let headers = ctx.headers.iter()
-            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-            .collect();
 
-        crate::ai_threat_detection::RequestContext {
-            client_ip: ctx.client_ip,
-            method: ctx.method.as_str().to_string(),
-            uri: ctx.uri.to_string(),
-            headers,
-            body: ctx.body.clone(),
-            timestamp: ctx.timestamp,
-            http_version: ctx.http_version.clone(),
-        }
-    }
 
     /// Get current configuration
     pub fn config(&self) -> &AiConfig {
