@@ -92,7 +92,7 @@ pin-project = "1.0"
 parking_lot = "0.12"
 
 # Time handling
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"], optional = true }
 
 # ModSecurity WASM Go integration
 wasmtime = { version = "26.0", features = ["component-model", "async", "pooling-allocator"], optional = true }
