@@ -1,0 +1,98 @@
+groups:
+  - name: waf-rejected-alerts
+    rules:
+      # Security incident alerts
+      - alert: HighSecurityEvents
+        expr: rate(waf_security_events_total{severity="high"}[5m]) > 10
+        for: 2m
+        labels:
+          severity: critical
+          category: security
+        annotations:
+          summary: "High rate of security events detected"
+          description: "WAF-Rejected detected {{ $value }} high-severity security events per second"
+          runbook_url: "https://docs.waf-rejected.com/incident-response"
+
+      - alert: AuthenticationFailures
+        expr: rate(waf_auth_failures_total[5m]) > 50
+        for: 5m
+        labels:
+          severity: warning
+          category: security
+        annotations:
+          summary: "High rate of authentication failures"
+          description: "Detected {{ $value }} authentication failures per second"
+
+      # Performance alerts
+      - alert: HighLatency
+        expr: histogram_quantile(0.95, rate(waf_request_duration_seconds_bucket[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          category: performance
+        annotations:
+          summary: "High request latency detected"
+          description: "95th percentile request latency is {{ $value }}s"
+
+      - alert: HighErrorRate
+        expr: rate(waf_requests_total{status=~"5.."}[5m]) / rate(waf_requests_total[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+          category: reliability
+        annotations:
+          summary: "High error rate detected"
+          description: "{{ $value | humanizePercentage }} of requests are failing"
+
+      # System health alerts
+      - alert: PodRestarting
+        expr: rate(kube_pod_container_status_restarts_total{namespace="security", pod=~"waf-rejected-.*"}[5m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+          category: infrastructure
+        annotations:
+          summary: "WAF-Rejected pod restarting"
+          description: "Pod {{ $labels.pod }} is restarting"
+
+      - alert: HighMemoryUsage
+        expr: container_memory_usage_bytes{namespace="security", pod=~"waf-rejected-.*"} / container_spec_memory_limit_bytes > 0.8
+        for: 5m
+        labels:
+          severity: warning
+          category: performance
+        annotations:
+          summary: "High memory usage"
+          description: "Pod {{ $labels.pod }} memory usage is {{ $value | humanizePercentage }}"
+
+      - alert: HighCPUUsage
+        expr: rate(container_cpu_usage_seconds_total{namespace="security", pod=~"waf-rejected-.*"}[5m]) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+          category: performance
+        annotations:
+          summary: "High CPU usage"
+          description: "Pod {{ $labels.pod }} CPU usage is high"
+
+      # Compliance alerts
+      - alert: AuditLogIntegrityFailure
+        expr: waf_audit_integrity_check_failures_total > 0
+        for: 1m
+        labels:
+          severity: critical
+          category: compliance
+        annotations:
+          summary: "Audit log integrity check failed"
+          description: "Audit log integrity verification failed"
+          runbook_url: "https://docs.waf-rejected.com/compliance/audit-integrity"
+
+      - alert: DataRetentionViolation
+        expr: waf_data_retention_violations_total > 0
+        for: 1m
+        labels:
+          severity: warning
+          category: compliance
+        annotations:
+          summary: "Data retention policy violation"
+          description: "Data retention policy was violated"
