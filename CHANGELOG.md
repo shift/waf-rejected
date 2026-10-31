@@ -2,13 +2,17 @@
 
 All notable changes to WAF-Rejected are documented here.
 
-## [Unreleased]
+## [0.1.0-beta.6] - 2026-10-31
 
 ### Added
 
 - HTTPS/WSS WebSocket upstream support using rustls with `webpki-roots`.
   Plaintext `http://` upstreams continue to work, and unsupported schemes are
   rejected with `502`.
+
+### Fixed
+
+- WebSocket text/binary frames larger than `server.max_body_size` are blocked.
 
 ## [0.1.0-beta.5] - 2026-10-31
 
