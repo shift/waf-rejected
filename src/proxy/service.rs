@@ -789,6 +789,7 @@ impl WafProxyService {
             "1.1".to_string(),
         );
         let leftover = buffer[header_end..].to_vec();
+        let max_frame_bytes = state.config.server.max_body_size;
         tokio::spawn(async move {
             let upgraded = match on_upgrade.await {
                 Ok(upgraded) => upgraded,
@@ -805,7 +806,14 @@ impl WafProxyService {
             let upstream_ws =
                 WebSocketStream::from_raw_socket(upstream_io, Role::Client, None).await;
 
-            Self::bridge_websocket(client_ws, upstream_ws, waf_engine, base_context).await;
+            Self::bridge_websocket(
+                client_ws,
+                upstream_ws,
+                waf_engine,
+                base_context,
+                max_frame_bytes,
+            )
+            .await;
         });
 
         info!(
@@ -824,6 +832,7 @@ impl WafProxyService {
         mut upstream: WebSocketStream<U>,
         waf_engine: Arc<WafEngine>,
         base_context: RequestContext,
+        max_frame_bytes: usize,
     ) where
         C: AsyncRead + AsyncWrite + Unpin,
         U: AsyncRead + AsyncWrite + Unpin,
@@ -833,7 +842,14 @@ impl WafProxyService {
                 incoming = client.next() => {
                     match incoming {
                         Some(Ok(message)) => {
-                            if Self::websocket_message_blocked(&waf_engine, &base_context, &message).await {
+                            if Self::websocket_message_blocked(
+                                &waf_engine,
+                                &base_context,
+                                &message,
+                                max_frame_bytes,
+                            )
+                            .await
+                            {
                                 let _ = client.send(Message::Close(None)).await;
                                 let _ = upstream.send(Message::Close(None)).await;
                                 break;
@@ -871,6 +887,7 @@ impl WafProxyService {
         waf_engine: &WafEngine,
         base_context: &RequestContext,
         message: &Message,
+        max_frame_bytes: usize,
     ) -> bool {
         let payload = match message {
             Message::Text(text) => text.as_bytes().to_vec(),
@@ -879,6 +896,15 @@ impl WafProxyService {
         };
         if payload.is_empty() {
             return false;
+        }
+        if payload.len() > max_frame_bytes {
+            warn!(
+                "WAF blocked oversized WebSocket frame from {}: {} bytes exceeds {}",
+                base_context.client_ip,
+                payload.len(),
+                max_frame_bytes
+            );
+            return true;
         }
 
         let mut context = base_context.clone();
