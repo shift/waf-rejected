@@ -99,6 +99,12 @@ persistence:
 
 ## Security Configuration
 
+The trust boundaries, request-path enforcement points, bypass classes and
+residual risks are described in the
+[security architecture and threat model](../architecture/security-model.md).
+Read it before choosing authentication, TLS termination or trusted-proxy
+settings.
+
 ### API Key Authentication
 
 ```yaml

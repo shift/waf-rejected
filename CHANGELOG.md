@@ -14,6 +14,10 @@ All notable changes to WAF-Rejected are documented here.
   `gh attestation verify <file> --repo shift/waf-rejected`.
 - Added a "verify provenance" section to `SECURITY.md`,
   `docs/operations/release-checklist.md` and `docs/operations/container.md`.
+- Added `docs/architecture/security-model.md`: trust boundaries, request
+  lifecycle and enforcement points, bypass classes, explicit non-goals,
+  deployment assumptions, hardening checklist and audit-evidence sources for
+  the current Beta.
 
 ## [0.1.0-beta.8] - 2026-10-31
 

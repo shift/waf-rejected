@@ -142,6 +142,7 @@ issues already fixed on `main` and released.
 
 ## Related documents
 
+- [Security architecture and threat model](docs/architecture/security-model.md)
 - [Support policy](docs/operations/support-policy.md)
 - [Supply-chain policy](docs/operations/supply-chain.md)
 - [Container usage](docs/operations/container.md)

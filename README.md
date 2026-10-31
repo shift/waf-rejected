@@ -1,6 +1,6 @@
 # WAF-Rejected
 
-**Current Beta:** `0.1.0-beta.3` · container `ghcr.io/shift/waf-rejected:v0.1.0-beta.3`
+**Current Beta:** `0.1.0-beta.8` · prebuilt image tarball attached to the GitHub release
 
 A Rust reverse-proxy web application firewall. Requests are inspected by a
 configurable rule chain (SQL injection, XSS, command injection, path traversal,
@@ -135,6 +135,9 @@ defaults to `docker`).
   report.
 - **Support period, patch targets and end of life:**
   [`docs/operations/support-policy.md`](docs/operations/support-policy.md).
+- **Security architecture and threat model:** trust boundaries, request-path
+  enforcement points, bypass classes and deployment assumptions:
+  [`docs/architecture/security-model.md`](docs/architecture/security-model.md).
 - **Container operations:** loading the released image tarball, pinning by
   digest, health/metrics ports (`8081`), upgrade and rollback:
   [`docs/operations/container.md`](docs/operations/container.md).
