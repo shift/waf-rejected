@@ -18,6 +18,10 @@ All notable changes to WAF-Rejected are documented here.
   lifecycle and enforcement points, bypass classes, explicit non-goals,
   deployment assumptions, hardening checklist and audit-evidence sources for
   the current Beta.
+- Added environment-gated MaxMind GeoIP integration tests and
+  `docs/operations/maxmind-testing.md`, covering database licensing, local
+  placement, test environment variables and failure handling. Database files
+  are never committed.
 
 ## [0.1.0-beta.8] - 2026-10-31
 

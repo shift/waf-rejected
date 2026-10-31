@@ -106,6 +106,17 @@ nix develop -c cargo check --all-targets
 nix build .#waf-ingress
 ```
 
+MaxMind-backed integration tests are skipped unless local databases are
+provided. Licensed `.mmdb` files are never committed; see
+[`docs/operations/maxmind-testing.md`](docs/operations/maxmind-testing.md) for
+licensing, placement and failure handling.
+
+```bash
+MAXMIND_CITY_DB=/path/to/GeoLite2-City.mmdb \
+MAXMIND_ANONYMOUS_DB=/path/to/GeoIP2-Anonymous-IP.mmdb \
+nix develop -c cargo test --test integration maxmind
+```
+
 Run the full local pipeline (format, lint for default/compliance/http3,
 checks, unit and integration tests, optional audit, supply-chain policy and
 Helm validation) with:
