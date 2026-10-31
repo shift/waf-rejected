@@ -12,6 +12,10 @@ run:
 test:
     cargo test
 
+# Run the full local CI pipeline (no paid runners required)
+ci-local:
+    ./scripts/ci-local.sh
+
 benchmark:
     cargo bench
 

@@ -106,6 +106,16 @@ nix develop -c cargo check --all-targets
 nix build .#waf-ingress
 ```
 
+Run the full local pipeline (format, lint for default/compliance/http3,
+checks, unit and integration tests, optional audit and Helm validation) with:
+
+```bash
+./scripts/ci-local.sh     # or: just ci-local
+```
+
+`SKIP_AUDIT=1` skips `cargo audit`, and `BUILD_IMAGE=1` additionally builds the
+container image (`CONTAINER_ENGINE` defaults to `docker`).
+
 ## Deployment
 
 - Docker: `docker build -t waf-rejected .`

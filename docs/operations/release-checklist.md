@@ -4,6 +4,7 @@
 
 ### Verification
 
+- [ ] `./scripts/ci-local.sh` (or `just ci-local`) passes locally
 - [ ] `cargo fmt -- --check`
 - [ ] `cargo clippy --lib -- --deny warnings`
 - [ ] `cargo check --all-targets`
