@@ -2,7 +2,7 @@ FROM rust:1.89-bookworm AS builder
 
 WORKDIR /build
 COPY . .
-RUN cargo build --release --bin waf-ingress
+RUN cargo build --release --bin waf-ingress --features http3
 
 FROM debian:bookworm-slim
 

@@ -74,8 +74,8 @@
           pname = "waf-ingress";
           
           # Build main binary
-          cargoBuildCommand = "cargo build --release --bin waf-ingress";
-          cargoCheckCommand = "cargo check --release --bin waf-ingress";
+          cargoBuildCommand = "cargo build --release --bin waf-ingress --features http3";
+          cargoCheckCommand = "cargo check --release --bin waf-ingress --features http3";
           # Tests run in the dedicated CI/test jobs; keeping them out of the
           # package build avoids compiling every test utility binary twice.
           doCheck = false;
