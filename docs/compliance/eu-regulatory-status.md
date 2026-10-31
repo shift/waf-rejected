@@ -82,8 +82,11 @@ Sources:
     exploited vulnerability, or within one month for a severe incident.
 - **What this means for WAF-Rejected:** if the project is supplied as a product
   with digital elements on the EU market, manufacturer duties may apply. The
-  repository currently has no SBOM generation, coordinated vulnerability
-  disclosure process, support-period policy or automated SRP submission.
+  repository now ships a coordinated vulnerability disclosure policy
+  ([`SECURITY.md`](../../SECURITY.md)), a support-period and patch policy
+  ([`docs/operations/support-policy.md`](../operations/support-policy.md)) and a
+  CycloneDX SBOM on every tagged release. Automated SRP submission is still not
+  implemented.
 - **Evidence the WAF can provide:** actively exploited vulnerability indicators,
   severe incident events, timestamps, affected deployment identity.
 - **Do not claim:** “CRA compliant” or automatic Article 14 reporting. Submission

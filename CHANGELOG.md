@@ -2,6 +2,24 @@
 
 All notable changes to WAF-Rejected are documented here.
 
+## [Unreleased]
+
+### Documentation
+
+- Added `SECURITY.md` with coordinated vulnerability disclosure, supported
+  versions, CRA Article 14 reporting timelines and NIS2 incident awareness.
+- Added `docs/operations/support-policy.md` covering the support period, patch
+  targets, end-of-life and the mapping to CRA manufacturer expectations.
+- Added `docs/operations/container.md` covering image tarball loading, digest
+  pinning, health/metrics ports, upgrade and rollback.
+- Documented that the project is not certified and that compliance reports are
+  evidence, not conformity.
+
+### Added
+
+- Release workflow now generates a CycloneDX SBOM with `cargo cyclonedx`,
+  attaches it to the GitHub release and includes it in the binary tarball.
+
 ## [0.1.0-beta.6] - 2026-10-31
 
 ### Added
