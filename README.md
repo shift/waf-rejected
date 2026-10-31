@@ -130,6 +130,20 @@ Helm validation) with:
 `BUILD_IMAGE=1` additionally builds the container image (`CONTAINER_ENGINE`
 defaults to `docker`).
 
+### Fuzzing
+
+Nightly-only `cargo-fuzz` harnesses live in [`fuzz/`](fuzz/) and are isolated
+from the default workspace. Targets cover content inspection (query/body),
+WebSocket frame inspection and TOML configuration deserialization:
+
+```bash
+cd fuzz
+cargo +nightly fuzz run content_inspection -- -runs=10000 -max_total_time=60
+```
+
+See [`fuzz/README.md`](fuzz/README.md) for prerequisites, seed corpora, run
+limits and CI guidance. Fuzzing is not part of `nix build`.
+
 ## Deployment
 
 - Docker: `docker build -t waf-rejected .`

@@ -4,6 +4,13 @@ All notable changes to WAF-Rejected are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- Added an isolated `fuzz/` cargo-fuzz workspace with `content_inspection`,
+  `websocket_frame` and `config_toml` targets, seed corpora for SQLi/XSS/
+  encoded payloads and valid/invalid configurations, and usage/CI guidance in
+  `fuzz/README.md`.
+
 ### Documentation
 
 - Added the audited WebTransport implementation plan
