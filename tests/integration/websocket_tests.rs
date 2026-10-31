@@ -69,6 +69,27 @@ async fn websocket_upgrade_is_tunneled_to_upstream() {
 }
 
 #[tokio::test]
+async fn websocket_frame_payload_is_inspected_by_waf() {
+    let upstream = spawn_ws_upstream().await;
+    let proxy = spawn_proxy(upstream).await;
+
+    let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{}/ws", proxy))
+        .await
+        .expect("websocket handshake through proxy");
+
+    client
+        .send(Message::Text("id=1 UNION SELECT * FROM users".into()))
+        .await
+        .unwrap();
+
+    let next = tokio::time::timeout(std::time::Duration::from_secs(3), client.next()).await;
+    match next {
+        Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Ok(Some(Err(_))) | Err(_) => {}
+        Ok(Some(Ok(other))) => panic!("malicious frame was forwarded: {:?}", other),
+    }
+}
+
+#[tokio::test]
 async fn websocket_upgrade_is_blocked_by_waf() {
     let upstream = spawn_ws_upstream().await;
     let proxy = spawn_proxy(upstream).await;

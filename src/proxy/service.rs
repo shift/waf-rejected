@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use futures_util::{SinkExt, StreamExt};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -12,8 +13,13 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use ipnetwork::IpNetwork;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::pin::Pin;
+use std::task::{Context as TaskContext, Poll};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_tungstenite::tungstenite::protocol::Role;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
@@ -47,6 +53,60 @@ pub struct WafProxyService {
     auth_validator: Option<Arc<ApiKeyValidator>>,
     trusted_proxies: Vec<IpNetwork>,
     metrics: Arc<Metrics>,
+}
+
+/// IO wrapper that replays bytes already read from the upstream socket during
+/// the HTTP upgrade handshake.
+struct PrefixedIo<S> {
+    prefix: Vec<u8>,
+    offset: usize,
+    inner: S,
+}
+
+impl<S> PrefixedIo<S> {
+    fn new(prefix: Vec<u8>, inner: S) -> Self {
+        Self {
+            prefix,
+            offset: 0,
+            inner,
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for PrefixedIo<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.offset < this.prefix.len() {
+            let remaining = &this.prefix[this.offset..];
+            let count = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..count]);
+            this.offset += count;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedIo<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
 }
 
 /// Per-connection state cloned into each hyper service invocation.
@@ -649,31 +709,33 @@ impl WafProxyService {
 
         let on_upgrade = hyper::upgrade::on(&mut req);
         let metrics = Arc::clone(&state.metrics);
+        let waf_engine = Arc::clone(&state.waf_engine);
+        let base_context = RequestContext::with_http_version(
+            client_ip,
+            req.method().clone(),
+            req.uri().clone(),
+            req.headers().clone(),
+            None,
+            "1.1".to_string(),
+        );
         let leftover = buffer[header_end..].to_vec();
         tokio::spawn(async move {
-            match on_upgrade.await {
-                Ok(upgraded) => {
-                    let mut client = hyper_util::rt::TokioIo::new(upgraded);
-                    if !leftover.is_empty() {
-                        let _ = client.write_all(&leftover).await;
-                    }
-                    const TUNNEL_TIMEOUT: Duration = Duration::from_secs(3600);
-                    match tokio::time::timeout(
-                        TUNNEL_TIMEOUT,
-                        tokio::io::copy_bidirectional(&mut client, &mut upstream_stream),
-                    )
-                    .await
-                    {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(e)) => debug!("WebSocket tunnel closed: {}", e),
-                        Err(_) => debug!("WebSocket tunnel reached maximum lifetime"),
-                    }
-                }
+            let upgraded = match on_upgrade.await {
+                Ok(upgraded) => upgraded,
                 Err(e) => {
                     metrics.record_upstream_error();
                     warn!("WebSocket client upgrade failed: {}", e);
+                    return;
                 }
-            }
+            };
+
+            let client_io = hyper_util::rt::TokioIo::new(upgraded);
+            let client_ws = WebSocketStream::from_raw_socket(client_io, Role::Server, None).await;
+            let upstream_io = PrefixedIo::new(leftover, upstream_stream);
+            let upstream_ws =
+                WebSocketStream::from_raw_socket(upstream_io, Role::Client, None).await;
+
+            Self::bridge_websocket(client_ws, upstream_ws, waf_engine, base_context).await;
         });
 
         info!(
@@ -683,6 +745,94 @@ impl WafProxyService {
         builder
             .body(Full::new(Bytes::new()))
             .unwrap_or_else(|_| Self::create_error_response(StatusCode::BAD_GATEWAY, "Handshake"))
+    }
+
+    /// Bridge two WebSocket streams, evaluating client data frames through the
+    /// WAF before forwarding them upstream.
+    async fn bridge_websocket<C, U>(
+        mut client: WebSocketStream<C>,
+        mut upstream: WebSocketStream<U>,
+        waf_engine: Arc<WafEngine>,
+        base_context: RequestContext,
+    ) where
+        C: AsyncRead + AsyncWrite + Unpin,
+        U: AsyncRead + AsyncWrite + Unpin,
+    {
+        loop {
+            tokio::select! {
+                incoming = client.next() => {
+                    match incoming {
+                        Some(Ok(message)) => {
+                            if Self::websocket_message_blocked(&waf_engine, &base_context, &message).await {
+                                let _ = client.send(Message::Close(None)).await;
+                                let _ = upstream.send(Message::Close(None)).await;
+                                break;
+                            }
+                            if upstream.send(message).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            debug!("WebSocket client stream error: {}", e);
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+                incoming = upstream.next() => {
+                    match incoming {
+                        Some(Ok(message)) => {
+                            if client.send(message).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            debug!("WebSocket upstream stream error: {}", e);
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+    }
+
+    async fn websocket_message_blocked(
+        waf_engine: &WafEngine,
+        base_context: &RequestContext,
+        message: &Message,
+    ) -> bool {
+        let payload = match message {
+            Message::Text(text) => text.as_bytes().to_vec(),
+            Message::Binary(data) => data.to_vec(),
+            _ => return false,
+        };
+        if payload.is_empty() {
+            return false;
+        }
+
+        let mut context = base_context.clone();
+        context.body = Some(Bytes::from(payload.clone()));
+        context.body_size = Some(payload.len());
+        context.timestamp = Instant::now();
+
+        match waf_engine.evaluate(&context).await {
+            Decision::Allow => false,
+            Decision::Block { status, reason } => {
+                warn!(
+                    "WAF blocked WebSocket frame from {}: {} (status: {})",
+                    context.client_ip, reason, status
+                );
+                true
+            }
+            Decision::RateLimit { reason } => {
+                warn!(
+                    "WAF rate limited WebSocket frame from {}: {}",
+                    context.client_ip, reason
+                );
+                true
+            }
+        }
     }
 
     /// Resolve the client address without blindly trusting client headers.

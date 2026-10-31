@@ -43,7 +43,7 @@ pub enum Decision {
 }
 
 /// WAF rule evaluation context containing request information
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RequestContext {
     pub client_ip: IpAddr,
     pub method: Method,

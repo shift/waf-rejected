@@ -9,7 +9,7 @@ request-size and rate limits) before being forwarded to an upstream service.
 ## What works
 
 - Reverse proxy with HTTP/1.1 and HTTP/2 over TLS.
-- WebSocket upgrade proxying with bidirectional tunnel.
+- WebSocket upgrade proxying with per-frame WAF inspection.
 - URI, query-string, header and **request-body** inspection.
 - Percent-encoded payload decoding (`%20`, `%27`, `%3C`, ...).
 - API-key authentication (`X-API-Key` by default).

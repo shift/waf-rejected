@@ -2,6 +2,13 @@
 
 All notable changes to WAF-Rejected are documented here.
 
+## [Unreleased]
+
+### Added
+
+- Per-frame WAF inspection of WebSocket text and binary messages.
+- WebSocket frame-block integration test.
+
 ## [0.1.0-beta.4] - 2026-10-31
 
 ### Added
