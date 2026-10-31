@@ -836,4 +836,20 @@ mod tests {
         assert_eq!(uri.host(), Some("127.0.0.1"));
         assert_eq!(uri.port_u16(), Some(3000));
     }
+
+    #[test]
+    fn environment_overrides_file_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        std::fs::write(&file, "upstream_uri = \"http://127.0.0.1:12345\"\n").unwrap();
+
+        std::env::set_var("WAF_CONFIG_FILE", &file);
+        std::env::set_var("WAF_UPSTREAM_URI", "http://127.0.0.1:54321");
+
+        let config = Config::load().unwrap();
+        assert_eq!(config.upstream_uri, "http://127.0.0.1:54321");
+
+        std::env::remove_var("WAF_UPSTREAM_URI");
+        std::env::remove_var("WAF_CONFIG_FILE");
+    }
 }
