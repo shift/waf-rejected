@@ -160,7 +160,8 @@ Key points:
   to `http://` and TLS-secured `https://` upstreams; WebTransport requests are
   rejected with `501`. Private upstream CAs can be added with the PEM bundle in
   `proxy.upstream_ca_path`; certificate and hostname verification are never
-  disabled.
+  weakened. The audited implementation plan is in
+  [`docs/webtransport-plan.md`](docs/webtransport-plan.md).
 - **GeoIP requires a MaxMind database.** Set `waf.geo_blocking.database_path` to a
   GeoLite2/GeoIP2 City `.mmdb`; without it only built-in test addresses resolve.
   Tor/VPN/datacenter detection additionally requires a GeoIP2 Anonymous IP

@@ -6,6 +6,8 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Documentation
 
+- Added the audited WebTransport implementation plan
+  (`docs/webtransport-plan.md`).
 - Documented release build provenance: tagged releases now publish GitHub
   attestations (`actions/attest-build-provenance`) for the binary tarball, the
   container image tarball and the CycloneDX SBOM, verifiable with
