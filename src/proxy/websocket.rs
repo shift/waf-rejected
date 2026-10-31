@@ -33,16 +33,33 @@ impl WebSocketHandler {
 
     /// Check if request is a WebSocket upgrade request
     pub fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
-        headers
+        let has_upgrade = headers
             .get("upgrade")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.eq_ignore_ascii_case("websocket"))
-            .unwrap_or(false)
-            && headers
-                .get("connection")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_lowercase().contains("upgrade"))
-                .unwrap_or(false)
+            .unwrap_or(false);
+        let connection_has_upgrade = headers
+            .get("connection")
+            .and_then(|v| v.to_str().ok())
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .any(|token| token.eq_ignore_ascii_case("upgrade"))
+            })
+            .unwrap_or(false);
+        let version_ok = headers
+            .get("sec-websocket-version")
+            .and_then(|v| v.to_str().ok())
+            .map(|value| value.trim() == "13")
+            .unwrap_or(false);
+        let key_present = headers
+            .get("sec-websocket-key")
+            .and_then(|v| v.to_str().ok())
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+
+        has_upgrade && connection_has_upgrade && version_ok && key_present
     }
 
     /// Handle WebSocket upgrade with WAF validation
@@ -579,5 +596,43 @@ impl WebTransportHandler {
             .header("content-type", "text/plain")
             .body(Full::new(Bytes::from(message.to_string())))
             .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn upgrade_headers(connection: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("upgrade", "websocket".parse().unwrap());
+        headers.insert("connection", connection.parse().unwrap());
+        headers.insert("sec-websocket-version", "13".parse().unwrap());
+        headers.insert(
+            "sec-websocket-key",
+            "dGhlIHNhbXBsZSBub25jZQ==".parse().unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn accepts_exact_upgrade_connection_token() {
+        assert!(WebSocketHandler::is_websocket_upgrade(&upgrade_headers(
+            "keep-alive, Upgrade"
+        )));
+    }
+
+    #[test]
+    fn rejects_substring_connection_tokens() {
+        assert!(!WebSocketHandler::is_websocket_upgrade(&upgrade_headers(
+            "notupgrade"
+        )));
+    }
+
+    #[test]
+    fn rejects_missing_version_or_key() {
+        let mut headers = upgrade_headers("Upgrade");
+        headers.remove("sec-websocket-version");
+        assert!(!WebSocketHandler::is_websocket_upgrade(&headers));
     }
 }

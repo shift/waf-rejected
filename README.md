@@ -1,5 +1,7 @@
 # WAF-Rejected
 
+**Current Beta:** `0.1.0-beta.3` · container `ghcr.io/shift/waf-rejected:v0.1.0-beta.3`
+
 A Rust reverse-proxy web application firewall. Requests are inspected by a
 configurable rule chain (SQL injection, XSS, command injection, path traversal,
 request-size and rate limits) before being forwarded to an upstream service.

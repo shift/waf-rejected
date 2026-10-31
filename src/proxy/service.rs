@@ -350,6 +350,36 @@ impl WafProxyService {
                     "WebSocket upgrades require HTTP/1.1",
                 ));
             }
+
+            // The upgrade request must pass the WAF before any tunneling.
+            let upgrade_context = RequestContext::with_http_version(
+                client_ip,
+                req.method().clone(),
+                req.uri().clone(),
+                req.headers().clone(),
+                None,
+                http_version.clone(),
+            );
+            match state.waf_engine.evaluate(&upgrade_context).await {
+                Decision::Allow => {}
+                Decision::Block { status, reason } => {
+                    warn!(
+                        "WAF blocked WebSocket upgrade from {}: {} (status: {})",
+                        client_ip, reason, status
+                    );
+                    state.metrics.record_blocked();
+                    return Ok(Self::create_blocked_response(status, &reason));
+                }
+                Decision::RateLimit { reason } => {
+                    warn!(
+                        "WAF rate limited WebSocket upgrade from {}: {}",
+                        client_ip, reason
+                    );
+                    state.metrics.record_blocked();
+                    return Ok(Self::create_rate_limit_response(&reason));
+                }
+            }
+
             return Ok(Self::proxy_websocket(req, &state, client_ip).await);
         }
         #[cfg(feature = "webtransport")]
@@ -486,19 +516,24 @@ impl WafProxyService {
             .path_and_query()
             .map(|pq| pq.as_str())
             .unwrap_or("/");
-        let original_host = req
+        let client_host = req
             .headers()
             .get(hyper::header::HOST)
             .and_then(|value| value.to_str().ok())
-            .unwrap_or(host)
+            .unwrap_or("")
             .to_string();
+        let upstream_host = if port == 80 {
+            host.to_string()
+        } else {
+            format!("{}:{}", host, port)
+        };
 
         let mut headers = String::new();
         for (name, value) in req.headers() {
             let lower = name.as_str().to_ascii_lowercase();
             if matches!(
                 lower.as_str(),
-                "host" | "connection" | "upgrade" | "proxy-connection"
+                "host" | "connection" | "upgrade" | "proxy-connection" | "x-forwarded-host"
             ) {
                 continue;
             }
@@ -508,21 +543,30 @@ impl WafProxyService {
         }
 
         let handshake = format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n{}\r\n",
-            path, original_host, headers
+            "GET {} HTTP/1.1\r\nHost: {}\r\nX-Forwarded-Host: {}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n{}\r\n",
+            path, upstream_host, client_host, headers
         );
 
-        let mut upstream_stream = match TcpStream::connect((host, port)).await {
-            Ok(stream) => stream,
-            Err(e) => {
-                error!("WebSocket upstream connect failed: {}", e);
-                state.metrics.record_upstream_error();
-                return Self::create_error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "WebSocket upstream unavailable",
-                );
-            }
-        };
+        const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+        let mut upstream_stream =
+            match tokio::time::timeout(HANDSHAKE_TIMEOUT, TcpStream::connect((host, port))).await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => {
+                    error!("WebSocket upstream connect failed: {}", e);
+                    state.metrics.record_upstream_error();
+                    return Self::create_error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "WebSocket upstream unavailable",
+                    );
+                }
+                Err(_) => {
+                    state.metrics.record_upstream_error();
+                    return Self::create_error_response(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "WebSocket upstream connect timed out",
+                    );
+                }
+            };
 
         if let Err(e) = upstream_stream.write_all(handshake.as_bytes()).await {
             error!("WebSocket upstream handshake write failed: {}", e);
@@ -546,20 +590,27 @@ impl WafProxyService {
                     "WebSocket upstream handshake too large",
                 );
             }
-            match upstream_stream.read(&mut chunk).await {
-                Ok(0) => {
+            match tokio::time::timeout(HANDSHAKE_TIMEOUT, upstream_stream.read(&mut chunk)).await {
+                Ok(Ok(0)) => {
                     return Self::create_error_response(
                         StatusCode::BAD_GATEWAY,
                         "WebSocket upstream closed during handshake",
                     )
                 }
-                Ok(n) => buffer.extend_from_slice(&chunk[..n]),
-                Err(e) => {
+                Ok(Ok(n)) => buffer.extend_from_slice(&chunk[..n]),
+                Ok(Err(e)) => {
                     error!("WebSocket upstream handshake read failed: {}", e);
                     state.metrics.record_upstream_error();
                     return Self::create_error_response(
                         StatusCode::BAD_GATEWAY,
                         "WebSocket upstream handshake failed",
+                    );
+                }
+                Err(_) => {
+                    state.metrics.record_upstream_error();
+                    return Self::create_error_response(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "WebSocket upstream handshake timed out",
                     );
                 }
             }
@@ -606,10 +657,16 @@ impl WafProxyService {
                     if !leftover.is_empty() {
                         let _ = client.write_all(&leftover).await;
                     }
-                    if let Err(e) =
-                        tokio::io::copy_bidirectional(&mut client, &mut upstream_stream).await
+                    const TUNNEL_TIMEOUT: Duration = Duration::from_secs(3600);
+                    match tokio::time::timeout(
+                        TUNNEL_TIMEOUT,
+                        tokio::io::copy_bidirectional(&mut client, &mut upstream_stream),
+                    )
+                    .await
                     {
-                        debug!("WebSocket tunnel closed: {}", e);
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => debug!("WebSocket tunnel closed: {}", e),
+                        Err(_) => debug!("WebSocket tunnel reached maximum lifetime"),
                     }
                 }
                 Err(e) => {

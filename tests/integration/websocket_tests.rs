@@ -67,3 +67,15 @@ async fn websocket_upgrade_is_tunneled_to_upstream() {
 
     assert_eq!(echoed, Message::Text("hello-through-waf".into()));
 }
+
+#[tokio::test]
+async fn websocket_upgrade_is_blocked_by_waf() {
+    let upstream = spawn_ws_upstream().await;
+    let proxy = spawn_proxy(upstream).await;
+
+    let result =
+        tokio_tungstenite::connect_async(format!("ws://{}/ws?id=1%20UNION%20SELECT%201", proxy))
+            .await;
+
+    assert!(result.is_err(), "WAF should block the upgrade handshake");
+}

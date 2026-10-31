@@ -1,6 +1,6 @@
 # Release Checklist
 
-## Beta 0.1.0-beta.1
+## Beta 0.1.0-beta.3
 
 ### Verification
 
@@ -25,7 +25,7 @@ curl -o /dev/null -w '%{http_code}\n' -X POST --data '<script>alert(1)</script>'
 ### Publishing
 
 - [ ] Commit release version and changelog.
-- [ ] Tag `v0.1.0-beta.1`.
+- [ ] Tag `v0.1.0-beta.3`.
 - [ ] Push branch and tag.
 - [ ] Confirm the Release workflow built the tarball.
 - [ ] Publish the GitHub pre-release with the known-limitations section from

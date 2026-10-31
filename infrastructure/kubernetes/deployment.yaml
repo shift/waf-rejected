@@ -28,7 +28,7 @@ spec:
         fsGroup: 2000
       containers:
       - name: waf-ingress
-        image: ghcr.io/shift/waf-rejected:latest
+        image: ghcr.io/shift/waf-rejected:v0.1.0-beta.3
         imagePullPolicy: Always
         ports:
         - name: http
