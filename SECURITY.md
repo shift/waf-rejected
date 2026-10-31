@@ -143,6 +143,7 @@ issues already fixed on `main` and released.
 ## Related documents
 
 - [Support policy](docs/operations/support-policy.md)
+- [Supply-chain policy](docs/operations/supply-chain.md)
 - [Container usage](docs/operations/container.md)
 - [EU regulatory status](docs/compliance/eu-regulatory-status.md)
 - [Release checklist](docs/operations/release-checklist.md)

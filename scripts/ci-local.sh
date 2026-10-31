@@ -3,7 +3,8 @@
 # Billing-independent local CI runner for WAF-Rejected.
 #
 # Runs the same format, lint, check and test stages as CI, plus optional
-# dependency auditing, Helm chart validation and container image build.
+# dependency auditing, supply-chain policy checks (cargo-deny), Helm chart
+# validation and container image build.
 #
 # Usage:
 #   ./scripts/ci-local.sh
@@ -11,6 +12,7 @@
 #
 # Environment:
 #   SKIP_AUDIT=1         Skip `cargo audit` even when cargo-audit is installed.
+#   SKIP_DENY=1          Skip `cargo deny check` even when cargo-deny is installed.
 #   BUILD_IMAGE=1        Also build the container image (docker by default).
 #   CONTAINER_ENGINE=... Container engine for BUILD_IMAGE (default: docker).
 
@@ -20,6 +22,7 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 SKIP_AUDIT="${SKIP_AUDIT:-0}"
+SKIP_DENY="${SKIP_DENY:-0}"
 BUILD_IMAGE="${BUILD_IMAGE:-0}"
 CONTAINER_ENGINE="${CONTAINER_ENGINE:-docker}"
 
@@ -108,9 +111,15 @@ if [[ "$SKIP_AUDIT" != "1" ]] &&
   audit_available=1
 fi
 
-STAGE_TOTAL=12
+deny_available=0
+if [[ "$SKIP_DENY" != "1" ]] &&
+  "${NIX_DEVELOP[@]}" cargo deny --version >/dev/null 2>&1; then
+  deny_available=1
+fi
+
+STAGE_TOTAL=13
 # Fixed cargo stages: fmt, 3x clippy, 2x check, 3x lib tests, 2x integration tests,
-# plus cargo audit (which may be skipped).
+# plus cargo audit and cargo deny (either of which may be skipped).
 if [[ $helm_available -eq 1 ]]; then
   STAGE_TOTAL=$((STAGE_TOTAL + 2))
 fi
@@ -148,6 +157,16 @@ elif [[ $audit_available -eq 1 ]]; then
 else
   skip_stage "cargo audit" "cargo-audit is not available in the dev shell"
   printf '%sWARNING%s cargo-audit not found; install it in the dev shell to enable the audit stage.\n' \
+    "$COLOR_SKIP" "$COLOR_RESET"
+fi
+
+if [[ "$SKIP_DENY" == "1" ]]; then
+  skip_stage "cargo deny check" "SKIP_DENY=1"
+elif [[ $deny_available -eq 1 ]]; then
+  cargo_stage "cargo deny check" deny check
+else
+  skip_stage "cargo deny check" "cargo-deny is not available in the dev shell"
+  printf '%sWARNING%s cargo-deny not found; install it (nix shell nixpkgs#cargo-deny nixpkgs#cargo) to enforce the supply-chain policy.\n' \
     "$COLOR_SKIP" "$COLOR_RESET"
 fi
 
