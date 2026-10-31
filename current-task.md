@@ -19,7 +19,19 @@ load balancer and will enforce the documented WAF controls.
 - [x] `nix build .#waf-ingress` verified from a clean build.
 - [x] Release notes published with explicit known limitations.
 - [x] Tag `v0.1.0-beta.1` and GitHub pre-release created.
-- [ ] Container image built and smoke-tested locally (build in progress).
+- [x] Container image built and smoke-tested locally (health 200, SQLi/XSS 403).
+
+## Beta.2 security hardening (PR #29)
+
+- [x] UTF-8-safe match truncation.
+- [x] Reject over-length URI/query rather than skipping inspection.
+- [x] Inspect the full accepted body.
+- [x] ALPN-aware HTTP/2 selection.
+- [x] Right-to-left XFF resolution through trusted proxies.
+- [x] Upstream response-size cap.
+- [x] Fail-closed WASM initialisation.
+- [x] Header inspection enabled for common attack patterns.
+- [x] Helm/K8s image, auth, PVC, service and alert fixes.
 
 ## Beta scope exclusions (documented)
 

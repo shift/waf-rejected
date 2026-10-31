@@ -2,7 +2,7 @@
 
 All notable changes to WAF-Rejected are documented here.
 
-## [Unreleased]
+## [0.1.0-beta.2] - 2026-10-31
 
 ### Added
 
@@ -10,11 +10,28 @@ All notable changes to WAF-Rejected are documented here.
   certification).
 - `docs/compliance/eu-regulatory-status.md` with the 2026-10-31 validated status
   of Regulation (EU) 2026/1744, NIS2 transposition/amendments and CRA Article 14.
+- Container-specific configuration and writable runtime data/log paths.
+- Helm PVC for Sled persistence.
 
 ### Changed
 
 - PCI report status is now `EVIDENCE GENERATED - ASSESSMENT REQUIRED` instead of
   the misleading `COMPLIANT`.
+- `WAF_*` environment variables now override configuration-file values.
+- Header inspection is enabled for SQLi/XSS/command/path patterns.
+- Alert rules now use metrics the service actually emits.
+
+### Fixed
+
+- UTF-8 boundary panic when truncating matched attack text.
+- Over-length URI/query strings are rejected instead of skipping inspection.
+- Full accepted request body is inspected, not only the first 1 MiB.
+- HTTP/2 is selected from negotiated ALPN, not just `enable_http2`.
+- `X-Forwarded-For` is resolved right-to-left across trusted proxies.
+- Upstream responses are capped before buffering.
+- A configured but unavailable WASM engine fails closed.
+- Helm auth default, chart dependencies, GHCR image paths, HTTPS target port and
+  Kubernetes persistence wiring corrected.
 
 ## [0.1.0-beta.1] - 2026-10-31
 
