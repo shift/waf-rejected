@@ -418,6 +418,18 @@ pub struct RegulatoryConfig {
     /// Enable PCI-DSS compliance features
     pub pci_dss: bool,
 
+    /// Generate EU AI Act evidence (Regulation (EU) 2024/1689 as amended by
+    /// Regulation (EU) 2026/1744). This is evidence, not a conformity assessment.
+    pub ai_act: bool,
+
+    /// Generate NIS2 incident-reporting evidence (Directive (EU) 2022/2555).
+    /// National transposition and competent-authority rules still apply.
+    pub nis2: bool,
+
+    /// Generate Cyber Resilience Act reporting evidence (Regulation (EU)
+    /// 2024/2847, Article 14). Submission to ENISA/CSIRT remains manual.
+    pub cra: bool,
+
     /// Data residency requirements
     pub data_residency: Option<String>,
 }
@@ -461,6 +473,9 @@ impl Default for RegulatoryConfig {
             gdpr: false,
             hipaa: false,
             pci_dss: false,
+            ai_act: false,
+            nis2: false,
+            cra: false,
             data_residency: None,
         }
     }
@@ -489,6 +504,9 @@ impl Default for ComplianceConfig {
                 gdpr: false,
                 hipaa: false,
                 pci_dss: false,
+                ai_act: false,
+                nis2: false,
+                cra: false,
                 data_residency: None,
             },
             retention: RetentionConfig {

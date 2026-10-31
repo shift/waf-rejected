@@ -3,6 +3,11 @@
 > `CHANGELOG.md` for what ships in `0.1.0-beta.1`. In particular, Coraza WASM
 > execution, WebSocket/WebTransport tunnelling, GeoIP country blocking and
 > HTTP/3 are **not** implemented in the Beta.
+>
+> **Compliance correction:** the compliance module produces evidence packs, not
+> certifications. Claims of being “GDPR/HIPAA/PCI-DSS ready” or “fully
+> compliant” in this document are superseded. Current EU AI Act, NIS2 and CRA
+> status is tracked in `docs/compliance/eu-regulatory-status.md`.
 
 # WAF-Rejected Strategic Roadmap v0.1 "The Stable Core" - COMPLETION SUMMARY
 

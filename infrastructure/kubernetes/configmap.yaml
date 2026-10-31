@@ -87,3 +87,9 @@ data:
 
     [security.compliance]
     enabled = true
+
+    [security.compliance.regulatory]
+    gdpr = true
+    ai_act = true
+    nis2 = true
+    cra = true

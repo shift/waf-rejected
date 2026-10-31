@@ -107,6 +107,9 @@ integrity_check_hours = 24
 gdpr = true
 hipaa = false
 pci_dss = true
+ai_act = true
+nis2 = true
+cra = true
 
 [security.compliance.retention]
 security_events_days = 90

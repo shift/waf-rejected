@@ -108,6 +108,23 @@ nix build .#waf-ingress
 - Helm chart: [`infrastructure/helm`](infrastructure/helm)
 - Monitoring: [`infrastructure/monitoring`](infrastructure/monitoring)
 
+## EU regulatory mapping
+
+The compliance module can produce evidence packs for GDPR, HIPAA, PCI-DSS, the
+EU AI Act, NIS2 and the Cyber Resilience Act. They are **not certifications**.
+Current dates and obligations (validated 2026-10-31) are documented in
+[`docs/compliance/eu-regulatory-status.md`](docs/compliance/eu-regulatory-status.md).
+
+Key points:
+
+- **AI Act:** amended by Regulation (EU) 2026/1744. General application and
+  Article 50 transparency apply from 2 August 2026; Annex III high-risk duties
+  are deferred to 2 December 2027, Annex I to 2 August 2028.
+- **NIS2:** in force, but national transposition remains uneven. The January
+  2026 amendment proposals were still in the legislative process in October 2026.
+- **CRA:** Article 14 reporting obligations have applied since 11 September
+  2026; main essential requirements and CE marking apply from 11 December 2027.
+
 ## Security limitations (read before production)
 
 - **ModSecurity/Coraza WASM execution is not implemented.** The engine currently

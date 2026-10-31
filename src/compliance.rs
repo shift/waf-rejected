@@ -3,6 +3,7 @@ use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use tracing::info;
 
 #[cfg(feature = "sled")]
 use sled;
@@ -31,7 +32,7 @@ pub enum ComplianceError {
 
 impl From<ComplianceError> for WafError {
     fn from(err: ComplianceError) -> Self {
-        WafError::Internal(format!("Compliance error: {}", err))
+        WafError::InternalError(format!("Compliance error: {}", err))
     }
 }
 
@@ -409,13 +410,172 @@ impl ComplianceReporter {
                     .unwrap_or(false))
                 .count(),
             if security_events.len() < 100 {
-                "COMPLIANT"
+                "EVIDENCE GENERATED - ASSESSMENT REQUIRED"
             } else {
                 "REVIEW REQUIRED"
             }
         );
 
         Ok(report)
+    }
+
+    /// Generate evidence relevant to the EU AI Act.
+    ///
+    /// This is an evidence pack, not a conformity assessment, CE marking, or
+    /// legal opinion. The AI Act was amended by Regulation (EU) 2026/1744.
+    pub fn generate_ai_act_report(&self, events: &[AuditEvent]) -> Result<String, ComplianceError> {
+        if !self.config.ai_act {
+            return Err(ComplianceError::NotEnabled("EU AI Act".to_string()));
+        }
+
+        let security_events = events
+            .iter()
+            .filter(|e| matches!(e.event_type, AuditEventType::SecurityEvent))
+            .count();
+        let config_changes = events
+            .iter()
+            .filter(|e| matches!(e.event_type, AuditEventType::ConfigChange))
+            .count();
+
+        Ok(format!(
+            "EU AI Act Readiness Evidence (not a conformity assessment)\n\
+             ==========================================================\n\
+             Generated: {}\n\
+             Legal basis: Regulation (EU) 2024/1689, as amended by Regulation (EU) 2026/1744\n\
+             \n\
+             Current timeline to verify against:\n\
+             - 2 August 2026: general application and Article 50 transparency duties\n\
+             - 2 December 2026: new Article 5 prohibitions; legacy Article 50(2) watermarking\n\
+             - 2 December 2027: Annex III high-risk obligations\n\
+             - 2 August 2028: Annex I embedded high-risk obligations\n\
+             \n\
+             Evidence available from this deployment:\n\
+             - Security events logged: {}\n\
+             - Configuration changes logged: {}\n\
+             - Audit-trail integrity mechanism: {}\n\
+             \n\
+             Scope note: WAF-Rejected is a security proxy, not an AI system by itself.\n\
+             AI/ML threat detection is experimental and disabled by default. A provider\n\
+             deploying AI functionality must perform its own classification, conformity\n\
+             assessment, transparency and record-keeping.",
+            Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
+            security_events,
+            config_changes,
+            if self.config.data_residency.is_some() {
+                "configured with data-residency label"
+            } else {
+                "SHA-256 chain (local configuration)"
+            }
+        ))
+    }
+
+    /// Generate evidence relevant to NIS2 incident reporting.
+    ///
+    /// NIS2 is a directive; obligations depend on national transposition and on
+    /// whether the entity is essential/important in scope. This report does not
+    /// submit anything to a CSIRT.
+    pub fn generate_nis2_report(&self, events: &[AuditEvent]) -> Result<String, ComplianceError> {
+        if !self.config.nis2 {
+            return Err(ComplianceError::NotEnabled("NIS2".to_string()));
+        }
+
+        let incidents = events
+            .iter()
+            .filter(|e| matches!(e.event_type, AuditEventType::SecurityEvent))
+            .filter(|e| {
+                e.details
+                    .get("severity")
+                    .map(|s| s == "high" || s == "critical")
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+
+        let unique_sources = incidents
+            .iter()
+            .filter_map(|e| e.ip_address.as_ref())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+
+        Ok(format!(
+            "NIS2 Incident-Reporting Evidence (not a notification)\n\
+             =======================================================\n\
+             Generated: {}\n\
+             Legal basis: Directive (EU) 2022/2555 (NIS2); check national transposition\n\
+             \n\
+             Reporting cascade to validate with your CSIRT:\n\
+             - Early warning: within 24 hours of awareness\n\
+             - Incident notification: within 72 hours\n\
+             - Final report: within one month of the notification\n\
+             \n\
+             Candidate high/critical incidents in this dataset: {}\n\
+             Unique source addresses: {}\n\
+             \n\
+             Scope note: the Commission adopted targeted NIS2 amendment proposals on\n\
+             20 January 2026, but they were still in the legislative process as of\n\
+             2026-10-31. Current national NIS2 law remains applicable. Submission to\n\
+             a national CSIRT is a manual, organisation-specific process.",
+            Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
+            incidents.len(),
+            unique_sources
+        ))
+    }
+
+    /// Generate evidence relevant to Cyber Resilience Act Article 14 reporting.
+    ///
+    /// The CRA reporting obligations have applied since 11 September 2026.
+    /// This report does not submit to the ENISA Single Reporting Platform.
+    pub fn generate_cra_report(&self, events: &[AuditEvent]) -> Result<String, ComplianceError> {
+        if !self.config.cra {
+            return Err(ComplianceError::NotEnabled(
+                "Cyber Resilience Act".to_string(),
+            ));
+        }
+
+        let vulnerability_events = events
+            .iter()
+            .filter(|e| {
+                e.details
+                    .get("actively_exploited_vulnerability")
+                    .map(|s| s == "true")
+                    .unwrap_or(false)
+                    || e.action.to_ascii_lowercase().contains("vulnerab")
+            })
+            .count();
+        let severe_incidents = events
+            .iter()
+            .filter(|e| matches!(e.event_type, AuditEventType::SecurityEvent))
+            .filter(|e| {
+                e.details
+                    .get("severity")
+                    .map(|s| s == "critical")
+                    .unwrap_or(false)
+            })
+            .count();
+
+        Ok(format!(
+            "CRA Article 14 Reporting Evidence (not a submission)\n\
+             =====================================================\n\
+             Generated: {}\n\
+             Legal basis: Regulation (EU) 2024/2847 (Cyber Resilience Act)\n\
+             \n\
+             Reporting obligations in force since 11 September 2026:\n\
+             - Early warning: within 24 hours of awareness\n\
+             - Full notification: within 72 hours\n\
+             - Final report: within 14 days of a corrective measure for an actively\n\
+               exploited vulnerability, or within one month for a severe incident\n\
+             - Channel: ENISA CRA Single Reporting Platform, addressed to the relevant CSIRT\n\
+             \n\
+             Candidate actively exploited vulnerability events: {}\n\
+             Candidate severe incidents: {}\n\
+             \n\
+             Scope note: full CRA essential requirements and CE marking apply from\n\
+             11 December 2027. Whether WAF-Rejected is a product with digital elements\n\
+             supplied on the EU market, and who is the manufacturer, requires a legal\n\
+             assessment. This report is supporting evidence only; submission is manual.",
+            Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
+            vulnerability_events,
+            severe_incidents
+        ))
     }
 }
 
@@ -432,7 +592,7 @@ impl DataRetentionManager {
     /// Clean up expired audit events
     pub async fn cleanup_expired_audit_events(
         &self,
-        logger: &AuditLogger,
+        _logger: &AuditLogger,
     ) -> Result<(), ComplianceError> {
         if !self.config.auto_delete {
             return Ok(());
@@ -453,7 +613,7 @@ impl DataRetentionManager {
     /// Clean up expired security events from database
     pub async fn cleanup_expired_security_events(
         &self,
-        db: &sled::Db,
+        _db: &sled::Db,
     ) -> Result<(), ComplianceError> {
         if !self.config.auto_delete {
             return Ok(());
@@ -548,6 +708,9 @@ mod tests {
             gdpr: false,
             hipaa: false,
             pci_dss: false,
+            ai_act: false,
+            nis2: false,
+            cra: false,
             data_residency: None,
         };
 
@@ -564,6 +727,9 @@ mod tests {
             gdpr: true,
             hipaa: false,
             pci_dss: false,
+            ai_act: false,
+            nis2: false,
+            cra: false,
             data_residency: None,
         };
 
@@ -572,6 +738,33 @@ mod tests {
 
         let result = reporter.generate_gdpr_report(&events).unwrap();
         assert!(result.contains("No reportable breaches"));
+    }
+
+    #[test]
+    fn test_eu_reports_are_evidence_not_certification() {
+        let config = RegulatoryConfig {
+            gdpr: false,
+            hipaa: false,
+            pci_dss: false,
+            ai_act: true,
+            nis2: true,
+            cra: true,
+            data_residency: None,
+        };
+        let reporter = ComplianceReporter::new(config);
+        let events = vec![create_test_event("eu-1", AuditEventType::SecurityEvent)];
+
+        let ai = reporter.generate_ai_act_report(&events).unwrap();
+        assert!(ai.contains("not a conformity assessment"));
+        assert!(ai.contains("2026/1744"));
+
+        let nis2 = reporter.generate_nis2_report(&events).unwrap();
+        assert!(nis2.contains("not a notification"));
+        assert!(nis2.contains("24 hours"));
+
+        let cra = reporter.generate_cra_report(&events).unwrap();
+        assert!(cra.contains("not a submission"));
+        assert!(cra.contains("11 September 2026"));
     }
 
     #[test]
