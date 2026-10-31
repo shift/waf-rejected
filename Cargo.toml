@@ -172,12 +172,6 @@ compliance = ["sled"]
 
 # Security modules performance benchmarks
 [[bench]]
-name = "wasm_performance"
-path = "benches/wasm_performance.rs"
-required-features = ["wasm-waf"]
-harness = false
-
-[[bench]]
 name = "security_performance"
 harness = false
 
@@ -245,11 +239,6 @@ path = "src/bin/phase4_comprehensive_test.rs"
 [[bin]]
 name = "phase4_standalone_test"
 path = "src/bin/phase4_standalone_test.rs"
-
-[[bin]]
-name = "test_wasm_integration"
-path = "src/bin/test_wasm_integration.rs"
-required-features = ["wasm-waf"]
 
 [[bin]]
 name = "benchmark_core"

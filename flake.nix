@@ -146,43 +146,6 @@
           cargoCheckCommand = "cargo check --release --bin simple_multi_protocol_test";
         });
 
-        websocket-performance-test = craneLib.buildPackage (commonArgs // {
-          inherit cargoArtifacts;
-          pname = "websocket-performance-test";
-          cargoBuildCommand = "cargo build --release --bin websocket_performance_test";
-          cargoCheckCommand = "cargo check --release --bin websocket_performance_test";
-        });
-
-        # WASM-enabled binaries (conditional)
-        test-wasm-integration = craneLib.buildPackage (commonArgs // {
-          inherit cargoArtifacts;
-          pname = "test-wasm-integration";
-          cargoBuildCommand = "cargo build --release --bin test_wasm_integration --features wasm-waf";
-          cargoCheckCommand = "cargo check --release --bin test_wasm_integration --features wasm-waf";
-          
-          # Additional WASM runtime tools for building
-          nativeBuildInputs = commonArgs.nativeBuildInputs ++ (with pkgs; [
-            wasmtime
-            binaryen
-            wabt
-          ]);
-        });
-
-        # WebTransport binaries (conditional on feature)
-        webtransport-waf-proxy = craneLib.buildPackage (commonArgs // {
-          inherit cargoArtifacts;
-          pname = "webtransport-waf-proxy";
-          cargoBuildCommand = "cargo build --release --bin webtransport_waf_proxy --features webtransport";
-          cargoCheckCommand = "cargo check --release --bin webtransport_waf_proxy --features webtransport";
-        });
-
-        webtransport-echo-backend = craneLib.buildPackage (commonArgs // {
-          inherit cargoArtifacts;
-          pname = "webtransport-echo-backend";
-          cargoBuildCommand = "cargo build --release --bin webtransport_echo_backend --features webtransport";
-          cargoCheckCommand = "cargo check --release --bin webtransport_echo_backend --features webtransport";
-        });
-
         # Export system binaries  
         waf-events-query = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
@@ -223,14 +186,6 @@
           progressive-load-test = progressive-load-test;
           echo-backend = echo-backend;
           simple-multi-protocol-test = simple-multi-protocol-test;
-          websocket-performance-test = websocket-performance-test;
-
-          # WASM integration
-          test-wasm-integration = test-wasm-integration;
-
-          # WebTransport (experimental)
-          webtransport-waf-proxy = webtransport-waf-proxy;
-          webtransport-echo-backend = webtransport-echo-backend;
 
           # Export system tools
           waf-events-query = waf-events-query;
