@@ -9,10 +9,9 @@ pub mod buffer_pool;
 pub(crate) mod http3;
 pub mod service;
 pub mod websocket;
+#[cfg(feature = "webtransport")]
+pub(crate) mod webtransport;
 
 pub use buffer_pool::BufferPool;
 pub use service::WafProxyService;
 pub use websocket::WebSocketHandler;
-
-#[cfg(feature = "webtransport")]
-pub use websocket::WebTransportHandler;

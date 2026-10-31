@@ -17,7 +17,10 @@ load balancer and will enforce the documented WAF controls.
 ## Active delegated work
 
 - HTTP/3 security parity tests (query/body block, 413, auth).
-- WebTransport implementation audit (`wtransport 0.7.2`).
+- ~~WebTransport implementation audit (`wtransport 0.7.2`).~~ Done on
+  `feat/webtransport`: feature-gated terminating HTTP/3 listener with
+  Origin/path/auth/WAF validation, session/stream/datagram caps, and tests.
+  See `docs/developer-guide/webtransport.md`.
 
 ## Beta acceptance criteria
 

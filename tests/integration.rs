@@ -27,3 +27,7 @@ mod waf_features_tests;
 
 #[path = "integration/websocket_tests.rs"]
 mod websocket_tests;
+
+#[cfg(feature = "webtransport")]
+#[path = "integration/webtransport_tests.rs"]
+mod webtransport_tests;

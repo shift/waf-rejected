@@ -35,9 +35,6 @@ use crate::waf::auth::{ApiKeyValidator, InMemoryKeyStore};
 use crate::waf::tls_config::TlsManager;
 use crate::waf::{Decision, RequestContext, WafEngine};
 
-#[cfg(feature = "webtransport")]
-use crate::proxy::websocket::WebTransportHandler;
-
 /// Core WAF Proxy Service with multi-protocol support
 ///
 /// This is the main HTTP proxy service that integrates the WAF engine
@@ -51,8 +48,6 @@ pub struct WafProxyService {
     config: Arc<Config>,
     buffer_pool: Arc<BufferPool>,
     websocket_handler: WebSocketHandler,
-    #[cfg(feature = "webtransport")]
-    webtransport_handler: WebTransportHandler,
     tls_manager: Option<Arc<TlsManager>>,
     auth_validator: Option<Arc<ApiKeyValidator>>,
     trusted_proxies: Vec<IpNetwork>,
@@ -126,6 +121,17 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedIo<S> {
     }
 }
 
+/// HTTP/1.1 `Upgrade: webtransport` is not a WebTransport transport; it is
+/// rejected with `501`. WebTransport is served over HTTP/3 on the dedicated
+/// UDP listener.
+#[cfg(feature = "webtransport")]
+fn is_webtransport_upgrade(headers: &hyper::HeaderMap) -> bool {
+    headers
+        .get("upgrade")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("webtransport"))
+}
+
 /// Per-connection state cloned into each hyper service invocation.
 #[derive(Clone)]
 pub(crate) struct ProxyState {
@@ -178,10 +184,6 @@ impl WafProxyService {
         // Initialize protocol handlers
         let websocket_handler =
             WebSocketHandler::new(Arc::clone(&waf_engine), Arc::clone(&config_arc));
-
-        #[cfg(feature = "webtransport")]
-        let webtransport_handler =
-            WebTransportHandler::new(Arc::clone(&waf_engine), Arc::clone(&config_arc));
 
         let tls_manager = if config_arc.server.tls.enabled {
             let manager = TlsManager::new(config_arc.server.tls.clone())?;
@@ -248,8 +250,6 @@ impl WafProxyService {
             config: config_arc,
             buffer_pool,
             websocket_handler,
-            #[cfg(feature = "webtransport")]
-            webtransport_handler,
             tls_manager,
             auth_validator,
             trusted_proxies,
@@ -335,6 +335,35 @@ impl WafProxyService {
         #[cfg(not(feature = "http3"))]
         if self.config.server.enable_http3 {
             debug!("HTTP/3 requested but this binary was built without the `http3` feature");
+        }
+
+        #[cfg(feature = "webtransport")]
+        if self.config.server.webtransport.enabled {
+            if let Some(tls_manager) = self.tls_manager.as_ref() {
+                let webtransport_state = state.clone();
+                let tls_manager = Arc::clone(tls_manager);
+                let webtransport_config = self.config.server.webtransport.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = crate::proxy::webtransport::serve(
+                        tls_manager,
+                        webtransport_state,
+                        webtransport_config,
+                    )
+                    .await
+                    {
+                        warn!("WebTransport listener not started: {}", e);
+                    }
+                });
+            } else {
+                warn!(
+                    "WebTransport enabled but TLS is disabled; not starting WebTransport (QUIC requires TLS 1.3)"
+                );
+            }
+        }
+
+        #[cfg(not(feature = "webtransport"))]
+        if self.config.server.webtransport.enabled {
+            debug!("WebTransport requested but this binary was built without the `webtransport` feature");
         }
 
         loop {
@@ -494,7 +523,7 @@ impl WafProxyService {
             return Ok(Self::proxy_websocket(req, &state, client_ip).await);
         }
         #[cfg(feature = "webtransport")]
-        if WebTransportHandler::is_webtransport_request(req.headers()) {
+        if is_webtransport_upgrade(req.headers()) {
             warn!("WebTransport request rejected: not implemented");
             state.metrics.record_blocked();
             return Ok(Self::create_error_response(

@@ -11,6 +11,11 @@ pub struct Metrics {
     allowed_total: AtomicU64,
     blocked_total: AtomicU64,
     upstream_errors_total: AtomicU64,
+    webtransport_sessions_total: AtomicU64,
+    webtransport_allowed_total: AtomicU64,
+    webtransport_blocked_total: AtomicU64,
+    webtransport_streams_total: AtomicU64,
+    webtransport_datagrams_total: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -27,6 +32,11 @@ impl Metrics {
             allowed_total: AtomicU64::new(0),
             blocked_total: AtomicU64::new(0),
             upstream_errors_total: AtomicU64::new(0),
+            webtransport_sessions_total: AtomicU64::new(0),
+            webtransport_allowed_total: AtomicU64::new(0),
+            webtransport_blocked_total: AtomicU64::new(0),
+            webtransport_streams_total: AtomicU64::new(0),
+            webtransport_datagrams_total: AtomicU64::new(0),
         }
     }
 
@@ -44,6 +54,31 @@ impl Metrics {
 
     pub fn record_upstream_error(&self) {
         self.upstream_errors_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_webtransport_session(&self) {
+        self.webtransport_sessions_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_webtransport_allowed(&self) {
+        self.webtransport_allowed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_webtransport_blocked(&self) {
+        self.webtransport_blocked_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_webtransport_stream(&self) {
+        self.webtransport_streams_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_webtransport_datagram(&self) {
+        self.webtransport_datagrams_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn uptime_seconds(&self) -> u64 {
@@ -65,6 +100,21 @@ impl Metrics {
              # HELP waf_upstream_errors_total Upstream connection/read failures.\n\
              # TYPE waf_upstream_errors_total counter\n\
              waf_upstream_errors_total {}\n\
+             # HELP waf_webtransport_sessions_total WebTransport sessions accepted.\n\
+             # TYPE waf_webtransport_sessions_total counter\n\
+             waf_webtransport_sessions_total {}\n\
+             # HELP waf_webtransport_allowed_total WebTransport sessions allowed by the WAF.\n\
+             # TYPE waf_webtransport_allowed_total counter\n\
+             waf_webtransport_allowed_total {}\n\
+             # HELP waf_webtransport_blocked_total WebTransport sessions or payloads blocked.\n\
+             # TYPE waf_webtransport_blocked_total counter\n\
+             waf_webtransport_blocked_total {}\n\
+             # HELP waf_webtransport_streams_total WebTransport streams inspected.\n\
+             # TYPE waf_webtransport_streams_total counter\n\
+             waf_webtransport_streams_total {}\n\
+             # HELP waf_webtransport_datagrams_total WebTransport datagrams inspected.\n\
+             # TYPE waf_webtransport_datagrams_total counter\n\
+             waf_webtransport_datagrams_total {}\n\
              # HELP waf_uptime_seconds Process uptime in seconds.\n\
              # TYPE waf_uptime_seconds gauge\n\
              waf_uptime_seconds {}\n",
@@ -72,6 +122,11 @@ impl Metrics {
             self.allowed_total.load(Ordering::Relaxed),
             self.blocked_total.load(Ordering::Relaxed),
             self.upstream_errors_total.load(Ordering::Relaxed),
+            self.webtransport_sessions_total.load(Ordering::Relaxed),
+            self.webtransport_allowed_total.load(Ordering::Relaxed),
+            self.webtransport_blocked_total.load(Ordering::Relaxed),
+            self.webtransport_streams_total.load(Ordering::Relaxed),
+            self.webtransport_datagrams_total.load(Ordering::Relaxed),
             self.uptime_seconds(),
         )
     }

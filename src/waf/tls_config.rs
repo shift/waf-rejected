@@ -98,21 +98,22 @@ impl TlsManager {
         self.config.enabled
     }
 
-    /// Build a rustls `ServerConfig` suitable for QUIC/HTTP/3.
+    /// Build a rustls `ServerConfig` suitable for QUIC/HTTP/3 and WebTransport.
     ///
     /// QUIC mandates TLS 1.3, so this ignores the configured version range
     /// except to reject a configuration that cannot negotiate 1.3. ALPN is
-    /// restricted to `h3`; the TCP ALPN list is left untouched.
-    #[cfg(feature = "http3")]
+    /// restricted to `h3` (also the WebTransport ALPN); the TCP ALPN list is
+    /// left untouched.
+    #[cfg(any(feature = "http3", feature = "webtransport"))]
     pub fn quic_server_config(&self) -> Result<Arc<RustlsServerConfig>, WafError> {
         if !self.config.enabled {
             return Err(WafError::Configuration(
-                "HTTP/3 requires TLS, but TLS is disabled".to_string(),
+                "QUIC (HTTP/3/WebTransport) requires TLS, but TLS is disabled".to_string(),
             ));
         }
         if tls_rank(&self.config.max_version)? < 3 {
             return Err(WafError::Configuration(format!(
-                "HTTP/3 requires TLS 1.3, but server.tls.max_version is {}",
+                "QUIC (HTTP/3/WebTransport) requires TLS 1.3, but server.tls.max_version is {}",
                 self.config.max_version
             )));
         }
@@ -220,7 +221,7 @@ fn selected_versions(
     Ok(versions)
 }
 
-fn tls_rank(version: &str) -> Result<u8, WafError> {
+pub(crate) fn tls_rank(version: &str) -> Result<u8, WafError> {
     match version {
         "1.2" => Ok(2),
         "1.3" => Ok(3),
@@ -241,5 +242,52 @@ mod tests {
         assert_eq!(selected_versions("1.2", "1.3").unwrap().len(), 2);
         assert!(selected_versions("1.3", "1.2").is_err());
         assert!(selected_versions("1.1", "1.3").is_err());
+    }
+
+    #[cfg(any(feature = "http3", feature = "webtransport"))]
+    #[test]
+    fn quic_config_is_tls13_only_with_h3_alpn() {
+        let dir = tempfile::tempdir().unwrap();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, certified.cert.pem()).unwrap();
+        std::fs::write(&key_path, certified.signing_key.serialize_pem()).unwrap();
+
+        let manager = TlsManager::new(TlsConfig {
+            enabled: true,
+            cert_path: cert_path.to_string_lossy().into_owned(),
+            key_path: key_path.to_string_lossy().into_owned(),
+            min_version: "1.2".to_string(),
+            max_version: "1.3".to_string(),
+            ..TlsConfig::default()
+        })
+        .unwrap();
+
+        let config = manager.quic_server_config().unwrap();
+        assert_eq!(config.alpn_protocols, vec![b"h3".to_vec()]);
+    }
+
+    #[cfg(any(feature = "http3", feature = "webtransport"))]
+    #[test]
+    fn quic_config_rejects_tls_12_max_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, certified.cert.pem()).unwrap();
+        std::fs::write(&key_path, certified.signing_key.serialize_pem()).unwrap();
+
+        let manager = TlsManager::new(TlsConfig {
+            enabled: true,
+            cert_path: cert_path.to_string_lossy().into_owned(),
+            key_path: key_path.to_string_lossy().into_owned(),
+            max_version: "1.2".to_string(),
+            ..TlsConfig::default()
+        })
+        .unwrap();
+
+        let error = manager.quic_server_config().unwrap_err();
+        assert!(format!("{}", error).contains("TLS 1.3"));
     }
 }

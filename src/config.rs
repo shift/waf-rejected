@@ -141,6 +141,9 @@ pub struct ServerConfig {
 
     /// TLS configuration
     pub tls: TlsConfig,
+
+    /// WebTransport over HTTP/3 configuration
+    pub webtransport: WebTransportConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,6 +172,224 @@ pub struct TlsConfig {
 
     /// Path to client CA certificate file (PEM format)
     pub client_ca_path: Option<String>,
+}
+
+/// WebTransport over HTTP/3 (QUIC) listener configuration.
+///
+/// WebTransport is a terminating endpoint: sessions are inspected locally and
+/// never proxied to the upstream. An empty `allowed_origins` or `allowed_paths`
+/// list denies every session (secure by default).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebTransportConfig {
+    /// Enable the WebTransport UDP listener
+    pub enabled: bool,
+
+    /// UDP address for the WebTransport listener. Must not collide with the
+    /// HTTP/3 UDP port.
+    pub bind_addr: SocketAddr,
+
+    /// Reject requests that do not carry an `Origin` header
+    pub require_origin: bool,
+
+    /// Exact allowlist of `https://host[:port]` origins. Empty denies all.
+    pub allowed_origins: Vec<String>,
+
+    /// Allowlist of `:path` values. A trailing `/*` matches a path prefix.
+    /// Empty denies all.
+    pub allowed_paths: Vec<String>,
+
+    /// Maximum concurrent WebTransport sessions across all clients
+    pub max_sessions: usize,
+
+    /// Maximum concurrent WebTransport sessions per client IP
+    pub max_sessions_per_ip: usize,
+
+    /// Maximum concurrent bidirectional streams per session
+    pub max_bidi_streams: u32,
+
+    /// Maximum concurrent unidirectional streams per session
+    pub max_uni_streams: u32,
+
+    /// Maximum accepted datagram payload size in bytes
+    pub max_datagram_bytes: usize,
+
+    /// Maximum bytes read (and inspected) from a single stream
+    pub max_stream_bytes: usize,
+
+    /// QUIC idle timeout in seconds
+    pub idle_timeout_secs: u64,
+
+    /// Maximum total session lifetime in seconds
+    pub max_session_secs: u64,
+
+    /// Inspect stream payloads through the WAF
+    pub inspect_streams: bool,
+
+    /// Inspect datagram payloads through the WAF
+    pub inspect_datagrams: bool,
+}
+
+impl Default for WebTransportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_addr: "0.0.0.0:4434".parse().unwrap(),
+            require_origin: true,
+            allowed_origins: Vec::new(),
+            allowed_paths: Vec::new(),
+            max_sessions: 1024,
+            max_sessions_per_ip: 32,
+            max_bidi_streams: 16,
+            max_uni_streams: 16,
+            max_datagram_bytes: 1200,
+            max_stream_bytes: 1024 * 1024,
+            idle_timeout_secs: 30,
+            max_session_secs: 300,
+            inspect_streams: true,
+            inspect_datagrams: true,
+        }
+    }
+}
+
+impl WebTransportConfig {
+    /// Returns true when the request origin passes the exact allowlist.
+    ///
+    /// A missing `Origin` is accepted only when `require_origin` is false. An
+    /// empty allowlist always denies.
+    pub fn is_origin_allowed(&self, origin: Option<&str>) -> bool {
+        let origin = match origin {
+            Some(origin) => origin,
+            None => return !self.require_origin,
+        };
+        if self.allowed_origins.is_empty() {
+            return false;
+        }
+        let normalized = match normalize_origin(origin) {
+            Some(origin) => origin,
+            None => return false,
+        };
+        self.allowed_origins
+            .iter()
+            .filter_map(|allowed| normalize_origin(allowed))
+            .any(|allowed| allowed == normalized)
+    }
+
+    /// Returns true when the request `:path` passes the allowlist.
+    ///
+    /// An empty allowlist always denies. Patterns ending in `/*` match by
+    /// prefix; every other pattern is an exact match. Query strings are
+    /// ignored.
+    pub fn is_path_allowed(&self, path: &str) -> bool {
+        if self.allowed_paths.is_empty() {
+            return false;
+        }
+        let path = path.split(['?', '#']).next().unwrap_or(path);
+        if !path.starts_with('/') {
+            return false;
+        }
+        self.allowed_paths.iter().any(|allowed| {
+            if let Some(prefix) = allowed.strip_suffix("/*") {
+                path == prefix || path.starts_with(&format!("{}/", prefix))
+            } else {
+                path == allowed
+            }
+        })
+    }
+
+    /// Validate WebTransport-specific limits and allowlist entries.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.max_sessions == 0 {
+            anyhow::bail!("server.webtransport.max_sessions must be greater than zero");
+        }
+        if self.max_sessions_per_ip == 0 {
+            anyhow::bail!("server.webtransport.max_sessions_per_ip must be greater than zero");
+        }
+        if self.max_bidi_streams == 0 {
+            anyhow::bail!("server.webtransport.max_bidi_streams must be greater than zero");
+        }
+        if self.max_uni_streams == 0 {
+            anyhow::bail!("server.webtransport.max_uni_streams must be greater than zero");
+        }
+        if self.max_datagram_bytes == 0 {
+            anyhow::bail!("server.webtransport.max_datagram_bytes must be greater than zero");
+        }
+        if self.max_stream_bytes == 0 {
+            anyhow::bail!("server.webtransport.max_stream_bytes must be greater than zero");
+        }
+        if self.idle_timeout_secs == 0 {
+            anyhow::bail!("server.webtransport.idle_timeout_secs must be greater than zero");
+        }
+        if self.max_session_secs == 0 {
+            anyhow::bail!("server.webtransport.max_session_secs must be greater than zero");
+        }
+
+        for origin in &self.allowed_origins {
+            let normalized = normalize_origin(origin).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid server.webtransport.allowed_origins entry '{}': expected https://host[:port]",
+                    origin
+                )
+            })?;
+            if !normalized.starts_with("https://") {
+                anyhow::bail!(
+                    "server.webtransport.allowed_origins entry '{}' must use the https scheme",
+                    origin
+                );
+            }
+        }
+
+        for path in &self.allowed_paths {
+            let candidate = path.strip_suffix("/*").unwrap_or(path);
+            if !candidate.starts_with('/') || path.contains(['?', '#']) {
+                anyhow::bail!(
+                    "invalid server.webtransport.allowed_paths entry '{}': expected a /path or /prefix/*",
+                    path
+                );
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Normalize an origin to `scheme://host[:port]` for exact comparison.
+///
+/// Default ports are removed, scheme and host are lowercased, and paths,
+/// queries, fragments, and userinfo are rejected.
+fn normalize_origin(value: &str) -> Option<String> {
+    let uri: http::Uri = value.trim().parse().ok()?;
+    let scheme = uri.scheme_str()?.to_ascii_lowercase();
+    if scheme != "https" && scheme != "http" {
+        return None;
+    }
+    if uri.path_and_query().is_some_and(|path| {
+        path.query().is_some() || (path.path() != "/" && !path.path().is_empty())
+    }) {
+        return None;
+    }
+    let authority = uri.authority()?;
+    if authority.as_str().contains('@') {
+        return None;
+    }
+    let host = authority.host().to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{}]", host)
+    } else {
+        host
+    };
+    let port = match authority.port_u16() {
+        Some(443) if scheme == "https" => None,
+        Some(80) if scheme == "http" => None,
+        port => port,
+    };
+    Some(match port {
+        Some(port) => format!("{}://{}:{}", scheme, host, port),
+        None => format!("{}://{}", scheme, host),
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -588,6 +809,7 @@ impl Default for ServerConfig {
             ],
             max_body_size: 10 * 1024 * 1024, // 10MB
             tls: TlsConfig::default(),
+            webtransport: WebTransportConfig::default(),
         }
     }
 }
@@ -779,6 +1001,39 @@ impl Config {
                 anyhow::anyhow!("invalid server.trusted_proxies entry '{}': {}", cidr, e)
             })?;
         }
+
+        if self.server.webtransport.enabled {
+            self.server.webtransport.validate()?;
+
+            if !self.server.tls.enabled {
+                anyhow::bail!(
+                    "server.webtransport.enabled requires TLS, but server.tls.enabled is false"
+                );
+            }
+            if crate::waf::tls_config::tls_rank(&self.server.tls.max_version)? < 3 {
+                anyhow::bail!(
+                    "server.webtransport.enabled requires TLS 1.3, but server.tls.max_version is {}",
+                    self.server.tls.max_version
+                );
+            }
+
+            if self.server.enable_http3 {
+                let webtransport = self.server.webtransport.bind_addr;
+                let http3 = self.bind_addr;
+                let shares_socket = webtransport.port() == http3.port()
+                    && (webtransport.ip().is_unspecified()
+                        || http3.ip().is_unspecified()
+                        || webtransport.ip() == http3.ip());
+                if shares_socket {
+                    anyhow::bail!(
+                        "server.webtransport.bind_addr ({}) must not collide with the HTTP/3 UDP port {}",
+                        webtransport,
+                        http3
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -876,6 +1131,128 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
         assert_eq!(uri.scheme_str(), Some("http"));
         assert_eq!(uri.host(), Some("127.0.0.1"));
         assert_eq!(uri.port_u16(), Some(3000));
+    }
+
+    #[test]
+    fn webtransport_defaults_are_disabled_and_secure() {
+        let config = WebTransportConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.bind_addr.to_string(), "0.0.0.0:4434");
+        assert!(config.require_origin);
+        assert!(config.allowed_origins.is_empty());
+        assert!(config.allowed_paths.is_empty());
+        assert!(config.inspect_streams);
+        assert!(config.inspect_datagrams);
+    }
+
+    #[test]
+    fn webtransport_origin_matching_is_exact_and_normalized() {
+        let mut config = WebTransportConfig::default();
+        config.allowed_origins = vec!["https://App.Example.com:443".to_string()];
+
+        assert!(config.is_origin_allowed(Some("https://app.example.com")));
+        assert!(config.is_origin_allowed(Some("https://APP.example.com/")));
+        assert!(!config.is_origin_allowed(Some("https://app.example.com:8443")));
+        assert!(!config.is_origin_allowed(Some("https://evil.example.com")));
+        assert!(!config.is_origin_allowed(Some("https://app.example.com.evil.test")));
+        assert!(!config.is_origin_allowed(None));
+    }
+
+    #[test]
+    fn webtransport_origin_requires_header_when_configured() {
+        let mut config = WebTransportConfig::default();
+        config.allowed_origins = vec!["https://app.example.com".to_string()];
+
+        assert!(!config.is_origin_allowed(None));
+
+        config.require_origin = false;
+        assert!(config.is_origin_allowed(None));
+    }
+
+    #[test]
+    fn webtransport_empty_origin_allowlist_denies_all() {
+        let config = WebTransportConfig::default();
+        assert!(!config.is_origin_allowed(Some("https://app.example.com")));
+
+        let mut permissive = config.clone();
+        permissive.require_origin = false;
+        assert!(!permissive.is_origin_allowed(Some("https://app.example.com")));
+    }
+
+    #[test]
+    fn webtransport_rejects_non_https_origins() {
+        let mut config = WebTransportConfig::default();
+        config.allowed_origins = vec!["http://app.example.com".to_string()];
+        assert!(config.validate().is_err());
+
+        config.allowed_origins = vec!["https://app.example.com/path".to_string()];
+        assert!(config.validate().is_err());
+
+        config.allowed_origins = vec!["https://app.example.com?x=1".to_string()];
+        assert!(config.validate().is_err());
+
+        config.allowed_origins = vec!["https://app.example.com".to_string()];
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn webtransport_path_matching_supports_exact_and_prefix() {
+        let mut config = WebTransportConfig::default();
+        config.allowed_paths = vec!["/echo".to_string(), "/api/*".to_string()];
+
+        assert!(config.is_path_allowed("/echo"));
+        assert!(config.is_path_allowed("/echo?x=1"));
+        assert!(!config.is_path_allowed("/echo/extra"));
+        assert!(config.is_path_allowed("/api"));
+        assert!(config.is_path_allowed("/api/v1/session"));
+        assert!(!config.is_path_allowed("/apiv1"));
+        assert!(!config.is_path_allowed("echo"));
+        assert!(!config.is_path_allowed("/other"));
+    }
+
+    #[test]
+    fn webtransport_empty_path_allowlist_denies_all() {
+        let config = WebTransportConfig::default();
+        assert!(!config.is_path_allowed("/echo"));
+    }
+
+    #[test]
+    fn webtransport_limits_must_be_positive() {
+        let mut config = WebTransportConfig::default();
+        config.allowed_origins = vec!["https://app.example.com".to_string()];
+        config.allowed_paths = vec!["/echo".to_string()];
+        assert!(config.validate().is_ok());
+
+        config.max_sessions = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = WebTransportConfig::default();
+        config.max_datagram_bytes = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn webtransport_config_requires_tls_13_and_distinct_udp_port() {
+        let mut config = Config::default();
+        config.server.webtransport.enabled = true;
+        config.server.webtransport.allowed_origins = vec!["https://app.example.com".to_string()];
+        config.server.webtransport.allowed_paths = vec!["/echo".to_string()];
+
+        assert!(config.validate().is_err(), "TLS must be required");
+
+        config.server.tls.enabled = true;
+        config.server.tls.max_version = "1.2".to_string();
+        assert!(config.validate().is_err(), "TLS 1.3 must be required");
+
+        config.server.tls.max_version = "1.3".to_string();
+        assert!(config.validate().is_ok());
+
+        let http3_bind_addr = config.bind_addr;
+        config.server.webtransport.bind_addr = http3_bind_addr;
+        assert!(config.validate().is_err(), "UDP port collision must fail");
+
+        config.server.enable_http3 = false;
+        assert!(config.validate().is_ok());
     }
 
     #[test]

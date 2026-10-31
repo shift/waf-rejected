@@ -1,6 +1,9 @@
 # WebTransport Implementation Plan
 
-**Status:** not implemented. HTTP/1.1 `Upgrade: webtransport` remains `501`.
+**Status:** implemented behind the non-default `webtransport` feature. See
+[developer-guide/webtransport.md](developer-guide/webtransport.md). HTTP/1.1
+`Upgrade: webtransport` remains `501`; WebTransport is served over HTTP/3 on a
+dedicated UDP listener.
 
 ## Dependencies and feature
 
