@@ -102,6 +102,13 @@ pub struct ProxyConfig {
 
     /// Maximum request size in bytes
     pub max_request_size: usize,
+
+    /// Optional PEM CA bundle used to verify TLS WebSocket upstreams.
+    ///
+    /// When unset, upstream certificates are verified against `webpki-roots`.
+    /// When set, the certificates in the bundle are trusted in addition to the
+    /// built-in roots. This is intended for private/self-signed upstream CAs.
+    pub upstream_ca_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -559,6 +566,7 @@ impl Default for ProxyConfig {
             bind_addr: "0.0.0.0:8080".to_string(),
             timeout_seconds: 30,
             max_request_size: 10 * 1024 * 1024, // 10MB
+            upstream_ca_path: None,
         }
     }
 }

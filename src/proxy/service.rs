@@ -13,7 +13,8 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use ipnetwork::IpNetwork;
-use rustls::pki_types::ServerName;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
@@ -684,6 +685,63 @@ impl WafProxyService {
         let mut upstream_stream: Box<dyn AsyncStream> = if use_tls {
             let mut roots = RootCertStore::empty();
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            if let Some(ca_path) = state.config.proxy.upstream_ca_path.as_deref() {
+                let ca_pem = match tokio::fs::read(ca_path).await {
+                    Ok(pem) => pem,
+                    Err(e) => {
+                        error!(
+                            "Failed to read WebSocket upstream CA bundle '{}': {}",
+                            ca_path, e
+                        );
+                        state.metrics.record_upstream_error();
+                        return Self::create_error_response(
+                            StatusCode::BAD_GATEWAY,
+                            "WebSocket upstream CA bundle unavailable",
+                        );
+                    }
+                };
+                let mut loaded = 0usize;
+                for cert in CertificateDer::pem_slice_iter(&ca_pem) {
+                    match cert {
+                        Ok(cert) => match roots.add(cert) {
+                            Ok(()) => loaded += 1,
+                            Err(e) => {
+                                error!(
+                                    "Invalid certificate in WebSocket upstream CA bundle '{}': {}",
+                                    ca_path, e
+                                );
+                                state.metrics.record_upstream_error();
+                                return Self::create_error_response(
+                                    StatusCode::BAD_GATEWAY,
+                                    "Invalid WebSocket upstream CA bundle",
+                                );
+                            }
+                        },
+                        Err(e) => {
+                            error!(
+                                "Failed to parse WebSocket upstream CA bundle '{}': {}",
+                                ca_path, e
+                            );
+                            state.metrics.record_upstream_error();
+                            return Self::create_error_response(
+                                StatusCode::BAD_GATEWAY,
+                                "Invalid WebSocket upstream CA bundle",
+                            );
+                        }
+                    }
+                }
+                if loaded == 0 {
+                    error!(
+                        "WebSocket upstream CA bundle '{}' contains no certificates",
+                        ca_path
+                    );
+                    state.metrics.record_upstream_error();
+                    return Self::create_error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "Invalid WebSocket upstream CA bundle",
+                    );
+                }
+            }
             // Select the ring provider explicitly: both ring and aws-lc-rs are
             // enabled in this crate, so the implicit default is ambiguous.
             let config = ClientConfig::builder_with_provider(Arc::new(
@@ -1359,6 +1417,7 @@ mod tests {
                 bind_addr: "0.0.0.0:3000".to_string(),
                 timeout_seconds: 30,
                 max_request_size: 10_485_760,
+                upstream_ca_path: None,
             },
             ..Default::default()
         };

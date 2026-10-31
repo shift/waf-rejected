@@ -2,6 +2,16 @@
 
 All notable changes to WAF-Rejected are documented here.
 
+## [Unreleased]
+
+### Added
+
+- Optional custom CA bundle for TLS WebSocket upstreams via
+  `proxy.upstream_ca_path`. The PEM bundle is trusted in addition to
+  `webpki-roots`; hostname and certificate verification remain enforced.
+- Integration test covering a `ws://` client tunnelled to an `https://`
+  WebSocket upstream whose certificate is signed by a generated test CA.
+
 ## [0.1.0-beta.7] - 2026-10-31
 
 ### Added

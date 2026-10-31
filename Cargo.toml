@@ -157,6 +157,8 @@ tokio-test = "0.4"
 wiremock = "0.6"
 tempfile = "3.0"
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+# Self-signed certificate generation for TLS WebSocket upstream tests
+rcgen = "0.14"
 
 [features]
 default = ["export-system", "websocket"]

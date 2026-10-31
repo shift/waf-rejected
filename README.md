@@ -10,6 +10,8 @@ request-size and rate limits) before being forwarded to an upstream service.
 
 - Reverse proxy with HTTP/1.1, HTTP/2 over TLS, and feature-gated HTTP/3 (QUIC).
 - WebSocket upgrade proxying with per-frame WAF inspection.
+- TLS WebSocket upstreams (`https://`) verified against `webpki-roots`, with an
+  optional private CA bundle via `proxy.upstream_ca_path`.
 - URI, query-string, header and **request-body** inspection.
 - Percent-encoded payload decoding (`%20`, `%27`, `%3C`, ...).
 - API-key authentication (`X-API-Key` by default).
@@ -156,7 +158,9 @@ Key points:
   expect OWASP CRS coverage.
 - **WebTransport is not implemented.** HTTP/1.1 WebSocket upgrades are proxied
   to `http://` and TLS-secured `https://` upstreams; WebTransport requests are
-  rejected with `501`.
+  rejected with `501`. Private upstream CAs can be added with the PEM bundle in
+  `proxy.upstream_ca_path`; certificate and hostname verification are never
+  disabled.
 - **GeoIP requires a MaxMind database.** Set `waf.geo_blocking.database_path` to a
   GeoLite2/GeoIP2 City `.mmdb`; without it only built-in test addresses resolve.
   Tor/VPN/datacenter detection additionally requires a GeoIP2 Anonymous IP
