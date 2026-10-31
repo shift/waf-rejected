@@ -559,31 +559,7 @@ F4s3IuSi44rR0CGaogZ+O/I=
         )
     }
 
-    #[tokio::test]
-    async fn loopback_h3_request_is_proxied() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-
-        let upstream = spawn_upstream().await;
-        let dir = tempfile::tempdir().unwrap();
-        let (cert_path, key_path) = write_test_tls_files(dir.path());
-
-        let mut config = crate::config::Config::default();
-        config.upstream_uri = format!("http://{}", upstream);
-        config.server.max_body_size = 4096;
-        config.server.enable_http3 = true;
-        config.server.tls.enabled = true;
-        config.server.tls.cert_path = cert_path;
-        config.server.tls.key_path = key_path;
-        config.waf.rate_limit.per_ip_enabled = false;
-        config.waf.rate_limit.global_enabled = false;
-
-        let service = Arc::new(WafProxyService::new(config).unwrap());
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = service.start_with_listener(listener).await;
-        });
-
+    fn h3_client_endpoint() -> quinn::Endpoint {
         let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(std::io::Cursor::new(
             TEST_CA_PEM.as_bytes(),
         )))
@@ -607,19 +583,48 @@ F4s3IuSi44rR0CGaogZ+O/I=
 
         let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         endpoint.set_default_client_config(client_config);
+        endpoint
+    }
 
+    async fn start_h3_proxy(
+        dir: &std::path::Path,
+        configure: impl FnOnce(&mut crate::config::Config),
+    ) -> (SocketAddr, quinn::Endpoint) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let upstream = spawn_upstream().await;
+        let (cert_path, key_path) = write_test_tls_files(dir);
+
+        let mut config = crate::config::Config::default();
+        config.upstream_uri = format!("http://{}", upstream);
+        config.server.max_body_size = 4096;
+        config.server.enable_http3 = true;
+        config.server.tls.enabled = true;
+        config.server.tls.cert_path = cert_path;
+        config.server.tls.key_path = key_path;
+        config.waf.rate_limit.per_ip_enabled = false;
+        config.waf.rate_limit.global_enabled = false;
+        configure(&mut config);
+
+        let service = Arc::new(WafProxyService::new(config).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = service.start_with_listener(listener).await;
+        });
+
+        (proxy_addr, h3_client_endpoint())
+    }
+
+    async fn connect_h3(endpoint: &quinn::Endpoint, proxy_addr: SocketAddr) -> quinn::Connection {
         // The UDP listener is started asynchronously by `start_with_listener`,
         // so retry the handshake briefly instead of racing it.
-        let mut connection = None;
         let mut last_error = String::new();
         for _ in 0..40 {
             match endpoint.connect(proxy_addr, "localhost") {
                 Ok(connecting) => {
                     match tokio::time::timeout(Duration::from_millis(250), connecting).await {
-                        Ok(Ok(conn)) => {
-                            connection = Some(conn);
-                            break;
-                        }
+                        Ok(Ok(connection)) => return connection,
                         Ok(Err(e)) => last_error = e.to_string(),
                         Err(_) => last_error = "connect timed out".to_string(),
                     }
@@ -628,9 +633,16 @@ F4s3IuSi44rR0CGaogZ+O/I=
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        let connection =
-            connection.unwrap_or_else(|| panic!("HTTP/3 connect failed: {}", last_error));
+        panic!("HTTP/3 connect failed: {}", last_error)
+    }
 
+    async fn send_h3_request(
+        endpoint: &quinn::Endpoint,
+        proxy_addr: SocketAddr,
+        request: Request<()>,
+        body: Option<Bytes>,
+    ) -> (StatusCode, Bytes) {
+        let connection = connect_h3(endpoint, proxy_addr).await;
         let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(connection))
             .await
             .unwrap();
@@ -638,20 +650,127 @@ F4s3IuSi44rR0CGaogZ+O/I=
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
         });
 
-        let request = Request::get(format!("https://localhost:{}/h3-test", proxy_addr.port()))
-            .body(())
-            .unwrap();
         let mut stream = send_request.send_request(request).await.unwrap();
+        if let Some(body) = body {
+            stream.send_data(body).await.unwrap();
+        }
         stream.finish().await.unwrap();
 
         let response = stream.recv_response().await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        let status = response.status();
 
-        let mut body = BytesMut::new();
+        let mut response_body = BytesMut::new();
         while let Some(mut chunk) = stream.recv_data().await.unwrap() {
             let len = chunk.remaining();
-            body.extend_from_slice(&chunk.copy_to_bytes(len));
+            response_body.extend_from_slice(&chunk.copy_to_bytes(len));
         }
+        (status, response_body.freeze())
+    }
+
+    #[tokio::test]
+    async fn loopback_h3_request_is_proxied() {
+        let dir = tempfile::tempdir().unwrap();
+        let (proxy_addr, endpoint) = start_h3_proxy(dir.path(), |_| {}).await;
+
+        let request = Request::get(format!("https://localhost:{}/h3-test", proxy_addr.port()))
+            .body(())
+            .unwrap();
+        let (status, body) = send_h3_request(&endpoint, proxy_addr, request, None).await;
+
+        assert_eq!(status, StatusCode::OK);
         assert_eq!(&body[..], b"upstream-ok");
+    }
+
+    #[tokio::test]
+    async fn blocks_sqli_in_query_over_h3() {
+        let dir = tempfile::tempdir().unwrap();
+        let (proxy_addr, endpoint) = start_h3_proxy(dir.path(), |_| {}).await;
+
+        let request = Request::get(format!(
+            "https://localhost:{}/?id=1%20UNION%20SELECT%20*%20FROM%20users",
+            proxy_addr.port()
+        ))
+        .body(())
+        .unwrap();
+        let (status, _) = send_h3_request(&endpoint, proxy_addr, request, None).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn blocks_sqli_in_body_over_h3() {
+        let dir = tempfile::tempdir().unwrap();
+        let (proxy_addr, endpoint) = start_h3_proxy(dir.path(), |_| {}).await;
+
+        let request = Request::post(format!("https://localhost:{}/login", proxy_addr.port()))
+            .body(())
+            .unwrap();
+        let (status, _) = send_h3_request(
+            &endpoint,
+            proxy_addr,
+            request,
+            Some(Bytes::from_static(b"id=1 UNION SELECT * FROM users")),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn blocks_xss_in_body_over_h3() {
+        let dir = tempfile::tempdir().unwrap();
+        let (proxy_addr, endpoint) = start_h3_proxy(dir.path(), |_| {}).await;
+
+        let request = Request::post(format!("https://localhost:{}/comment", proxy_addr.port()))
+            .body(())
+            .unwrap();
+        let (status, _) = send_h3_request(
+            &endpoint,
+            proxy_addr,
+            request,
+            Some(Bytes::from_static(b"<script>alert(1)</script>")),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_body_over_h3() {
+        let dir = tempfile::tempdir().unwrap();
+        let (proxy_addr, endpoint) =
+            start_h3_proxy(dir.path(), |config| config.server.max_body_size = 512).await;
+
+        let request = Request::post(format!("https://localhost:{}/upload", proxy_addr.port()))
+            .body(())
+            .unwrap();
+        let (status, _) = send_h3_request(
+            &endpoint,
+            proxy_addr,
+            request,
+            Some(Bytes::from(vec![b'A'; 4096])),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn missing_api_key_is_rejected_over_h3() {
+        let dir = tempfile::tempdir().unwrap();
+        let (proxy_addr, endpoint) = start_h3_proxy(dir.path(), |config| {
+            config.security.auth.enabled = true;
+            config.security.auth.api_keys = vec!["test-api-key-123".to_string()];
+            config.security.auth.header_name = "X-API-Key".to_string();
+            config.security.auth.require_https = false;
+        })
+        .await;
+
+        let request = Request::get(format!("https://localhost:{}/h3-test", proxy_addr.port()))
+            .body(())
+            .unwrap();
+        let (status, _) = send_h3_request(&endpoint, proxy_addr, request, None).await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 }
