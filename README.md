@@ -7,6 +7,7 @@ request-size and rate limits) before being forwarded to an upstream service.
 ## What works
 
 - Reverse proxy with HTTP/1.1 and HTTP/2 over TLS.
+- WebSocket upgrade proxying with bidirectional tunnel.
 - URI, query-string, header and **request-body** inspection.
 - Percent-encoded payload decoding (`%20`, `%27`, `%3C`, ...).
 - API-key authentication (`X-API-Key` by default).
@@ -130,8 +131,8 @@ Key points:
 - **ModSecurity/Coraza WASM execution is not implemented.** The WASM runtime
   dependency was removed from the Beta build; the historical module is retained
   in-tree but not compiled. Do not expect OWASP CRS coverage.
-- **WebSocket and WebTransport tunneling are not implemented.** Upgrade requests
-  are rejected with `501` rather than returning a misleading `101`.
+- **WebTransport is not implemented.** HTTP/1.1 WebSocket upgrades are proxied;
+  WebTransport requests are rejected with `501`.
 - **GeoIP blocking needs a database loader.** Without a MaxMind database only the
   built-in test addresses resolve, so country rules are not effective.
 - **HTTP/3 is not implemented.** Keep `enable_http3 = false`; use TLS + HTTP/2.

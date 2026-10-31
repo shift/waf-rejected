@@ -12,7 +12,8 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use ipnetwork::IpNetwork;
-use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
@@ -293,10 +294,11 @@ impl WafProxyService {
                 .await
                 .map_err(|e| WafError::NetworkError(format!("HTTP/2 connection error: {}", e)))
         } else {
-            hyper::server::conn::http1::Builder::new()
-                .keep_alive(true)
-                .pipeline_flush(true)
+            let mut builder = hyper::server::conn::http1::Builder::new();
+            builder.keep_alive(true).pipeline_flush(true);
+            builder
                 .serve_connection(io, service)
+                .with_upgrades()
                 .await
                 .map_err(|e| WafError::NetworkError(format!("HTTP/1.1 connection error: {}", e)))
         }
@@ -339,15 +341,16 @@ impl WafProxyService {
             }
         }
 
-        // Upgrades require raw connection tunneling. Reject them explicitly
-        // instead of returning a fake 101 that never reaches the backend.
+        // Proxy WebSocket upgrades end-to-end over a raw upstream connection.
         if WebSocketHandler::is_websocket_upgrade(req.headers()) {
-            warn!("WebSocket upgrade rejected: upstream tunneling is not implemented");
-            state.metrics.record_blocked();
-            return Ok(Self::create_error_response(
-                StatusCode::NOT_IMPLEMENTED,
-                "WebSocket proxying is not implemented",
-            ));
+            if req.version() != hyper::Version::HTTP_11 {
+                state.metrics.record_blocked();
+                return Ok(Self::create_error_response(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "WebSocket upgrades require HTTP/1.1",
+                ));
+            }
+            return Ok(Self::proxy_websocket(req, &state, client_ip).await);
         }
         #[cfg(feature = "webtransport")]
         if WebTransportHandler::is_webtransport_request(req.headers()) {
@@ -452,6 +455,177 @@ impl WafProxyService {
                 Ok(Self::create_rate_limit_response(&reason))
             }
         }
+    }
+
+    /// Proxy a WebSocket upgrade to the configured upstream over a raw TCP
+    /// connection, then splice the two upgraded byte streams together.
+    async fn proxy_websocket(
+        mut req: Request<Incoming>,
+        state: &ProxyState,
+        client_ip: IpAddr,
+    ) -> Response<Full<Bytes>> {
+        let upstream = &state.upstream_uri;
+        if upstream.scheme_str() != Some("http") {
+            return Self::create_error_response(
+                StatusCode::BAD_GATEWAY,
+                "WebSocket upstream must use http://",
+            );
+        }
+        let host = match upstream.host() {
+            Some(host) => host,
+            None => {
+                return Self::create_error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "Invalid WebSocket upstream host",
+                )
+            }
+        };
+        let port = upstream.port_u16().unwrap_or(80);
+        let path = req
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
+        let original_host = req
+            .headers()
+            .get(hyper::header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or(host)
+            .to_string();
+
+        let mut headers = String::new();
+        for (name, value) in req.headers() {
+            let lower = name.as_str().to_ascii_lowercase();
+            if matches!(
+                lower.as_str(),
+                "host" | "connection" | "upgrade" | "proxy-connection"
+            ) {
+                continue;
+            }
+            if let Ok(value) = value.to_str() {
+                headers.push_str(&format!("{}: {}\r\n", name.as_str(), value));
+            }
+        }
+
+        let handshake = format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n{}\r\n",
+            path, original_host, headers
+        );
+
+        let mut upstream_stream = match TcpStream::connect((host, port)).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                error!("WebSocket upstream connect failed: {}", e);
+                state.metrics.record_upstream_error();
+                return Self::create_error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "WebSocket upstream unavailable",
+                );
+            }
+        };
+
+        if let Err(e) = upstream_stream.write_all(handshake.as_bytes()).await {
+            error!("WebSocket upstream handshake write failed: {}", e);
+            state.metrics.record_upstream_error();
+            return Self::create_error_response(
+                StatusCode::BAD_GATEWAY,
+                "WebSocket upstream handshake failed",
+            );
+        }
+
+        // Read the upstream handshake response headers only.
+        let mut buffer = Vec::with_capacity(2048);
+        let mut chunk = [0u8; 1024];
+        let header_end = loop {
+            if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+            if buffer.len() > 16 * 1024 {
+                return Self::create_error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "WebSocket upstream handshake too large",
+                );
+            }
+            match upstream_stream.read(&mut chunk).await {
+                Ok(0) => {
+                    return Self::create_error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "WebSocket upstream closed during handshake",
+                    )
+                }
+                Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+                Err(e) => {
+                    error!("WebSocket upstream handshake read failed: {}", e);
+                    state.metrics.record_upstream_error();
+                    return Self::create_error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "WebSocket upstream handshake failed",
+                    );
+                }
+            }
+        };
+
+        let head = String::from_utf8_lossy(&buffer[..header_end]);
+        let mut lines = head.lines();
+        let status = lines
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok())
+            .unwrap_or(502);
+        if status != 101 {
+            warn!("WebSocket upstream rejected upgrade with status {}", status);
+            return Self::create_error_response(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                "WebSocket upstream rejected upgrade",
+            );
+        }
+
+        let mut builder = Response::builder()
+            .status(StatusCode::SWITCHING_PROTOCOLS)
+            .version(hyper::Version::HTTP_11);
+        for line in lines {
+            if let Some((name, value)) = line.split_once(':') {
+                let lower = name.trim().to_ascii_lowercase();
+                if lower == "connection" || lower == "upgrade" {
+                    continue;
+                }
+                builder = builder.header(name.trim(), value.trim());
+            }
+        }
+        builder = builder
+            .header("connection", "upgrade")
+            .header("upgrade", "websocket");
+
+        let on_upgrade = hyper::upgrade::on(&mut req);
+        let metrics = Arc::clone(&state.metrics);
+        let leftover = buffer[header_end..].to_vec();
+        tokio::spawn(async move {
+            match on_upgrade.await {
+                Ok(upgraded) => {
+                    let mut client = hyper_util::rt::TokioIo::new(upgraded);
+                    if !leftover.is_empty() {
+                        let _ = client.write_all(&leftover).await;
+                    }
+                    if let Err(e) =
+                        tokio::io::copy_bidirectional(&mut client, &mut upstream_stream).await
+                    {
+                        debug!("WebSocket tunnel closed: {}", e);
+                    }
+                }
+                Err(e) => {
+                    metrics.record_upstream_error();
+                    warn!("WebSocket client upgrade failed: {}", e);
+                }
+            }
+        });
+
+        info!(
+            "WebSocket tunnel established from {} to {}:{}",
+            client_ip, host, port
+        );
+        builder
+            .body(Full::new(Bytes::new()))
+            .unwrap_or_else(|_| Self::create_error_response(StatusCode::BAD_GATEWAY, "Handshake"))
     }
 
     /// Resolve the client address without blindly trusting client headers.

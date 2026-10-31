@@ -2,6 +2,13 @@
 
 All notable changes to WAF-Rejected are documented here.
 
+## [Unreleased]
+
+### Added
+
+- HTTP/1.1 WebSocket upgrade proxying with a raw bidirectional tunnel.
+- End-to-end WebSocket integration test.
+
 ## [0.1.0-beta.2] - 2026-10-31
 
 ### Added

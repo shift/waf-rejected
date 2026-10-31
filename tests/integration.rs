@@ -21,3 +21,6 @@ mod proxy_tests;
 
 #[path = "integration/waf_features_tests.rs"]
 mod waf_features_tests;
+
+#[path = "integration/websocket_tests.rs"]
+mod websocket_tests;
