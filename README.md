@@ -130,9 +130,11 @@ Key points:
 
 ## Security limitations (read before production)
 
-- **ModSecurity/Coraza WASM execution is not implemented.** The WASM runtime
-  dependency was removed from the Beta build; the historical module is retained
-  in-tree but not compiled. Do not expect OWASP CRS coverage.
+- **ModSecurity/Coraza WASM execution is not implemented.** The bundled
+  `rules/coraza.wasm` is a Go-JS demo module, not Coraza/CRS. The WASM runtime
+  dependency was removed from the Beta build; see
+  [`docs/wasm-integration-status.md`](docs/wasm-integration-status.md). Do not
+  expect OWASP CRS coverage.
 - **WebTransport is not implemented.** HTTP/1.1 WebSocket upgrades are proxied
   to `http://` and TLS-secured `https://` upstreams; WebTransport requests are
   rejected with `501`.

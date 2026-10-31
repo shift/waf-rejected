@@ -14,6 +14,12 @@ All notable changes to WAF-Rejected are documented here.
 
 - WebSocket text/binary frames larger than `server.max_body_size` are blocked.
 
+### Documentation
+
+- Documented that the bundled `rules/coraza.wasm` is a Go-JS demo, not a
+  Coraza/CRS engine, in `docs/wasm-integration-status.md`.
+- Beta.6 release now includes a prebuilt container image tarball.
+
 ## [0.1.0-beta.5] - 2026-10-31
 
 ### Added
