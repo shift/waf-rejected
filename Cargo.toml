@@ -58,6 +58,14 @@ webpki-roots = "1"
 # HTTP connector for clients
 hyper-rustls = { version = "0.27", features = ["http1", "http2"] }
 
+# HTTP/3 (QUIC) support, enabled with the `http3` feature
+# NOTE: quinn 0.11.18 does not exist on crates.io; 0.11.12 is the latest
+# release and requires quinn-proto ^0.11.18. The proto crate is pinned to
+# 0.11.18 in Cargo.lock.
+quinn = { version = "0.11.12", optional = true, default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+h3 = { version = "0.0.8", optional = true }
+h3-quinn = { version = "0.0.10", optional = true }
+
 # Logging and tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
@@ -156,6 +164,9 @@ integration-tests = []
 wasm-waf = []
 # Protocol support features
 websocket = []
+# HTTP/3 over QUIC. Not part of default features: it pulls in quinn/h3 and
+# requires TLS 1.3 with certificates configured.
+http3 = ["dep:quinn", "dep:h3", "dep:h3-quinn"]
 # Reserved; WebTransport is not implemented and its binaries/dependencies were removed.
 webtransport = []
 # Security features

@@ -5,6 +5,8 @@
 //! Includes support for HTTP/1.0-3, WebSocket, and WebTransport protocols.
 
 pub mod buffer_pool;
+#[cfg(feature = "http3")]
+pub(crate) mod http3;
 pub mod service;
 pub mod websocket;
 

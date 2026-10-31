@@ -98,6 +98,68 @@ impl TlsManager {
         self.config.enabled
     }
 
+    /// Build a rustls `ServerConfig` suitable for QUIC/HTTP/3.
+    ///
+    /// QUIC mandates TLS 1.3, so this ignores the configured version range
+    /// except to reject a configuration that cannot negotiate 1.3. ALPN is
+    /// restricted to `h3`; the TCP ALPN list is left untouched.
+    #[cfg(feature = "http3")]
+    pub fn quic_server_config(&self) -> Result<Arc<RustlsServerConfig>, WafError> {
+        if !self.config.enabled {
+            return Err(WafError::Configuration(
+                "HTTP/3 requires TLS, but TLS is disabled".to_string(),
+            ));
+        }
+        if tls_rank(&self.config.max_version)? < 3 {
+            return Err(WafError::Configuration(format!(
+                "HTTP/3 requires TLS 1.3, but server.tls.max_version is {}",
+                self.config.max_version
+            )));
+        }
+
+        let certs = load_certs(&self.config.cert_path)?;
+        let key = load_private_key(&self.config.key_path)?;
+
+        let builder = RustlsServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&TLS13])
+        .map_err(|e| {
+            WafError::Configuration(format!("QUIC TLS protocol configuration error: {}", e))
+        })?;
+
+        let mut server_config = if self.config.require_client_cert {
+            let ca_path = self.config.client_ca_path.as_deref().ok_or_else(|| {
+                WafError::Configuration(
+                    "server.tls.require_client_cert is true but client_ca_path is not set"
+                        .to_string(),
+                )
+            })?;
+            let mut roots = RootCertStore::empty();
+            for cert in load_certs(ca_path)? {
+                roots.add(cert).map_err(|e| {
+                    WafError::Configuration(format!("Invalid client CA certificate: {}", e))
+                })?;
+            }
+            let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+                .build()
+                .map_err(|e| {
+                    WafError::Configuration(format!("Failed to build client verifier: {}", e))
+                })?;
+            builder
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(certs, key)
+        } else {
+            builder.with_no_client_auth().with_single_cert(certs, key)
+        }
+        .map_err(|e| WafError::Configuration(format!("QUIC TLS configuration error: {}", e)))?;
+
+        // HTTP/3 only. `h3` must never be advertised on the TCP listener.
+        server_config.alpn_protocols = vec![b"h3".to_vec()];
+
+        Ok(Arc::new(server_config))
+    }
+
     pub async fn accept(&self, stream: TcpStream) -> Result<TlsStream<TcpStream>, WafError> {
         match &self.acceptor {
             Some(acceptor) => acceptor

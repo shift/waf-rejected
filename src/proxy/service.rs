@@ -127,15 +127,15 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedIo<S> {
 
 /// Per-connection state cloned into each hyper service invocation.
 #[derive(Clone)]
-struct ProxyState {
-    waf_engine: Arc<WafEngine>,
-    upstream_client: Client<HttpConnector, Full<Bytes>>,
-    upstream_uri: Uri,
-    config: Arc<Config>,
-    buffer_pool: Arc<BufferPool>,
-    auth_validator: Option<Arc<ApiKeyValidator>>,
-    trusted_proxies: Arc<Vec<IpNetwork>>,
-    metrics: Arc<Metrics>,
+pub(crate) struct ProxyState {
+    pub(crate) waf_engine: Arc<WafEngine>,
+    pub(crate) upstream_client: Client<HttpConnector, Full<Bytes>>,
+    pub(crate) upstream_uri: Uri,
+    pub(crate) config: Arc<Config>,
+    pub(crate) buffer_pool: Arc<BufferPool>,
+    pub(crate) auth_validator: Option<Arc<ApiKeyValidator>>,
+    pub(crate) trusted_proxies: Arc<Vec<IpNetwork>>,
+    pub(crate) metrics: Arc<Metrics>,
 }
 
 impl WafProxyService {
@@ -301,6 +301,40 @@ impl WafProxyService {
             trusted_proxies: Arc::new(self.trusted_proxies.clone()),
             metrics: Arc::clone(&self.metrics),
         };
+
+        #[cfg(feature = "http3")]
+        if self.config.server.enable_http3 {
+            if !self
+                .config
+                .server
+                .supported_http_versions
+                .iter()
+                .any(|version| version == "3")
+            {
+                warn!(
+                    "HTTP/3 enabled but \"3\" is not in server.supported_http_versions; not starting HTTP/3"
+                );
+            } else if let Some(tls_manager) = self.tls_manager.as_ref() {
+                let h3_state = state.clone();
+                let tls_manager = Arc::clone(tls_manager);
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        crate::proxy::http3::serve(tls_manager, h3_state, bind_addr).await
+                    {
+                        warn!("HTTP/3 listener not started: {}", e);
+                    }
+                });
+            } else {
+                warn!(
+                    "HTTP/3 enabled but TLS is disabled; not starting HTTP/3 (QUIC requires TLS 1.3)"
+                );
+            }
+        }
+
+        #[cfg(not(feature = "http3"))]
+        if self.config.server.enable_http3 {
+            debug!("HTTP/3 requested but this binary was built without the `http3` feature");
+        }
 
         loop {
             let (tcp_stream, remote_addr) = listener
@@ -936,7 +970,7 @@ impl WafProxyService {
     /// `X-Forwarded-For` / `X-Real-IP` are only honoured when the immediate
     /// peer is a configured trusted proxy; otherwise the socket address is
     /// authoritative.
-    fn resolve_client_ip(
+    pub(crate) fn resolve_client_ip(
         peer_ip: IpAddr,
         headers: &hyper::HeaderMap,
         trusted_proxies: &[IpNetwork],
@@ -987,7 +1021,7 @@ impl WafProxyService {
     }
 
     /// Check if the detected HTTP version is supported
-    fn is_http_version_supported(version: &str, config: &Config) -> bool {
+    pub(crate) fn is_http_version_supported(version: &str, config: &Config) -> bool {
         config
             .server
             .supported_http_versions
@@ -996,7 +1030,7 @@ impl WafProxyService {
 
     /// Protocol-aware request forwarding with version preservation
     #[allow(clippy::too_many_arguments)]
-    async fn forward_to_upstream_with_protocol(
+    pub(crate) async fn forward_to_upstream_with_protocol(
         parts: hyper::http::request::Parts,
         body_bytes: Bytes,
         upstream_client: Client<HttpConnector, Full<Bytes>>,
@@ -1233,7 +1267,7 @@ impl WafProxyService {
     }
 
     /// Create blocked response with protocol information
-    fn create_blocked_response(status_code: u16, reason: &str) -> Response<Full<Bytes>> {
+    pub(crate) fn create_blocked_response(status_code: u16, reason: &str) -> Response<Full<Bytes>> {
         let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::FORBIDDEN);
         let body = format!("Request blocked by WAF: {}", reason);
 
@@ -1255,7 +1289,7 @@ impl WafProxyService {
     }
 
     /// Create rate limit response with protocol information
-    fn create_rate_limit_response(reason: &str) -> Response<Full<Bytes>> {
+    pub(crate) fn create_rate_limit_response(reason: &str) -> Response<Full<Bytes>> {
         let body = format!("Rate limited: {}", reason);
 
         Response::builder()
@@ -1277,7 +1311,10 @@ impl WafProxyService {
     }
 
     /// Create generic error response with protocol information
-    fn create_error_response(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
+    pub(crate) fn create_error_response(
+        status: StatusCode,
+        message: &str,
+    ) -> Response<Full<Bytes>> {
         Response::builder()
             .status(status)
             .header("content-type", "text/plain")
