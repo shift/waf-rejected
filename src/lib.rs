@@ -61,8 +61,9 @@ pub mod threat_intelligence;
 // Advanced modules for future phases
 pub mod modsecurity;
 
-#[cfg(feature = "wasm-waf")]
-pub mod wasm;
+// The historical `wasm` module is retained in-tree but is not compiled:
+// the Coraza/ModSecurity component ABI is not implemented for Beta.
+// The `wasm-waf` feature is intentionally empty and not enabled by default.
 
 // Re-export main components for easy access
 pub use config::Config;

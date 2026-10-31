@@ -477,7 +477,6 @@ impl WasmEngine {
         let mut wasmtime_config = Config::new();
         wasmtime_config.wasm_component_model(true);
         wasmtime_config.async_support(true);
-        wasmtime_config.cache_config_load_default()?;
 
         // Disable pooling allocator temporarily to fix compilation
         // if config.enable_shared_memory {

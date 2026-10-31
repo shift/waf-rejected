@@ -127,9 +127,9 @@ Key points:
 
 ## Security limitations (read before production)
 
-- **ModSecurity/Coraza WASM execution is not implemented.** The engine currently
-  uses an internal heuristic fallback. `[waf.wasm] enabled = false` is the safe
-  default; do not enable it expecting OWASP CRS coverage.
+- **ModSecurity/Coraza WASM execution is not implemented.** The WASM runtime
+  dependency was removed from the Beta build; the historical module is retained
+  in-tree but not compiled. Do not expect OWASP CRS coverage.
 - **WebSocket and WebTransport tunneling are not implemented.** Upgrade requests
   are rejected with `501` rather than returning a misleading `101`.
 - **GeoIP blocking needs a database loader.** Without a MaxMind database only the

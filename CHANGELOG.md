@@ -32,6 +32,9 @@ All notable changes to WAF-Rejected are documented here.
 - A configured but unavailable WASM engine fails closed.
 - Helm auth default, chart dependencies, GHCR image paths, HTTPS target port and
   Kubernetes persistence wiring corrected.
+- Dependency audit cleaned: removed the unused WASM runtime, HTTP/3/QUIC and
+  WebTransport stacks and updated live-path crates; `cargo audit` reports
+  0 vulnerabilities.
 
 ## [0.1.0-beta.1] - 2026-10-31
 

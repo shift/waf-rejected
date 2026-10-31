@@ -40,20 +40,10 @@ hyper = { version = "1.0", features = ["full", "server", "client", "http1", "htt
 hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
 
-# HTTP/3 and QUIC support
-h3 = { version = "0.0.5", optional = true }
-h3-quinn = { version = "0.0.5", optional = true }
-quinn = { version = "0.11", optional = true }
-rustls-native-certs = { version = "0.7", optional = true }
-
-# WebSocket and WebTransport support
-tokio-tungstenite = { version = "0.20", features = ["rustls-tls-webpki-roots"] }
-tungstenite = { version = "0.20", features = ["rustls-tls-webpki-roots"] }
+# WebSocket support
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", features = ["sink"] }
-
-# WebTransport support (experimental)
-web-transport = { git = "https://github.com/kixelated/web-transport-rs", optional = true }
-web-transport-quinn = { git = "https://github.com/kixelated/web-transport-rs", optional = true }
 
 # Tower middleware stack
 tower = { version = "0.4", features = ["full"] }
@@ -95,9 +85,6 @@ parking_lot = "0.12"
 chrono = { version = "0.4", features = ["serde"] }
 
 # ModSecurity WASM Go integration
-wasmtime = { version = "26.0", features = ["component-model", "async", "pooling-allocator"], optional = true }
-wasmtime-wasi = { version = "26.0", optional = true }
-wasmtime-wasi-http = { version = "26.0", optional = true }
 
 # Streaming body processing
 async-stream = "0.3"
@@ -109,7 +96,6 @@ serde_bytes = "0.11"
 # notify = "6.0" # Moved to additional dependencies section
 
 # Redis client for rate limiting
-redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
 
 # Additional dependencies for new features
 regex = "1.10"
@@ -120,7 +106,6 @@ urlencoding = "2.1"
 async-trait = "0.1"
 
 # Development-only dependencies
-rcgen = { version = "0.12", optional = true }
 
 # WebSocket handshake dependencies
 sha1 = "0.10"
@@ -138,9 +123,6 @@ sled = { version = "0.34", optional = true }
 # High-performance embedded database (Phase 2)
 redb = { version = "3.0", optional = true }
 
-# High-performance I/O with io_uring (Linux only)
-tokio-uring = { version = "0.5", optional = true }
-
 # CLI utilities
 clap = { version = "4.0", features = ["derive"] }
 
@@ -151,34 +133,12 @@ rand = "0.8"
 num_cpus = "1.0"
 
 # Memory mapping for optimized WASM loading
-memmap2 = "0.9"
 
 # Security modules dependencies
-maxminddb = { version = "0.24", optional = true }
 ipnetwork = "0.20"
-
-# AI/ML dependencies for threat detection
-candle-core = { version = "0.7", optional = true }
-candle-nn = { version = "0.7", optional = true }
-candle-transformers = { version = "0.7", optional = true }
-
-# Data processing for ML
-polars = { version = "0.41", features = ["lazy"], optional = true }
-arrow = { version = "53.0", optional = true }
-
-# Time series analysis
-smartcore = { version = "0.3", optional = true }
-
-# Statistics and ML utilities  
-ndarray = { version = "0.15", optional = true }
-rand_distr = { version = "0.4", optional = true }
 
 # Threat intelligence integration
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-
-# New dependencies for WebTransport binaries
-url = { version = "2.5" }
-rustls-pki-types = { version = "1.7" }
 
 [dev-dependencies]
 # Testing framework
@@ -189,28 +149,34 @@ tempfile = "3.0"
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 
 [features]
-default = ["wasm-waf", "export-system", "http3", "websocket"]
+default = ["export-system", "websocket"]
 integration-tests = []
-wasm-waf = ["wasmtime", "wasmtime-wasi", "wasmtime-wasi-http"]
+wasm-waf = []
 # Protocol support features
-http3 = ["h3", "h3-quinn", "quinn", "rustls-native-certs"]
 websocket = []
-webtransport = ["web-transport", "web-transport-quinn", "rcgen"]
-# Security features
-geoip = ["maxminddb"]
+# Reserved; WebTransport is not implemented and its binaries/dependencies were removed.
+webtransport = []
+# Security features (GeoIP database integration is not implemented yet)
+geoip = []
 # Export system features
 export-system = ["sled", "opentelemetry", "opentelemetry_sdk"]
 export-otel = ["opentelemetry", "opentelemetry_sdk"]
 export-sled = ["sled"]
 export-redb = ["redb"]
-# I/O optimization features
-io-uring = ["tokio-uring"]
-# AI/ML threat detection features (simplified)
-ai-threat-detection = ["polars", "smartcore", "ndarray", "rand_distr"]
+# Reserved; io_uring backend is a stub in Beta.
+io-uring = []
+# AI/ML threat detection features (heuristic implementation, no heavy ML deps)
+ai-threat-detection = []
 # Compliance features
 compliance = ["sled"]
 
 # Security modules performance benchmarks
+[[bench]]
+name = "wasm_performance"
+path = "benches/wasm_performance.rs"
+required-features = ["wasm-waf"]
+harness = false
+
 [[bench]]
 name = "security_performance"
 harness = false
@@ -288,23 +254,3 @@ required-features = ["wasm-waf"]
 [[bin]]
 name = "benchmark_core"
 path = "src/bin/benchmark_core.rs"
-
-[[bin]]
-name = "websocket_performance_test"
-path = "src/bin/websocket_performance_test.rs"
-
-# New WebTransport E2E components (guarded by feature)
-[[bin]]
-name = "webtransport_waf_proxy"
-path = "src/bin/webtransport_waf_proxy.rs"
-required-features = ["webtransport"]
-
-[[bin]]
-name = "webtransport_echo_backend"
-path = "src/bin/webtransport_echo_backend.rs"
-required-features = ["webtransport"]
-
-[[bin]]
-name = "webtransport_performance_test"
-path = "src/bin/webtransport_performance_test.rs"
-required-features = ["webtransport"]
