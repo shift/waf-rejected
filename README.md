@@ -200,12 +200,13 @@ Key points:
   dependency was removed from the Beta build; see
   [`docs/wasm-integration-status.md`](docs/wasm-integration-status.md). Do not
   expect OWASP CRS coverage.
-- **WebTransport is not implemented.** HTTP/1.1 WebSocket upgrades are proxied
-  to `http://` and TLS-secured `https://` upstreams; WebTransport requests are
-  rejected with `501`. Private upstream CAs can be added with the PEM bundle in
-  `proxy.upstream_ca_path`; certificate and hostname verification are never
-  weakened. The audited implementation plan is in
-  [`docs/webtransport-plan.md`](docs/webtransport-plan.md).
+- **WebTransport is feature-gated and terminating.** Build with
+  `--features webtransport`, enable `server.webtransport`, and configure Origin
+  and path allowlists. It inspects sessions locally; it does **not** proxy
+  arbitrary WebTransport applications upstream. HTTP/1.1
+  `Upgrade: webtransport` remains `501`. See
+  [`docs/webtransport-plan.md`](docs/webtransport-plan.md) and
+  [`docs/developer-guide/webtransport.md`](docs/developer-guide/webtransport.md).
 - **GeoIP requires a MaxMind database.** Set `waf.geo_blocking.database_path` to a
   GeoLite2/GeoIP2 City `.mmdb`; without it only built-in test addresses resolve.
   Tor/VPN/datacenter detection additionally requires a GeoIP2 Anonymous IP

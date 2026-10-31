@@ -2,10 +2,13 @@
 
 All notable changes to WAF-Rejected are documented here.
 
-## [Unreleased]
+## [0.1.0-beta.9] - 2026-10-31
 
 ### Added
 
+- Feature-gated WebTransport over HTTP/3 terminating endpoint with Origin/path
+  allowlists, API-key auth, WAF inspection, session/stream/datagram limits,
+  duplicate-session guard, timeouts and metrics.
 - Added an isolated `fuzz/` cargo-fuzz workspace with `content_inspection`,
   `websocket_frame` and `config_toml` targets, seed corpora for SQLi/XSS/
   encoded payloads and valid/invalid configurations, and usage/CI guidance in
