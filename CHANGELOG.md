@@ -4,6 +4,12 @@ All notable changes to WAF-Rejected are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- Feature-gated HTTP/3 (QUIC) ingress reusing the WAF/auth/rate-limit pipeline.
+- TLS 1.3-only QUIC configuration with ALPN `h3` and explicit ring provider.
+- Loopback HTTP/3 request test.
+
 ### Documentation
 
 - Added `SECURITY.md` with coordinated vulnerability disclosure, supported

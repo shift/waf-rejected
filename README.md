@@ -8,7 +8,7 @@ request-size and rate limits) before being forwarded to an upstream service.
 
 ## What works
 
-- Reverse proxy with HTTP/1.1 and HTTP/2 over TLS.
+- Reverse proxy with HTTP/1.1, HTTP/2 over TLS, and feature-gated HTTP/3 (QUIC).
 - WebSocket upgrade proxying with per-frame WAF inspection.
 - URI, query-string, header and **request-body** inspection.
 - Percent-encoded payload decoding (`%20`, `%27`, `%3C`, ...).
@@ -162,7 +162,9 @@ Key points:
   Tor/VPN/datacenter detection additionally requires a GeoIP2 Anonymous IP
   `.mmdb` via `waf.geo_blocking.anonymous_database_path`; without it those flags
   remain false.
-- **HTTP/3 is not implemented.** Keep `enable_http3 = false`; use TLS + HTTP/2.
+- **HTTP/3 is feature-gated.** Build with `--features http3`, enable TLS 1.3 and
+  `server.enable_http3`, and add `"3"` to `server.supported_http_versions`.
+  HTTP/3 and WebTransport datagrams/streams are not inspected frame-by-frame.
 - The legacy AI/threat-intelligence modules are experimental and are not on the
   request path by default.
 
