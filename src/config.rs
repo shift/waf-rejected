@@ -716,18 +716,11 @@ impl Default for WasmConfig {
 impl Config {
     /// Load configuration from environment variables and config file
     pub fn load() -> anyhow::Result<Self> {
-        let mut settings = config::Config::builder()
-            // Start with default values
-            .add_source(config::Config::try_from(&Config::default())?)
-            // Add environment variables (with WAF_ prefix)
-            .add_source(
-                config::Environment::with_prefix("WAF")
-                    .prefix_separator("_")
-                    .separator("__"),
-            );
+        let mut settings =
+            config::Config::builder().add_source(config::Config::try_from(&Config::default())?);
 
-        // Try to load from config file if it exists. Support both the historic
-        // WAF_CONFIG_FILE name and the CONFIG_PATH name used by deployments.
+        // Load the file before the environment so WAF_* variables can override
+        // file values (important for containers and Kubernetes deployments).
         let config_file = std::env::var("WAF_CONFIG_FILE")
             .or_else(|_| std::env::var("CONFIG_PATH"))
             .ok();
@@ -735,6 +728,12 @@ impl Config {
             info!("Loading configuration from file: {}", config_file);
             settings = settings.add_source(config::File::with_name(&config_file).required(true));
         }
+
+        settings = settings.add_source(
+            config::Environment::with_prefix("WAF")
+                .prefix_separator("_")
+                .separator("__"),
+        );
 
         let config: Config = settings.build()?.try_deserialize()?;
         config.validate()?;
