@@ -109,6 +109,25 @@ in-scope service:
 - Report supply-chain issues you find in WAF-Rejected to us through the private
   channel above so that other operators can be warned.
 
+## Verifying release provenance
+
+Tagged releases publish a GitHub build provenance attestation for the binary
+tarball, the container image tarball and the CycloneDX SBOM. The attestation is
+signed by the Release workflow's OIDC identity and records the repository, the
+workflow and the source commit that produced the artifact.
+
+```bash
+gh attestation verify waf-rejected-v<version>-x86_64-linux.tar.gz --repo shift/waf-rejected
+gh attestation verify waf-rejected-<version>-image.tar.gz --repo shift/waf-rejected
+gh attestation verify waf-rejected-<version>.cdx.json --repo shift/waf-rejected
+```
+
+Verify provenance before deploying a downloaded artifact. A failed verification
+means the file did not come from this repository's release pipeline; do not
+deploy it and report it through the private channel above. The published
+`<asset>.sha256` files remain useful for corruption checks but are not a
+substitute for the signed attestation.
+
 ## Scope
 
 In scope: the `waf-ingress` binary, the container image published from this

@@ -80,6 +80,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
       - name: Download SBOM
@@ -117,6 +119,13 @@ jobs:
             sha256sum "${asset}" > "${asset}.sha256"
           done
           sha256sum --check ./*.sha256
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/waf-rejected-v*-x86_64-linux.tar.gz
+            dist/waf-rejected-*-image.tar.gz
+            dist/waf-rejected-*.cdx.json
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:

@@ -24,7 +24,8 @@ The image is a Debian slim runtime with the `waf-ingress` binary, the bundled
 Tags are mutable; a digest is not. Pin by digest for anything that matters.
 
 Every tagged release publishes the image tarball, the binary tarball and the
-CycloneDX SBOM, each with a matching `<asset>.sha256` checksum file.
+CycloneDX SBOM, each with a matching `<asset>.sha256` checksum file and a GitHub
+build provenance attestation.
 
 ## Load the released tarball
 
@@ -32,9 +33,17 @@ CycloneDX SBOM, each with a matching `<asset>.sha256` checksum file.
 # Verify the asset against the checksum published with the release
 sha256sum --check waf-rejected-0.1.0-beta.6-image.tar.gz.sha256
 
+# Verify the tarball was built by this repository's Release workflow
+gh attestation verify waf-rejected-0.1.0-beta.6-image.tar.gz --repo shift/waf-rejected
+
 docker load -i waf-rejected-0.1.0-beta.6-image.tar.gz
 # Loaded image: ghcr.io/shift/waf-rejected:v0.1.0-beta.6
 ```
+
+The provenance attestation is published for the image tarball, the binary
+tarball and the CycloneDX SBOM. `gh attestation verify` exits non-zero if the
+file does not match the signed attestation, which is a stronger check than the
+checksum alone: it binds the bytes to a specific workflow run and commit.
 
 Use the asset name shown on the release page if it differs from the convention
 above. Podman uses the same archive:

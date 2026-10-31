@@ -2,6 +2,17 @@
 
 All notable changes to WAF-Rejected are documented here.
 
+## [Unreleased]
+
+### Documentation
+
+- Documented release build provenance: tagged releases now publish GitHub
+  attestations (`actions/attest-build-provenance`) for the binary tarball, the
+  container image tarball and the CycloneDX SBOM, verifiable with
+  `gh attestation verify <file> --repo shift/waf-rejected`.
+- Added a "verify provenance" section to `SECURITY.md`,
+  `docs/operations/release-checklist.md` and `docs/operations/container.md`.
+
 ## [0.1.0-beta.8] - 2026-10-31
 
 ### Added
