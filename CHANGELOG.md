@@ -8,6 +8,8 @@ All notable changes to WAF-Rejected are documented here.
 
 - HTTP/1.1 WebSocket upgrade proxying with a raw bidirectional tunnel.
 - End-to-end WebSocket integration test.
+- MaxMind GeoLite2/GeoIP2 City database loading for real country blocking.
+- `waf.geo_blocking.database_path` configuration.
 
 ## [0.1.0-beta.2] - 2026-10-31
 

@@ -135,8 +135,8 @@ Key points:
   in-tree but not compiled. Do not expect OWASP CRS coverage.
 - **WebTransport is not implemented.** HTTP/1.1 WebSocket upgrades are proxied;
   WebTransport requests are rejected with `501`.
-- **GeoIP blocking needs a database loader.** Without a MaxMind database only the
-  built-in test addresses resolve, so country rules are not effective.
+- **GeoIP requires a MaxMind database.** Set `waf.geo_blocking.database_path` to a
+  GeoLite2/GeoIP2 City `.mmdb`; without it only built-in test addresses resolve.
 - **HTTP/3 is not implemented.** Keep `enable_http3 = false`; use TLS + HTTP/2.
 - The legacy AI/threat-intelligence modules are experimental and are not on the
   request path by default.

@@ -67,6 +67,7 @@ threat_patterns = ["sql_injection", "xss", "command_injection", "path_traversal"
 
 [waf.geo_blocking]
 enabled = false
+database_path = "/etc/waf/GeoLite2-City.mmdb"
 blocked_countries = []
 blocked_regions = []
 block_tor = true

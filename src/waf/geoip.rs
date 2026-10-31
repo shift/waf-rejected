@@ -19,22 +19,30 @@ pub struct GeoInfo {
     pub asn_org: String,
 }
 
-/// Simple GeoIP lookup service (placeholder for MaxMind/IP2Location integration)
+/// GeoIP lookup service backed optionally by a MaxMind City database.
 pub struct GeoIpService {
-    // For now, use a simple in-memory cache
-    // TODO: Integrate with MaxMind GeoLite2 database before K/V integration
     cache: HashMap<IpAddr, GeoInfo>,
+    reader: Option<maxminddb::Reader<Vec<u8>>>,
 }
 
 impl GeoIpService {
     pub fn new() -> Self {
         Self {
             cache: Self::init_test_data(),
+            reader: None,
         }
     }
 
-    /// Initialize with some test data for development
-    /// TODO: Replace with actual MaxMind database loading
+    /// Load a MaxMind GeoLite2/GeoIP2 City database.
+    pub fn from_database(path: &str) -> Result<Self, maxminddb::MaxMindDbError> {
+        let reader = maxminddb::Reader::open_readfile(path)?;
+        Ok(Self {
+            cache: Self::init_test_data(),
+            reader: Some(reader),
+        })
+    }
+
+    /// Initialize with some test data for development.
     fn init_test_data() -> HashMap<IpAddr, GeoInfo> {
         let mut cache = HashMap::new();
 
@@ -81,16 +89,38 @@ impl GeoIpService {
         cache
     }
 
-    /// Look up geographic information for an IP address
-    pub fn lookup(&self, ip: &IpAddr) -> Option<&GeoInfo> {
-        // First check cache
+    /// Look up geographic information for an IP address.
+    pub fn lookup(&self, ip: &IpAddr) -> Option<GeoInfo> {
         if let Some(geo_info) = self.cache.get(ip) {
-            return Some(geo_info);
+            return Some(geo_info.clone());
         }
 
-        // TODO: Implement actual MaxMind database lookup
-        // For now, return default info for unknown IPs
-        None
+        let reader = self.reader.as_ref()?;
+        let city = reader
+            .lookup(*ip)
+            .ok()?
+            .decode::<maxminddb::geoip2::City>()
+            .ok()??;
+        let region = city
+            .subdivisions
+            .first()
+            .and_then(|subdivision| subdivision.names.english.or(subdivision.iso_code))
+            .unwrap_or("Unknown")
+            .to_string();
+
+        Some(GeoInfo {
+            country_code: city.country.iso_code.unwrap_or("XX").to_string(),
+            country_name: city.country.names.english.unwrap_or("Unknown").to_string(),
+            region,
+            city: city.city.names.english.unwrap_or("Unknown").to_string(),
+            latitude: city.location.latitude.unwrap_or(0.0),
+            longitude: city.location.longitude.unwrap_or(0.0),
+            is_tor_exit: false,
+            is_vpn: false,
+            is_datacenter: false,
+            asn: 0,
+            asn_org: "Unknown".to_string(),
+        })
     }
 
     /// Update cache with new geo information
@@ -223,7 +253,6 @@ impl WafRule for GeoBlockingRule {
         let geo_service = geoip_service().lock().unwrap();
         let geo_info = geo_service
             .lookup(&ctx.client_ip)
-            .cloned()
             .unwrap_or_else(|| geo_service.default_geo_info());
 
         // Check if country is in allowed list (if specified)
@@ -349,6 +378,11 @@ mod tests {
             HeaderMap::new(),
             None,
         )
+    }
+
+    #[test]
+    fn test_missing_database_is_reported() {
+        assert!(GeoIpService::from_database("/nonexistent/GeoLite2-City.mmdb").is_err());
     }
 
     #[test]

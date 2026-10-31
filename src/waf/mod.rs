@@ -170,7 +170,7 @@ impl WafEngine {
         let mut engine = Self {
             rules: Arc::new(RwLock::new(Vec::new())),
             event_logger: SecurityEventLogger::new(config.waf.security_events.clone()),
-            geoip_service: Arc::new(GeoIpService::new()),
+            geoip_service: Self::initialize_geoip(config),
             fail_closed: config.waf.fail_mode != "open",
             wasm_init_failed,
             #[cfg(feature = "wasm-waf")]
@@ -183,6 +183,24 @@ impl WafEngine {
         engine.add_default_rules(config);
 
         engine
+    }
+
+    fn initialize_geoip(config: &Config) -> Arc<GeoIpService> {
+        if let Some(path) = &config.waf.geo_blocking.database_path {
+            match GeoIpService::from_database(path) {
+                Ok(service) => {
+                    info!("GeoIP database loaded from {}", path);
+                    return Arc::new(service);
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to load GeoIP database '{}': {}. Country blocking will only match built-in test data",
+                        path, e
+                    );
+                }
+            }
+        }
+        Arc::new(GeoIpService::new())
     }
 
     #[cfg(feature = "wasm-waf")]

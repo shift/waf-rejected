@@ -287,6 +287,9 @@ pub struct GeoBlockingConfig {
     /// Enable geographic blocking
     pub enabled: bool,
 
+    /// Path to a MaxMind GeoLite2/GeoIP2 City database (`.mmdb`).
+    pub database_path: Option<String>,
+
     /// Blocked country codes (ISO 3166-1 alpha-2)
     pub blocked_countries: Vec<String>,
 
@@ -675,7 +678,8 @@ impl Default for ContentInspectionConfig {
 impl Default for GeoBlockingConfig {
     fn default() -> Self {
         Self {
-            enabled: false,            // Disabled by default
+            enabled: false, // Disabled by default
+            database_path: None,
             blocked_countries: vec![], // Empty by default
             blocked_regions: vec![],
             block_tor: true,
