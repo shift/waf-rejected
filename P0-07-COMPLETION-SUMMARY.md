@@ -1,3 +1,9 @@
+> **Beta status correction (2026-10-31):** This document describes the original
+> roadmap intent, not the current verified feature set. See `README.md` and
+> `CHANGELOG.md` for what ships in `0.1.0-beta.1`. In particular, Coraza WASM
+> execution, WebSocket/WebTransport tunnelling, GeoIP country blocking and
+> HTTP/3 are **not** implemented in the Beta.
+
 # WAF-Rejected Strategic Roadmap v0.1 "The Stable Core" - COMPLETION SUMMARY
 
 ## Executive Summary

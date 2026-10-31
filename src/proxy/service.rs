@@ -1,5 +1,5 @@
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,14 +11,16 @@ use hyper::{Request, Response, StatusCode, Uri};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
+use ipnetwork::IpNetwork;
 use tokio::net::TcpListener;
-use tokio_rustls::server::TlsStream;
 use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::error::WafError;
-use crate::proxy::buffer_pool::BufferPool;
+use crate::metrics::Metrics;
+use crate::proxy::buffer_pool::{BodyReadError, BufferPool};
 use crate::proxy::websocket::WebSocketHandler;
+use crate::waf::auth::{ApiKeyValidator, InMemoryKeyStore};
 use crate::waf::tls_config::TlsManager;
 use crate::waf::{Decision, RequestContext, WafEngine};
 
@@ -41,6 +43,22 @@ pub struct WafProxyService {
     #[cfg(feature = "webtransport")]
     webtransport_handler: WebTransportHandler,
     tls_manager: Option<Arc<TlsManager>>,
+    auth_validator: Option<Arc<ApiKeyValidator>>,
+    trusted_proxies: Vec<IpNetwork>,
+    metrics: Arc<Metrics>,
+}
+
+/// Per-connection state cloned into each hyper service invocation.
+#[derive(Clone)]
+struct ProxyState {
+    waf_engine: Arc<WafEngine>,
+    upstream_client: Client<HttpConnector, Full<Bytes>>,
+    upstream_uri: Uri,
+    config: Arc<Config>,
+    buffer_pool: Arc<BufferPool>,
+    auth_validator: Option<Arc<ApiKeyValidator>>,
+    trusted_proxies: Arc<Vec<IpNetwork>>,
+    metrics: Arc<Metrics>,
 }
 
 impl WafProxyService {
@@ -94,6 +112,38 @@ impl WafProxyService {
             None
         };
 
+        let auth_validator = if config_arc.security.auth.enabled {
+            let store = Arc::new(InMemoryKeyStore::from_raw_keys(
+                &config_arc.security.auth.api_keys,
+            ));
+            info!(
+                "API key authentication enabled ({} key(s), header '{}')",
+                config_arc.security.auth.api_keys.len(),
+                config_arc.security.auth.header_name
+            );
+            Some(Arc::new(ApiKeyValidator::new(
+                store,
+                config_arc.security.auth.clone(),
+            )))
+        } else {
+            None
+        };
+
+        let trusted_proxies = config_arc
+            .server
+            .trusted_proxies
+            .iter()
+            .filter_map(|cidr| match cidr.parse::<IpNetwork>() {
+                Ok(network) => Some(network),
+                Err(e) => {
+                    warn!("Ignoring invalid trusted proxy '{}': {}", cidr, e);
+                    None
+                }
+            })
+            .collect();
+
+        let metrics = Arc::new(Metrics::new());
+
         info!(
             "WAF Proxy Service initialized with {} rules",
             waf_engine.rule_count()
@@ -123,7 +173,15 @@ impl WafProxyService {
             #[cfg(feature = "webtransport")]
             webtransport_handler,
             tls_manager,
+            auth_validator,
+            trusted_proxies,
+            metrics,
         })
+    }
+
+    /// Shared runtime metrics, also served by the health service.
+    pub fn metrics(&self) -> Arc<Metrics> {
+        Arc::clone(&self.metrics)
     }
 
     /// Start the proxy server with optimized concurrency
@@ -137,13 +195,35 @@ impl WafProxyService {
             .await
             .map_err(|e| WafError::internal(format!("Failed to bind to {}: {}", bind_addr, e)))?;
 
+        self.start_with_listener(listener).await
+    }
+
+    /// Serve on an already-bound listener (useful for tests and socket activation).
+    pub async fn start_with_listener(&self, listener: TcpListener) -> Result<(), WafError> {
+        let bind_addr = listener
+            .local_addr()
+            .map_err(|e| WafError::internal(format!("Failed to read listener address: {}", e)))?;
+
         info!("🚀 WAF Proxy Server started successfully on {}", bind_addr);
         info!("📊 Performance optimizations: connection pooling, async processing, rule caching");
         if self.tls_manager.is_some() {
             info!("🔒 TLS enabled - all connections require TLS 1.2+");
         } else {
-            warn!("⚠️  TLS disabled - connections are unencrypted (not recommended for production)");
+            warn!(
+                "⚠️  TLS disabled - connections are unencrypted (not recommended for production)"
+            );
         }
+
+        let state = ProxyState {
+            waf_engine: Arc::clone(&self.waf_engine),
+            upstream_client: self.upstream_client.clone(),
+            upstream_uri: self.upstream_uri.clone(),
+            config: Arc::clone(&self.config),
+            buffer_pool: Arc::clone(&self.buffer_pool),
+            auth_validator: self.auth_validator.clone(),
+            trusted_proxies: Arc::new(self.trusted_proxies.clone()),
+            metrics: Arc::clone(&self.metrics),
+        };
 
         loop {
             let (tcp_stream, remote_addr) = listener
@@ -151,26 +231,16 @@ impl WafProxyService {
                 .await
                 .map_err(|e| WafError::internal(format!("Failed to accept connection: {}", e)))?;
 
-            let waf_engine = Arc::clone(&self.waf_engine);
-            let upstream_client = self.upstream_client.clone();
-            let upstream_uri = self.upstream_uri.clone();
-            let config = Arc::clone(&self.config);
-            let buffer_pool = Arc::clone(&self.buffer_pool);
             let tls_manager = self.tls_manager.clone();
+            let state = state.clone();
+            let peer_ip = remote_addr.ip();
 
             tokio::task::spawn(async move {
                 if let Some(tls_mgr) = tls_manager {
                     match tls_mgr.accept(tcp_stream).await {
                         Ok(tls_stream) => {
-                            if let Err(e) = Self::handle_tls_connection(
-                                tls_stream,
-                                waf_engine,
-                                upstream_client,
-                                upstream_uri,
-                                config,
-                                buffer_pool,
-                            )
-                            .await
+                            if let Err(e) =
+                                Self::handle_connection(tls_stream, state, peer_ip, true).await
                             {
                                 error!("TLS connection error from {}: {}", remote_addr, e);
                             }
@@ -179,117 +249,44 @@ impl WafProxyService {
                             error!("TLS handshake failed from {}: {}", remote_addr, e);
                         }
                     }
-                } else {
-                    if let Err(e) = Self::handle_plaintext_connection(
-                        tcp_stream,
-                        waf_engine,
-                        upstream_client,
-                        upstream_uri,
-                        config,
-                        buffer_pool,
-                    )
-                    .await
-                    {
-                        error!("Connection error from {}: {}", remote_addr, e);
-                    }
+                } else if let Err(e) =
+                    Self::handle_connection(tcp_stream, state, peer_ip, false).await
+                {
+                    error!("Connection error from {}: {}", remote_addr, e);
                 }
             });
         }
     }
 
-    async fn handle_tls_connection(
-        stream: TlsStream<tokio::net::TcpStream>,
-        waf_engine: Arc<WafEngine>,
-        upstream_client: Client<HttpConnector, Full<Bytes>>,
-        upstream_uri: Uri,
-        config: Arc<Config>,
-        buffer_pool: Arc<BufferPool>,
-    ) -> Result<(), WafError> {
-        if config.server.enable_http2 {
-            hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                .keep_alive_interval(Some(Duration::from_secs(30)))
-                .keep_alive_timeout(Duration::from_secs(10))
-                .serve_connection(
-                    hyper_util::rt::TokioIo::new(stream),
-                    service_fn(move |req| {
-                        Self::handle_request(
-                            req,
-                            Arc::clone(&waf_engine),
-                            upstream_client.clone(),
-                            upstream_uri.clone(),
-                            Arc::clone(&config),
-                            Arc::clone(&buffer_pool),
-                        )
-                    }),
-                )
-                .await
-                .map_err(|e| WafError::NetworkError(format!("HTTP/2 TLS connection error: {}", e)))
-        } else {
-            hyper::server::conn::http1::Builder::new()
-                .keep_alive(true)
-                .pipeline_flush(true)
-                .serve_connection(
-                    hyper_util::rt::TokioIo::new(stream),
-                    service_fn(move |req| {
-                        Self::handle_request(
-                            req,
-                            Arc::clone(&waf_engine),
-                            upstream_client.clone(),
-                            upstream_uri.clone(),
-                            Arc::clone(&config),
-                            Arc::clone(&buffer_pool),
-                        )
-                    }),
-                )
-                .await
-                .map_err(|e| WafError::NetworkError(format!("HTTP/1.1 TLS connection error: {}", e)))
-        }
-    }
+    async fn handle_connection<S>(
+        stream: S,
+        state: ProxyState,
+        peer_ip: IpAddr,
+        is_https: bool,
+    ) -> Result<(), WafError>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
+        let io = hyper_util::rt::TokioIo::new(stream);
+        // HTTP/2 over cleartext requires h2c negotiation/prior knowledge.
+        // Plaintext listeners therefore speak HTTP/1.1; HTTP/2 is enabled
+        // only after a TLS handshake with ALPN.
+        let enable_http2 = is_https && state.config.server.enable_http2;
+        let service =
+            service_fn(move |req| Self::handle_request(req, state.clone(), peer_ip, is_https));
 
-    async fn handle_plaintext_connection(
-        stream: tokio::net::TcpStream,
-        waf_engine: Arc<WafEngine>,
-        upstream_client: Client<HttpConnector, Full<Bytes>>,
-        upstream_uri: Uri,
-        config: Arc<Config>,
-        buffer_pool: Arc<BufferPool>,
-    ) -> Result<(), WafError> {
-        if config.server.enable_http2 {
+        if enable_http2 {
             hyper::server::conn::http2::Builder::new(TokioExecutor::new())
                 .keep_alive_interval(Some(Duration::from_secs(30)))
                 .keep_alive_timeout(Duration::from_secs(10))
-                .serve_connection(
-                    hyper_util::rt::TokioIo::new(stream),
-                    service_fn(move |req| {
-                        Self::handle_request(
-                            req,
-                            Arc::clone(&waf_engine),
-                            upstream_client.clone(),
-                            upstream_uri.clone(),
-                            Arc::clone(&config),
-                            Arc::clone(&buffer_pool),
-                        )
-                    }),
-                )
+                .serve_connection(io, service)
                 .await
                 .map_err(|e| WafError::NetworkError(format!("HTTP/2 connection error: {}", e)))
         } else {
             hyper::server::conn::http1::Builder::new()
                 .keep_alive(true)
                 .pipeline_flush(true)
-                .serve_connection(
-                    hyper_util::rt::TokioIo::new(stream),
-                    service_fn(move |req| {
-                        Self::handle_request(
-                            req,
-                            Arc::clone(&waf_engine),
-                            upstream_client.clone(),
-                            upstream_uri.clone(),
-                            Arc::clone(&config),
-                            Arc::clone(&buffer_pool),
-                        )
-                    }),
-                )
+                .serve_connection(io, service)
                 .await
                 .map_err(|e| WafError::NetworkError(format!("HTTP/1.1 connection error: {}", e)))
         }
@@ -298,20 +295,19 @@ impl WafProxyService {
     /// Handle incoming HTTP requests with multi-protocol support
     async fn handle_request(
         req: Request<Incoming>,
-        waf_engine: Arc<WafEngine>,
-        upstream_client: Client<HttpConnector, Full<Bytes>>,
-        upstream_uri: Uri,
-        config: Arc<Config>,
-        buffer_pool: Arc<BufferPool>,
+        state: ProxyState,
+        peer_ip: IpAddr,
+        is_https: bool,
     ) -> Result<Response<Full<Bytes>>, Infallible> {
         let start_time = Instant::now();
+        state.metrics.record_request();
 
         // Detect HTTP protocol version
         let http_version = Self::detect_http_version(&req);
         debug!("Detected HTTP version: {}", http_version);
 
         // Check if HTTP version is supported
-        if !Self::is_http_version_supported(&http_version, &config) {
+        if !Self::is_http_version_supported(&http_version, &state.config) {
             warn!("Unsupported HTTP version: {}", http_version);
             return Ok(Self::create_error_response(
                 StatusCode::HTTP_VERSION_NOT_SUPPORTED,
@@ -319,126 +315,169 @@ impl WafProxyService {
             ));
         }
 
-        // Extract client IP for WAF evaluation
-        let client_ip = req
-            .headers()
-            .get("x-forwarded-for")
-            .or_else(|| req.headers().get("x-real-ip"))
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.split(',').next())
-            .and_then(|s| s.trim().parse().ok());
+        let client_ip = Self::resolve_client_ip(peer_ip, req.headers(), &state.trusted_proxies);
 
-        // Check for protocol upgrades (WebSocket, WebTransport)
-        if WebSocketHandler::is_websocket_upgrade(req.headers()) {
-            info!("WebSocket upgrade request detected");
-            let websocket_handler =
-                WebSocketHandler::new(Arc::clone(&waf_engine), Arc::clone(&config));
-            match websocket_handler
-                .handle_websocket_upgrade(req, client_ip)
-                .await
-            {
-                Ok(response) => return Ok(response),
-                Err(e) => {
-                    error!("WebSocket upgrade failed: {}", e);
-                    return Ok(Self::create_error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "WebSocket upgrade failed",
-                    ));
-                }
+        // Authentication is a first-class pipeline stage, not an unused module.
+        if let Some(validator) = &state.auth_validator {
+            if let Err(e) = validator.validate_request(req.headers(), is_https) {
+                warn!("Authentication rejected request from {}: {}", client_ip, e);
+                state.metrics.record_blocked();
+                return Ok(Self::create_error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "Unauthorized",
+                ));
             }
         }
 
+        // Upgrades require raw connection tunneling. Reject them explicitly
+        // instead of returning a fake 101 that never reaches the backend.
+        if WebSocketHandler::is_websocket_upgrade(req.headers()) {
+            warn!("WebSocket upgrade rejected: upstream tunneling is not implemented");
+            state.metrics.record_blocked();
+            return Ok(Self::create_error_response(
+                StatusCode::NOT_IMPLEMENTED,
+                "WebSocket proxying is not implemented",
+            ));
+        }
         #[cfg(feature = "webtransport")]
         if WebTransportHandler::is_webtransport_request(req.headers()) {
-            info!("WebTransport connection request detected");
-            let webtransport_handler =
-                WebTransportHandler::new(Arc::clone(&waf_engine), Arc::clone(&config));
-            match webtransport_handler
-                .handle_webtransport_connection(req, client_ip)
-                .await
-            {
-                Ok(response) => return Ok(response),
-                Err(e) => {
-                    error!("WebTransport connection failed: {}", e);
-                    return Ok(Self::create_error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "WebTransport connection failed",
-                    ));
-                }
-            }
+            warn!("WebTransport request rejected: not implemented");
+            state.metrics.record_blocked();
+            return Ok(Self::create_error_response(
+                StatusCode::NOT_IMPLEMENTED,
+                "WebTransport is not implemented",
+            ));
         }
 
-        // Fast-path WAF evaluation
-        let decision =
-            match Self::fast_evaluate_request_with_waf(&req, client_ip, &waf_engine).await {
-                Ok(decision) => decision,
-                Err(e) => {
-                    error!("WAF evaluation failed: {}", e);
-                    return Ok(Self::create_error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "WAF evaluation failed",
-                    ));
-                }
-            };
+        let (parts, body) = req.into_parts();
+        let size_hint = parts
+            .headers
+            .get(hyper::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<usize>().ok());
+        let max_body_size = state.config.server.max_body_size;
 
-        // Handle WAF decision with protocol-aware forwarding
+        let body_bytes = match tokio::time::timeout(
+            Duration::from_secs(state.config.server.request_timeout_secs.max(1)),
+            state
+                .buffer_pool
+                .read_incoming_body(body, size_hint, Some(max_body_size)),
+        )
+        .await
+        {
+            Ok(Ok(buffer)) => buffer.to_bytes(),
+            Ok(Err(BodyReadError::TooLarge { .. })) => {
+                warn!(
+                    "Request body from {} exceeds limit {}",
+                    client_ip, max_body_size
+                );
+                state.metrics.record_blocked();
+                return Ok(Self::create_error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Request body too large",
+                ));
+            }
+            Ok(Err(e)) => {
+                warn!("Failed to read request body from {}: {}", client_ip, e);
+                return Ok(Self::create_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Failed to read request body",
+                ));
+            }
+            Err(_) => {
+                warn!("Request body read timed out for {}", client_ip);
+                return Ok(Self::create_error_response(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "Request body timeout",
+                ));
+            }
+        };
+
+        // Full evaluation includes body inspection, WASM/AI stages and audit
+        // logging. The previous fast path silently skipped all of these.
+        let request_context = RequestContext::with_http_version(
+            client_ip,
+            parts.method.clone(),
+            parts.uri.clone(),
+            parts.headers.clone(),
+            Some(body_bytes.len()),
+            http_version.clone(),
+        )
+        .with_body(Some(body_bytes.clone()));
+
+        let decision = state.waf_engine.evaluate(&request_context).await;
+
         match decision {
             Decision::Allow => {
                 debug!(
-                    "WAF allowed request, forwarding to upstream with HTTP/{}",
-                    http_version
+                    "WAF allowed request from {}, forwarding with HTTP/{}",
+                    client_ip, http_version
                 );
+                state.metrics.record_allowed();
                 Self::forward_to_upstream_with_protocol(
-                    req,
-                    upstream_client,
-                    upstream_uri,
+                    parts,
+                    body_bytes,
+                    state.upstream_client,
+                    state.upstream_uri,
                     start_time,
                     &http_version,
-                    buffer_pool,
+                    &state.metrics,
+                    client_ip,
+                    is_https,
                 )
                 .await
             }
             Decision::Block { status, reason } => {
-                warn!("WAF blocked request: {} (status: {})", reason, status);
+                warn!(
+                    "WAF blocked request from {}: {} (status: {})",
+                    client_ip, reason, status
+                );
+                state.metrics.record_blocked();
                 Ok(Self::create_blocked_response(status, &reason))
             }
             Decision::RateLimit { reason } => {
-                warn!("WAF rate limited request: {}", reason);
+                warn!("WAF rate limited request from {}: {}", client_ip, reason);
+                state.metrics.record_blocked();
                 Ok(Self::create_rate_limit_response(&reason))
             }
         }
     }
-    /// Fast-path WAF evaluation without reading full body
-    async fn fast_evaluate_request_with_waf<T>(
-        req: &Request<T>,
-        client_ip: Option<std::net::IpAddr>,
-        waf_engine: &WafEngine,
-    ) -> Result<Decision, WafError> {
-        // Extract request metadata for WAF evaluation
-        let method = req.method().clone();
-        let uri = req.uri().clone();
-        let headers = req.headers().clone();
-        let http_version = Self::detect_http_version(req);
 
-        // Get body size from headers (don't read body for performance)
-        let body_size = headers
-            .get(hyper::header::CONTENT_LENGTH)
+    /// Resolve the client address without blindly trusting client headers.
+    ///
+    /// `X-Forwarded-For` / `X-Real-IP` are only honoured when the immediate
+    /// peer is a configured trusted proxy; otherwise the socket address is
+    /// authoritative.
+    fn resolve_client_ip(
+        peer_ip: IpAddr,
+        headers: &hyper::HeaderMap,
+        trusted_proxies: &[IpNetwork],
+    ) -> IpAddr {
+        let trusted_peer = trusted_proxies
+            .iter()
+            .any(|network| network.contains(peer_ip));
+        if !trusted_peer {
+            return peer_ip;
+        }
+
+        if let Some(value) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+            if let Some(ip) = value
+                .split(',')
+                .map(str::trim)
+                .filter_map(|part| part.parse::<IpAddr>().ok())
+                .next()
+            {
+                return ip;
+            }
+        }
+        if let Some(ip) = headers
+            .get("x-real-ip")
             .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse().ok());
-
-        // Create lightweight WAF request context with HTTP version info
-        let request_context = RequestContext::with_http_version(
-            client_ip.unwrap_or_else(|| "127.0.0.1".parse().unwrap()),
-            method,
-            uri,
-            headers,
-            body_size,
-            http_version,
-        );
-
-        // Fast WAF evaluation against headers, URI, and metadata only
-        let decision = waf_engine.fast_evaluate(&request_context).await;
-        Ok(decision)
+            .and_then(|value| value.trim().parse::<IpAddr>().ok())
+        {
+            return ip;
+        }
+        peer_ip
     }
 
     /// Detect HTTP protocol version from request
@@ -462,44 +501,18 @@ impl WafProxyService {
     }
 
     /// Protocol-aware request forwarding with version preservation
+    #[allow(clippy::too_many_arguments)]
     async fn forward_to_upstream_with_protocol(
-        req: Request<Incoming>,
+        parts: hyper::http::request::Parts,
+        body_bytes: Bytes,
         upstream_client: Client<HttpConnector, Full<Bytes>>,
         upstream_uri: Uri,
         start_time: Instant,
         http_version: &str,
-        buffer_pool: Arc<BufferPool>,
+        metrics: &Metrics,
+        client_ip: IpAddr,
+        is_https: bool,
     ) -> Result<Response<Full<Bytes>>, Infallible> {
-        // Extract request parts
-        let (parts, body) = req.into_parts();
-
-        // Stream body collection using optimized buffer pool
-        let body_bytes = match tokio::time::timeout(
-            Duration::from_secs(10), // Prevent hanging on large bodies
-            buffer_pool.read_incoming_body(body, None),
-        )
-        .await
-        {
-            Ok(Ok(pooled_buffer)) => {
-                // Convert pooled buffer to bytes efficiently
-                pooled_buffer.freeze()
-            }
-            Ok(Err(e)) => {
-                error!("Failed to collect request body with buffer pool: {}", e);
-                return Ok(Self::create_error_response(
-                    StatusCode::BAD_REQUEST,
-                    "Failed to read request body",
-                ));
-            }
-            Err(_) => {
-                error!("Request body collection timed out");
-                return Ok(Self::create_error_response(
-                    StatusCode::REQUEST_TIMEOUT,
-                    "Request body too large or slow",
-                ));
-            }
-        };
-
         // Optimized URI rewriting with protocol version awareness
         let upstream_path_and_query = parts
             .uri
@@ -528,6 +541,9 @@ impl WafProxyService {
                 ));
             }
         };
+
+        // Preserve the original virtual host for the upstream application.
+        let original_host = parts.headers.get(hyper::header::HOST).cloned();
 
         // Build protocol-aware proxy request
         let mut proxy_req = Request::builder()
@@ -558,22 +574,44 @@ impl WafProxyService {
             }
         }
 
-        // Efficient header copying (skip unnecessary headers)
+        // Efficient header copying (skip hop-by-hop and untrusted forwarding headers)
         for (key, value) in parts.headers {
             if let Some(key) = key {
-                let key_str = key.as_str();
-                // Skip headers that should not be forwarded
+                let key_str = key.as_str().to_ascii_lowercase();
                 if !matches!(
-                    key_str.to_lowercase().as_str(),
-                    "host" | "connection" | "proxy-connection" | "upgrade" | "te" | "trailer"
+                    key_str.as_str(),
+                    "host"
+                        | "connection"
+                        | "proxy-connection"
+                        | "upgrade"
+                        | "te"
+                        | "trailer"
+                        | "transfer-encoding"
+                        | "keep-alive"
+                        | "x-forwarded-for"
+                        | "x-real-ip"
+                        | "x-forwarded-proto"
                 ) {
                     proxy_req = proxy_req.header(key, value);
                 }
             }
         }
 
-        // Add optimized WAF proxy headers
-        proxy_req = proxy_req.header("x-waf-proxy", "waf-rejected/0.1.0");
+        // The WAF is authoritative for client identity.
+        proxy_req = proxy_req
+            .header("x-forwarded-for", client_ip.to_string())
+            .header("x-real-ip", client_ip.to_string())
+            .header("x-forwarded-proto", if is_https { "https" } else { "http" })
+            .header(
+                "x-waf-proxy",
+                concat!("waf-rejected/", env!("CARGO_PKG_VERSION")),
+            );
+
+        if let Some(host) = original_host {
+            proxy_req = proxy_req
+                .header("x-forwarded-host", host.clone())
+                .header(hyper::header::HOST, host);
+        }
 
         let proxy_req = match proxy_req.body(Full::new(body_bytes)) {
             Ok(req) => req,
@@ -622,10 +660,22 @@ impl WafProxyService {
                     .status(parts.status)
                     .version(parts.version);
 
-                // Copy response headers efficiently
+                // Copy response headers, dropping hop-by-hop values that the
+                // downstream connection must negotiate for itself.
                 for (key, value) in parts.headers {
                     if let Some(key) = key {
-                        response_builder = response_builder.header(key, value);
+                        let name = key.as_str().to_ascii_lowercase();
+                        if !matches!(
+                            name.as_str(),
+                            "connection"
+                                | "proxy-connection"
+                                | "keep-alive"
+                                | "transfer-encoding"
+                                | "upgrade"
+                                | "trailer"
+                        ) {
+                            response_builder = response_builder.header(key, value);
+                        }
                     }
                 }
 
@@ -635,7 +685,10 @@ impl WafProxyService {
                         "x-waf-processing-time-ms",
                         processing_time.as_millis().to_string(),
                     )
-                    .header("x-waf-version", "waf-rejected/0.1.0")
+                    .header(
+                        "x-waf-version",
+                        concat!("waf-rejected/", env!("CARGO_PKG_VERSION")),
+                    )
                     .header("x-content-type-options", "nosniff");
 
                 match response_builder.body(Full::new(body_bytes)) {
@@ -650,6 +703,7 @@ impl WafProxyService {
                 }
             }
             Ok(Err(e)) => {
+                metrics.record_upstream_error();
                 error!("Upstream request failed: {}", e);
                 Ok(Self::create_error_response(
                     StatusCode::BAD_GATEWAY,
@@ -657,6 +711,7 @@ impl WafProxyService {
                 ))
             }
             Err(_) => {
+                metrics.record_upstream_error();
                 error!("Upstream request timed out");
                 Ok(Self::create_error_response(
                     StatusCode::GATEWAY_TIMEOUT,
@@ -664,32 +719,6 @@ impl WafProxyService {
                 ))
             }
         }
-    }
-
-    /// Extract client IP from request
-    fn extract_client_ip<T>(req: &Request<T>) -> Option<std::net::IpAddr> {
-        // Try X-Forwarded-For first
-        if let Some(xff) = req.headers().get("x-forwarded-for") {
-            if let Ok(xff_str) = xff.to_str() {
-                if let Some(first_ip) = xff_str.split(',').next() {
-                    if let Ok(ip) = first_ip.trim().parse() {
-                        return Some(ip);
-                    }
-                }
-            }
-        }
-
-        // Try X-Real-IP
-        if let Some(xri) = req.headers().get("x-real-ip") {
-            if let Ok(ip_str) = xri.to_str() {
-                if let Ok(ip) = ip_str.parse() {
-                    return Some(ip);
-                }
-            }
-        }
-
-        // For now, return None - in production this would extract from connection
-        None
     }
 
     /// Create blocked response with protocol information
@@ -702,7 +731,10 @@ impl WafProxyService {
             .header("content-type", "text/plain")
             .header("x-waf-decision", "block")
             .header("x-waf-reason", reason)
-            .header("x-waf-version", "waf-rejected/0.1.0")
+            .header(
+                "x-waf-version",
+                concat!("waf-rejected/", env!("CARGO_PKG_VERSION")),
+            )
             .header(
                 "x-waf-supported-protocols",
                 "HTTP/1.0,HTTP/1.1,HTTP/2,HTTP/3",
@@ -720,7 +752,10 @@ impl WafProxyService {
             .header("content-type", "text/plain")
             .header("x-waf-decision", "rate-limit")
             .header("x-waf-reason", reason)
-            .header("x-waf-version", "waf-rejected/0.1.0")
+            .header(
+                "x-waf-version",
+                concat!("waf-rejected/", env!("CARGO_PKG_VERSION")),
+            )
             .header(
                 "x-waf-supported-protocols",
                 "HTTP/1.0,HTTP/1.1,HTTP/2,HTTP/3",
@@ -735,7 +770,10 @@ impl WafProxyService {
         Response::builder()
             .status(status)
             .header("content-type", "text/plain")
-            .header("x-waf-version", "waf-rejected/0.1.0")
+            .header(
+                "x-waf-version",
+                concat!("waf-rejected/", env!("CARGO_PKG_VERSION")),
+            )
             .header(
                 "x-waf-supported-protocols",
                 "HTTP/1.0,HTTP/1.1,HTTP/2,HTTP/3",
@@ -766,17 +804,29 @@ mod tests {
         assert!(service.is_ok());
     }
 
-    #[tokio::test]
-    async fn test_client_ip_extraction() {
-        use bytes::Bytes;
-        use http_body_util::Empty;
+    #[test]
+    fn test_client_ip_ignores_forwarded_header_from_untrusted_peer() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "192.168.1.100, 10.0.0.1".parse().unwrap(),
+        );
 
-        let req = Request::builder()
-            .header("x-forwarded-for", "192.168.1.100, 10.0.0.1")
-            .body(Empty::<Bytes>::new())
-            .unwrap();
+        let ip = WafProxyService::resolve_client_ip("203.0.113.10".parse().unwrap(), &headers, &[]);
+        assert_eq!(ip, "203.0.113.10".parse::<IpAddr>().unwrap());
+    }
 
-        let ip = WafProxyService::extract_client_ip(&req);
-        assert_eq!(ip, Some("192.168.1.100".parse().unwrap()));
+    #[test]
+    fn test_client_ip_uses_forwarded_header_from_trusted_peer() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "192.168.1.100, 10.0.0.1".parse().unwrap(),
+        );
+
+        let trusted: Vec<IpNetwork> = vec!["10.0.0.0/8".parse().unwrap()];
+        let ip =
+            WafProxyService::resolve_client_ip("10.0.0.5".parse().unwrap(), &headers, &trusted);
+        assert_eq!(ip, "192.168.1.100".parse::<IpAddr>().unwrap());
     }
 }

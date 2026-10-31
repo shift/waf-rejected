@@ -5,8 +5,8 @@
 use std::time::Duration;
 use tokio;
 use waf_ingress::waf::storage::{
-    MemoryStorageAdapter, ReadConsistency, StorageAdapter, StorageAdapterFactory,
-    StorageBackend, StorageConfig,
+    MemoryStorageAdapter, ReadConsistency, StorageAdapter, StorageAdapterFactory, StorageBackend,
+    StorageConfig,
 };
 
 #[tokio::main]
@@ -35,24 +35,29 @@ async fn test_memory_storage() -> Result<(), Box<dyn std::error::Error>> {
 
     // Test basic operations
     adapter.set(b"test_key", b"test_value", None).await?;
-    
+
     let value = adapter.get(b"test_key", ReadConsistency::Strong).await?;
     assert_eq!(value, Some(b"test_value".to_vec()));
     println!("  ✓ Basic set/get operations");
 
     // Test TTL
-    adapter.set(b"ttl_key", b"ttl_value", Some(Duration::from_millis(100))).await?;
+    adapter
+        .set(b"ttl_key", b"ttl_value", Some(Duration::from_millis(100)))
+        .await?;
     assert!(adapter.exists(b"ttl_key").await?);
-    
+
     tokio::time::sleep(Duration::from_millis(200)).await;
-    
+
     // Force TTL cleanup
     let expired = adapter.expire_keys().await?;
     println!("  ✓ TTL functionality (expired {} keys)", expired);
 
     // Test statistics
     let stats = adapter.stats().await?;
-    println!("  ✓ Statistics: {} keys, {} bytes", stats.key_count, stats.data_size);
+    println!(
+        "  ✓ Statistics: {} keys, {} bytes",
+        stats.key_count, stats.data_size
+    );
 
     Ok(())
 }
@@ -66,13 +71,15 @@ async fn test_storage_factory() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let adapter = StorageAdapterFactory::create(config).await?;
-    
+
     // Test through the generic interface
     adapter.set(b"factory_test", b"factory_value", None).await?;
-    let value = adapter.get(b"factory_test", ReadConsistency::Strong).await?;
+    let value = adapter
+        .get(b"factory_test", ReadConsistency::Strong)
+        .await?;
     assert_eq!(value, Some(b"factory_value".to_vec()));
-    
+
     println!("  ✓ Factory-created adapter works correctly");
-    
+
     Ok(())
 }

@@ -3,6 +3,7 @@
 
 # Server configuration
 bind_addr = "0.0.0.0:8080"
+health_bind_addr = "0.0.0.0:8081"
 upstream_uri = "http://127.0.0.1:3000"
 
 [proxy]
@@ -13,21 +14,23 @@ max_request_size = 10485760
 
 [server]
 max_connections = 1000
+# Only trust X-Forwarded-For from these CIDRs. Empty means never trust it.
+trusted_proxies = []
 request_timeout_secs = 30
 keep_alive_timeout_secs = 90
 enable_http2 = true
+enable_http3 = false
+supported_http_versions = ["1.0", "1.1", "2"]
 max_body_size = 10485760
 
-# TLS/SSL Configuration (Production Security - P0-01)
-# CRITICAL: Enable TLS in production to prevent CVE 9.8 cleartext transmission
 [server.tls]
-enabled = false  # Set to true in production
+enabled = false  # Set to true in production or terminate TLS at the load balancer
 cert_path = "/etc/waf-rejected/certs/server.crt"
 key_path = "/etc/waf-rejected/certs/server.key"
-min_version = "1.2"  # TLS 1.2 minimum (options: "1.2", "1.3")
-max_version = "1.3"  # TLS 1.3 maximum (options: "1.2", "1.3")
-alpn_protocols = ["h2", "http/1.1"]  # HTTP/2 and HTTP/1.1 support
-require_client_cert = false  # Set to true for mutual TLS (mTLS)
+min_version = "1.2"
+max_version = "1.3"
+alpn_protocols = ["h2", "http/1.1"]
+require_client_cert = false
 
 [logging]
 level = "info"
@@ -35,6 +38,8 @@ json_format = false
 
 [waf]
 enabled = true
+fail_mode = "closed"
+upstream_timeout_ms = 30000
 
 [waf.rate_limit]
 per_ip_enabled = true
@@ -48,23 +53,12 @@ global_window_secs = 60
 enabled = true
 format = "json"
 min_threat_level = "Medium"
-
-# Export configuration with local collector by default
 enable_cef = true
 cef_output_file = "./logs/security_events.cef"
 cef_device_vendor = "WAF-Rejected"
 cef_device_product = "Security WAF"
 cef_device_version = "1.0.0"
-
-# OpenTelemetry with local collector (default)
-enable_otel = true
-otel_service_name = "waf-security-events"
-otel_service_version = "1.0.0"
-otel_export_traces = true
-otel_export_logs = true
-otel_endpoint = "http://localhost:4317"  # Local collector
-
-# Local embedded database for development
+enable_otel = false
 enable_sled = true
 sled_db_path = "./data/waf_security_events.sled"
 sled_max_events = 100000
@@ -72,8 +66,10 @@ sled_compress = false
 
 [waf.content_inspection]
 enabled = true
+inspect_headers = true
+inspect_body = true
 max_body_size = 10485760
-threat_patterns = ["<script>", "' OR ", "UNION SELECT", "../", "../../"]
+threat_patterns = ["sql_injection", "xss", "command_injection", "path_traversal"]
 
 [waf.geo_blocking]
 enabled = false
@@ -83,41 +79,28 @@ block_tor = false
 block_vpn = false
 block_datacenter = false
 
-# AI/ML Threat Detection Configuration
-[waf.ai_threat_detection]
-enabled = true
-model_inference_timeout_ms = 5
-batch_size = 64
-explainable_ai = true
-
-# WASM ModSecurity Configuration
 [waf.wasm]
-enabled = true
+# The component ABI is not wired up yet; enabling this uses the built-in
+# heuristic fallback, not the actual Coraza module.
+enabled = false
 module_path = "rules/coraza.wasm"
-memory_limit = 16777216  # 16MB
+memory_limit = 16777216  # 16 MiB
 timeout_ms = 100
 debug = false
 instance_pool_size = 10
 hot_reload = true
 rules_config = "rules/coraza.conf"
 
-# Local Observability Stack (Default Configuration)
-[monitoring]
-# OpenTelemetry Configuration
-otel_enabled = true
-otel_endpoint = "http://localhost:4317"
-otel_service_name = "waf-rejected"
-otel_service_version = "1.0.0"
+[security.auth]
+enabled = false
+api_keys = []
+header_name = "X-API-Key"
+require_https = false
 
-# Local stack endpoints
-prometheus_endpoint = "http://localhost:9090"
-jaeger_endpoint = "http://localhost:14268/api/traces"
-grafana_endpoint = "http://localhost:3000"
+[security.ai]
+enabled = false
+threat_threshold = 0.8
+timeout_ms = 5000
 
-# Health check settings
-health_check_interval_secs = 30
-metrics_collection_interval_secs = 10
-
-[security]
-[security.events]
-enabled = true
+[security.compliance]
+enabled = false

@@ -2,11 +2,11 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use std::time::Instant;
 
-use hyper::{Method, Uri, HeaderMap};
 use bytes::Bytes;
+use hyper::{HeaderMap, Method, Uri};
 
-use waf_ingress::waf::{WafEngine, RequestContext, Decision};
 use waf_ingress::config::Config;
+use waf_ingress::waf::{Decision, RequestContext, WafEngine};
 
 /// Integration tests for AI threat detection
 #[cfg(test)]
@@ -33,16 +33,24 @@ mod ai_integration_tests {
             Uri::from_str("http://example.com/api/user").unwrap(),
             headers,
             Some(1024),
-        ).with_body(Some(Bytes::from(r#"{
+        )
+        .with_body(Some(Bytes::from(
+            r#"{
             "query": "'; DROP TABLE users; --",
             "action": "<script>alert('xss')</script>",
             "data": "UNION SELECT * FROM admin"
-        }"#)))
+        }"#,
+        )))
     }
 
     fn create_benign_request() -> RequestContext {
         let mut headers = HeaderMap::new();
-        headers.insert("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36".parse().unwrap());
+        headers.insert(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                .parse()
+                .unwrap(),
+        );
         headers.insert("X-API-Key", "test-key".parse().unwrap());
 
         RequestContext::new(
@@ -96,8 +104,9 @@ mod ai_integration_tests {
         // Should not hang due to timeout
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(100),
-            engine.evaluate(&request)
-        ).await;
+            engine.evaluate(&request),
+        )
+        .await;
 
         // Should complete within timeout (may allow or block, but shouldn't hang)
         assert!(result.is_ok());
@@ -175,6 +184,10 @@ mod ai_integration_tests {
         let avg_latency = elapsed.as_millis() as f64 / 10.0;
 
         // AI should not add excessive latency (less than 50ms per request in test environment)
-        assert!(avg_latency < 50.0, "AI analysis too slow: {}ms average", avg_latency);
+        assert!(
+            avg_latency < 50.0,
+            "AI analysis too slow: {}ms average",
+            avg_latency
+        );
     }
 }

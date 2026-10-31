@@ -40,11 +40,22 @@ impl PooledBuffer {
         &mut self.inner
     }
 
-    /// Get the buffer data as bytes  
+    /// Copy the buffered data out and let this buffer return to the pool.
+    ///
+    /// A pooled `BytesMut` cannot be reused once its allocation has been
+    /// converted into `Bytes`, so copying is the only way to keep the pool
+    /// effective while handing the body to hyper.
+    pub fn to_bytes(&self) -> Bytes {
+        Bytes::copy_from_slice(&self.inner)
+    }
+
+    /// Consume the buffer as `Bytes` without returning it to the pool.
+    ///
+    /// This is intentionally not used by the proxy hot path because it defeats
+    /// pooling; prefer [`PooledBuffer::to_bytes`].
     pub fn freeze(mut self) -> Bytes {
-        // Prevent drop from running by taking ownership and forgetting self
         let inner = std::mem::replace(&mut self.inner, BytesMut::new());
-        std::mem::forget(self); // Prevent the Drop implementation from running
+        std::mem::forget(self);
         inner.freeze()
     }
 
@@ -247,6 +258,28 @@ impl PoolStats {
     }
 }
 
+/// Errors returned while collecting a request body.
+#[derive(Debug)]
+pub enum BodyReadError {
+    /// The body exceeded the configured maximum size.
+    TooLarge { limit: usize },
+    /// The body stream could not be read.
+    Read(String),
+}
+
+impl std::fmt::Display for BodyReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BodyReadError::TooLarge { limit } => {
+                write!(f, "request body exceeds limit of {} bytes", limit)
+            }
+            BodyReadError::Read(message) => write!(f, "failed to read request body: {}", message),
+        }
+    }
+}
+
+impl std::error::Error for BodyReadError {}
+
 /// HTTP-specific buffer utilities
 impl BufferPool {
     /// Create a pooled HTTP response body
@@ -254,22 +287,31 @@ impl BufferPool {
         Full::new(data)
     }
 
-    /// Efficiently read an incoming HTTP body into a pooled buffer
+    /// Efficiently read an incoming HTTP body into a pooled buffer.
+    ///
+    /// `max_size` is enforced while streaming, including for chunked bodies
+    /// that do not advertise a `Content-Length`.
     pub async fn read_incoming_body(
         self: &Arc<Self>,
         body: Incoming,
         size_hint: Option<usize>,
-    ) -> Result<PooledBuffer, Box<dyn std::error::Error + Send + Sync>> {
+        max_size: Option<usize>,
+    ) -> Result<PooledBuffer, BodyReadError> {
         let expected_size = size_hint.unwrap_or(MEDIUM_BUFFER_SIZE);
         let mut buffer = self.get_buffer(expected_size);
 
         // Stream body data into pooled buffer
         let mut body = std::pin::pin!(body);
-        while let Some(chunk) = http_body_util::BodyExt::frame(&mut body)
-            .await
-            .transpose()?
-        {
+        loop {
+            let frame = http_body_util::BodyExt::frame(&mut body).await;
+            let Some(frame) = frame else { break };
+            let chunk = frame.map_err(|e| BodyReadError::Read(e.to_string()))?;
             if let Some(data) = chunk.data_ref() {
+                if let Some(limit) = max_size {
+                    if buffer.len().saturating_add(data.len()) > limit {
+                        return Err(BodyReadError::TooLarge { limit });
+                    }
+                }
                 buffer.as_mut().extend_from_slice(data);
             }
         }

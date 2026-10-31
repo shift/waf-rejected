@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "sled")]
 use sled;
@@ -103,7 +103,7 @@ impl IntegrityVerifier {
 
     /// Generate integrity hash for an audit event
     pub fn hash_event(&self, event: &AuditEvent) -> String {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
 
         let mut hasher = Sha256::new();
 
@@ -200,11 +200,13 @@ impl AuditLogger {
         let len = events.len();
         if len >= 1 {
             let last_idx = len - 1;
-            events[last_idx].integrity_hash = Some(self.integrity_verifier.hash_event(&events[last_idx]));
+            events[last_idx].integrity_hash =
+                Some(self.integrity_verifier.hash_event(&events[last_idx]));
         }
         if len >= 2 {
             let prev_idx = len - 2;
-            events[prev_idx].integrity_hash = Some(self.integrity_verifier.hash_event(&events[prev_idx]));
+            events[prev_idx].integrity_hash =
+                Some(self.integrity_verifier.hash_event(&events[prev_idx]));
         }
 
         // Verify chain integrity
@@ -230,7 +232,9 @@ impl AuditLogger {
 
     /// Get events within a time range
     pub fn get_events_in_range(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<AuditEvent> {
-        self.event_store.read().unwrap()
+        self.event_store
+            .read()
+            .unwrap()
             .iter()
             .filter(|event| event.timestamp >= start && event.timestamp <= end)
             .cloned()
@@ -255,9 +259,15 @@ impl ComplianceReporter {
         }
 
         // Filter for security incidents that may involve personal data
-        let breaches = events.iter()
+        let breaches = events
+            .iter()
             .filter(|e| matches!(e.event_type, AuditEventType::SecurityEvent))
-            .filter(|e| e.details.get("severity").map(|s| s == "high").unwrap_or(false))
+            .filter(|e| {
+                e.details
+                    .get("severity")
+                    .map(|s| s == "high")
+                    .unwrap_or(false)
+            })
             .collect::<Vec<_>>();
 
         if breaches.is_empty() {
@@ -296,7 +306,11 @@ impl ComplianceReporter {
              security@waf-rejected.com",
             Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
             breaches.len(),
-            breaches.iter().map(|e| e.ip_address.as_ref()).collect::<std::collections::HashSet<_>>().len()
+            breaches
+                .iter()
+                .map(|e| e.ip_address.as_ref())
+                .collect::<std::collections::HashSet<_>>()
+                .len()
         );
 
         Ok(report)
@@ -309,9 +323,15 @@ impl ComplianceReporter {
         }
 
         // HIPAA requires notification for breaches of unsecured PHI
-        let breaches = events.iter()
+        let breaches = events
+            .iter()
             .filter(|e| matches!(e.event_type, AuditEventType::SecurityEvent))
-            .filter(|e| e.details.get("contains_phi").map(|s| s == "true").unwrap_or(false))
+            .filter(|e| {
+                e.details
+                    .get("contains_phi")
+                    .map(|s| s == "true")
+                    .unwrap_or(false)
+            })
             .collect::<Vec<_>>();
 
         if breaches.is_empty() {
@@ -349,7 +369,8 @@ impl ComplianceReporter {
         }
 
         // PCI-DSS requires logging of security events
-        let security_events = events.iter()
+        let security_events = events
+            .iter()
             .filter(|e| matches!(e.event_type, AuditEventType::SecurityEvent))
             .collect::<Vec<_>>();
 
@@ -371,10 +392,27 @@ impl ComplianceReporter {
              - Monitor for emerging threats\n\
              - Ensure log integrity",
             security_events.len(),
-            security_events.iter().filter(|e| e.action.contains("auth")).count(),
-            security_events.iter().filter(|e| e.action.contains("unauthorized")).count(),
-            security_events.iter().filter(|e| e.details.get("suspicious").map(|s| s == "true").unwrap_or(false)).count(),
-            if security_events.len() < 100 { "COMPLIANT" } else { "REVIEW REQUIRED" }
+            security_events
+                .iter()
+                .filter(|e| e.action.contains("auth"))
+                .count(),
+            security_events
+                .iter()
+                .filter(|e| e.action.contains("unauthorized"))
+                .count(),
+            security_events
+                .iter()
+                .filter(|e| e
+                    .details
+                    .get("suspicious")
+                    .map(|s| s == "true")
+                    .unwrap_or(false))
+                .count(),
+            if security_events.len() < 100 {
+                "COMPLIANT"
+            } else {
+                "REVIEW REQUIRED"
+            }
         );
 
         Ok(report)
@@ -392,7 +430,10 @@ impl DataRetentionManager {
     }
 
     /// Clean up expired audit events
-    pub async fn cleanup_expired_audit_events(&self, logger: &AuditLogger) -> Result<(), ComplianceError> {
+    pub async fn cleanup_expired_audit_events(
+        &self,
+        logger: &AuditLogger,
+    ) -> Result<(), ComplianceError> {
         if !self.config.auto_delete {
             return Ok(());
         }
@@ -402,12 +443,18 @@ impl DataRetentionManager {
         // Note: In a real implementation, this would filter and remove expired events
         // from the audit logger's storage. For now, we just log the intent.
 
-        info!("Audit log cleanup: would remove events older than {}", cutoff);
+        info!(
+            "Audit log cleanup: would remove events older than {}",
+            cutoff
+        );
         Ok(())
     }
 
     /// Clean up expired security events from database
-    pub async fn cleanup_expired_security_events(&self, db: &sled::Db) -> Result<(), ComplianceError> {
+    pub async fn cleanup_expired_security_events(
+        &self,
+        db: &sled::Db,
+    ) -> Result<(), ComplianceError> {
         if !self.config.auto_delete {
             return Ok(());
         }
@@ -417,7 +464,10 @@ impl DataRetentionManager {
         // Note: Implementation depends on actual database schema
         // This is a placeholder for the cleanup logic
 
-        info!("Security event cleanup: would remove events older than {}", cutoff);
+        info!(
+            "Security event cleanup: would remove events older than {}",
+            cutoff
+        );
         Ok(())
     }
 
@@ -430,7 +480,11 @@ impl DataRetentionManager {
              - Auto-deletion: {}",
             self.config.security_events_days,
             self.config.audit_logs_days,
-            if self.config.auto_delete { "Enabled" } else { "Disabled" }
+            if self.config.auto_delete {
+                "Enabled"
+            } else {
+                "Disabled"
+            }
         )
     }
 }

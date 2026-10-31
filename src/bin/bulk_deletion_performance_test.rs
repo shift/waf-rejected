@@ -5,19 +5,17 @@
 
 use std::time::{Duration, SystemTime};
 use tokio::time::sleep;
-use tracing::{info, debug};
+use tracing::{debug, info};
 
 use waf_ingress::waf::storage::{
-    BulkDeletionOptimizer, BulkDeletionConfig, DeletionKey, TransactionResult,
-    BulkDeletionStats, BulkDeletionResult,
+    BulkDeletionConfig, BulkDeletionOptimizer, BulkDeletionResult, BulkDeletionStats, DeletionKey,
+    TransactionResult,
 };
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_env_filter("debug")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("debug").init();
 
     info!("🚀 Starting Bulk Deletion Performance Test (P2-06)");
 
@@ -83,7 +81,9 @@ async fn test_bulk_deletion_optimizer() -> Result<(), Box<dyn std::error::Error>
     };
 
     // Execute bulk deletion
-    let result = optimizer.execute_bulk_deletion(key_groups, deletion_fn).await?;
+    let result = optimizer
+        .execute_bulk_deletion(key_groups, deletion_fn)
+        .await?;
 
     assert_eq!(result.keys_deleted, 5);
     assert!(result.bytes_reclaimed > 0);
@@ -185,7 +185,9 @@ async fn test_parallel_vs_sequential() -> Result<(), Box<dyn std::error::Error>>
 
     // Create multiple groups for testing
     let test_keys = create_test_keys(20, 5); // 20 keys, priority 5
-    let key_groups_sequential = sequential_optimizer.optimize_key_grouping(test_keys.clone()).await;
+    let key_groups_sequential = sequential_optimizer
+        .optimize_key_grouping(test_keys.clone())
+        .await;
     let key_groups_parallel = parallel_optimizer.optimize_key_grouping(test_keys).await;
 
     // Mock deletion function with simulated processing time
@@ -279,7 +281,7 @@ async fn test_performance_under_load() -> Result<(), Box<dyn std::error::Error>>
         parallel_workers: 4,
         transaction_timeout_ms: 2000,
         enable_result_caching: false, // Disable for performance testing
-        cache_ttl_seconds: 300, // Default value
+        cache_ttl_seconds: 300,       // Default value
         enable_statistics: true,
     };
     let optimizer = BulkDeletionOptimizer::new(config);
@@ -293,7 +295,10 @@ async fn test_performance_under_load() -> Result<(), Box<dyn std::error::Error>>
     ];
 
     for (key_count, scenario_name) in load_scenarios {
-        info!("📊 Testing scenario: {} ({} keys)", scenario_name, key_count);
+        info!(
+            "📊 Testing scenario: {} ({} keys)",
+            scenario_name, key_count
+        );
 
         let test_keys = create_test_keys(key_count, 2);
         let key_groups = optimizer.optimize_key_grouping(test_keys).await;
@@ -301,11 +306,11 @@ async fn test_performance_under_load() -> Result<(), Box<dyn std::error::Error>>
         // Mock deletion function with variable processing time
         let deletion_fn = |keys: Vec<DeletionKey>| async move {
             let total_size: u64 = keys.iter().map(|k| k.estimated_size).sum();
-            
+
             // Simulate processing time that scales with batch size
             let processing_time = (keys.len() as f64).sqrt() as u64;
             sleep(Duration::from_millis(processing_time)).await;
-            
+
             Ok(TransactionResult {
                 keys_count: keys.len(),
                 bytes_reclaimed: total_size,
@@ -316,7 +321,9 @@ async fn test_performance_under_load() -> Result<(), Box<dyn std::error::Error>>
         };
 
         let scenario_start = SystemTime::now();
-        let result = optimizer.execute_bulk_deletion(key_groups, deletion_fn).await?;
+        let result = optimizer
+            .execute_bulk_deletion(key_groups, deletion_fn)
+            .await?;
         let scenario_duration = scenario_start.elapsed().unwrap();
 
         debug!(
@@ -334,12 +341,21 @@ async fn test_performance_under_load() -> Result<(), Box<dyn std::error::Error>>
     // Generate performance report
     let final_stats = optimizer.get_stats().await;
     let performance_report = optimizer.generate_performance_report().await;
-    
+
     info!("📈 Final Performance Statistics:");
-    info!("Total bulk operations: {}", final_stats.total_bulk_operations);
+    info!(
+        "Total bulk operations: {}",
+        final_stats.total_bulk_operations
+    );
     info!("Total keys deleted: {}", final_stats.total_keys_deleted);
-    info!("Average deletion rate: {:.1} keys/sec", final_stats.avg_deletion_rate_per_sec);
-    info!("Efficiency ratio: {:.1}%", final_stats.efficiency_ratio * 100.0);
+    info!(
+        "Average deletion rate: {:.1} keys/sec",
+        final_stats.avg_deletion_rate_per_sec
+    );
+    info!(
+        "Efficiency ratio: {:.1}%",
+        final_stats.efficiency_ratio * 100.0
+    );
 
     debug!("📄 Full Performance Report:\n{}", performance_report);
 
@@ -379,11 +395,13 @@ async fn test_timeout_handling() -> Result<(), Box<dyn std::error::Error>> {
         })
     };
 
-    let result = optimizer.execute_bulk_deletion(key_groups, slow_deletion_fn).await?;
+    let result = optimizer
+        .execute_bulk_deletion(key_groups, slow_deletion_fn)
+        .await?;
 
     // Should have timeout failures
     assert!(result.failed_deletions > 0);
-    
+
     // Check that timeout was properly recorded
     let stats = optimizer.get_stats().await;
     assert!(stats.timeout_errors > 0 || stats.failed_transactions > 0);

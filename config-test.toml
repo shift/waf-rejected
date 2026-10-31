@@ -1,15 +1,19 @@
 # End-to-End Test Configuration for WAF-Rejected
-# Optimized for testing with echo backend service
+# Optimized for testing with the echo backend service
 
 bind_addr = "127.0.0.1:8080"
+health_bind_addr = "127.0.0.1:8081"
 upstream_uri = "http://127.0.0.1:3000"
 
 [server]
 max_connections = 10000
+trusted_proxies = []
 request_timeout_secs = 30
 keep_alive_timeout_secs = 90
 enable_http2 = true
-max_body_size = 10485760  # 10MB
+enable_http3 = false
+supported_http_versions = ["1.0", "1.1", "2"]
+max_body_size = 10485760
 
 [logging]
 level = "info"
@@ -38,38 +42,12 @@ enable_sled = false
 enabled = true
 inspect_headers = true
 inspect_body = true
-max_body_size = 1048576  # 1MB
-threat_patterns = ["sql_injection", "xss", "command_injection", "path_traversal"]
-
-[waf.geo_blocking]
-enabled = true
-blocked_countries = ["XX", "ZZ"]  # Use fake country codes for testing
-blocked_regions = []
-block_tor = false
-block_vpn = false
-block_datacenter = false
-
-[security]
-# Nested configuration following the Config struct
-
-[security.events]
-enabled = true
-format = "json"
-min_threat_level = "medium"
-enable_cef = false
-enable_otel = false
-enable_sled = false
-
-[security.content_inspection]
-enabled = true
-inspect_headers = true
-inspect_body = true
 max_body_size = 1048576
 threat_patterns = ["sql_injection", "xss", "command_injection", "path_traversal"]
 
-[security.geo_blocking]
-enabled = true
-blocked_countries = ["XX", "ZZ"]
+[waf.geo_blocking]
+enabled = false
+blocked_countries = []
 blocked_regions = []
 block_tor = false
 block_vpn = false

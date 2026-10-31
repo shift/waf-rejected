@@ -5,7 +5,7 @@ metadata:
   namespace: security
   labels:
     app: waf-rejected
-    version: v0.1.0
+    version: v0.1.0-beta.1
 spec:
   replicas: 3
   strategy:
@@ -20,7 +20,7 @@ spec:
     metadata:
       labels:
         app: waf-rejected
-        version: v0.1.0
+        version: v0.1.0-beta.1
     spec:
       securityContext:
         runAsNonRoot: true
@@ -28,19 +28,19 @@ spec:
         fsGroup: 2000
       containers:
       - name: waf-ingress
-        image: waf-rejected:v0.1.0
+        image: waf-rejected:v0.1.0-beta.1
         imagePullPolicy: Always
         ports:
         - name: http
           containerPort: 8080
           protocol: TCP
         - name: metrics
-          containerPort: 9090
+          containerPort: 8081
           protocol: TCP
         env:
         - name: RUST_LOG
           value: "waf_ingress=info,security=warn"
-        - name: CONFIG_PATH
+        - name: WAF_CONFIG_FILE
           value: "/config/production.toml"
         - name: OTEL_SERVICE_NAME
           value: "waf-rejected"
@@ -56,7 +56,7 @@ spec:
         livenessProbe:
           httpGet:
             path: /health
-            port: http
+            port: metrics
             scheme: HTTP
           initialDelaySeconds: 30
           periodSeconds: 10
@@ -64,8 +64,8 @@ spec:
           failureThreshold: 3
         readinessProbe:
           httpGet:
-            path: /ready
-            port: http
+            path: /health/ready
+            port: metrics
             scheme: HTTP
           initialDelaySeconds: 5
           periodSeconds: 5

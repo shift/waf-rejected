@@ -3,8 +3,8 @@
 //! Advanced TTL expiration strategies and bulk optimization enhancements
 //! for the WAF-Rejected storage system.
 
-use std::time::Duration;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::info;
 
@@ -94,7 +94,7 @@ pub struct CleanupResult {
 }
 
 /// TTL Enhancement Manager
-/// 
+///
 /// This manager provides advanced TTL expiration strategies that can be
 /// integrated with existing storage adapters to enhance their performance.
 pub struct TtlEnhancementManager {
@@ -131,7 +131,7 @@ impl TtlEnhancementManager {
         self.config = new_config.clone();
         let mut stats = self.stats.write().await;
         stats.current_batch_size = new_config.max_batch_size;
-        
+
         if new_config.base_interval != *self.current_interval.read().await {
             *self.current_interval.write().await = new_config.base_interval;
             stats.current_interval_ms = new_config.base_interval.as_millis() as u64;
@@ -142,19 +142,21 @@ impl TtlEnhancementManager {
     /// Calculate optimal batch size based on recent performance
     pub async fn calculate_optimal_batch_size(&self) -> usize {
         let stats = self.stats.read().await;
-        
+
         if stats.cleanup_runs < 3 {
             return self.config.max_batch_size;
         }
 
         // Adjust batch size based on processing time
         let target_processing_time = self.config.max_processing_time_ms as f64 * 0.8; // 80% of max
-        
+
         if stats.avg_cleanup_duration_ms > target_processing_time {
             // Reduce batch size if processing takes too long
             let reduction_factor = target_processing_time / stats.avg_cleanup_duration_ms;
             let new_size = (stats.current_batch_size as f64 * reduction_factor) as usize;
-            new_size.max(self.config.min_batch_size).min(self.config.max_batch_size)
+            new_size
+                .max(self.config.min_batch_size)
+                .min(self.config.max_batch_size)
         } else if stats.avg_cleanup_duration_ms < target_processing_time * 0.5 {
             // Increase batch size if processing is very fast
             let increase_factor = 1.5;
@@ -174,16 +176,16 @@ impl TtlEnhancementManager {
         let threshold = self.config.adaptive_threshold as u64;
         let mut low_activity = self.consecutive_low_activity.write().await;
         let mut high_activity = self.consecutive_high_activity.write().await;
-        
+
         if expired_keys < threshold / 2 {
             *low_activity += 1;
             *high_activity = 0;
-            
+
             // Increase interval if consistently low activity
             if *low_activity >= 3 {
                 let current = *self.current_interval.read().await;
                 let new_interval = (current * 2).min(self.config.max_interval);
-                
+
                 if new_interval != current {
                     *low_activity = 0;
                     return Some(new_interval);
@@ -192,12 +194,12 @@ impl TtlEnhancementManager {
         } else if expired_keys > threshold {
             *high_activity += 1;
             *low_activity = 0;
-            
+
             // Decrease interval if consistently high activity
             if *high_activity >= 2 {
                 let current = *self.current_interval.read().await;
                 let new_interval = (current / 2).max(self.config.min_interval);
-                
+
                 if new_interval != current {
                     *high_activity = 0;
                     return Some(new_interval);
@@ -208,19 +210,20 @@ impl TtlEnhancementManager {
             *low_activity = 0;
             *high_activity = 0;
         }
-        
+
         None
     }
 
     /// Update statistics after cleanup operation
     pub async fn update_stats(&self, result: &CleanupResult) {
         let mut stats = self.stats.write().await;
-        
+
         stats.cleanup_runs += 1;
         stats.total_expired_keys += result.expired_keys;
         stats.last_cleanup_duration_ms = result.processing_time_ms;
         stats.last_cleanup_key_count = result.expired_keys;
-        stats.max_cleanup_duration_ms = stats.max_cleanup_duration_ms.max(result.processing_time_ms);
+        stats.max_cleanup_duration_ms =
+            stats.max_cleanup_duration_ms.max(result.processing_time_ms);
         stats.total_bytes_cleaned += result.bytes_cleaned;
         stats.total_batch_operations += result.batches_processed as u64;
         stats.priority_keys_processed += result.priority_keys;
@@ -231,13 +234,13 @@ impl TtlEnhancementManager {
                 * (stats.cleanup_runs - 1) as f64
                 + result.processing_time_ms as f64)
                 / stats.cleanup_runs as f64;
-                
+
             // Calculate cleanup rate (keys per second)
             if result.processing_time_ms > 0 {
                 let rate = (result.expired_keys as f64 * 1000.0) / result.processing_time_ms as f64;
-                stats.avg_cleanup_rate_per_sec = (stats.avg_cleanup_rate_per_sec
-                    * (stats.cleanup_runs - 1) as f64 + rate)
-                    / stats.cleanup_runs as f64;
+                stats.avg_cleanup_rate_per_sec =
+                    (stats.avg_cleanup_rate_per_sec * (stats.cleanup_runs - 1) as f64 + rate)
+                        / stats.cleanup_runs as f64;
             }
 
             // Update batch processing average
@@ -257,11 +260,11 @@ impl TtlEnhancementManager {
         if *current_interval != new_interval {
             let old_interval = *current_interval;
             *current_interval = new_interval;
-            
+
             let mut stats = self.stats.write().await;
             stats.current_interval_ms = new_interval.as_millis() as u64;
             stats.adaptive_interval_changes += 1;
-            
+
             // Estimate time saved/lost due to adjustment
             let old_ms = old_interval.as_millis() as u64;
             let new_ms = new_interval.as_millis() as u64;
@@ -269,12 +272,12 @@ impl TtlEnhancementManager {
                 // Interval increased - we're saving processing time
                 stats.estimated_time_saved_ms += new_ms - old_ms;
             }
-            
+
             info!(
                 "TTL cleanup interval adjusted from {}ms to {}ms (activity-based optimization)",
                 old_ms, new_ms
             );
-            
+
             true
         } else {
             false
@@ -284,7 +287,7 @@ impl TtlEnhancementManager {
     /// Generate performance report
     pub async fn generate_performance_report(&self) -> String {
         let stats = self.stats.read().await;
-        
+
         format!(
             r#"TTL Enhancement Performance Report
 =====================================
@@ -326,14 +329,25 @@ Efficiency Indicators:
             stats.estimated_time_saved_ms,
             // Efficiency calculations
             if self.config.max_processing_time_ms > 0 {
-                100.0 - (stats.avg_cleanup_duration_ms / self.config.max_processing_time_ms as f64 * 100.0)
-            } else { 0.0 },
+                100.0
+                    - (stats.avg_cleanup_duration_ms / self.config.max_processing_time_ms as f64
+                        * 100.0)
+            } else {
+                0.0
+            },
             if stats.total_batch_operations > 0 {
-                (stats.total_expired_keys as f64 / stats.total_batch_operations as f64 / self.config.max_batch_size as f64) * 100.0
-            } else { 0.0 },
+                (stats.total_expired_keys as f64
+                    / stats.total_batch_operations as f64
+                    / self.config.max_batch_size as f64)
+                    * 100.0
+            } else {
+                0.0
+            },
             if stats.cleanup_runs > 0 {
                 (stats.adaptive_interval_changes as f64 / stats.cleanup_runs as f64) * 100.0
-            } else { 0.0 }
+            } else {
+                0.0
+            }
         )
     }
 }
@@ -347,10 +361,13 @@ mod tests {
     async fn test_ttl_enhancement_manager_creation() {
         let config = TtlCleanupConfig::default();
         let manager = TtlEnhancementManager::new(config.clone());
-        
+
         let stats = manager.get_stats().await;
         assert_eq!(stats.current_batch_size, config.max_batch_size);
-        assert_eq!(stats.current_interval_ms, config.base_interval.as_millis() as u64);
+        assert_eq!(
+            stats.current_interval_ms,
+            config.base_interval.as_millis() as u64
+        );
         assert_eq!(stats.cleanup_runs, 0);
     }
 
@@ -358,33 +375,32 @@ mod tests {
     async fn test_adaptive_interval_calculation() {
         let config = TtlCleanupConfig::default();
         let manager = TtlEnhancementManager::new(config.clone());
-        
+
         // Test low activity scenario
         let new_interval = manager.should_adjust_interval(10).await; // Low activity
         assert!(new_interval.is_none()); // Should not adjust on first run
-        
-        // Simulate consistent low activity
+
+        // The third consecutive low-activity sample should widen the interval.
+        let mut adjustments = Vec::new();
         for _ in 0..3 {
-            manager.should_adjust_interval(10).await;
+            if let Some(interval) = manager.should_adjust_interval(10).await {
+                adjustments.push(interval);
+            }
         }
-        
-        let adjusted_interval = manager.should_adjust_interval(10).await;
-        // Should increase interval due to consistent low activity
-        assert!(adjusted_interval.is_some());
-        if let Some(interval) = adjusted_interval {
-            assert!(interval > config.base_interval);
-        }
+
+        assert_eq!(adjustments.len(), 1);
+        assert!(adjustments[0] > config.base_interval);
     }
 
     #[tokio::test]
     async fn test_optimal_batch_size_calculation() {
         let config = TtlCleanupConfig::default();
         let manager = TtlEnhancementManager::new(config.clone());
-        
+
         // Initial batch size should be max
         let initial_batch_size = manager.calculate_optimal_batch_size().await;
         assert_eq!(initial_batch_size, config.max_batch_size);
-        
+
         // Simulate slow processing
         let slow_result = CleanupResult {
             expired_keys: 500,
@@ -394,11 +410,11 @@ mod tests {
             priority_keys: 0,
             adaptive_adjustments: 0,
         };
-        
+
         manager.update_stats(&slow_result).await;
         manager.update_stats(&slow_result).await;
         manager.update_stats(&slow_result).await;
-        
+
         let adjusted_batch_size = manager.calculate_optimal_batch_size().await;
         assert!(adjusted_batch_size < config.max_batch_size);
     }
@@ -407,7 +423,7 @@ mod tests {
     async fn test_performance_report_generation() {
         let config = TtlCleanupConfig::default();
         let manager = TtlEnhancementManager::new(config);
-        
+
         let result = CleanupResult {
             expired_keys: 100,
             bytes_cleaned: 5000,
@@ -416,9 +432,9 @@ mod tests {
             priority_keys: 10,
             adaptive_adjustments: 1,
         };
-        
+
         manager.update_stats(&result).await;
-        
+
         let report = manager.generate_performance_report().await;
         assert!(report.contains("Total Cleanup Runs: 1"));
         assert!(report.contains("Total Keys Expired: 100"));

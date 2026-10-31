@@ -2,8 +2,8 @@ apiVersion: v2
 name: waf-rejected
 description: Enterprise Web Application Firewall with AI threat detection
 type: application
-version: 0.1.0
-appVersion: "0.1.0"
+version: 0.1.0-beta.1
+appVersion: "0.1.0-beta.1"
 
 keywords:
   - waf

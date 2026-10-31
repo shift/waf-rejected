@@ -356,8 +356,9 @@ impl DistributedTrainingEngine {
         // Distribute training data across nodes
         let data_chunks = self.split_training_data(training_data)?;
 
-        // Execute distributed training
-        let nodes = self.cluster_nodes.lock().unwrap();
+        // Execute distributed training. Clone the node list so the lock is not
+        // held across the training await points.
+        let nodes = { self.cluster_nodes.lock().unwrap().clone() };
         for (i, node) in nodes.iter().enumerate() {
             if matches!(node.node_type, NodeType::Primary | NodeType::Worker) {
                 if let Some(chunk) = data_chunks.get(i) {

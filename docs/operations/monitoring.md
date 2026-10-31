@@ -41,13 +41,13 @@ WAF-Rejected provides comprehensive monitoring capabilities through OpenTelemetr
 scrape_configs:
   - job_name: 'waf-rejected'
     static_configs:
-      - targets: ['waf-rejected:9090']
+      - targets: ['waf-rejected:8081']
     metrics_path: '/metrics'
     scrape_interval: 15s
 
   - job_name: 'waf-rejected-security'
     static_configs:
-      - targets: ['waf-rejected:9090']
+      - targets: ['waf-rejected:8081']
     metrics_path: '/security-metrics'
     scrape_interval: 30s
 ```
@@ -238,10 +238,10 @@ WAF-Rejected outputs structured JSON logs for easy aggregation:
 
 ```bash
 # Liveness probe
-curl -f http://localhost:8080/health
+curl -f http://localhost:8081/health
 
 # Readiness probe
-curl -f http://localhost:8080/ready
+curl -f http://localhost:8081/health/ready
 
 # Metrics endpoint
 curl -f http://localhost:8080/metrics
@@ -305,7 +305,7 @@ kubectl logs -f deployment/waf-rejected -n security
 
 2. Review buffer pool usage:
    ```bash
-   curl http://localhost:9090/metrics | grep buffer
+   curl http://localhost:8081/metrics | grep buffer
    ```
 
 3. Check for memory leaks:

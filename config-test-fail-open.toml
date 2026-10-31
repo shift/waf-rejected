@@ -1,17 +1,21 @@
-[server]
-bind_addr = "0.0.0.0:8080"
+bind_addr = "127.0.0.1:8080"
+health_bind_addr = "127.0.0.1:8081"
 upstream_uri = "http://127.0.0.1:3000"
+
+[server]
+max_body_size = 1048576
 
 [waf]
 enabled = true
-fail_mode = "open"  # Test fail-open mode
+fail_mode = "open"
 upstream_timeout_ms = 3000
 
 [waf.content_inspection]
 enabled = true
 inspect_headers = true
 inspect_body = true
-max_body_size = 1048576  # 1MB
+max_body_size = 1048576
+threat_patterns = ["sql_injection", "xss", "command_injection", "path_traversal"]
 
 [logging]
 level = "info"

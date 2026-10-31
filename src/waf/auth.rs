@@ -6,12 +6,22 @@ use std::sync::{Arc, RwLock};
 
 /// Rate limiting configuration per API key
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct RateLimitConfig {
     /// Requests per minute per key
     pub requests_per_minute: u32,
 }
 
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            requests_per_minute: 60,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct AuthConfig {
     pub enabled: bool,
     pub api_keys: Vec<String>,
@@ -51,7 +61,12 @@ impl InMemoryKeyStore {
         }
     }
 
-    fn hash_key(key: &str) -> String {
+    /// Build a store from plaintext API keys by hashing them at startup.
+    pub fn from_raw_keys(keys: &[String]) -> Self {
+        Self::new(keys.iter().map(|key| Self::hash_key(key)).collect())
+    }
+
+    pub fn hash_key(key: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(key.as_bytes());
         hex::encode(hasher.finalize())

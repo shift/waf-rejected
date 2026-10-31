@@ -1,3 +1,76 @@
+# P0-09: Beta Release 0.1.0-beta.1 (NORTH STAR)
+
+**Target**: ship a usable Beta that can be deployed behind a TLS-terminating
+load balancer and will enforce the documented WAF controls.
+
+## Beta acceptance criteria
+
+- [x] Real server starts from `waf-ingress` and from the container image.
+- [x] Fail-fast configuration; every shipped config validates.
+- [x] Request bodies, params, headers and URI inspected; size limits enforced.
+- [x] API-key auth and per-IP/global rate limits enforced.
+- [x] Security events emitted for blocks/rate limits.
+- [x] Health, readiness and Prometheus metrics exposed.
+- [x] TLS min/max versions and optional mTLS enforced.
+- [x] `fail_mode = closed` applied to WASM/AI failures.
+- [x] Automated end-to-end proxy tests (allow, query block, body block, 413).
+- [x] Versioned as `0.1.0-beta.1` with `CHANGELOG.md`.
+- [x] Dockerfile, Helm templates, K8s manifests and monitoring wired.
+- [ ] `nix build .#waf-ingress` verified from a clean build.
+- [ ] Release notes published with explicit known limitations.
+- [ ] Tag `v0.1.0-beta.1` and GitHub pre-release created.
+
+## Beta scope exclusions (documented)
+
+- Coraza/ModSecurity component execution
+- WebSocket/WebTransport tunneling
+- GeoIP database-backed country blocking
+- HTTP/3
+
+---
+
+# P0-08: Connect the Core Runtime Pipeline (ACTIVE)
+
+**Branch**: `fix/connect-core-pipeline`
+**Status**: Implemented, local verification complete
+**Objective**: Make the running binary actually enforce the WAF and start reliably.
+
+## Implementation checklist
+
+- [x] Make `waf-ingress` launch the real server (shared `server::run`), not a banner.
+- [x] Fix WASM memory units so the default configuration cannot panic at startup.
+- [x] Make configuration load fail-fast and stop silently discarding empty arrays.
+- [x] Consolidate duplicate `[security.*]` and `[waf.*]` configuration trees.
+- [x] Wire full WAF evaluation into the proxy: body inspection, event logging, AI/WASM stages.
+- [x] Enforce `max_body_size` while streaming request bodies.
+- [x] Wire API-key authentication and per-IP/global rate limiting into the pipeline.
+- [x] Trust `X-Forwarded-For` only from configured `trusted_proxies`.
+- [x] Forward authoritative `X-Forwarded-For`/`X-Real-IP`/`X-Forwarded-Proto` upstream.
+- [x] Add `/health`, `/health/ready`, `/metrics` and real request/block counters.
+- [x] Fix SQLi/XSS detection false negatives and percent-encoded payload handling.
+- [x] Make integration tests discoverable and passing.
+- [x] Fix `wasm_performance` benchmark compilation and formatting/clippy debt.
+- [x] Update Kubernetes/Helm/Prometheus wiring and add a Dockerfile.
+- [x] Reject unsupported WebSocket/WebTransport upgrades with `501` instead of a fake `101`.
+
+## Verification
+
+- `cargo fmt -- --check` — pass
+- `cargo clippy --lib -- --deny warnings` — pass
+- `cargo check --all-targets` — pass
+- `cargo test --lib` — 114 passed
+- `cargo test --test integration` — 17 passed
+- End-to-end: benign `200`, body/query SQLi and XSS `403`, oversized body `413`, missing API key `401`, rate limit `429`.
+
+## Known follow-ups
+
+- Real Coraza/ModSecurity component execution is still not implemented; `[waf.wasm]` is disabled by default and the existing implementation is an internal heuristic fallback.
+- WebSocket/WebTransport tunneling is intentionally rejected until a raw upgrade proxy is implemented.
+- GeoIP still needs a real MaxMind database loader before country blocking is effective.
+- HTTP/3 is advertised nowhere in the default config now; the dependency remains behind a feature.
+
+---
+
 # P1-01: Production Deployment and Operational Readiness
 
 **Priority**: P1 (HIGH - Production Launch)

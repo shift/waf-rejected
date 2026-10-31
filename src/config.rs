@@ -6,9 +6,13 @@ use tracing::info;
 use crate::waf::storage::StorageConfig as WafStorageConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
     /// Address to bind the server to
     pub bind_addr: SocketAddr,
+
+    /// Address to bind the health/metrics service to
+    pub health_bind_addr: SocketAddr,
 
     /// Upstream URI to proxy requests to
     pub upstream_uri: String,
@@ -32,6 +36,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StorageConfig {
     pub backend: String,
     pub path: String,
@@ -84,6 +89,7 @@ impl StorageConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ProxyConfig {
     /// Upstream server URL
     pub upstream_url: String,
@@ -99,9 +105,14 @@ pub struct ProxyConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ServerConfig {
     /// Maximum number of concurrent connections
     pub max_connections: usize,
+
+    /// CIDRs of reverse proxies/LBs whose X-Forwarded-For header is trusted.
+    /// Empty means the peer socket address is always used (header ignored).
+    pub trusted_proxies: Vec<String>,
 
     /// Request timeout in seconds
     pub request_timeout_secs: u64,
@@ -126,6 +137,7 @@ pub struct ServerConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TlsConfig {
     /// Enable TLS/SSL
     pub enabled: bool,
@@ -153,6 +165,7 @@ pub struct TlsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LoggingConfig {
     /// Log level (trace, debug, info, warn, error)
     pub level: String,
@@ -162,6 +175,7 @@ pub struct LoggingConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct WafConfig {
     /// Enable WAF functionality
     pub enabled: bool,
@@ -190,6 +204,7 @@ pub struct WafConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RateLimitConfig {
     /// Enable per-IP rate limiting
     pub per_ip_enabled: bool,
@@ -211,6 +226,7 @@ pub struct RateLimitConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SecurityEventsConfig {
     /// Enable security event logging
     pub enabled: bool,
@@ -247,6 +263,7 @@ pub struct SecurityEventsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ContentInspectionConfig {
     /// Enable content inspection
     pub enabled: bool,
@@ -265,6 +282,7 @@ pub struct ContentInspectionConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GeoBlockingConfig {
     /// Enable geographic blocking
     pub enabled: bool,
@@ -288,6 +306,7 @@ pub struct GeoBlockingConfig {
 /// WASM ModSecurity configuration
 #[cfg(feature = "wasm-waf")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct WasmConfig {
     /// Enable WASM ModSecurity engine
     pub enabled: bool,
@@ -315,6 +334,7 @@ pub struct WasmConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AiConfig {
     /// Enable AI threat detection
     pub enabled: bool,
@@ -330,6 +350,7 @@ pub struct AiConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AiModelConfig {
     /// Path to ML model file
     pub model_path: Option<String>,
@@ -357,6 +378,7 @@ impl Default for AiConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ComplianceConfig {
     /// Enable compliance features
     pub enabled: bool,
@@ -372,6 +394,7 @@ pub struct ComplianceConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AuditConfig {
     /// Enable tamper-evident audit logging
     pub tamper_evident: bool,
@@ -384,6 +407,7 @@ pub struct AuditConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RegulatoryConfig {
     /// Enable GDPR compliance features
     pub gdpr: bool,
@@ -399,6 +423,7 @@ pub struct RegulatoryConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RetentionConfig {
     /// Security event retention in days
     pub security_events_days: u32,
@@ -408,6 +433,47 @@ pub struct RetentionConfig {
 
     /// Automatic deletion of expired data
     pub auto_delete: bool,
+}
+
+impl Default for AiModelConfig {
+    fn default() -> Self {
+        Self {
+            model_path: None,
+            anomaly_detection: true,
+            advanced_classification: false,
+        }
+    }
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            tamper_evident: true,
+            retention_days: 2555,
+            integrity_check_hours: 24,
+        }
+    }
+}
+
+impl Default for RegulatoryConfig {
+    fn default() -> Self {
+        Self {
+            gdpr: false,
+            hipaa: false,
+            pci_dss: false,
+            data_residency: None,
+        }
+    }
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            security_events_days: 90,
+            audit_logs_days: 2555,
+            auto_delete: true,
+        }
+    }
 }
 
 impl Default for ComplianceConfig {
@@ -435,16 +501,8 @@ impl Default for ComplianceConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SecurityConfig {
-    /// Security events configuration
-    pub events: SecurityEventsConfig,
-
-    /// Content inspection configuration
-    pub content_inspection: ContentInspectionConfig,
-
-    /// Geographic blocking configuration
-    pub geo_blocking: GeoBlockingConfig,
-
     /// Authentication configuration
     pub auth: crate::waf::auth::AuthConfig,
     /// AI threat detection configuration
@@ -458,6 +516,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             bind_addr: "0.0.0.0:8080".parse().unwrap(),
+            health_bind_addr: "0.0.0.0:8081".parse().unwrap(),
             upstream_uri: "http://127.0.0.1:3000".to_string(),
             proxy: ProxyConfig::default(),
             server: ServerConfig::default(),
@@ -484,6 +543,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             max_connections: 10000,
+            trusted_proxies: vec![],
             request_timeout_secs: 30,
             keep_alive_timeout_secs: 90,
             enable_http2: true,
@@ -610,9 +670,6 @@ impl Default for GeoBlockingConfig {
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
-            events: SecurityEventsConfig::default(),
-            content_inspection: ContentInspectionConfig::default(),
-            geo_blocking: GeoBlockingConfig::default(),
             auth: crate::waf::auth::AuthConfig::default(),
             ai: AiConfig::default(),
             compliance: ComplianceConfig::default(),
@@ -624,7 +681,9 @@ impl Default for SecurityConfig {
 impl Default for WasmConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            // The WASM component ABI is not wired up yet. Enabling this runs the
+            // built-in heuristic fallback, not the real Coraza module.
+            enabled: false,
             module_path: "rules/coraza.wasm".to_string(),
             memory_limit: 16 * 1024 * 1024, // 16MB
             timeout_ms: 100,
@@ -635,8 +694,6 @@ impl Default for WasmConfig {
         }
     }
 }
-
-
 
 impl Config {
     /// Load configuration from environment variables and config file
@@ -651,15 +708,45 @@ impl Config {
                     .separator("__"),
             );
 
-        // Try to load from config file if it exists
-        if let Ok(config_file) = std::env::var("WAF_CONFIG_FILE") {
+        // Try to load from config file if it exists. Support both the historic
+        // WAF_CONFIG_FILE name and the CONFIG_PATH name used by deployments.
+        let config_file = std::env::var("WAF_CONFIG_FILE")
+            .or_else(|_| std::env::var("CONFIG_PATH"))
+            .ok();
+        if let Some(config_file) = config_file {
             info!("Loading configuration from file: {}", config_file);
-            settings = settings.add_source(config::File::with_name(&config_file).required(false));
+            settings = settings.add_source(config::File::with_name(&config_file).required(true));
         }
 
         let config: Config = settings.build()?.try_deserialize()?;
+        config.validate()?;
 
         Ok(config)
+    }
+
+    /// Reject configurations that would make the proxy unsafe or unusable.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.server.max_body_size == 0 {
+            anyhow::bail!("server.max_body_size must be greater than zero");
+        }
+        if self.proxy.timeout_seconds == 0 || self.server.request_timeout_secs == 0 {
+            anyhow::bail!("request timeouts must be greater than zero");
+        }
+        if self.waf.rate_limit.per_ip_window_secs == 0 && self.waf.rate_limit.per_ip_enabled {
+            anyhow::bail!("waf.rate_limit.per_ip_window_secs must be greater than zero");
+        }
+        if self.waf.rate_limit.global_window_secs == 0 && self.waf.rate_limit.global_enabled {
+            anyhow::bail!("waf.rate_limit.global_window_secs must be greater than zero");
+        }
+        if self.security.auth.enabled && self.security.auth.api_keys.is_empty() {
+            anyhow::bail!("security.auth.enabled is true but security.auth.api_keys is empty");
+        }
+        for cidr in &self.server.trusted_proxies {
+            cidr.parse::<ipnetwork::IpNetwork>().map_err(|e| {
+                anyhow::anyhow!("invalid server.trusted_proxies entry '{}': {}", cidr, e)
+            })?;
+        }
+        Ok(())
     }
 
     /// Get the upstream URI as a hyper::Uri
@@ -691,6 +778,37 @@ mod tests {
         assert_eq!(config.bind_addr.to_string(), "0.0.0.0:8080");
         assert!(config.upstream_uri.starts_with("http://"));
         assert!(config.server.max_connections > 0);
+    }
+
+    #[test]
+    fn test_shipped_configs_deserialize() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let files = [
+            "config.toml",
+            "config-test.toml",
+            "config-test-fail-open.toml",
+            "config-with-exports.toml",
+            "test_config.toml",
+            "config/development-production.toml",
+            "config/enterprise.toml",
+        ];
+
+        for file in files {
+            let path = root.join(file);
+            let contents = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e));
+            let settings = config::Config::builder()
+                .add_source(config::Config::try_from(&Config::default()).unwrap())
+                .add_source(config::File::from_str(&contents, config::FileFormat::Toml))
+                .build()
+                .unwrap_or_else(|e| panic!("failed to build {}: {}", file, e));
+            let parsed: Config = settings
+                .try_deserialize()
+                .unwrap_or_else(|e| panic!("failed to deserialize {}: {}", file, e));
+            parsed
+                .validate()
+                .unwrap_or_else(|e| panic!("{} failed validation: {}", file, e));
+        }
     }
 
     #[test]

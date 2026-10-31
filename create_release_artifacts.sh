@@ -60,10 +60,9 @@ fi
 # Copy essential documentation
 mkdir -p "$RELEASE_DIR/docs"
 if [[ -d "docs" ]]; then
-    cp docs/INSTALLATION.md "$RELEASE_DIR/docs/" 2>/dev/null || true
-    cp docs/USER_GUIDE.md "$RELEASE_DIR/docs/" 2>/dev/null || true
-    cp docs/CONFIGURATION.md "$RELEASE_DIR/docs/" 2>/dev/null || true
-    cp docs/API.md "$RELEASE_DIR/docs/" 2>/dev/null || true
+    cp -r docs/operations "$RELEASE_DIR/docs/" 2>/dev/null || true
+    cp docs/ai-context.md "$RELEASE_DIR/docs/" 2>/dev/null || true
+    cp docs/PERFORMANCE_API.md "$RELEASE_DIR/docs/" 2>/dev/null || true
     echo "✅ Added essential documentation"
 fi
 
@@ -90,7 +89,8 @@ fi
 echo "🚀 Starting WAF-Rejected..."
 echo "📝 Config: $CONFIG_FILE"
 
-exec ./waf-ingress --config "$CONFIG_FILE"
+export WAF_CONFIG_FILE="$CONFIG_FILE"
+exec ./waf-ingress
 EOF
 
 chmod +x "$RELEASE_DIR/start_waf.sh"
@@ -135,19 +135,19 @@ See \`docs/CONFIGURATION.md\` for detailed configuration options.
 Test the WAF is working:
 
 \`\`\`bash
-# Health check
-curl http://localhost:8080/health
+# Health check (health/metrics run on 8081)
+curl http://localhost:8081/health
 
 # Test security detection (should be blocked)
-curl "http://localhost:8080/test?id=1' OR '1'='1"
+curl "http://localhost:8080/test?id=1%20UNION%20SELECT%20*%20FROM%20users"
 \`\`\`
 
 ## Documentation
 
-- **Full documentation**: See \`docs/\` directory
-- **Installation guide**: \`docs/INSTALLATION.md\`
-- **User guide**: \`docs/USER_GUIDE.md\`
-- **API reference**: \`docs/API.md\`
+- **Full documentation**: See the `README.md` and `docs/` directory
+- **Deployment**: `docs/operations/deployment.md`
+- **Monitoring**: `docs/operations/monitoring.md`
+- **Backup/DR**: `docs/operations/backup-recovery.md`
 
 ## Support
 

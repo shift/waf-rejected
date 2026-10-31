@@ -23,6 +23,8 @@ use tracing::{debug, info, warn};
 
 use self::content_inspection::ContentInspectionRuleFactory;
 use self::geoip::{GeoBlockingRuleFactory, GeoIpService};
+use self::rate_limit::{GlobalRateLimiter, RateLimiter};
+use self::rules::{MethodRule, RequestSizeRule};
 use self::security_events::SecurityEventLogger;
 use crate::config::Config;
 
@@ -114,6 +116,7 @@ pub struct WafEngine {
     rules: Arc<RwLock<Vec<Box<dyn WafRule>>>>,
     event_logger: SecurityEventLogger,
     geoip_service: Arc<GeoIpService>,
+    fail_closed: bool,
     #[cfg(feature = "wasm-waf")]
     wasm_engine: Option<Arc<WasmEngine>>,
     #[cfg(feature = "ai-threat-detection")]
@@ -132,6 +135,7 @@ impl Clone for WafEngine {
             rules: Arc::clone(&self.rules),
             event_logger: SecurityEventLogger::default_logger(),
             geoip_service: Arc::clone(&self.geoip_service),
+            fail_closed: self.fail_closed,
             #[cfg(feature = "wasm-waf")]
             wasm_engine: self.wasm_engine.clone(),
             #[cfg(feature = "ai-threat-detection")]
@@ -146,6 +150,7 @@ impl WafEngine {
             rules: Arc::new(RwLock::new(Vec::new())),
             event_logger: SecurityEventLogger::default_logger(),
             geoip_service: Arc::new(GeoIpService::new()),
+            fail_closed: true,
             #[cfg(feature = "wasm-waf")]
             wasm_engine: None,
         }
@@ -156,6 +161,7 @@ impl WafEngine {
             rules: Arc::new(RwLock::new(Vec::new())),
             event_logger: SecurityEventLogger::new(config.waf.security_events.clone()),
             geoip_service: Arc::new(GeoIpService::new()),
+            fail_closed: config.waf.fail_mode != "open",
             #[cfg(feature = "wasm-waf")]
             wasm_engine: Self::initialize_wasm_engine(config),
             #[cfg(feature = "ai-threat-detection")]
@@ -179,7 +185,8 @@ impl WafEngine {
 
         let wasm_config = crate::wasm::WasmEngineConfig {
             module_path: config.waf.wasm.module_path.clone(),
-            memory_limit_mb: config.waf.wasm.memory_limit,
+            // Config stores bytes; the engine API expects megabytes.
+            memory_limit_mb: (config.waf.wasm.memory_limit / (1024 * 1024)).max(1),
             timeout_ms: config.waf.wasm.timeout_ms,
             debug: config.waf.wasm.debug,
             instance_pool_size: config.waf.wasm.instance_pool_size,
@@ -230,6 +237,39 @@ impl WafEngine {
             }
         }
 
+        // Reject oversized bodies and dangerous HTTP methods before any
+        // payload inspection.
+        self.add_rule(RequestSizeRule::new(
+            "request_body_size",
+            config.server.max_body_size,
+        ));
+        self.add_rule(MethodRule::new("dangerous_methods"));
+
+        // Rate limiting must be part of the live rule chain, not just config.
+        if config.waf.rate_limit.per_ip_enabled {
+            let window = config.waf.rate_limit.per_ip_window_secs.max(1);
+            let refill = (config.waf.rate_limit.per_ip_max_requests as f64 / window as f64)
+                .ceil()
+                .max(1.0) as u32;
+            self.add_rule(RateLimiter::new(
+                "per_ip_rate_limit",
+                config.waf.rate_limit.per_ip_max_requests.max(1),
+                refill,
+                std::time::Duration::from_secs(window),
+            ));
+        }
+        if config.waf.rate_limit.global_enabled {
+            let window = config.waf.rate_limit.global_window_secs.max(1);
+            let refill = (config.waf.rate_limit.global_max_requests as f64 / window as f64)
+                .ceil()
+                .max(1.0) as u32;
+            self.add_rule(GlobalRateLimiter::new(
+                "global_rate_limit",
+                config.waf.rate_limit.global_max_requests.max(1),
+                refill,
+            ));
+        }
+
         // Add geographic blocking rules
         if config.waf.geo_blocking.enabled {
             for country_code in &config.waf.geo_blocking.blocked_countries {
@@ -239,6 +279,22 @@ impl WafEngine {
                 );
                 self.add_rule(rule);
             }
+            warn!(
+                "Geographic blocking is enabled for {} countries, but no GeoIP database is loaded; unknown IPs will not be matched",
+                config.waf.geo_blocking.blocked_countries.len()
+            );
+        }
+
+        if config.waf.security_events.enabled
+            && !matches!(
+                config.waf.security_events.format.as_str(),
+                "json" | "cef" | "plain"
+            )
+        {
+            warn!(
+                "Unknown security event format '{}'; falling back to json",
+                config.waf.security_events.format
+            );
         }
 
         info!("Added {} default WAF rules", self.rule_count());
@@ -318,7 +374,10 @@ impl WafEngine {
 
         // Now we can safely do async operations (if needed)
         if let Some(decision) = blocking_decision {
-            // Skip expensive logging for performance in fast path
+            // Even the fast path must produce an audit event for blocks.
+            self.event_logger
+                .log_event(request, &decision, triggered_rules)
+                .await;
             return decision;
         }
 
@@ -369,7 +428,16 @@ impl WafEngine {
                 }
                 Err(e) => {
                     warn!("WASM ModSecurity engine error: {}", e);
-                    // Continue with traditional rules on WASM error (fail-open for WASM)
+                    if self.fail_closed {
+                        let decision = Decision::Block {
+                            status: 503,
+                            reason: "WAF engine unavailable (fail-closed)".to_string(),
+                        };
+                        self.event_logger
+                            .log_event(request, &decision, triggered_rules)
+                            .await;
+                        return decision;
+                    }
                 }
             }
         }
@@ -382,14 +450,18 @@ impl WafEngine {
             match ai_detector.analyze_request(request).await {
                 Ok(ai_result) => {
                     if ai_result.should_block {
-                        info!("Request blocked by AI threat detection (score: {:.3})",
-                              ai_result.analysis.threat_score);
+                        info!(
+                            "Request blocked by AI threat detection (score: {:.3})",
+                            ai_result.analysis.threat_score
+                        );
                         triggered_rules.push("AI-Threat-Detection".to_string());
 
                         let decision = Decision::Block {
                             status: 403,
-                            reason: format!("AI detected threat (score: {:.3})",
-                                          ai_result.analysis.threat_score),
+                            reason: format!(
+                                "AI detected threat (score: {:.3})",
+                                ai_result.analysis.threat_score
+                            ),
                         };
 
                         self.event_logger
@@ -397,13 +469,24 @@ impl WafEngine {
                             .await;
                         return decision;
                     } else {
-                        debug!("AI analysis passed (score: {:.3})",
-                               ai_result.analysis.threat_score);
+                        debug!(
+                            "AI analysis passed (score: {:.3})",
+                            ai_result.analysis.threat_score
+                        );
                     }
                 }
                 Err(e) => {
                     warn!("AI analysis error: {}", e);
-                    // Continue with traditional rules on AI error (fail-open for AI)
+                    if self.fail_closed {
+                        let decision = Decision::Block {
+                            status: 503,
+                            reason: "WAF AI engine unavailable (fail-closed)".to_string(),
+                        };
+                        self.event_logger
+                            .log_event(request, &decision, triggered_rules)
+                            .await;
+                        return decision;
+                    }
                 }
             }
         }

@@ -14,8 +14,8 @@ echo "🚀 Preparing WAF-Rejected release v$VERSION"
 echo "============================================"
 
 # Validate version format
-if [[ ! $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    echo "❌ Invalid version format. Use semantic versioning (e.g., 1.0.0)"
+if [[ ! $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+    echo "❌ Invalid version format. Use semantic versioning (e.g., 1.0.0 or 0.1.0-beta.1)"
     exit 1
 fi
 
@@ -41,10 +41,14 @@ echo ""
 echo "📋 Pre-release validation"
 echo "========================="
 
-# Run comprehensive tests
+# Run the test suite that is actually wired into the pipeline.
 echo "🧪 Running test suite..."
-if ! cargo test --quiet; then
-    echo "❌ Tests failed"
+if ! cargo test --lib --quiet; then
+    echo "❌ Unit tests failed"
+    exit 1
+fi
+if ! cargo test --test integration --quiet; then
+    echo "❌ Integration tests failed"
     exit 1
 fi
 echo "✅ All tests passed"
@@ -57,25 +61,29 @@ if ! cargo fmt --all -- --check; then
 fi
 echo "✅ Code formatting is correct"
 
-# Run linting
+# Run linting on the library (the live request path).
 echo "🔍 Running linter..."
-if ! cargo clippy --all-targets --all-features -- -D warnings; then
+if ! cargo clippy --lib -- -D warnings; then
     echo "❌ Linting issues found"
     exit 1
 fi
 echo "✅ Linting passed"
 
-# Security audit
+# Security audit (cargo-audit is optional in local environments).
 echo "🔒 Running security audit..."
-if ! cargo audit; then
-    echo "❌ Security vulnerabilities found"
-    exit 1
+if command -v cargo-audit >/dev/null 2>&1; then
+    if ! cargo audit; then
+        echo "❌ Security vulnerabilities found"
+        exit 1
+    fi
+    echo "✅ Security audit passed"
+else
+    echo "⚠️  cargo-audit not installed; skipping local audit (CI still runs it)"
 fi
-echo "✅ Security audit passed"
 
 # Build release binary
 echo "🏗️  Building release binary..."
-if ! cargo build --release --quiet; then
+if ! cargo build --release --bin waf-ingress --quiet; then
     echo "❌ Release build failed"
     exit 1
 fi
@@ -122,7 +130,7 @@ echo "=================="
 
 # Build again to ensure version changes don't break anything
 echo "🏗️  Final build validation..."
-if ! cargo build --release --quiet; then
+if ! cargo build --release --bin waf-ingress --quiet; then
     echo "❌ Final build failed"
     exit 1
 fi

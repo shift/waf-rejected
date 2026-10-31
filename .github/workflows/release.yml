@@ -1,0 +1,33 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Nix
+        uses: cachix/install-nix-action@v25
+      - name: Build release binary
+        run: nix build .#waf-ingress
+      - name: Package artifact
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p "waf-rejected-v${VERSION}"
+          cp result/bin/waf-ingress "waf-rejected-v${VERSION}/"
+          cp README.md CHANGELOG.md LICENSE-* "waf-rejected-v${VERSION}/"
+          cp -r rules "waf-rejected-v${VERSION}/"
+          tar -czf "waf-rejected-v${VERSION}-x86_64-linux.tar.gz" "waf-rejected-v${VERSION}"
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          generate_release_notes: true
+          files: waf-rejected-*-x86_64-linux.tar.gz

@@ -15,18 +15,10 @@ scrape_configs:
   # WAF-Rejected service metrics
   - job_name: 'waf-rejected'
     static_configs:
-      - targets: ['waf-rejected.security.svc.cluster.local:9090']
+      - targets: ['waf-rejected.security.svc.cluster.local:8081']
     metrics_path: '/metrics'
     scrape_interval: 5s
     scrape_timeout: 5s
-
-  # WAF-Rejected security event metrics
-  - job_name: 'waf-rejected-security'
-    static_configs:
-      - targets: ['waf-rejected.security.svc.cluster.local:9090']
-    metrics_path: '/security-metrics'
-    scrape_interval: 30s
-    scrape_timeout: 10s
 
   # Kubernetes service discovery
   - job_name: 'kubernetes-apiservers'

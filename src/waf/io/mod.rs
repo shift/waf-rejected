@@ -1,10 +1,9 @@
 /// High-performance I/O backends for WAF operations
-/// 
+///
 /// This module provides pluggable I/O backends optimized for different scenarios:
 /// - Standard tokio I/O for general compatibility
 /// - io_uring backend for maximum performance on Linux
 /// - Zero-copy operations where possible
-
 pub mod backend;
 pub mod network;
 pub mod traits;

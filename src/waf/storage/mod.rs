@@ -7,17 +7,22 @@ use async_trait::async_trait;
 use std::time::Duration;
 use thiserror::Error;
 
+pub mod bulk_deletion;
 pub mod memory;
 pub mod redb;
 pub mod sled;
 pub mod ttl_enhancements;
-pub mod bulk_deletion;
 
+pub use bulk_deletion::{
+    BulkDeletionConfig, BulkDeletionOptimizer, BulkDeletionResult, BulkDeletionStats, DeletionKey,
+    TransactionResult,
+};
 pub use memory::MemoryStorageAdapter;
 pub use redb::RedbStorageAdapter;
 pub use sled::SledStorageAdapter;
-pub use ttl_enhancements::{TtlEnhancementManager, TtlCleanupConfig, EnhancedTtlStats, CleanupResult};
-pub use bulk_deletion::{BulkDeletionOptimizer, BulkDeletionConfig, BulkDeletionStats, BulkDeletionResult, DeletionKey, TransactionResult};
+pub use ttl_enhancements::{
+    CleanupResult, EnhancedTtlStats, TtlCleanupConfig, TtlEnhancementManager,
+};
 
 /// Read consistency levels for storage operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

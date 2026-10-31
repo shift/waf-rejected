@@ -1,7 +1,9 @@
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
-use waf_ingress::compliance::{AuditEvent, AuditEventType, AuditLogger, ComplianceReporter, ComplianceError};
+use waf_ingress::compliance::{
+    AuditEvent, AuditEventType, AuditLogger, ComplianceError, ComplianceReporter,
+};
 use waf_ingress::config::{AuditConfig, RegulatoryConfig};
 
 /// Integration tests for compliance features
@@ -187,7 +189,9 @@ mod compliance_integration_tests {
         let result = reporter.generate_pci_report(&events);
 
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ComplianceError::NotEnabled(ref s) if s == "PCI-DSS"));
+        assert!(
+            matches!(result.unwrap_err(), ComplianceError::NotEnabled(ref s) if s == "PCI-DSS")
+        );
     }
 
     #[test]

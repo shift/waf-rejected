@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
 use hyper::Request;
 
 use crate::config::AiConfig;
@@ -64,7 +63,10 @@ impl AiThreatDetector {
     }
 
     /// Analyze a request for threats using AI
-    pub async fn analyze_request(&self, ctx: &RequestContext) -> Result<AiAnalysisResult, WafError> {
+    pub async fn analyze_request(
+        &self,
+        ctx: &RequestContext,
+    ) -> Result<AiAnalysisResult, WafError> {
         if !self.config.enabled {
             return Ok(AiAnalysisResult::default());
         }
@@ -86,8 +88,9 @@ impl AiThreatDetector {
         // Perform AI analysis with timeout
         let analysis_result = tokio::time::timeout(
             Duration::from_millis(self.config.timeout_ms),
-            self.ai_middleware.analyze_request(&req, body_bytes)
-        ).await
+            self.ai_middleware.analyze_request(&req, body_bytes),
+        )
+        .await
         .map_err(|_| WafError::internal("AI analysis timeout".to_string()))?
         .map_err(|e| WafError::internal(format!("AI analysis error: {}", e)))?;
 
@@ -105,8 +108,6 @@ impl AiThreatDetector {
         })
     }
 
-
-
     /// Get current configuration
     pub fn config(&self) -> &AiConfig {
         &self.config
@@ -121,8 +122,8 @@ impl AiThreatDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::IpAddr;
     use hyper::{HeaderMap, Method};
+    use std::net::IpAddr;
     use std::str::FromStr;
 
     fn create_test_context() -> RequestContext {

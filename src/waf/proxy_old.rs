@@ -133,7 +133,7 @@ impl Service<Request<Incoming>> for BaseProxyService {
                 .method(parts.method)
                 .uri(full_upstream_uri)
                 .body(Full::new(body_bytes))
-                .map_err(|e| WafError::Http(e.to_string()))?;
+                .map_err(|e| WafError::http(e.to_string()))?;
             
             // Copy headers (but skip host header to avoid conflicts)
             *upstream_req.headers_mut() = parts.headers;

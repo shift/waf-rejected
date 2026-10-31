@@ -5,60 +5,85 @@ metadata:
   namespace: security
 data:
   production.toml: |
-    # WAF-Rejected Production Configuration
+    bind_addr = "0.0.0.0:8080"
+    health_bind_addr = "0.0.0.0:8081"
+    upstream_uri = "http://backend-service:8080"
 
     [server]
-    bind_addr = "0.0.0.0:8080"
     max_connections = 10000
+    trusted_proxies = ["10.0.0.0/8"]
     request_timeout_secs = 30
     keep_alive_timeout_secs = 90
     enable_http2 = true
-    enable_http3 = true
-    supported_http_versions = ["1.0", "1.1", "2", "3"]
+    enable_http3 = false
+    supported_http_versions = ["1.0", "1.1", "2"]
+    max_body_size = 10485760
 
-    [proxy]
-    upstream_url = "http://backend-service:8080"
-    bind_addr = "0.0.0.0:8080"
-    timeout_seconds = 30
-    max_request_size = 10485760  # 10MB
+    [server.tls]
+    enabled = false
 
     [logging]
-    level = "INFO"
+    level = "info"
+    json_format = true
+
+    [waf]
+    enabled = true
+    fail_mode = "closed"
+    upstream_timeout_ms = 30000
+
+    [waf.rate_limit]
+    per_ip_enabled = true
+    per_ip_max_requests = 100
+    per_ip_window_secs = 60
+    global_enabled = true
+    global_max_requests = 10000
+    global_window_secs = 60
+
+    [waf.security_events]
+    enabled = true
     format = "json"
+    min_threat_level = "medium"
+    enable_cef = true
+    cef_output_file = "/var/log/waf/security_events.cef"
+    cef_device_vendor = "WAF-Rejected"
+    cef_device_product = "WAF-Rejected"
+    cef_device_version = "0.1.0"
     enable_otel = true
     otel_service_name = "waf-rejected"
     otel_service_version = "0.1.0"
-
-    [waf]
-    enable_wasm = true
-    wasm_module_path = "/config/coraza.wasm"
-    wasm_memory_limit = 16777216  # 16MB
-    wasm_timeout_ms = 100
-
-    [security.events]
-    enable_cef = true
-    enable_otel = true
+    otel_export_traces = true
+    otel_export_logs = true
     enable_sled = true
     sled_db_path = "/var/log/waf/security.db"
     sled_max_events = 1000000
     sled_compress = true
 
-    [security.auth]
+    [waf.content_inspection]
     enabled = true
+    inspect_headers = true
+    inspect_body = true
+    max_body_size = 10485760
+    threat_patterns = ["sql_injection", "xss", "command_injection", "path_traversal"]
+
+    [waf.geo_blocking]
+    enabled = false
+    blocked_countries = []
+    blocked_regions = []
+    block_tor = false
+    block_vpn = false
+    block_datacenter = false
+
+    [waf.wasm]
+    enabled = false
+
+    [security.auth]
+    enabled = false
+    api_keys = []
     header_name = "X-API-Key"
     require_https = true
-    # API keys configured via secrets
 
     [security.ai]
-    enabled = true
-    threat_threshold = 0.8
-    timeout_ms = 5000
+    enabled = false
 
     [security.compliance]
     enabled = true
-    audit.tamper_evident = true
-    audit.retention_days = 2555
-    regulatory.gdpr = true
-    regulatory.pci_dss = true
-    retention.security_events_days = 90
-    retention.audit_logs_days = 2555

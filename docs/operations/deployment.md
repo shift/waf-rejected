@@ -75,7 +75,7 @@ security:
 ```yaml
 # Production values.yaml
 image:
-  tag: "v0.1.0"
+  tag: "v0.1.0-beta.1"
 
 resources:
   requests:
@@ -256,7 +256,7 @@ kubectl logs deployment/waf-rejected -n security | grep auth
 curl -f http://waf-service/health
 
 # Readiness check
-curl -f http://waf-service/ready
+curl -f http://waf-service:8081/health/ready
 
 # Metrics check
 curl -f http://waf-service/metrics

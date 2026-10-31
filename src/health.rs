@@ -11,6 +11,8 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 
 use crate::error::WafError;
+use crate::metrics::Metrics;
+use std::sync::Arc;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HealthStatus {
@@ -31,12 +33,18 @@ pub struct ComponentHealth {
 #[derive(Debug)]
 pub struct HealthService {
     start_time: Instant,
+    metrics: Arc<Metrics>,
 }
 
 impl HealthService {
     pub fn new() -> Self {
+        Self::with_metrics(Arc::new(Metrics::new()))
+    }
+
+    pub fn with_metrics(metrics: Arc<Metrics>) -> Self {
         Self {
             start_time: Instant::now(),
+            metrics,
         }
     }
 
@@ -51,17 +59,21 @@ impl HealthService {
         })?;
 
         let start_time = self.start_time;
+        let metrics = Arc::clone(&self.metrics);
 
         loop {
             let (stream, _) = listener.accept().await.map_err(|e| {
                 WafError::internal(format!("Failed to accept health check connection: {}", e))
             })?;
 
+            let metrics = Arc::clone(&metrics);
             tokio::task::spawn(async move {
                 if let Err(e) = hyper::server::conn::http1::Builder::new()
                     .serve_connection(
                         hyper_util::rt::TokioIo::new(stream),
-                        service_fn(move |req| Self::handle_health_request(req, start_time)),
+                        service_fn(move |req| {
+                            Self::handle_health_request(req, start_time, Arc::clone(&metrics))
+                        }),
                     )
                     .await
                 {
@@ -74,6 +86,7 @@ impl HealthService {
     async fn handle_health_request(
         req: Request<Incoming>,
         start_time: Instant,
+        metrics: Arc<Metrics>,
     ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
         if req.method() != Method::GET {
             return Ok(Response::builder()
@@ -102,15 +115,20 @@ impl HealthService {
                     .body(Full::new(Bytes::from(json)))
                     .unwrap())
             }
-            "/health/ready" => Ok(Response::builder()
+            "/health/ready" | "/ready" => Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "text/plain")
                 .body(Full::new(Bytes::from("ready")))
                 .unwrap()),
-            "/health/live" => Ok(Response::builder()
+            "/health/live" | "/live" => Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "text/plain")
                 .body(Full::new(Bytes::from("live")))
+                .unwrap()),
+            "/metrics" => Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/plain; version=0.0.4")
+                .body(Full::new(Bytes::from(metrics.render_prometheus())))
                 .unwrap()),
             _ => Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)

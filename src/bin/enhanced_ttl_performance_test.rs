@@ -4,20 +4,18 @@
 //! adaptive cleanup strategies and bulk optimization.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::time::{sleep, interval};
-use tracing::{info, debug};
+use tokio::time::{interval, sleep};
+use tracing::{debug, info};
 
 use waf_ingress::waf::storage::{
-    TtlEnhancementManager, TtlCleanupConfig, CleanupResult, EnhancedTtlStats,
-    MemoryStorageAdapter, StorageAdapter, ReadConsistency,
+    CleanupResult, EnhancedTtlStats, MemoryStorageAdapter, ReadConsistency, StorageAdapter,
+    TtlCleanupConfig, TtlEnhancementManager,
 };
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_env_filter("debug")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("debug").init();
 
     info!("🚀 Starting Enhanced TTL Performance Test (P2-05/P2-06)");
 
@@ -130,8 +128,11 @@ async fn test_adaptive_intervals() -> Result<(), Box<dyn std::error::Error>> {
     debug!("Testing low activity scenario");
     for i in 0..4 {
         let adjustment = manager.should_adjust_interval(10).await; // Low activity
-        debug!("Low activity iteration {}: adjustment = {:?}", i, adjustment);
-        
+        debug!(
+            "Low activity iteration {}: adjustment = {:?}",
+            i, adjustment
+        );
+
         if i >= 2 {
             // Should suggest interval increase after 3 consecutive low activity runs
             if let Some(new_interval) = adjustment {
@@ -146,8 +147,11 @@ async fn test_adaptive_intervals() -> Result<(), Box<dyn std::error::Error>> {
     debug!("Testing high activity scenario");
     for i in 0..3 {
         let adjustment = manager.should_adjust_interval(100).await; // High activity
-        debug!("High activity iteration {}: adjustment = {:?}", i, adjustment);
-        
+        debug!(
+            "High activity iteration {}: adjustment = {:?}",
+            i, adjustment
+        );
+
         if i >= 1 {
             // Should suggest interval decrease after 2 consecutive high activity runs
             if let Some(new_interval) = adjustment {
@@ -220,8 +224,10 @@ async fn test_optimal_batch_sizing() -> Result<(), Box<dyn std::error::Error>> {
 
     let reduced_batch_size = manager.calculate_optimal_batch_size().await;
     assert!(reduced_batch_size < config.max_batch_size);
-    debug!("Batch size reduced from {} to {} due to slow processing", 
-           config.max_batch_size, reduced_batch_size);
+    debug!(
+        "Batch size reduced from {} to {} due to slow processing",
+        config.max_batch_size, reduced_batch_size
+    );
 
     info!("✅ Optimal batch size calculation test passed");
     Ok(())
@@ -232,15 +238,28 @@ async fn test_storage_integration() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create a memory storage adapter for testing
     let storage = MemoryStorageAdapter::new(
-        Some(1000), // Capacity
+        Some(1000),                 // Capacity
         Duration::from_millis(100), // TTL cleanup interval
-    ).await?;
+    )
+    .await?;
 
     // Insert test data with TTL
     let test_data = vec![
-        (b"key1".to_vec(), b"value1".to_vec(), Some(Duration::from_millis(200))),
-        (b"key2".to_vec(), b"value2".to_vec(), Some(Duration::from_millis(400))),
-        (b"key3".to_vec(), b"value3".to_vec(), Some(Duration::from_millis(600))),
+        (
+            b"key1".to_vec(),
+            b"value1".to_vec(),
+            Some(Duration::from_millis(200)),
+        ),
+        (
+            b"key2".to_vec(),
+            b"value2".to_vec(),
+            Some(Duration::from_millis(400)),
+        ),
+        (
+            b"key3".to_vec(),
+            b"value3".to_vec(),
+            Some(Duration::from_millis(600)),
+        ),
         (b"key4".to_vec(), b"value4".to_vec(), None), // No TTL
     ];
 
@@ -249,10 +268,22 @@ async fn test_storage_integration() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Verify initial data
-    assert!(storage.get(b"key1", ReadConsistency::Strong).await?.is_some());
-    assert!(storage.get(b"key2", ReadConsistency::Strong).await?.is_some());
-    assert!(storage.get(b"key3", ReadConsistency::Strong).await?.is_some());
-    assert!(storage.get(b"key4", ReadConsistency::Strong).await?.is_some());
+    assert!(storage
+        .get(b"key1", ReadConsistency::Strong)
+        .await?
+        .is_some());
+    assert!(storage
+        .get(b"key2", ReadConsistency::Strong)
+        .await?
+        .is_some());
+    assert!(storage
+        .get(b"key3", ReadConsistency::Strong)
+        .await?
+        .is_some());
+    assert!(storage
+        .get(b"key4", ReadConsistency::Strong)
+        .await?
+        .is_some());
 
     // Wait for some keys to expire
     sleep(Duration::from_millis(250)).await;
@@ -260,13 +291,28 @@ async fn test_storage_integration() -> Result<(), Box<dyn std::error::Error>> {
     // key1 should be expired, others should still exist
     // Note: Due to cleanup intervals, we might need to trigger cleanup manually
     let expired_count = storage.expire_keys().await?;
-    debug!("Manually triggered expiration, removed {} keys", expired_count);
+    debug!(
+        "Manually triggered expiration, removed {} keys",
+        expired_count
+    );
 
     // Verify expiration
-    assert!(storage.get(b"key1", ReadConsistency::Strong).await?.is_none());
-    assert!(storage.get(b"key2", ReadConsistency::Strong).await?.is_some());
-    assert!(storage.get(b"key3", ReadConsistency::Strong).await?.is_some());
-    assert!(storage.get(b"key4", ReadConsistency::Strong).await?.is_some());
+    assert!(storage
+        .get(b"key1", ReadConsistency::Strong)
+        .await?
+        .is_none());
+    assert!(storage
+        .get(b"key2", ReadConsistency::Strong)
+        .await?
+        .is_some());
+    assert!(storage
+        .get(b"key3", ReadConsistency::Strong)
+        .await?
+        .is_some());
+    assert!(storage
+        .get(b"key4", ReadConsistency::Strong)
+        .await?
+        .is_some());
 
     // Wait for more keys to expire
     sleep(Duration::from_millis(200)).await;
@@ -274,9 +320,18 @@ async fn test_storage_integration() -> Result<(), Box<dyn std::error::Error>> {
     debug!("Second expiration cycle, removed {} keys", expired_count2);
 
     // key2 should now also be expired
-    assert!(storage.get(b"key2", ReadConsistency::Strong).await?.is_none());
-    assert!(storage.get(b"key3", ReadConsistency::Strong).await?.is_some());
-    assert!(storage.get(b"key4", ReadConsistency::Strong).await?.is_some());
+    assert!(storage
+        .get(b"key2", ReadConsistency::Strong)
+        .await?
+        .is_none());
+    assert!(storage
+        .get(b"key3", ReadConsistency::Strong)
+        .await?
+        .is_some());
+    assert!(storage
+        .get(b"key4", ReadConsistency::Strong)
+        .await?
+        .is_some());
 
     info!("✅ Storage integration test passed");
     Ok(())
@@ -303,7 +358,7 @@ async fn test_performance_characteristics() -> Result<(), Box<dyn std::error::Er
     let workload_scenarios = vec![
         // High load period
         (vec![150, 200, 180, 220, 190], "High Load"),
-        // Medium load period  
+        // Medium load period
         (vec![80, 90, 85, 95, 88], "Medium Load"),
         // Low load period
         (vec![20, 15, 25, 18, 22], "Low Load"),
@@ -313,11 +368,11 @@ async fn test_performance_characteristics() -> Result<(), Box<dyn std::error::Er
 
     for (load_pattern, scenario_name) in workload_scenarios {
         info!("📊 Testing scenario: {}", scenario_name);
-        
+
         let scenario_start = SystemTime::now();
-        
+
         for (i, expired_keys) in load_pattern.iter().enumerate() {
-            let processing_time = if *expired_keys > 150 { 
+            let processing_time = if *expired_keys > 150 {
                 80 // High load = longer processing
             } else if *expired_keys > 50 {
                 40 // Medium load
@@ -347,20 +402,32 @@ async fn test_performance_characteristics() -> Result<(), Box<dyn std::error::Er
         }
 
         let scenario_duration = scenario_start.elapsed().unwrap();
-        debug!("Scenario '{}' completed in {:?}", scenario_name, scenario_duration);
+        debug!(
+            "Scenario '{}' completed in {:?}",
+            scenario_name, scenario_duration
+        );
     }
 
     // Generate final performance report
     let final_stats = manager.get_stats().await;
     let performance_report = manager.generate_performance_report().await;
-    
+
     info!("📈 Final Performance Statistics:");
     info!("Total cleanup runs: {}", final_stats.cleanup_runs);
     info!("Total keys processed: {}", final_stats.total_expired_keys);
-    info!("Average processing time: {:.2}ms", final_stats.avg_cleanup_duration_ms);
-    info!("Average cleanup rate: {:.1} keys/sec", final_stats.avg_cleanup_rate_per_sec);
-    info!("Adaptive adjustments: {}", final_stats.adaptive_interval_changes);
-    
+    info!(
+        "Average processing time: {:.2}ms",
+        final_stats.avg_cleanup_duration_ms
+    );
+    info!(
+        "Average cleanup rate: {:.1} keys/sec",
+        final_stats.avg_cleanup_rate_per_sec
+    );
+    info!(
+        "Adaptive adjustments: {}",
+        final_stats.adaptive_interval_changes
+    );
+
     // Performance assertions
     assert!(final_stats.cleanup_runs >= 20); // Should have multiple runs
     assert!(final_stats.avg_cleanup_duration_ms > 0.0);

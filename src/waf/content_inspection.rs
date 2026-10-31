@@ -1,4 +1,3 @@
-use crate::waf::simd_ops::WafPatternMatcher;
 use crate::waf::{Decision, RequestContext, WafRule};
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -45,12 +44,21 @@ pub enum ThreatSeverity {
 }
 
 // Pre-compiled patterns for performance
+fn percent_decode(input: &str) -> Option<String> {
+    if !input.contains('%') && !input.contains('+') {
+        return None;
+    }
+    urlencoding::decode(input)
+        .ok()
+        .map(|decoded| decoded.into_owned())
+}
+
 static COMMON_PATTERNS: Lazy<Vec<ThreatPattern>> = Lazy::new(|| {
     vec![
         // SQL Injection patterns
         ThreatPattern {
             name: "SQL Injection - UNION SELECT".to_string(),
-            pattern: Regex::new(r"(?i)\bunion(\s|%20|\+)+select\b").unwrap(),
+            pattern: Regex::new(r"(?i)(?:^|[^a-z0-9_]|%20|\+)union(\s|%20|\+)+select(?:$|[^a-z0-9_]|%20|\+)").unwrap(),
             severity: ThreatSeverity::High,
             attack_type: AttackType::SqlInjection,
             check_uri: true,
@@ -59,7 +67,10 @@ static COMMON_PATTERNS: Lazy<Vec<ThreatPattern>> = Lazy::new(|| {
         },
         ThreatPattern {
             name: "SQL Injection - OR 1=1".to_string(),
-            pattern: Regex::new(r"(?i)\bor(\s|%20|\+)+\d+(\s|%20|\+)*=(\s|%20|\+)*\d+").unwrap(),
+            pattern: Regex::new(
+                r#"(?i)(?:^|[^a-z0-9_]|%20|\+)or(\s|%20|\+)+['"]?\d+['"]?(\s|%20|\+)*=(\s|%20|\+)*['"]?\d+"#,
+            )
+            .unwrap(),
             severity: ThreatSeverity::High,
             attack_type: AttackType::SqlInjection,
             check_uri: true,
@@ -68,7 +79,7 @@ static COMMON_PATTERNS: Lazy<Vec<ThreatPattern>> = Lazy::new(|| {
         },
         ThreatPattern {
             name: "SQL Injection - DROP TABLE".to_string(),
-            pattern: Regex::new(r"(?i)\bdrop(\s|%20|\+)+table\b").unwrap(),
+            pattern: Regex::new(r"(?i)(?:^|[^a-z0-9_]|%20|\+)drop(\s|%20|\+)+table(?:$|[^a-z0-9_]|%20|\+)").unwrap(),
             severity: ThreatSeverity::Critical,
             attack_type: AttackType::SqlInjection,
             check_uri: true,
@@ -255,124 +266,77 @@ impl ContentInspectionRule {
         (high_priority, low_priority)
     }
 
-    /// Fast check for high-priority patterns using SIMD acceleration
+    /// Check high-priority patterns.
+    ///
+    /// Regex matching is always performed. The SIMD helpers are only a
+    /// fast-path optimisation and must never decide that content is safe,
+    /// otherwise encodings such as `UNION+SELECT` or `%3Cscript%3E` bypass
+    /// inspection.
     fn fast_check_content(&self, content: &str) -> Option<(&ThreatPattern, String)> {
-        let content_bytes = content.as_bytes();
-
-        // SIMD-accelerated pre-filtering for common attack patterns
-        // This provides significant performance improvement for large payloads
-        if WafPatternMatcher::contains_sql_injection(content_bytes) {
-            // Found potential SQL injection, now verify with precise regex patterns
-            for pattern in &self.high_priority_patterns {
-                if matches!(pattern.attack_type, AttackType::SqlInjection) {
-                    if let Some(captures) = pattern.pattern.find(content) {
-                        let matched_text = captures.as_str();
-                        let limited_match = if matched_text.len() > 100 {
-                            &matched_text[..100]
-                        } else {
-                            matched_text
-                        };
-                        return Some((pattern, limited_match.to_string()));
-                    }
-                }
-            }
-        }
-
-        if WafPatternMatcher::contains_xss(content_bytes) {
-            // Found potential XSS, now verify with precise regex patterns
-            for pattern in &self.high_priority_patterns {
-                if matches!(pattern.attack_type, AttackType::XssAttack) {
-                    if let Some(captures) = pattern.pattern.find(content) {
-                        let matched_text = captures.as_str();
-                        let limited_match = if matched_text.len() > 100 {
-                            &matched_text[..100]
-                        } else {
-                            matched_text
-                        };
-                        return Some((pattern, limited_match.to_string()));
-                    }
-                }
-            }
-        }
-
-        // Check remaining high-priority patterns with traditional regex
-        // (patterns not covered by SIMD fast-path)
-        for pattern in &self.high_priority_patterns {
-            if !matches!(
-                pattern.attack_type,
-                AttackType::SqlInjection | AttackType::XssAttack
-            ) {
-                if let Some(captures) = pattern.pattern.find(content) {
-                    let matched_text = captures.as_str();
-                    let limited_match = if matched_text.len() > 100 {
-                        &matched_text[..100]
-                    } else {
-                        matched_text
-                    };
-                    return Some((pattern, limited_match.to_string()));
-                }
-            }
-        }
-
-        None
+        Self::find_match(&self.high_priority_patterns, content)
     }
 
     fn check_content(&self, content: &str) -> Option<(&ThreatPattern, String)> {
-        // First check high-priority patterns with SIMD acceleration
+        // First check high-priority patterns, then medium/low severity ones.
         if let Some(result) = self.fast_check_content(content) {
             return Some(result);
         }
+        Self::find_match(&self.low_priority_patterns, content)
+    }
 
-        let content_bytes = content.as_bytes();
+    /// Check both the raw value and its percent-decoded form. Attackers often
+    /// encode quote/space/angle-bracket characters to bypass naive rules.
+    fn check_with_decoding(&self, content: &str, full: bool) -> Option<(&ThreatPattern, String)> {
+        let check = |value: &str| {
+            if full {
+                self.check_content(value)
+            } else {
+                self.fast_check_content(value)
+            }
+        };
 
-        // SIMD-accelerated pre-filtering for low-priority patterns
-        if WafPatternMatcher::contains_sql_injection(content_bytes) {
-            for pattern in &self.low_priority_patterns {
-                if matches!(pattern.attack_type, AttackType::SqlInjection) {
-                    if let Some(captures) = pattern.pattern.find(content) {
-                        let matched_text = captures.as_str();
-                        let limited_match = if matched_text.len() > 100 {
-                            &matched_text[..100]
-                        } else {
-                            matched_text
-                        };
-                        return Some((pattern, limited_match.to_string()));
-                    }
-                }
+        if let Some(found) = check(content) {
+            return Some(found);
+        }
+        if let Some(decoded) = percent_decode(content) {
+            if decoded != content {
+                return check(&decoded);
             }
         }
+        None
+    }
 
-        if WafPatternMatcher::contains_xss(content_bytes) {
-            for pattern in &self.low_priority_patterns {
-                if matches!(pattern.attack_type, AttackType::XssAttack) {
-                    if let Some(captures) = pattern.pattern.find(content) {
-                        let matched_text = captures.as_str();
-                        let limited_match = if matched_text.len() > 100 {
-                            &matched_text[..100]
-                        } else {
-                            matched_text
-                        };
-                        return Some((pattern, limited_match.to_string()));
-                    }
-                }
+    fn inspect_body(&self, content: &str) -> Option<(&ThreatPattern, String)> {
+        for pattern in &self.patterns {
+            if !pattern.check_body {
+                continue;
+            }
+            if let Some(matched) = pattern.pattern.find(content) {
+                let matched_text = matched.as_str();
+                let limited_match = if matched_text.len() > 100 {
+                    &matched_text[..100]
+                } else {
+                    matched_text
+                };
+                return Some((pattern, limited_match.to_string()));
             }
         }
+        None
+    }
 
-        // Check remaining low-priority patterns with traditional regex
-        for pattern in &self.low_priority_patterns {
-            if !matches!(
-                pattern.attack_type,
-                AttackType::SqlInjection | AttackType::XssAttack
-            ) {
-                if let Some(captures) = pattern.pattern.find(content) {
-                    let matched_text = captures.as_str();
-                    let limited_match = if matched_text.len() > 100 {
-                        &matched_text[..100]
-                    } else {
-                        matched_text
-                    };
-                    return Some((pattern, limited_match.to_string()));
-                }
+    fn find_match<'a>(
+        patterns: &'a [ThreatPattern],
+        content: &str,
+    ) -> Option<(&'a ThreatPattern, String)> {
+        for pattern in patterns {
+            if let Some(matched) = pattern.pattern.find(content) {
+                let matched_text = matched.as_str();
+                let limited_match = if matched_text.len() > 100 {
+                    &matched_text[..100]
+                } else {
+                    matched_text
+                };
+                return Some((pattern, limited_match.to_string()));
             }
         }
         None
@@ -408,7 +372,7 @@ impl WafRule for ContentInspectionRule {
         // Check URI path (high priority)
         let uri_path = ctx.uri.path();
         if uri_path.len() <= MAX_CONTENT_SIZE {
-            if let Some((pattern, matched)) = self.fast_check_content(uri_path) {
+            if let Some((pattern, matched)) = self.check_with_decoding(uri_path, false) {
                 if pattern.check_uri {
                     return Decision::Block {
                         status: self.severity_to_status(&pattern.severity),
@@ -425,7 +389,7 @@ impl WafRule for ContentInspectionRule {
         if let Some(query) = ctx.uri.query() {
             if query.len() <= MAX_CONTENT_SIZE {
                 // Use full check on query to include medium/low severity patterns (e.g., javascript:)
-                if let Some((pattern, matched)) = self.check_content(query) {
+                if let Some((pattern, matched)) = self.check_with_decoding(query, true) {
                     if pattern.check_uri {
                         return Decision::Block {
                             status: self.severity_to_status(&pattern.severity),
@@ -460,8 +424,32 @@ impl WafRule for ContentInspectionRule {
             }
         }
 
-        // TODO: Check request body when available (with size limits for performance)
-        // This requires streaming body inspection during request processing
+        // Inspect the request body when the proxy has supplied it. The proxy
+        // enforces the configured maximum body size, and we still cap the
+        // amount examined here to keep regex work bounded.
+        const MAX_BODY_INSPECTION: usize = 1024 * 1024; // 1 MiB
+        if let Some(body) = &ctx.body {
+            let slice = if body.len() > MAX_BODY_INSPECTION {
+                &body[..MAX_BODY_INSPECTION]
+            } else {
+                &body[..]
+            };
+            let content = String::from_utf8_lossy(slice);
+            let found = self.inspect_body(&content).or_else(|| {
+                percent_decode(&content)
+                    .filter(|decoded| decoded != &content)
+                    .and_then(|decoded| self.inspect_body(&decoded))
+            });
+            if let Some((pattern, matched)) = found {
+                return Decision::Block {
+                    status: self.severity_to_status(&pattern.severity),
+                    reason: format!(
+                        "Content inspection: {} detected in body: {}",
+                        pattern.name, matched
+                    ),
+                };
+            }
+        }
 
         Decision::Allow
     }

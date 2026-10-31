@@ -56,7 +56,7 @@ impl WafError {
     }
 
     /// Create an HTTP error
-    pub fn Http<T: Into<String>>(msg: T) -> Self {
+    pub fn http<T: Into<String>>(msg: T) -> Self {
         WafError::NetworkError(msg.into())
     }
 

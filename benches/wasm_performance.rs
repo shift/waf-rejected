@@ -15,11 +15,13 @@ fn bench_wasm_engine_performance(c: &mut Criterion) {
     for pool_size in [1, 5, 10, 20].iter() {
         let config = WasmEngineConfig {
             module_path: "rules/coraza.wasm".to_string(),
-            memory_limit: 16 * 1024 * 1024,
+            memory_limit_mb: 16,
             timeout_ms: 100,
             debug: false,
             instance_pool_size: *pool_size,
             hot_reload: false,
+            enable_memory_mapping: false,
+            enable_shared_memory: false,
         };
 
         group.bench_with_input(
@@ -37,8 +39,9 @@ fn bench_wasm_engine_performance(c: &mut Criterion) {
                         headers: std::collections::HashMap::new(),
                         body: None,
                         client_ip: "192.168.1.100".to_string(),
-                        user_agent: Some("TestAgent/1.0".to_string()),
-                        timestamp: std::time::SystemTime::now(),
+                        http_version: "HTTP/1.1".to_string(),
+                        geo_context: None,
+                        security_metadata: Default::default(),
                     };
 
                     // Process request through WASM engine
@@ -51,13 +54,19 @@ fn bench_wasm_engine_performance(c: &mut Criterion) {
 
     // Test different attack patterns for performance
     let attack_patterns = vec![
-        ("clean_request", "/normal/path"),
-        ("sql_injection", "/test?id=' OR '1'='1"),
-        ("xss_attack", "/search?q=<script>alert('xss')</script>"),
-        ("path_traversal", "/file?path=../../../etc/passwd"),
+        ("clean_request", "/normal/path".to_string()),
+        ("sql_injection", "/test?id=' OR '1'='1".to_string()),
+        (
+            "xss_attack",
+            "/search?q=<script>alert('xss')</script>".to_string(),
+        ),
+        (
+            "path_traversal",
+            "/file?path=../../../etc/passwd".to_string(),
+        ),
         (
             "large_request",
-            &format!("/data?payload={}", "A".repeat(10000)),
+            format!("/data?payload={}", "A".repeat(10000)),
         ),
     ];
 
@@ -77,8 +86,9 @@ fn bench_wasm_engine_performance(c: &mut Criterion) {
                     headers: std::collections::HashMap::new(),
                     body: None,
                     client_ip: "192.168.1.100".to_string(),
-                    user_agent: Some("TestAgent/1.0".to_string()),
-                    timestamp: std::time::SystemTime::now(),
+                    http_version: "HTTP/1.1".to_string(),
+                    geo_context: None,
+                    security_metadata: Default::default(),
                 };
 
                 let decision = engine.process_request(context).await;
@@ -122,8 +132,9 @@ fn bench_wasm_concurrent_processing(c: &mut Criterion) {
                                 headers: std::collections::HashMap::new(),
                                 body: None,
                                 client_ip: "192.168.1.100".to_string(),
-                                user_agent: Some("TestAgent/1.0".to_string()),
-                                timestamp: std::time::SystemTime::now(),
+                                http_version: "HTTP/1.1".to_string(),
+                                geo_context: None,
+                                security_metadata: Default::default(),
                             };
 
                             engine_clone.process_request(context).await
@@ -165,8 +176,9 @@ fn bench_pool_efficiency(c: &mut Criterion) {
                     headers: std::collections::HashMap::new(),
                     body: None,
                     client_ip: "192.168.1.100".to_string(),
-                    user_agent: Some("TestAgent/1.0".to_string()),
-                    timestamp: std::time::SystemTime::now(),
+                    http_version: "HTTP/1.1".to_string(),
+                    geo_context: None,
+                    security_metadata: Default::default(),
                 };
 
                 let decision = engine.process_request(context).await;

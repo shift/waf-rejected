@@ -5,20 +5,17 @@
 
 use std::time::{Duration, SystemTime};
 use tokio::time::sleep;
-use tracing::{info, debug, warn};
+use tracing::{debug, info, warn};
 
 use waf_ingress::waf::storage::{
-    TtlEnhancementManager, TtlCleanupConfig, 
-    BulkDeletionOptimizer, BulkDeletionConfig, DeletionKey, TransactionResult,
-    MemoryStorageAdapter, StorageAdapter, ReadConsistency,
+    BulkDeletionConfig, BulkDeletionOptimizer, DeletionKey, MemoryStorageAdapter, ReadConsistency,
+    StorageAdapter, TransactionResult, TtlCleanupConfig, TtlEnhancementManager,
 };
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
     info!("🚀 Starting Comprehensive TTL Performance Validation (P2-07)");
 
@@ -92,13 +89,13 @@ async fn test_integrated_ttl_enhancements() -> Result<(), Box<dyn std::error::Er
     // Simulate cleanup process with integrated components
     let deletion_fn = |keys: Vec<DeletionKey>| async move {
         let total_size: u64 = keys.iter().map(|k| k.estimated_size).sum();
-        
+
         // Simulate variable processing time based on priority
         let avg_priority = keys.iter().map(|k| k.priority as f64).sum::<f64>() / keys.len() as f64;
         let processing_time = if avg_priority > 3.0 { 10 } else { 20 };
-        
+
         sleep(Duration::from_millis(processing_time)).await;
-        
+
         Ok(TransactionResult {
             keys_count: keys.len(),
             bytes_reclaimed: total_size,
@@ -109,7 +106,9 @@ async fn test_integrated_ttl_enhancements() -> Result<(), Box<dyn std::error::Er
     };
 
     let cleanup_start = SystemTime::now();
-    let deletion_result = bulk_optimizer.execute_bulk_deletion(key_groups, deletion_fn).await?;
+    let deletion_result = bulk_optimizer
+        .execute_bulk_deletion(key_groups, deletion_fn)
+        .await?;
     let cleanup_duration = cleanup_start.elapsed().unwrap();
 
     // Update TTL manager statistics
@@ -118,7 +117,8 @@ async fn test_integrated_ttl_enhancements() -> Result<(), Box<dyn std::error::Er
         bytes_cleaned: deletion_result.bytes_reclaimed,
         processing_time_ms: cleanup_duration.as_millis() as u64,
         batches_processed: deletion_result.transaction_results.len() as u32,
-        priority_keys: deletion_result.transaction_results
+        priority_keys: deletion_result
+            .transaction_results
             .iter()
             .map(|tr| tr.keys_count / 10) // Estimate priority keys
             .sum::<usize>() as u64,
@@ -132,7 +132,9 @@ async fn test_integrated_ttl_enhancements() -> Result<(), Box<dyn std::error::Er
     assert_eq!(deletion_result.failed_deletions, 0);
 
     // Check adaptive behavior
-    let interval_adjustment = ttl_manager.should_adjust_interval(deletion_result.keys_deleted).await;
+    let interval_adjustment = ttl_manager
+        .should_adjust_interval(deletion_result.keys_deleted)
+        .await;
     if let Some(new_interval) = interval_adjustment {
         ttl_manager.apply_interval_adjustment(new_interval).await;
         debug!("Interval adjusted based on cleanup performance");
@@ -142,9 +144,18 @@ async fn test_integrated_ttl_enhancements() -> Result<(), Box<dyn std::error::Er
     let bulk_stats = bulk_optimizer.get_stats().await;
 
     info!("Integration test results:");
-    info!("  TTL cleanup rate: {:.1} keys/sec", ttl_stats.avg_cleanup_rate_per_sec);
-    info!("  Bulk deletion rate: {:.1} keys/sec", bulk_stats.avg_deletion_rate_per_sec);
-    info!("  Combined efficiency: {:.1}%", bulk_stats.efficiency_ratio * 100.0);
+    info!(
+        "  TTL cleanup rate: {:.1} keys/sec",
+        ttl_stats.avg_cleanup_rate_per_sec
+    );
+    info!(
+        "  Bulk deletion rate: {:.1} keys/sec",
+        bulk_stats.avg_deletion_rate_per_sec
+    );
+    info!(
+        "  Combined efficiency: {:.1}%",
+        bulk_stats.efficiency_ratio * 100.0
+    );
 
     assert!(ttl_stats.avg_cleanup_rate_per_sec > 0.0);
     assert!(bulk_stats.efficiency_ratio > 0.95); // >95% efficiency
@@ -161,11 +172,11 @@ async fn test_realistic_workload_simulation() -> Result<(), Box<dyn std::error::
 
     // Simulate realistic workload patterns over time
     let workload_phases = vec![
-        ("Startup Phase", 50usize, 1u8, 2u8),      // Light load, low priority
-        ("Normal Operation", 200usize, 2u8, 3u8),  // Medium load, mixed priority
-        ("Peak Hours", 500usize, 3u8, 4u8),        // Heavy load, high priority
+        ("Startup Phase", 50usize, 1u8, 2u8), // Light load, low priority
+        ("Normal Operation", 200usize, 2u8, 3u8), // Medium load, mixed priority
+        ("Peak Hours", 500usize, 3u8, 4u8),   // Heavy load, high priority
         ("Maintenance Window", 1000usize, 1u8, 5u8), // Very heavy load, mixed priority
-        ("Off-Peak", 100usize, 2u8, 2u8),          // Return to light load
+        ("Off-Peak", 100usize, 2u8, 2u8),     // Return to light load
     ];
 
     let mut total_processed = 0u64;
@@ -177,15 +188,18 @@ async fn test_realistic_workload_simulation() -> Result<(), Box<dyn std::error::
         // Generate keys with realistic patterns
         let keys: Vec<DeletionKey> = (0..key_count)
             .map(|i| {
-                let priority = base_priority + ((i % (max_priority - base_priority + 1) as usize) as u8);
+                let priority =
+                    base_priority + ((i % (max_priority - base_priority + 1) as usize) as u8);
                 DeletionKey {
-                    key: format!("{}_{}", phase_name.replace(" ", "_").to_lowercase(), i).into_bytes(),
+                    key: format!("{}_{}", phase_name.replace(" ", "_").to_lowercase(), i)
+                        .into_bytes(),
                     estimated_size: 50 + (i as u64 * 25) + (priority as u64 * 100),
                     priority,
                     expiration_time: SystemTime::now()
                         .duration_since(SystemTime::UNIX_EPOCH)
                         .unwrap()
-                        .as_millis() as u64 + (i as u64 * 1000),
+                        .as_millis() as u64
+                        + (i as u64 * 1000),
                 }
             })
             .collect();
@@ -194,34 +208,41 @@ async fn test_realistic_workload_simulation() -> Result<(), Box<dyn std::error::
 
         // Process keys with optimized grouping
         let key_groups = bulk_optimizer.optimize_key_grouping(keys).await;
-        
+
         // Realistic deletion function that varies by load
         let deletion_fn = move |keys: Vec<DeletionKey>| async move {
             let total_size: u64 = keys.iter().map(|k| k.estimated_size).sum();
-            
+
             // Processing time varies with batch size and priority
-            let avg_priority = keys.iter().map(|k| k.priority as f64).sum::<f64>() / keys.len() as f64;
+            let avg_priority =
+                keys.iter().map(|k| k.priority as f64).sum::<f64>() / keys.len() as f64;
             let base_time = (keys.len() as f64).sqrt() as u64;
             let priority_factor = if avg_priority > 4.0 { 0.5 } else { 1.0 }; // High priority = faster
             let processing_time = (base_time as f64 * priority_factor) as u64;
-            
+
             if processing_time > 0 {
                 sleep(Duration::from_millis(processing_time)).await;
             }
-            
+
             // Simulate occasional failures in high-load scenarios
             let success = (key_count < 800) || (keys.len() % 20) != 0; // Deterministic "failure" pattern
-            
+
             Ok(TransactionResult {
                 keys_count: keys.len(),
                 bytes_reclaimed: total_size,
                 duration_ms: processing_time,
                 success,
-                error_message: if success { None } else { Some("High load timeout".to_string()) },
+                error_message: if success {
+                    None
+                } else {
+                    Some("High load timeout".to_string())
+                },
             })
         };
 
-        let result = bulk_optimizer.execute_bulk_deletion(key_groups, deletion_fn).await?;
+        let result = bulk_optimizer
+            .execute_bulk_deletion(key_groups, deletion_fn)
+            .await?;
         let phase_duration = phase_start.elapsed().unwrap();
 
         total_processed += result.keys_deleted;
@@ -233,7 +254,8 @@ async fn test_realistic_workload_simulation() -> Result<(), Box<dyn std::error::
             bytes_cleaned: result.bytes_reclaimed,
             processing_time_ms: phase_duration.as_millis() as u64,
             batches_processed: result.transaction_results.len() as u32,
-            priority_keys: result.transaction_results
+            priority_keys: result
+                .transaction_results
                 .iter()
                 .filter(|tr| tr.success)
                 .map(|tr| tr.keys_count / 5) // Estimate high-priority keys
@@ -243,13 +265,18 @@ async fn test_realistic_workload_simulation() -> Result<(), Box<dyn std::error::
         ttl_manager.update_stats(&cleanup_result).await;
 
         // Check for adaptive adjustments
-        if let Some(new_interval) = ttl_manager.should_adjust_interval(result.keys_deleted).await {
+        if let Some(new_interval) = ttl_manager
+            .should_adjust_interval(result.keys_deleted)
+            .await
+        {
             ttl_manager.apply_interval_adjustment(new_interval).await;
             debug!("Interval adjusted during {} phase", phase_name);
         }
 
-        debug!("Phase '{}' completed: {} keys processed in {:?}", 
-               phase_name, result.keys_deleted, phase_duration);
+        debug!(
+            "Phase '{}' completed: {} keys processed in {:?}",
+            phase_name, result.keys_deleted, phase_duration
+        );
     }
 
     // Validate overall performance
@@ -259,9 +286,18 @@ async fn test_realistic_workload_simulation() -> Result<(), Box<dyn std::error::
     info!("Realistic workload results:");
     info!("  Total keys processed: {}", total_processed);
     info!("  Total duration: {:?}", total_duration);
-    info!("  Overall rate: {:.1} keys/sec", total_processed as f64 / total_duration.as_secs_f64());
-    info!("  TTL adaptive adjustments: {}", final_ttl_stats.adaptive_interval_changes);
-    info!("  Bulk operation efficiency: {:.1}%", final_bulk_stats.efficiency_ratio * 100.0);
+    info!(
+        "  Overall rate: {:.1} keys/sec",
+        total_processed as f64 / total_duration.as_secs_f64()
+    );
+    info!(
+        "  TTL adaptive adjustments: {}",
+        final_ttl_stats.adaptive_interval_changes
+    );
+    info!(
+        "  Bulk operation efficiency: {:.1}%",
+        final_bulk_stats.efficiency_ratio * 100.0
+    );
 
     assert!(total_processed >= 1850); // Should process most keys successfully
     assert!(final_bulk_stats.efficiency_ratio > 0.85); // >85% efficiency under realistic load
@@ -311,7 +347,8 @@ async fn test_stress_testing() -> Result<(), Box<dyn std::error::Error>> {
             expiration_time: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
-                .as_millis() as u64 + (i as u64 * 100),
+                .as_millis() as u64
+                + (i as u64 * 100),
         })
         .collect();
 
@@ -326,17 +363,17 @@ async fn test_stress_testing() -> Result<(), Box<dyn std::error::Error>> {
     for batch_start in (0..stress_key_count).step_by(batch_size) {
         let batch_end = (batch_start + batch_size).min(stress_key_count);
         let batch_keys = stress_keys[batch_start..batch_end].to_vec();
-        
+
         // Don't clone the manager, just use it for each batch sequentially
         let groups = bulk_optimizer.optimize_key_grouping(batch_keys).await;
-        
+
         let deletion_fn = |keys: Vec<DeletionKey>| async move {
             let total_size: u64 = keys.iter().map(|k| k.estimated_size).sum();
-            
+
             // Fast processing for stress test
             let processing_time = 5 + (keys.len() / 20) as u64;
             sleep(Duration::from_millis(processing_time)).await;
-            
+
             Ok(TransactionResult {
                 keys_count: keys.len(),
                 bytes_reclaimed: total_size,
@@ -346,8 +383,10 @@ async fn test_stress_testing() -> Result<(), Box<dyn std::error::Error>> {
             })
         };
 
-        let result = bulk_optimizer.execute_bulk_deletion(groups, deletion_fn).await?;
-        
+        let result = bulk_optimizer
+            .execute_bulk_deletion(groups, deletion_fn)
+            .await?;
+
         // Update TTL manager for each batch
         let cleanup_result = waf_ingress::waf::storage::CleanupResult {
             expired_keys: result.keys_deleted,
@@ -358,7 +397,7 @@ async fn test_stress_testing() -> Result<(), Box<dyn std::error::Error>> {
             adaptive_adjustments: 0,
         };
         ttl_manager.update_stats(&cleanup_result).await;
-        
+
         total_stress_processed += result.keys_deleted;
         total_stress_bytes += result.bytes_reclaimed;
     }
@@ -370,12 +409,27 @@ async fn test_stress_testing() -> Result<(), Box<dyn std::error::Error>> {
     let stress_bulk_stats = bulk_optimizer.get_stats().await;
 
     info!("Stress test results:");
-    info!("  Keys processed: {}/{}", total_stress_processed, stress_key_count);
+    info!(
+        "  Keys processed: {}/{}",
+        total_stress_processed, stress_key_count
+    );
     info!("  Total duration: {:?}", stress_duration);
-    info!("  Processing rate: {:.1} keys/sec", total_stress_processed as f64 / stress_duration.as_secs_f64());
-    info!("  Bytes reclaimed: {} MB", total_stress_bytes / (1024 * 1024));
-    info!("  Average batch time: {:.2}ms", stress_bulk_stats.avg_transaction_time_ms);
-    info!("  Efficiency: {:.1}%", stress_bulk_stats.efficiency_ratio * 100.0);
+    info!(
+        "  Processing rate: {:.1} keys/sec",
+        total_stress_processed as f64 / stress_duration.as_secs_f64()
+    );
+    info!(
+        "  Bytes reclaimed: {} MB",
+        total_stress_bytes / (1024 * 1024)
+    );
+    info!(
+        "  Average batch time: {:.2}ms",
+        stress_bulk_stats.avg_transaction_time_ms
+    );
+    info!(
+        "  Efficiency: {:.1}%",
+        stress_bulk_stats.efficiency_ratio * 100.0
+    );
 
     // Stress test acceptance criteria
     assert_eq!(total_stress_processed, stress_key_count as u64); // Should process all keys
@@ -411,12 +465,15 @@ async fn test_performance_regression_validation() -> Result<(), Box<dyn std::err
     info!("  Baseline rate: {:.1} keys/sec", baseline_rate);
     info!("  Enhanced rate: {:.1} keys/sec", enhanced_rate);
     info!("  Improvement ratio: {:.2}x", improvement_ratio);
-    info!("  Enhanced efficiency: {:.1}%", enhanced_result.efficiency_ratio * 100.0);
+    info!(
+        "  Enhanced efficiency: {:.1}%",
+        enhanced_result.efficiency_ratio * 100.0
+    );
 
     // Regression validation criteria
     assert!(improvement_ratio >= 1.0); // Enhanced should be at least as fast as baseline
     assert!(enhanced_result.efficiency_ratio > 0.95); // High efficiency maintained
-    
+
     if improvement_ratio < 1.2 {
         warn!("Performance improvement is less than 20% - consider further optimizations");
     }
@@ -430,17 +487,38 @@ async fn test_end_to_end_storage_integration() -> Result<(), Box<dyn std::error:
 
     // Create storage adapter with TTL support
     let storage = MemoryStorageAdapter::new(
-        Some(2000), // Capacity
+        Some(2000),                // Capacity
         Duration::from_millis(50), // Fast cleanup for testing
-    ).await?;
+    )
+    .await?;
 
     // Insert test data with various TTL values
     let test_data = vec![
-        (b"short_ttl_1".to_vec(), b"value1".to_vec(), Some(Duration::from_millis(100))),
-        (b"short_ttl_2".to_vec(), b"value2".to_vec(), Some(Duration::from_millis(150))),
-        (b"medium_ttl_1".to_vec(), b"value3".to_vec(), Some(Duration::from_millis(300))),
-        (b"medium_ttl_2".to_vec(), b"value4".to_vec(), Some(Duration::from_millis(350))),
-        (b"long_ttl_1".to_vec(), b"value5".to_vec(), Some(Duration::from_millis(600))),
+        (
+            b"short_ttl_1".to_vec(),
+            b"value1".to_vec(),
+            Some(Duration::from_millis(100)),
+        ),
+        (
+            b"short_ttl_2".to_vec(),
+            b"value2".to_vec(),
+            Some(Duration::from_millis(150)),
+        ),
+        (
+            b"medium_ttl_1".to_vec(),
+            b"value3".to_vec(),
+            Some(Duration::from_millis(300)),
+        ),
+        (
+            b"medium_ttl_2".to_vec(),
+            b"value4".to_vec(),
+            Some(Duration::from_millis(350)),
+        ),
+        (
+            b"long_ttl_1".to_vec(),
+            b"value5".to_vec(),
+            Some(Duration::from_millis(600)),
+        ),
         (b"persistent".to_vec(), b"value6".to_vec(), None), // No TTL
     ];
 
@@ -460,10 +538,22 @@ async fn test_end_to_end_storage_integration() -> Result<(), Box<dyn std::error:
     debug!("First cleanup removed {} keys", first_cleanup);
 
     // Check expiration results
-    assert!(storage.get(b"short_ttl_1", ReadConsistency::Strong).await?.is_none());
-    assert!(storage.get(b"short_ttl_2", ReadConsistency::Strong).await?.is_none());
-    assert!(storage.get(b"medium_ttl_1", ReadConsistency::Strong).await?.is_some());
-    assert!(storage.get(b"persistent", ReadConsistency::Strong).await?.is_some());
+    assert!(storage
+        .get(b"short_ttl_1", ReadConsistency::Strong)
+        .await?
+        .is_none());
+    assert!(storage
+        .get(b"short_ttl_2", ReadConsistency::Strong)
+        .await?
+        .is_none());
+    assert!(storage
+        .get(b"medium_ttl_1", ReadConsistency::Strong)
+        .await?
+        .is_some());
+    assert!(storage
+        .get(b"persistent", ReadConsistency::Strong)
+        .await?
+        .is_some());
 
     // Wait for second batch to expire
     sleep(Duration::from_millis(200)).await;
@@ -471,10 +561,22 @@ async fn test_end_to_end_storage_integration() -> Result<(), Box<dyn std::error:
     debug!("Second cleanup removed {} keys", second_cleanup);
 
     // Check second expiration results
-    assert!(storage.get(b"medium_ttl_1", ReadConsistency::Strong).await?.is_none());
-    assert!(storage.get(b"medium_ttl_2", ReadConsistency::Strong).await?.is_none());
-    assert!(storage.get(b"long_ttl_1", ReadConsistency::Strong).await?.is_some());
-    assert!(storage.get(b"persistent", ReadConsistency::Strong).await?.is_some());
+    assert!(storage
+        .get(b"medium_ttl_1", ReadConsistency::Strong)
+        .await?
+        .is_none());
+    assert!(storage
+        .get(b"medium_ttl_2", ReadConsistency::Strong)
+        .await?
+        .is_none());
+    assert!(storage
+        .get(b"long_ttl_1", ReadConsistency::Strong)
+        .await?
+        .is_some());
+    assert!(storage
+        .get(b"persistent", ReadConsistency::Strong)
+        .await?
+        .is_some());
 
     // Final cleanup after all TTLs expired
     sleep(Duration::from_millis(500)).await;
@@ -482,8 +584,14 @@ async fn test_end_to_end_storage_integration() -> Result<(), Box<dyn std::error:
     debug!("Final cleanup removed {} keys", final_cleanup);
 
     // Only persistent key should remain
-    assert!(storage.get(b"long_ttl_1", ReadConsistency::Strong).await?.is_none());
-    assert!(storage.get(b"persistent", ReadConsistency::Strong).await?.is_some());
+    assert!(storage
+        .get(b"long_ttl_1", ReadConsistency::Strong)
+        .await?
+        .is_none());
+    assert!(storage
+        .get(b"persistent", ReadConsistency::Strong)
+        .await?
+        .is_some());
 
     let total_cleaned = first_cleanup + second_cleanup + final_cleanup;
     debug!("Total keys cleaned up: {}", total_cleaned);
@@ -519,9 +627,11 @@ struct EnhancedCleanupResult {
     efficiency_ratio: f64,
 }
 
-async fn simulate_simple_cleanup(keys: Vec<DeletionKey>) -> Result<SimpleCleanupResult, Box<dyn std::error::Error>> {
+async fn simulate_simple_cleanup(
+    keys: Vec<DeletionKey>,
+) -> Result<SimpleCleanupResult, Box<dyn std::error::Error>> {
     let start = SystemTime::now();
-    
+
     // Simple sequential processing
     let mut processed = 0u64;
     for batch in keys.chunks(50) {
@@ -529,7 +639,7 @@ async fn simulate_simple_cleanup(keys: Vec<DeletionKey>) -> Result<SimpleCleanup
         sleep(Duration::from_millis(batch.len() as u64 * 2)).await;
         processed += batch.len() as u64;
     }
-    
+
     let duration = start.elapsed().unwrap();
     Ok(SimpleCleanupResult {
         keys_deleted: processed,
@@ -537,19 +647,21 @@ async fn simulate_simple_cleanup(keys: Vec<DeletionKey>) -> Result<SimpleCleanup
     })
 }
 
-async fn simulate_enhanced_cleanup(keys: Vec<DeletionKey>) -> Result<EnhancedCleanupResult, Box<dyn std::error::Error>> {
+async fn simulate_enhanced_cleanup(
+    keys: Vec<DeletionKey>,
+) -> Result<EnhancedCleanupResult, Box<dyn std::error::Error>> {
     let bulk_optimizer = BulkDeletionOptimizer::new(BulkDeletionConfig::default());
-    
+
     let start = SystemTime::now();
     let key_groups = bulk_optimizer.optimize_key_grouping(keys).await;
-    
+
     let deletion_fn = |keys: Vec<DeletionKey>| async move {
         let total_size: u64 = keys.iter().map(|k| k.estimated_size).sum();
-        
+
         // Enhanced processing with optimizations
         let processing_time = (keys.len() as f64).sqrt() as u64;
         sleep(Duration::from_millis(processing_time)).await;
-        
+
         Ok(TransactionResult {
             keys_count: keys.len(),
             bytes_reclaimed: total_size,
@@ -559,11 +671,13 @@ async fn simulate_enhanced_cleanup(keys: Vec<DeletionKey>) -> Result<EnhancedCle
         })
     };
 
-    let result = bulk_optimizer.execute_bulk_deletion(key_groups, deletion_fn).await?;
+    let result = bulk_optimizer
+        .execute_bulk_deletion(key_groups, deletion_fn)
+        .await?;
     let duration = start.elapsed().unwrap();
-    
+
     let stats = bulk_optimizer.get_stats().await;
-    
+
     Ok(EnhancedCleanupResult {
         keys_deleted: result.keys_deleted,
         processing_time_ms: duration.as_millis() as u64,

@@ -38,31 +38,31 @@ impl MemoryStorageAdapter {
             ttl_cleanup_interval,
             expired_count: Arc::new(RwLock::new(0)),
         };
-        
+
         // Start TTL cleanup task
         adapter.start_ttl_cleanup().await;
-        
+
         Ok(adapter)
     }
-    
+
     /// Start background TTL cleanup task
     async fn start_ttl_cleanup(&self) {
         let data = self.data.clone();
         let expired_count = self.expired_count.clone();
         let cleanup_interval = self.ttl_cleanup_interval;
-        
+
         tokio::spawn(async move {
             let mut interval = interval(cleanup_interval);
-            
+
             loop {
                 interval.tick().await;
-                
+
                 let now = SystemTime::now();
                 let mut data_lock = data.write().await;
                 let mut expired_lock = expired_count.write().await;
-                
+
                 let mut expired_keys = Vec::new();
-                
+
                 for (key, entry) in data_lock.iter() {
                     if let Some(expires_at) = entry.expires_at {
                         if now >= expires_at {
@@ -70,11 +70,11 @@ impl MemoryStorageAdapter {
                         }
                     }
                 }
-                
+
                 for key in &expired_keys {
                     data_lock.remove(key);
                 }
-                
+
                 if !expired_keys.is_empty() {
                     *expired_lock += expired_keys.len() as u64;
                     debug!("Expired {} keys from memory storage", expired_keys.len());
@@ -82,14 +82,18 @@ impl MemoryStorageAdapter {
             }
         });
     }
-    
+
     /// Check if storage has reached capacity
     async fn check_capacity(&self) -> StorageResult<()> {
         if let Some(max_size) = self.max_size {
             let data = self.data.read().await;
             if data.len() >= max_size {
                 return Err(StorageError::DatabaseError {
-                    message: format!("Memory storage capacity exceeded: {}/{}", data.len(), max_size)
+                    message: format!(
+                        "Memory storage capacity exceeded: {}/{}",
+                        data.len(),
+                        max_size
+                    ),
                 });
             }
         }
@@ -99,15 +103,19 @@ impl MemoryStorageAdapter {
 
 #[async_trait]
 impl StorageAdapter for MemoryStorageAdapter {
-    async fn get(&self, key: &[u8], consistency: ReadConsistency) -> StorageResult<Option<Vec<u8>>> {
+    async fn get(
+        &self,
+        key: &[u8],
+        consistency: ReadConsistency,
+    ) -> StorageResult<Option<Vec<u8>>> {
         // For memory storage, consistency level doesn't affect the implementation much
         // since all data is immediately available. We'll use different lock strategies for performance.
-        
+
         match consistency {
             ReadConsistency::Strong => {
                 // Strong consistency - full read lock, ensures complete consistency
                 let data = self.data.read().await;
-                
+
                 if let Some(entry) = data.get(key) {
                     // Check if entry has expired
                     if let Some(expires_at) = entry.expires_at {
@@ -116,12 +124,12 @@ impl StorageAdapter for MemoryStorageAdapter {
                             return Ok(None);
                         }
                     }
-                    
+
                     Ok(Some(entry.value.clone()))
                 } else {
                     Ok(None)
                 }
-            },
+            }
             ReadConsistency::Eventual => {
                 // Eventual consistency - optimized read that can potentially
                 // use try_read for better concurrency
@@ -138,7 +146,7 @@ impl StorageAdapter for MemoryStorageAdapter {
                         } else {
                             Ok(None)
                         }
-                    },
+                    }
                     Err(_) => {
                         // If try_read fails, fall back to regular read
                         let data = self.data.read().await;
@@ -157,31 +165,31 @@ impl StorageAdapter for MemoryStorageAdapter {
             }
         }
     }
-    
+
     async fn set(&self, key: &[u8], value: &[u8], ttl: Option<Duration>) -> StorageResult<()> {
         self.check_capacity().await?;
-        
+
         let expires_at = ttl.map(|duration| SystemTime::now() + duration);
-        
+
         let entry = TTLEntry {
             value: value.to_vec(),
             expires_at,
         };
-        
+
         let mut data = self.data.write().await;
         data.insert(key.to_vec(), entry);
-        
+
         Ok(())
     }
-    
+
     async fn delete(&self, key: &[u8]) -> StorageResult<bool> {
         let mut data = self.data.write().await;
         Ok(data.remove(key).is_some())
     }
-    
+
     async fn exists(&self, key: &[u8]) -> StorageResult<bool> {
         let data = self.data.read().await;
-        
+
         if let Some(entry) = data.get(key) {
             // Check if entry has expired
             if let Some(expires_at) = entry.expires_at {
@@ -194,14 +202,14 @@ impl StorageAdapter for MemoryStorageAdapter {
             Ok(false)
         }
     }
-    
+
     async fn expire_keys(&self) -> StorageResult<u64> {
         let now = SystemTime::now();
         let mut data = self.data.write().await;
         let mut expired_count = self.expired_count.write().await;
-        
+
         let mut expired_keys = Vec::new();
-        
+
         for (key, entry) in data.iter() {
             if let Some(expires_at) = entry.expires_at {
                 if now >= expires_at {
@@ -209,26 +217,27 @@ impl StorageAdapter for MemoryStorageAdapter {
                 }
             }
         }
-        
+
         for key in &expired_keys {
             data.remove(key);
         }
-        
+
         let expired_len = expired_keys.len() as u64;
         *expired_count += expired_len;
-        
+
         Ok(expired_len)
     }
-    
+
     async fn stats(&self) -> StorageResult<StorageStats> {
         let data = self.data.read().await;
         let expired_count = *self.expired_count.read().await;
-        
+
         let key_count = data.len() as u64;
-        let data_size = data.iter()
+        let data_size = data
+            .iter()
             .map(|(k, v)| k.len() + v.value.len())
             .sum::<usize>() as u64;
-        
+
         Ok(StorageStats {
             key_count,
             data_size,
@@ -237,12 +246,12 @@ impl StorageAdapter for MemoryStorageAdapter {
             cache_hit_ratio: Some(1.0), // All data is in memory
         })
     }
-    
+
     async fn flush(&self) -> StorageResult<()> {
         // No-op for memory storage
         Ok(())
     }
-    
+
     async fn compact(&self) -> StorageResult<()> {
         // No-op for memory storage
         Ok(())
@@ -253,52 +262,64 @@ impl StorageAdapter for MemoryStorageAdapter {
 mod tests {
     use super::*;
     use tokio::time::{sleep, Duration};
-    
+
     #[tokio::test]
     async fn test_memory_storage_basic_operations() {
-        let adapter = MemoryStorageAdapter::new(None, Duration::from_secs(60)).await.unwrap();
-        
+        let adapter = MemoryStorageAdapter::new(None, Duration::from_secs(60))
+            .await
+            .unwrap();
+
         // Test set and get
         adapter.set(b"key1", b"value1", None).await.unwrap();
         let result = adapter.get(b"key1", ReadConsistency::Strong).await.unwrap();
         assert_eq!(result, Some(b"value1".to_vec()));
-        
+
         // Test exists
         assert!(adapter.exists(b"key1").await.unwrap());
         assert!(!adapter.exists(b"key2").await.unwrap());
-        
+
         // Test delete
         assert!(adapter.delete(b"key1").await.unwrap());
         assert!(!adapter.delete(b"key1").await.unwrap());
     }
-    
+
     #[tokio::test]
     async fn test_memory_storage_ttl() {
-        let adapter = MemoryStorageAdapter::new(None, Duration::from_millis(100)).await.unwrap();
-        
+        let adapter = MemoryStorageAdapter::new(None, Duration::from_millis(100))
+            .await
+            .unwrap();
+
         // Set with TTL
-        adapter.set(b"ttl_key", b"ttl_value", Some(Duration::from_millis(50))).await.unwrap();
-        
+        adapter
+            .set(b"ttl_key", b"ttl_value", Some(Duration::from_millis(50)))
+            .await
+            .unwrap();
+
         // Should exist immediately
         assert!(adapter.exists(b"ttl_key").await.unwrap());
-        
+
         // Wait for expiration
         sleep(Duration::from_millis(100)).await;
-        
+
         // Should be expired
         assert!(!adapter.exists(b"ttl_key").await.unwrap());
-        let result = adapter.get(b"ttl_key", ReadConsistency::Strong).await.unwrap();
+        let result = adapter
+            .get(b"ttl_key", ReadConsistency::Strong)
+            .await
+            .unwrap();
         assert_eq!(result, None);
     }
-    
+
     #[tokio::test]
     async fn test_memory_storage_capacity() {
-        let adapter = MemoryStorageAdapter::new(Some(2), Duration::from_secs(60)).await.unwrap();
-        
+        let adapter = MemoryStorageAdapter::new(Some(2), Duration::from_secs(60))
+            .await
+            .unwrap();
+
         // Add up to capacity
         adapter.set(b"key1", b"value1", None).await.unwrap();
         adapter.set(b"key2", b"value2", None).await.unwrap();
-        
+
         // Should fail when exceeding capacity
         let result = adapter.set(b"key3", b"value3", None).await;
         assert!(result.is_err());

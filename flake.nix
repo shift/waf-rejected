@@ -76,10 +76,13 @@
           # Build main binary
           cargoBuildCommand = "cargo build --release --bin waf-ingress";
           cargoCheckCommand = "cargo check --release --bin waf-ingress";
+          # Tests run in the dedicated CI/test jobs; keeping them out of the
+          # package build avoids compiling every test utility binary twice.
+          doCheck = false;
           
           meta = with pkgs.lib; {
             description = "High-Performance Rust-Based WAF Ingress";
-            homepage = "https://github.com/your-org/waf-ingress";
+            homepage = "https://github.com/shift/waf-rejected";
             license = with licenses; [ mit asl20 ];
             maintainers = [ ];
           };

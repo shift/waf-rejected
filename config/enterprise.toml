@@ -1,119 +1,114 @@
-# Enterprise WAF Configuration for Testing
-# Optimized for high-performance enterprise deployment
+# Enterprise WAF Configuration
+bind_addr = "0.0.0.0:8080"
+health_bind_addr = "0.0.0.0:8081"
+upstream_uri = "https://backend.enterprise.local:8443"
 
 [server]
-host = "0.0.0.0"
-port = 8080
-workers = 8
 max_connections = 10000
+trusted_proxies = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+request_timeout_secs = 30
+keep_alive_timeout_secs = 90
+enable_http2 = true
+enable_http3 = false
+supported_http_versions = ["1.0", "1.1", "2"]
+max_body_size = 33554432
 
 [server.tls]
 enabled = true
-cert_file = "/etc/ssl/certs/waf.crt"
-key_file = "/etc/ssl/private/waf.key"
+cert_path = "/etc/ssl/certs/waf.crt"
+key_path = "/etc/ssl/private/waf.key"
 min_version = "1.2"
-ciphers = "ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:!aNULL:!MD5:!DSS"
+max_version = "1.3"
+alpn_protocols = ["h2", "http/1.1"]
+require_client_cert = false
 
-[proxy]
-upstream = "https://backend.enterprise.local:8443"
-timeout_seconds = 30
-retry_attempts = 3
-health_check_interval = 10
+[logging]
+level = "info"
+json_format = true
 
-[wasm]
+[waf]
 enabled = true
-module_path = "rules/enterprise-modsecurity.wasm"
-memory_limit = 33554432  # 32MB for enterprise rules
-execution_timeout_ms = 150
-debug_mode = false
-async_execution = true
+fail_mode = "closed"
+upstream_timeout_ms = 30000
 
-[wasm.pooling]
-max_instances = 200
-instance_reuse = true
-gc_interval_seconds = 180
+[waf.rate_limit]
+per_ip_enabled = true
+per_ip_max_requests = 300
+per_ip_window_secs = 60
+global_enabled = true
+global_max_requests = 50000
+global_window_secs = 60
 
-[security]
-max_request_size = 10485760  # 10MB
-max_header_size = 32768      # 32KB
-rate_limit_requests = 10000  # Per IP per minute
-rate_limit_window = 60
-
-[security.geo]
+[waf.security_events]
 enabled = true
-database_path = "/var/lib/waf/GeoIP.mmdb"
-cache_ttl_seconds = 3600
-threat_intel_enabled = true
+format = "json"
+min_threat_level = "medium"
+enable_cef = true
+cef_output_file = "/var/log/waf/security_events.cef"
+cef_device_vendor = "WAF-Rejected"
+cef_device_product = "Enterprise WAF"
+cef_device_version = "1.0.0"
+enable_otel = true
+otel_service_name = "waf-security-events"
+otel_service_version = "1.0.0"
+otel_export_traces = true
+otel_export_logs = true
+enable_sled = true
+sled_db_path = "/var/log/waf/security.db"
+sled_max_events = 1000000
+sled_compress = true
+
+[waf.content_inspection]
+enabled = true
+inspect_headers = true
+inspect_body = true
+max_body_size = 33554432
+threat_patterns = ["sql_injection", "xss", "command_injection", "path_traversal"]
 
 [waf.geo_blocking]
 enabled = false
 blocked_countries = []
+blocked_regions = []
+block_tor = true
+block_vpn = false
+block_datacenter = false
 
-[logging]
-level = "info"
-format = "json"
-access_log = "/var/log/waf/access.log"
-error_log = "/var/log/waf/error.log"
-security_log = "/var/log/waf/security.log"
+[waf.wasm]
+enabled = false
+module_path = "rules/enterprise-modsecurity.wasm"
+memory_limit = 33554432
+timeout_ms = 150
+debug = false
+instance_pool_size = 20
+hot_reload = true
+rules_config = "rules/enterprise-modsecurity.conf"
 
-[export]
+[security.auth]
+# Set to true and provide keys (ideally from a secret) before enabling.
+enabled = false
+api_keys = []
+header_name = "X-API-Key"
+require_https = true
+
+[security.ai]
+enabled = false
+threat_threshold = 0.8
+timeout_ms = 5000
+
+[security.compliance]
 enabled = true
 
-[export.cef]
-enabled = true
-output_file = "/var/log/waf/security-events.cef"
-severity_mapping = "enterprise"
-max_file_size_mb = 100
-rotate_files = 5
+[security.compliance.audit]
+tamper_evident = true
+retention_days = 2555
+integrity_check_hours = 24
 
-[export.opentelemetry]
-enabled = true
-endpoint = "http://jaeger:14250"
-service_name = "enterprise-waf"
-batch_timeout = "2s"
-max_batch_size = 512
+[security.compliance.regulatory]
+gdpr = true
+hipaa = false
+pci_dss = true
 
-[export.sled]
-enabled = true
-database_path = "/var/lib/waf/security_events.db"
-retention_days = 90
-compression_enabled = true
-
-[metrics]
-enabled = true
-port = 9090
-endpoint = "/metrics"
-
-[health]
-enabled = true
-port = 8081
-endpoint = "/health"
-
-[redis]
-url = "redis://redis-cluster.enterprise.local:6379"
-pool_size = 20
-timeout_seconds = 5
-retry_attempts = 3
-
-# Enterprise compliance settings
-[compliance]
-pci_dss_enabled = true
-gdpr_enabled = true
-hipaa_enabled = true
-soc2_enabled = true
-
-[compliance.audit]
-enabled = true
-log_format = "json"
-include_request_body = false  # Security: don't log sensitive data
-include_response_body = false
-retention_days = 2555  # 7 years for compliance
-
-# Performance tuning for enterprise workloads
-[performance]
-worker_threads = 16
-blocking_threads = 32
-tcp_backlog = 8192
-tcp_nodelay = true
-tcp_keepalive = true
-memory_pool_size = 268435456  # 256MB
+[security.compliance.retention]
+security_events_days = 90
+audit_logs_days = 2555
+auto_delete = true

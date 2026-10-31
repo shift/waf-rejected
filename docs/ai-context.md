@@ -20,14 +20,14 @@ WAF-Rejected is a high-performance, enterprise-grade Web Application Firewall (W
 ### Build Commands
 - **Development shell**: `nix develop`
 - **Build all**: `nix build`
-- **Test**: `nix develop -c cargo test --package waf-clean`
+- **Test**: `nix develop -c cargo test --lib` and `nix develop -c cargo test --test integration`
 - **Format check**: `nix develop -c cargo fmt -- --check`
 - **Lint check**: `nix develop -c cargo clippy -- --deny warnings`
 
 ### Current Development Status
-- **Active Task**: P0-02 Authentication Implementation (CVE 9.8 - Critical)
-- **Status**: Phase 3 - Implementation
-- **Branch**: `feat/authentication`
+- **Active Task**: P0-08 Connect the Core Runtime Pipeline
+- **Status**: Implemented on `fix/connect-core-pipeline`
+- **Focus**: live body inspection, auth, rate limits, event logging, health/metrics
 - **Priority**: Fix broken access control by implementing API key validation
 
 ## Architecture Summary

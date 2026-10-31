@@ -487,15 +487,18 @@ impl AiWafMiddleware {
     /// Submit feedback for model improvement
     pub async fn submit_feedback(&self, feedback: ThreatFeedback) -> Result<()> {
         if self.ai_config.collect_feedback {
-            let mut buffer = self.feedback_buffer.lock().unwrap();
-            buffer.push(feedback);
+            let feedback_batch = {
+                let mut buffer = self.feedback_buffer.lock().unwrap();
+                buffer.push(feedback);
+                if buffer.len() >= 100 {
+                    Some(buffer.drain(..).collect::<Vec<_>>())
+                } else {
+                    None
+                }
+            };
 
-            // Process feedback when buffer is full
-            if buffer.len() >= 100 {
-                let feedback_batch = buffer.drain(..).collect::<Vec<_>>();
-                drop(buffer); // Release lock before async operation
-
-                // Update models with feedback (async)
+            // Update models with feedback (async) after the lock is released.
+            if let Some(feedback_batch) = feedback_batch {
                 if let Err(e) = self.process_feedback_batch(feedback_batch).await {
                     eprintln!("Failed to process feedback batch: {}", e);
                 }

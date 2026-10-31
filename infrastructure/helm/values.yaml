@@ -3,7 +3,7 @@
 # Image configuration
 image:
   repository: waf-rejected
-  tag: "v0.1.0"
+  tag: "v0.1.0-beta.1"
   pullPolicy: Always
 
 # Service configuration
@@ -11,7 +11,7 @@ service:
   type: LoadBalancer
   port: 80
   httpsPort: 443
-  metricsPort: 9090
+  metricsPort: 8081
 
 # Replica count
 replicaCount: 3

@@ -94,10 +94,12 @@ pub struct SharedLinearMemoryPool {
     created_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-
 impl SharedLinearMemoryPool {
     /// Create a new shared memory pool
     pub fn new(min_size: usize, max_size: usize, memory_limit_pages: u32) -> Result<Self> {
+        // Guard against invalid/unbounded limits reaching wasmtime, which
+        // panics internally when the maximum exceeds the index type.
+        let memory_limit_pages = memory_limit_pages.clamp(1, 65_536);
         let memory_type = MemoryType::new(0, Some(memory_limit_pages));
 
         Ok(Self {
@@ -114,10 +116,11 @@ impl SharedLinearMemoryPool {
         // TODO: Implement actual pooling with proper Store management
         let memory = Memory::new(store, self.memory_type.clone())
             .context("Failed to create linear memory")?;
-        
-        self.created_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        self.created_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         debug!("Created new shared linear memory");
-        
+
         Ok(memory)
     }
 
@@ -132,7 +135,9 @@ impl SharedLinearMemoryPool {
     pub fn stats(&self) -> MemoryPoolStats {
         MemoryPoolStats {
             available_memories: 0, // No pooling yet
-            total_created: self.created_count.load(std::sync::atomic::Ordering::Relaxed),
+            total_created: self
+                .created_count
+                .load(std::sync::atomic::Ordering::Relaxed),
             max_size: self.max_size,
             min_size: self.min_size,
         }
@@ -198,13 +203,18 @@ pub struct WasmInstancePool {
 impl WasmInstancePool {
     /// Create a new WASM instance pool with memory optimization
     pub fn new(min_size: usize, max_size: usize, memory_limit_mb: usize) -> Result<Self> {
-        // Calculate memory limit in pages (64KB per page)
-        let memory_limit_pages = (memory_limit_mb * 1024 * 1024) / (64 * 1024);
+        // Calculate memory limit in pages (64KB per page). Wasmtime's 32-bit
+        // linear memories are capped at 65536 pages (4 GiB); clamp rather than
+        // allowing the value to overflow a u32 / panic inside wasmtime.
+        let memory_limit_pages = memory_limit_mb
+            .saturating_mul(1024 * 1024)
+            .saturating_div(64 * 1024)
+            .clamp(1, 65_536) as u32;
 
         let memory_pool = Arc::new(SharedLinearMemoryPool::new(
             min_size,
-            max_size * 2, // Allow more memories than instances for flexibility
-            memory_limit_pages as u32,
+            max_size.saturating_mul(2), // Allow more memories than instances for flexibility
+            memory_limit_pages,
         )?);
 
         Ok(Self {

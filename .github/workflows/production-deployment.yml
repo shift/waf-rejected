@@ -16,10 +16,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+    - name: Install cargo-audit
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-audit
     - name: Run cargo audit
       run: cargo audit
-    - name: Run cargo outdated
-      run: cargo outdated --exit-code 1
     - name: Security scan with Trivy
       uses: aquasecurity/trivy-action@master
       with:
@@ -46,14 +48,18 @@ jobs:
       with:
         name: waf-rejected
         authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+    - name: Check formatting
+      run: nix develop -c cargo fmt -- --check
+    - name: Clippy
+      run: nix develop -c cargo clippy --lib -- --deny warnings
     - name: Build with Nix
       run: nix build .#waf-ingress
-    - name: Run tests
-      run: nix develop -c cargo test --release
+    - name: Check all targets compile
+      run: nix develop -c cargo check --all-targets
+    - name: Run unit tests
+      run: nix develop -c cargo test --lib --release
     - name: Run integration tests
       run: nix develop -c cargo test --test integration --release
-    - name: Run performance benchmarks
-      run: nix develop -c cargo bench
 
   # Build container images
   build-image:

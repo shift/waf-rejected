@@ -139,7 +139,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::stream;
     use std::sync::Arc;
 
     #[tokio::test]

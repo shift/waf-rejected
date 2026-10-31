@@ -17,8 +17,8 @@ spec:
     targetPort: 8443
     protocol: TCP
   - name: metrics
-    port: 9090
-    targetPort: 9090
+    port: 8081
+    targetPort: 8081
     protocol: TCP
   selector:
     app: waf-rejected
@@ -38,8 +38,8 @@ spec:
     targetPort: 8080
     protocol: TCP
   - name: metrics
-    port: 9090
-    targetPort: 9090
+    port: 8081
+    targetPort: 8081
     protocol: TCP
   selector:
     app: waf-rejected

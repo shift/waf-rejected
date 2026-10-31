@@ -138,7 +138,7 @@ impl WebSocketHandler {
         let websocket_key = headers
             .get("sec-websocket-key")
             .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| WafError::Http("Missing Sec-WebSocket-Key header".to_string()))?;
+            .ok_or_else(|| WafError::http("Missing Sec-WebSocket-Key header".to_string()))?;
 
         let websocket_version = headers
             .get("sec-websocket-version")
@@ -146,7 +146,7 @@ impl WebSocketHandler {
             .unwrap_or("13");
 
         if websocket_version != "13" {
-            return Err(WafError::Http("Unsupported WebSocket version".to_string()));
+            return Err(WafError::http("Unsupported WebSocket version".to_string()));
         }
 
         // Generate WebSocket accept key

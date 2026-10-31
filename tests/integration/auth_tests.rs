@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::time::Duration;
 
-use hyper::{Method, Uri, HeaderMap, body::Bytes};
+use hyper::{body::Bytes, HeaderMap, Method, Uri};
 use reqwest::Client;
 use tokio::net::TcpListener;
 use tokio::time::timeout;
@@ -50,10 +50,8 @@ mod auth_integration_tests {
     fn create_config_with_auth() -> Config {
         let mut config = Config::default();
         config.security.auth.enabled = true;
-        config.security.auth.api_keys = vec![
-            "test-api-key-123".to_string(),
-            "admin-key-456".to_string(),
-        ];
+        config.security.auth.api_keys =
+            vec!["test-api-key-123".to_string(), "admin-key-456".to_string()];
         config.security.auth.header_name = "X-API-Key".to_string();
         config.security.auth.require_https = false; // Allow HTTP for testing
 
@@ -73,7 +71,11 @@ mod auth_integration_tests {
         // This test validates that the auth config is properly loaded
         assert!(config.security.auth.enabled);
         assert_eq!(config.security.auth.api_keys.len(), 2);
-        assert!(config.security.auth.api_keys.contains(&"test-api-key-123".to_string()));
+        assert!(config
+            .security
+            .auth
+            .api_keys
+            .contains(&"test-api-key-123".to_string()));
     }
 
     #[tokio::test]

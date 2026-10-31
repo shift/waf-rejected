@@ -4,7 +4,7 @@
 //! environments, with SIMD-accelerated pattern matching for WAF rules.
 //! Compatible across different deployment environments with graceful fallback.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
 /// CPU features available for optimization
 #[derive(Debug, Clone)]
@@ -25,21 +25,12 @@ pub struct CpuFeatures {
 }
 
 /// Global CPU feature detection result (cached)
-static CPU_FEATURES_DETECTED: AtomicBool = AtomicBool::new(false);
-static mut CPU_FEATURES: Option<CpuFeatures> = None;
+static CPU_FEATURES: OnceLock<CpuFeatures> = OnceLock::new();
 
 impl CpuFeatures {
     /// Detect CPU features once and cache the result
     pub fn detect() -> &'static CpuFeatures {
-        if !CPU_FEATURES_DETECTED.load(Ordering::Acquire) {
-            let features = Self::detect_features();
-            unsafe {
-                CPU_FEATURES = Some(features);
-            }
-            CPU_FEATURES_DETECTED.store(true, Ordering::Release);
-        }
-
-        unsafe { CPU_FEATURES.as_ref().unwrap() }
+        CPU_FEATURES.get_or_init(Self::detect_features)
     }
 
     /// Perform actual CPU feature detection
@@ -432,6 +423,15 @@ impl SimdStringOps {
     }
 }
 
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
 /// WAF-specific optimized pattern matching functions
 pub struct WafPatternMatcher;
 
@@ -439,23 +439,27 @@ impl WafPatternMatcher {
     /// Search for SQL injection patterns with SIMD acceleration
     pub fn contains_sql_injection(payload: &[u8]) -> bool {
         // Common SQL injection patterns
+        // Must be lowercase because the payload is lowercased before matching.
         const SQL_PATTERNS: &[&[u8]] = &[
-            b"' OR '1'='1",
-            b"' OR 1=1--",
-            b"UNION SELECT",
-            b"DROP TABLE",
-            b"DELETE FROM",
-            b"INSERT INTO",
-            b"UPDATE SET",
+            b"' or '1'='1",
+            b"' or 1=1--",
+            b" or 1=1--",
+            b"union select",
+            b"drop table",
+            b"delete from",
+            b"insert into",
+            b"update set",
         ];
 
         // Convert to lowercase once using SIMD
         let lowercase_payload = Self::to_lowercase_simd(payload);
 
-        // Check all patterns using optimized SIMD search
+        // Security decisions use the scalar substring check. The SIMD helper
+        // remains available for non-authoritative callers, but must not be
+        // able to produce false negatives here.
         SQL_PATTERNS
             .iter()
-            .any(|pattern| SimdStringOps::find_pattern(&lowercase_payload, pattern).is_some())
+            .any(|pattern| contains(&lowercase_payload, pattern))
     }
 
     /// Search for XSS patterns with SIMD acceleration
@@ -474,48 +478,16 @@ impl WafPatternMatcher {
 
         XSS_PATTERNS
             .iter()
-            .any(|pattern| SimdStringOps::find_pattern(&lowercase_payload, pattern).is_some())
+            .any(|pattern| contains(&lowercase_payload, pattern))
     }
 
-    /// Convert string to lowercase using best available SIMD instructions
+    /// Convert string to lowercase.
+    ///
+    /// Security decisions must not depend on a SIMD path that may miss input;
+    /// use the straightforward implementation and keep SIMD for the
+    /// non-authoritative helper methods.
     fn to_lowercase_simd(input: &[u8]) -> Vec<u8> {
-        let cpu_features = CpuFeatures::detect();
-
-        match cpu_features.get_pattern_matcher() {
-            PatternMatcher::Avx2 => unsafe { Self::to_lowercase_avx2_wrapper(input) },
-            _ => input.iter().map(|b| b.to_ascii_lowercase()).collect(),
-        }
-    }
-
-    #[target_feature(enable = "avx2")]
-    unsafe fn to_lowercase_avx2_wrapper(input: &[u8]) -> Vec<u8> {
-        use std::arch::x86_64::*;
-
-        let mut result = Vec::with_capacity(input.len());
-        let mut ptr = input.as_ptr();
-        let mut remaining = input.len();
-
-        while remaining >= 32 {
-            let chunk = _mm256_loadu_si256(ptr as *const __m256i);
-            let lowercase = SimdStringOps::to_lowercase_avx2(chunk);
-
-            // Store result
-            let mut temp = [0u8; 32];
-            _mm256_storeu_si256(temp.as_mut_ptr() as *mut __m256i, lowercase);
-            result.extend_from_slice(&temp);
-
-            ptr = ptr.add(32);
-            remaining -= 32;
-        }
-
-        // Handle remaining bytes
-        while remaining > 0 {
-            result.push((*ptr).to_ascii_lowercase());
-            ptr = ptr.add(1);
-            remaining -= 1;
-        }
-
-        result
+        input.iter().map(|b| b.to_ascii_lowercase()).collect()
     }
 }
 
