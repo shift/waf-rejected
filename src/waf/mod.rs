@@ -117,6 +117,7 @@ pub struct WafEngine {
     event_logger: SecurityEventLogger,
     geoip_service: Arc<GeoIpService>,
     fail_closed: bool,
+    wasm_init_failed: bool,
     #[cfg(feature = "wasm-waf")]
     wasm_engine: Option<Arc<WasmEngine>>,
     #[cfg(feature = "ai-threat-detection")]
@@ -136,6 +137,7 @@ impl Clone for WafEngine {
             event_logger: SecurityEventLogger::default_logger(),
             geoip_service: Arc::clone(&self.geoip_service),
             fail_closed: self.fail_closed,
+            wasm_init_failed: self.wasm_init_failed,
             #[cfg(feature = "wasm-waf")]
             wasm_engine: self.wasm_engine.clone(),
             #[cfg(feature = "ai-threat-detection")]
@@ -151,19 +153,28 @@ impl WafEngine {
             event_logger: SecurityEventLogger::default_logger(),
             geoip_service: Arc::new(GeoIpService::new()),
             fail_closed: true,
+            wasm_init_failed: false,
             #[cfg(feature = "wasm-waf")]
             wasm_engine: None,
         }
     }
 
     pub fn with_config(config: &Config) -> Self {
+        #[cfg(feature = "wasm-waf")]
+        let wasm_engine = Self::initialize_wasm_engine(config);
+        #[cfg(feature = "wasm-waf")]
+        let wasm_init_failed = config.waf.wasm.enabled && wasm_engine.is_none();
+        #[cfg(not(feature = "wasm-waf"))]
+        let wasm_init_failed = false;
+
         let mut engine = Self {
             rules: Arc::new(RwLock::new(Vec::new())),
             event_logger: SecurityEventLogger::new(config.waf.security_events.clone()),
             geoip_service: Arc::new(GeoIpService::new()),
             fail_closed: config.waf.fail_mode != "open",
+            wasm_init_failed,
             #[cfg(feature = "wasm-waf")]
-            wasm_engine: Self::initialize_wasm_engine(config),
+            wasm_engine,
             #[cfg(feature = "ai-threat-detection")]
             ai_detector: Self::initialize_ai_detector(config),
         };
@@ -396,6 +407,19 @@ impl WafEngine {
         let mut triggered_rules = Vec::new();
         let mut blocking_decision = None;
         let rules_count;
+
+        // A configured-but-unavailable WASM engine must not silently downgrade
+        // to traditional rules when fail-closed is requested.
+        if self.wasm_init_failed && self.fail_closed {
+            let decision = Decision::Block {
+                status: 503,
+                reason: "WAF engine failed to initialise (fail-closed)".to_string(),
+            };
+            self.event_logger
+                .log_event(request, &decision, vec!["wasm_init_failed".to_string()])
+                .await;
+            return decision;
+        }
 
         // PHASE 1: WASM ModSecurity evaluation (if enabled)
         #[cfg(feature = "wasm-waf")]

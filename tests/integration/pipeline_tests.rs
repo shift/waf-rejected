@@ -27,11 +27,16 @@ async fn spawn_upstream() -> std::net::SocketAddr {
                 let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(
                         TokioIo::new(stream),
-                        service_fn(|_req: Request<hyper::body::Incoming>| async {
+                        service_fn(|req: Request<hyper::body::Incoming>| async move {
+                            let body = if req.uri().path() == "/large" {
+                                Bytes::from("A".repeat(4096))
+                            } else {
+                                Bytes::from_static(b"upstream-ok")
+                            };
                             Ok::<_, Infallible>(
                                 Response::builder()
                                     .status(StatusCode::OK)
-                                    .body(Full::new(Bytes::from_static(b"upstream-ok")))
+                                    .body(Full::new(body))
                                     .unwrap(),
                             )
                         }),
@@ -98,6 +103,14 @@ async fn pipeline_blocks_body_sqli() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn pipeline_rejects_oversized_upstream_response() {
+    let upstream = spawn_upstream().await;
+    let proxy = spawn_proxy(upstream).await;
+    let response = reqwest::get(format!("{}/large", proxy)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
 }
 
 #[tokio::test]

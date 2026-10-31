@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode, Uri};
@@ -239,8 +239,17 @@ impl WafProxyService {
                 if let Some(tls_mgr) = tls_manager {
                     match tls_mgr.accept(tcp_stream).await {
                         Ok(tls_stream) => {
-                            if let Err(e) =
-                                Self::handle_connection(tls_stream, state, peer_ip, true).await
+                            // Only speak HTTP/2 when ALPN actually negotiated h2.
+                            let negotiated_h2 =
+                                tls_stream.get_ref().1.alpn_protocol() == Some(b"h2");
+                            if let Err(e) = Self::handle_connection(
+                                tls_stream,
+                                state,
+                                peer_ip,
+                                true,
+                                negotiated_h2,
+                            )
+                            .await
                             {
                                 error!("TLS connection error from {}: {}", remote_addr, e);
                             }
@@ -250,7 +259,7 @@ impl WafProxyService {
                         }
                     }
                 } else if let Err(e) =
-                    Self::handle_connection(tcp_stream, state, peer_ip, false).await
+                    Self::handle_connection(tcp_stream, state, peer_ip, false, false).await
                 {
                     error!("Connection error from {}: {}", remote_addr, e);
                 }
@@ -263,15 +272,16 @@ impl WafProxyService {
         state: ProxyState,
         peer_ip: IpAddr,
         is_https: bool,
+        negotiated_h2: bool,
     ) -> Result<(), WafError>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
         let io = hyper_util::rt::TokioIo::new(stream);
         // HTTP/2 over cleartext requires h2c negotiation/prior knowledge.
-        // Plaintext listeners therefore speak HTTP/1.1; HTTP/2 is enabled
-        // only after a TLS handshake with ALPN.
-        let enable_http2 = is_https && state.config.server.enable_http2;
+        // Plaintext listeners therefore speak HTTP/1.1; HTTP/2 is enabled only
+        // when TLS ALPN negotiated h2.
+        let enable_http2 = negotiated_h2 && state.config.server.enable_http2;
         let service =
             service_fn(move |req| Self::handle_request(req, state.clone(), peer_ip, is_https));
 
@@ -424,6 +434,7 @@ impl WafProxyService {
                     &state.metrics,
                     client_ip,
                     is_https,
+                    state.config.server.max_body_size,
                 )
                 .await
             }
@@ -461,13 +472,19 @@ impl WafProxyService {
         }
 
         if let Some(value) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-            if let Some(ip) = value
+            let hops: Vec<IpAddr> = value
                 .split(',')
                 .map(str::trim)
                 .filter_map(|part| part.parse::<IpAddr>().ok())
-                .next()
-            {
-                return ip;
+                .collect();
+
+            // Walk from the nearest hop backwards, skipping addresses that are
+            // themselves trusted proxies. This prevents a client behind a
+            // trusted LB from spoofing its source by prepending an address.
+            for hop in hops.iter().rev() {
+                if !trusted_proxies.iter().any(|network| network.contains(*hop)) {
+                    return *hop;
+                }
             }
         }
         if let Some(ip) = headers
@@ -512,6 +529,7 @@ impl WafProxyService {
         metrics: &Metrics,
         client_ip: IpAddr,
         is_https: bool,
+        max_response_bytes: usize,
     ) -> Result<Response<Full<Bytes>>, Infallible> {
         // Optimized URI rewriting with protocol version awareness
         let upstream_path_and_query = parts
@@ -637,10 +655,26 @@ impl WafProxyService {
 
                 // Optimized response handling
                 let (parts, body) = response.into_parts();
+                if let Some(length) = parts
+                    .headers
+                    .get(hyper::header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<usize>().ok())
+                {
+                    if length > max_response_bytes {
+                        metrics.record_upstream_error();
+                        return Ok(Self::create_error_response(
+                            StatusCode::BAD_GATEWAY,
+                            "Upstream response too large",
+                        ));
+                    }
+                }
+                let limited = Limited::new(body, max_response_bytes);
                 let body_bytes =
-                    match tokio::time::timeout(Duration::from_secs(30), body.collect()).await {
+                    match tokio::time::timeout(Duration::from_secs(30), limited.collect()).await {
                         Ok(Ok(collected)) => collected.to_bytes(),
                         Ok(Err(e)) => {
+                            metrics.record_upstream_error();
                             error!("Failed to collect upstream response body: {}", e);
                             return Ok(Self::create_error_response(
                                 StatusCode::BAD_GATEWAY,
@@ -828,5 +862,21 @@ mod tests {
         let ip =
             WafProxyService::resolve_client_ip("10.0.0.5".parse().unwrap(), &headers, &trusted);
         assert_eq!(ip, "192.168.1.100".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn test_client_ip_walks_forwarded_chain_from_the_right() {
+        let mut headers = hyper::HeaderMap::new();
+        // A client-prepended spoofed value must not win over the hop appended
+        // by the trusted proxy.
+        headers.insert(
+            "x-forwarded-for",
+            "203.0.113.9, 198.51.100.7, 10.0.0.7".parse().unwrap(),
+        );
+
+        let trusted: Vec<IpNetwork> = vec!["10.0.0.0/8".parse().unwrap()];
+        let ip =
+            WafProxyService::resolve_client_ip("10.0.0.5".parse().unwrap(), &headers, &trusted);
+        assert_eq!(ip, "198.51.100.7".parse::<IpAddr>().unwrap());
     }
 }

@@ -16,12 +16,5 @@ maintainers:
   - name: WAF-Rejected Team
     email: security@waf-rejected.com
 
-dependencies:
-  - name: prometheus
-    version: "15.0.0"
-    repository: "https://prometheus-community.github.io/helm-charts"
-    condition: prometheus.enabled
-  - name: grafana
-    version: "6.50.0"
-    repository: "https://grafana.github.io/helm-charts"
-    condition: grafana.enabled
+# Prometheus/Grafana are installed separately; keeping undeclared subchart
+# dependencies here would make `helm upgrade` fail without `helm dependency build`.

@@ -292,7 +292,7 @@ impl SecurityEventLogger {
 
     /// Determine if event should be logged based on threat level
     fn should_log_event(&self, event: &SecurityEvent) -> bool {
-        let min_level = &self.config.min_threat_level;
+        let min_level = self.config.min_threat_level.to_ascii_lowercase();
 
         match (min_level.as_str(), &event.threat_level) {
             ("low", _) => true,

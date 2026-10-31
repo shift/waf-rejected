@@ -44,6 +44,17 @@ pub enum ThreatSeverity {
 }
 
 // Pre-compiled patterns for performance
+/// Truncate attacker-controlled text on a UTF-8 character boundary.
+fn limited_match_text(value: &str) -> &str {
+    if value.len() <= 100 {
+        return value;
+    }
+    match value.char_indices().nth(100) {
+        Some((index, _)) => &value[..index],
+        None => value,
+    }
+}
+
 fn percent_decode(input: &str) -> Option<String> {
     if !input.contains('%') && !input.contains('+') {
         return None;
@@ -62,7 +73,7 @@ static COMMON_PATTERNS: Lazy<Vec<ThreatPattern>> = Lazy::new(|| {
             severity: ThreatSeverity::High,
             attack_type: AttackType::SqlInjection,
             check_uri: true,
-            check_headers: false,
+            check_headers: true,
             check_body: true,
         },
         ThreatPattern {
@@ -74,7 +85,7 @@ static COMMON_PATTERNS: Lazy<Vec<ThreatPattern>> = Lazy::new(|| {
             severity: ThreatSeverity::High,
             attack_type: AttackType::SqlInjection,
             check_uri: true,
-            check_headers: false,
+            check_headers: true,
             check_body: true,
         },
         ThreatPattern {
@@ -83,7 +94,7 @@ static COMMON_PATTERNS: Lazy<Vec<ThreatPattern>> = Lazy::new(|| {
             severity: ThreatSeverity::Critical,
             attack_type: AttackType::SqlInjection,
             check_uri: true,
-            check_headers: false,
+            check_headers: true,
             check_body: true,
         },
         // XSS patterns
@@ -93,7 +104,7 @@ static COMMON_PATTERNS: Lazy<Vec<ThreatPattern>> = Lazy::new(|| {
             severity: ThreatSeverity::High,
             attack_type: AttackType::XssAttack,
             check_uri: true,
-            check_headers: false,
+            check_headers: true,
             check_body: true,
         },
         ThreatPattern {
@@ -102,7 +113,7 @@ static COMMON_PATTERNS: Lazy<Vec<ThreatPattern>> = Lazy::new(|| {
             severity: ThreatSeverity::Medium,
             attack_type: AttackType::XssAttack,
             check_uri: true,
-            check_headers: false,
+            check_headers: true,
             check_body: true,
         },
         ThreatPattern {
@@ -111,7 +122,7 @@ static COMMON_PATTERNS: Lazy<Vec<ThreatPattern>> = Lazy::new(|| {
             severity: ThreatSeverity::High,
             attack_type: AttackType::XssAttack,
             check_uri: true,
-            check_headers: false,
+            check_headers: true,
             check_body: true,
         },
         // Command Injection patterns
@@ -121,7 +132,7 @@ static COMMON_PATTERNS: Lazy<Vec<ThreatPattern>> = Lazy::new(|| {
             severity: ThreatSeverity::Critical,
             attack_type: AttackType::CommandInjection,
             check_uri: true,
-            check_headers: false,
+            check_headers: true,
             check_body: true,
         },
         ThreatPattern {
@@ -130,7 +141,7 @@ static COMMON_PATTERNS: Lazy<Vec<ThreatPattern>> = Lazy::new(|| {
             severity: ThreatSeverity::Critical,
             attack_type: AttackType::CommandInjection,
             check_uri: true,
-            check_headers: false,
+            check_headers: true,
             check_body: true,
         },
         // Path Traversal patterns
@@ -140,7 +151,7 @@ static COMMON_PATTERNS: Lazy<Vec<ThreatPattern>> = Lazy::new(|| {
             severity: ThreatSeverity::High,
             attack_type: AttackType::PathTraversal,
             check_uri: true,
-            check_headers: false,
+            check_headers: true,
             check_body: true,
         },
         ThreatPattern {
@@ -149,7 +160,7 @@ static COMMON_PATTERNS: Lazy<Vec<ThreatPattern>> = Lazy::new(|| {
             severity: ThreatSeverity::High,
             attack_type: AttackType::PathTraversal,
             check_uri: true,
-            check_headers: false,
+            check_headers: true,
             check_body: true,
         },
         // File Inclusion patterns
@@ -312,13 +323,7 @@ impl ContentInspectionRule {
                 continue;
             }
             if let Some(matched) = pattern.pattern.find(content) {
-                let matched_text = matched.as_str();
-                let limited_match = if matched_text.len() > 100 {
-                    &matched_text[..100]
-                } else {
-                    matched_text
-                };
-                return Some((pattern, limited_match.to_string()));
+                return Some((pattern, limited_match_text(matched.as_str()).to_string()));
             }
         }
         None
@@ -330,13 +335,7 @@ impl ContentInspectionRule {
     ) -> Option<(&'a ThreatPattern, String)> {
         for pattern in patterns {
             if let Some(matched) = pattern.pattern.find(content) {
-                let matched_text = matched.as_str();
-                let limited_match = if matched_text.len() > 100 {
-                    &matched_text[..100]
-                } else {
-                    matched_text
-                };
-                return Some((pattern, limited_match.to_string()));
+                return Some((pattern, limited_match_text(matched.as_str()).to_string()));
             }
         }
         None
@@ -369,36 +368,45 @@ impl WafRule for ContentInspectionRule {
         // Performance optimization: limit content size to prevent DoS
         const MAX_CONTENT_SIZE: usize = 8192; // 8KB limit for pattern matching
 
-        // Check URI path (high priority)
+        // Check URI path (high priority). Over-length URIs are rejected rather
+        // than skipped, otherwise padding can hide a payload.
         let uri_path = ctx.uri.path();
-        if uri_path.len() <= MAX_CONTENT_SIZE {
-            if let Some((pattern, matched)) = self.check_with_decoding(uri_path, false) {
+        if uri_path.len() > MAX_CONTENT_SIZE {
+            return Decision::Block {
+                status: 414,
+                reason: "Content inspection: URI path too long".to_string(),
+            };
+        }
+        if let Some((pattern, matched)) = self.check_with_decoding(uri_path, false) {
+            if pattern.check_uri {
+                return Decision::Block {
+                    status: self.severity_to_status(&pattern.severity),
+                    reason: format!(
+                        "Content inspection: {} detected in URI: {}",
+                        pattern.name, matched
+                    ),
+                };
+            }
+        }
+
+        // Check query parameters (if present).
+        if let Some(query) = ctx.uri.query() {
+            if query.len() > MAX_CONTENT_SIZE {
+                return Decision::Block {
+                    status: 414,
+                    reason: "Content inspection: query string too long".to_string(),
+                };
+            }
+            // Use full check on query to include medium/low severity patterns.
+            if let Some((pattern, matched)) = self.check_with_decoding(query, true) {
                 if pattern.check_uri {
                     return Decision::Block {
                         status: self.severity_to_status(&pattern.severity),
                         reason: format!(
-                            "Content inspection: {} detected in URI: {}",
+                            "Content inspection: {} detected in query: {}",
                             pattern.name, matched
                         ),
                     };
-                }
-            }
-        }
-
-        // Check query parameters (if present and not too large)
-        if let Some(query) = ctx.uri.query() {
-            if query.len() <= MAX_CONTENT_SIZE {
-                // Use full check on query to include medium/low severity patterns (e.g., javascript:)
-                if let Some((pattern, matched)) = self.check_with_decoding(query, true) {
-                    if pattern.check_uri {
-                        return Decision::Block {
-                            status: self.severity_to_status(&pattern.severity),
-                            reason: format!(
-                                "Content inspection: {} detected in query: {}",
-                                pattern.name, matched
-                            ),
-                        };
-                    }
                 }
             }
         }
@@ -408,9 +416,7 @@ impl WafRule for ContentInspectionRule {
             if pattern.check_headers {
                 for (header_name, header_value) in ctx.headers.iter() {
                     if let Ok(header_str) = header_value.to_str() {
-                        if header_str.len() <= MAX_CONTENT_SIZE
-                            && pattern.pattern.is_match(header_str)
-                        {
+                        if pattern.pattern.is_match(header_str) {
                             return Decision::Block {
                                 status: self.severity_to_status(&pattern.severity),
                                 reason: format!(
@@ -424,17 +430,21 @@ impl WafRule for ContentInspectionRule {
             }
         }
 
-        // Inspect the request body when the proxy has supplied it. The proxy
-        // enforces the configured maximum body size, and we still cap the
-        // amount examined here to keep regex work bounded.
-        const MAX_BODY_INSPECTION: usize = 1024 * 1024; // 1 MiB
+        // Inspect the complete accepted body. The proxy enforces
+        // `server.max_body_size`; this hard cap is a final defence against
+        // inspecting an unbounded buffer.
+        const MAX_BODY_INSPECTION: usize = 16 * 1024 * 1024; // 16 MiB
         if let Some(body) = &ctx.body {
-            let slice = if body.len() > MAX_BODY_INSPECTION {
-                &body[..MAX_BODY_INSPECTION]
-            } else {
-                &body[..]
-            };
-            let content = String::from_utf8_lossy(slice);
+            if body.len() > MAX_BODY_INSPECTION {
+                return Decision::Block {
+                    status: 413,
+                    reason: format!(
+                        "Content inspection: body exceeds {} bytes",
+                        MAX_BODY_INSPECTION
+                    ),
+                };
+            }
+            let content = String::from_utf8_lossy(body);
             let found = self.inspect_body(&content).or_else(|| {
                 percent_decode(&content)
                     .filter(|decoded| decoded != &content)
@@ -672,5 +682,28 @@ mod tests {
         assert_eq!(rule.severity_to_status(&ThreatSeverity::Medium), 403);
         assert_eq!(rule.severity_to_status(&ThreatSeverity::High), 403);
         assert_eq!(rule.severity_to_status(&ThreatSeverity::Critical), 403);
+    }
+
+    #[test]
+    fn test_overlong_uri_is_rejected_not_skipped() {
+        let rule = ContentInspectionRuleFactory::sql_injection_rule();
+        let uri = format!("/?q={}", "a".repeat(9000));
+        let ctx = create_test_context(&uri, None);
+
+        assert!(matches!(
+            rule.evaluate(&ctx),
+            Decision::Block { status: 414, .. }
+        ));
+    }
+
+    #[test]
+    fn test_body_payload_after_one_mib_is_inspected() {
+        let rule = ContentInspectionRuleFactory::sql_injection_rule();
+        let mut body = "A".repeat(1_100_000);
+        body.push_str(" id=1 UNION SELECT * FROM users");
+
+        let mut ctx = create_test_context("/login", None);
+        ctx = ctx.with_body(Some(bytes::Bytes::from(body)));
+        assert!(matches!(rule.evaluate(&ctx), Decision::Block { .. }));
     }
 }

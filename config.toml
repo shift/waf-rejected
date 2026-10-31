@@ -52,7 +52,7 @@ global_window_secs = 60
 [waf.security_events]
 enabled = true
 format = "json"
-min_threat_level = "Medium"
+min_threat_level = "medium"
 enable_cef = true
 cef_output_file = "./logs/security_events.cef"
 cef_device_vendor = "WAF-Rejected"

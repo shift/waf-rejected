@@ -2,8 +2,8 @@
 
 # Image configuration
 image:
-  repository: waf-rejected
-  tag: "v0.1.0-beta.1"
+  repository: ghcr.io/shift/waf-rejected
+  tag: "latest"
   pullPolicy: Always
 
 # Service configuration
@@ -28,7 +28,8 @@ resources:
 # Security configuration
 security:
   auth:
-    enabled: true
+    # Enable only after supplying API keys via a Secret.
+    enabled: false
     requireHttps: true
   ai:
     enabled: true

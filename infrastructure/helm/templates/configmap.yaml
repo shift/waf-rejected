@@ -39,6 +39,7 @@ data:
     enable_cef = false
     enable_otel = {{ .Values.logging.otel.enabled }}
     enable_sled = {{ .Values.persistence.enabled }}
+    sled_db_path = "/var/lib/waf/data/waf_security_events.sled"
 
     [waf.content_inspection]
     enabled = true
