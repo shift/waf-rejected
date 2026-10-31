@@ -1417,6 +1417,7 @@ impl WafProxyService {
 mod tests {
     use super::*;
     use crate::config::ProxyConfig;
+    use proptest::prelude::*;
 
     #[test]
     fn test_websocket_upstream_transport_schemes() {
@@ -1490,5 +1491,40 @@ mod tests {
         let ip =
             WafProxyService::resolve_client_ip("10.0.0.5".parse().unwrap(), &headers, &trusted);
         assert_eq!(ip, "198.51.100.7".parse::<IpAddr>().unwrap());
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// Arbitrary (possibly malformed) forwarding headers must never panic,
+        /// and an untrusted peer must never have its address overridden.
+        #[test]
+        fn resolve_client_ip_never_panics_for_arbitrary_headers(
+            forwarded in any::<String>(),
+            real_ip in any::<String>(),
+            peer_last_octet in any::<u8>(),
+            trust_peer in any::<bool>(),
+        ) {
+            let mut headers = hyper::HeaderMap::new();
+            if let Ok(value) = forwarded.parse() {
+                headers.insert("x-forwarded-for", value);
+            }
+            if let Ok(value) = real_ip.parse() {
+                headers.insert("x-real-ip", value);
+            }
+
+            let peer = IpAddr::from([10, 0, 0, peer_last_octet]);
+            let trusted: Vec<IpNetwork> = if trust_peer {
+                vec!["10.0.0.0/8".parse().unwrap()]
+            } else {
+                Vec::new()
+            };
+
+            let resolved = WafProxyService::resolve_client_ip(peer, &headers, &trusted);
+
+            if !trust_peer {
+                prop_assert_eq!(resolved, peer);
+            }
+        }
     }
 }

@@ -153,6 +153,7 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 
 [dev-dependencies]
 # Testing framework
+proptest = "1"
 testcontainers = "0.15"
 tokio-test = "0.4"
 wiremock = "0.6"
