@@ -8,6 +8,9 @@ All notable changes to WAF-Rejected are documented here.
 
 - Per-frame WAF inspection of WebSocket text and binary messages.
 - WebSocket frame-block integration test.
+- Optional MaxMind GeoIP2 Anonymous IP database loading via
+  `waf.geo_blocking.anonymous_database_path` for Tor exit, VPN/proxy and
+  datacenter/hosting detection.
 
 ## [0.1.0-beta.4] - 2026-10-31
 

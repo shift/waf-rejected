@@ -23,6 +23,7 @@ pub struct GeoInfo {
 pub struct GeoIpService {
     cache: HashMap<IpAddr, GeoInfo>,
     reader: Option<maxminddb::Reader<Vec<u8>>>,
+    anonymous_reader: Option<maxminddb::Reader<Vec<u8>>>,
 }
 
 impl GeoIpService {
@@ -30,6 +31,7 @@ impl GeoIpService {
         Self {
             cache: Self::init_test_data(),
             reader: None,
+            anonymous_reader: None,
         }
     }
 
@@ -39,7 +41,23 @@ impl GeoIpService {
         Ok(Self {
             cache: Self::init_test_data(),
             reader: Some(reader),
+            anonymous_reader: None,
         })
+    }
+
+    /// Load a MaxMind GeoIP2 Anonymous IP database into this service.
+    pub fn load_anonymous_database(&mut self, path: &str) -> Result<(), maxminddb::MaxMindDbError> {
+        self.anonymous_reader = Some(maxminddb::Reader::open_readfile(path)?);
+        Ok(())
+    }
+
+    /// Attach a MaxMind GeoIP2 Anonymous IP database to this service.
+    pub fn with_anonymous_database(
+        mut self,
+        path: &str,
+    ) -> Result<Self, maxminddb::MaxMindDbError> {
+        self.load_anonymous_database(path)?;
+        Ok(self)
     }
 
     /// Initialize with some test data for development.
@@ -95,29 +113,76 @@ impl GeoIpService {
             return Some(geo_info.clone());
         }
 
-        let reader = self.reader.as_ref()?;
-        let city = reader
-            .lookup(*ip)
-            .ok()?
-            .decode::<maxminddb::geoip2::City>()
-            .ok()??;
+        let city = self.reader.as_ref().and_then(|reader| {
+            reader
+                .lookup(*ip)
+                .ok()
+                .and_then(|result| result.decode::<maxminddb::geoip2::City>().ok())
+                .flatten()
+        });
+        let anonymous = self.anonymous_reader.as_ref().and_then(|reader| {
+            reader
+                .lookup(*ip)
+                .ok()
+                .and_then(|result| result.decode::<maxminddb::geoip2::AnonymousIp>().ok())
+                .flatten()
+        });
+
+        if city.is_none() && anonymous.is_none() {
+            return None;
+        }
+
         let region = city
-            .subdivisions
-            .first()
+            .as_ref()
+            .and_then(|city| city.subdivisions.first())
             .and_then(|subdivision| subdivision.names.english.or(subdivision.iso_code))
             .unwrap_or("Unknown")
             .to_string();
+        let is_tor_exit = anonymous
+            .as_ref()
+            .and_then(|record| record.is_tor_exit_node)
+            .unwrap_or(false);
+        let is_vpn = anonymous
+            .as_ref()
+            .map(|record| {
+                record.is_anonymous_vpn.unwrap_or(false)
+                    || record.is_public_proxy.unwrap_or(false)
+                    || record.is_residential_proxy.unwrap_or(false)
+            })
+            .unwrap_or(false);
+        let is_datacenter = anonymous
+            .as_ref()
+            .and_then(|record| record.is_hosting_provider)
+            .unwrap_or(false);
 
         Some(GeoInfo {
-            country_code: city.country.iso_code.unwrap_or("XX").to_string(),
-            country_name: city.country.names.english.unwrap_or("Unknown").to_string(),
+            country_code: city
+                .as_ref()
+                .and_then(|city| city.country.iso_code)
+                .unwrap_or("XX")
+                .to_string(),
+            country_name: city
+                .as_ref()
+                .and_then(|city| city.country.names.english)
+                .unwrap_or("Unknown")
+                .to_string(),
             region,
-            city: city.city.names.english.unwrap_or("Unknown").to_string(),
-            latitude: city.location.latitude.unwrap_or(0.0),
-            longitude: city.location.longitude.unwrap_or(0.0),
-            is_tor_exit: false,
-            is_vpn: false,
-            is_datacenter: false,
+            city: city
+                .as_ref()
+                .and_then(|city| city.city.names.english)
+                .unwrap_or("Unknown")
+                .to_string(),
+            latitude: city
+                .as_ref()
+                .and_then(|city| city.location.latitude)
+                .unwrap_or(0.0),
+            longitude: city
+                .as_ref()
+                .and_then(|city| city.location.longitude)
+                .unwrap_or(0.0),
+            is_tor_exit,
+            is_vpn,
+            is_datacenter,
             asn: 0,
             asn_org: "Unknown".to_string(),
         })
@@ -383,6 +448,13 @@ mod tests {
     #[test]
     fn test_missing_database_is_reported() {
         assert!(GeoIpService::from_database("/nonexistent/GeoLite2-City.mmdb").is_err());
+    }
+
+    #[test]
+    fn test_missing_anonymous_database_is_reported() {
+        assert!(GeoIpService::new()
+            .with_anonymous_database("/nonexistent/GeoIP2-Anonymous-IP.mmdb")
+            .is_err());
     }
 
     #[test]

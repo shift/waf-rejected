@@ -186,21 +186,38 @@ impl WafEngine {
     }
 
     fn initialize_geoip(config: &Config) -> Arc<GeoIpService> {
-        if let Some(path) = &config.waf.geo_blocking.database_path {
-            match GeoIpService::from_database(path) {
+        let mut service = match &config.waf.geo_blocking.database_path {
+            Some(path) => match GeoIpService::from_database(path) {
                 Ok(service) => {
                     info!("GeoIP database loaded from {}", path);
-                    return Arc::new(service);
+                    service
                 }
                 Err(e) => {
                     warn!(
                         "Failed to load GeoIP database '{}': {}. Country blocking will only match built-in test data",
                         path, e
                     );
+                    GeoIpService::new()
+                }
+            },
+            None => GeoIpService::new(),
+        };
+
+        if let Some(path) = &config.waf.geo_blocking.anonymous_database_path {
+            match service.load_anonymous_database(path) {
+                Ok(()) => {
+                    info!("GeoIP Anonymous IP database loaded from {}", path);
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to load GeoIP Anonymous IP database '{}': {}. Anonymous network detection will be unavailable",
+                        path, e
+                    );
                 }
             }
         }
-        Arc::new(GeoIpService::new())
+
+        Arc::new(service)
     }
 
     #[cfg(feature = "wasm-waf")]

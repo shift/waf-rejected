@@ -137,6 +137,9 @@ Key points:
   WebTransport requests are rejected with `501`.
 - **GeoIP requires a MaxMind database.** Set `waf.geo_blocking.database_path` to a
   GeoLite2/GeoIP2 City `.mmdb`; without it only built-in test addresses resolve.
+  Tor/VPN/datacenter detection additionally requires a GeoIP2 Anonymous IP
+  `.mmdb` via `waf.geo_blocking.anonymous_database_path`; without it those flags
+  remain false.
 - **HTTP/3 is not implemented.** Keep `enable_http3 = false`; use TLS + HTTP/2.
 - The legacy AI/threat-intelligence modules are experimental and are not on the
   request path by default.

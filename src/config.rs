@@ -290,6 +290,9 @@ pub struct GeoBlockingConfig {
     /// Path to a MaxMind GeoLite2/GeoIP2 City database (`.mmdb`).
     pub database_path: Option<String>,
 
+    /// Path to a MaxMind GeoIP2 Anonymous IP database (`.mmdb`).
+    pub anonymous_database_path: Option<String>,
+
     /// Blocked country codes (ISO 3166-1 alpha-2)
     pub blocked_countries: Vec<String>,
 
@@ -680,6 +683,7 @@ impl Default for GeoBlockingConfig {
         Self {
             enabled: false, // Disabled by default
             database_path: None,
+            anonymous_database_path: None,
             blocked_countries: vec![], // Empty by default
             blocked_regions: vec![],
             block_tor: true,
@@ -830,6 +834,31 @@ mod tests {
                 .validate()
                 .unwrap_or_else(|e| panic!("{} failed validation: {}", file, e));
         }
+    }
+
+    #[test]
+    fn test_geo_blocking_anonymous_database_path_deserializes() {
+        let contents = r#"
+[waf.geo_blocking]
+enabled = true
+database_path = "/tmp/GeoLite2-City.mmdb"
+anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
+"#;
+        let settings = config::Config::builder()
+            .add_source(config::Config::try_from(&Config::default()).unwrap())
+            .add_source(config::File::from_str(contents, config::FileFormat::Toml))
+            .build()
+            .unwrap();
+        let parsed: Config = settings.try_deserialize().unwrap();
+
+        assert_eq!(
+            parsed.waf.geo_blocking.database_path.as_deref(),
+            Some("/tmp/GeoLite2-City.mmdb")
+        );
+        assert_eq!(
+            parsed.waf.geo_blocking.anonymous_database_path.as_deref(),
+            Some("/tmp/GeoIP2-Anonymous-IP.mmdb")
+        );
     }
 
     #[test]
