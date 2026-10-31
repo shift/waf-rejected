@@ -1,6 +1,6 @@
 [package]
 name = "waf-ingress"
-version = "0.1.0-beta.7"
+version = "0.1.0-beta.8"
 edition = "2021"
 authors = ["WAF Team"]
 description = "High-Performance Rust-Based WAF Ingress"
