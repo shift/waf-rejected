@@ -27,6 +27,12 @@ curl -o /dev/null -w '%{http_code}\n' -X POST --data '<script>alert(1)</script>'
 - [ ] Commit release version and changelog.
 - [ ] Tag `v0.1.0-beta.3`.
 - [ ] Push branch and tag.
-- [ ] Confirm the Release workflow built the tarball.
+- [ ] Confirm the Release workflow built and attached every asset:
+      - `waf-rejected-v<version>-x86_64-linux.tar.gz` (binary tarball)
+      - `waf-rejected-<version>-image.tar.gz` (prebuilt container image)
+      - `waf-rejected-<version>.cdx.json` (CycloneDX SBOM)
+      - `<asset>.sha256` for each of the three assets above
+- [ ] Confirm the image is still pushed to GHCR under `v<version>`.
+- [ ] Download the assets and verify them: `sha256sum --check *.sha256`.
 - [ ] Publish the GitHub pre-release with the known-limitations section from
       `CHANGELOG.md`.

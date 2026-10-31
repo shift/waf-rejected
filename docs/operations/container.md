@@ -13,7 +13,8 @@ The image is a Debian slim runtime with the `waf-ingress` binary, the bundled
 |---|---|
 | Registry image | `ghcr.io/shift/waf-rejected` |
 | Tag convention | `v<version>`, for example `v0.1.0-beta.6` |
-| Tarball convention | `waf-rejected-<version>-image.tar` |
+| Tarball convention | `waf-rejected-<version>-image.tar.gz` |
+| Checksum asset | `waf-rejected-<version>-image.tar.gz.sha256` |
 | Proxy port | `8080` (`bind_addr`) |
 | Health/metrics port | `8081` (`health_bind_addr`) |
 | Config path | `/etc/waf/config.toml` |
@@ -22,13 +23,16 @@ The image is a Debian slim runtime with the `waf-ingress` binary, the bundled
 
 Tags are mutable; a digest is not. Pin by digest for anything that matters.
 
+Every tagged release publishes the image tarball, the binary tarball and the
+CycloneDX SBOM, each with a matching `<asset>.sha256` checksum file.
+
 ## Load the released tarball
 
 ```bash
-# Compare against the checksum or digest published with the release
-sha256sum waf-rejected-0.1.0-beta.6-image.tar
+# Verify the asset against the checksum published with the release
+sha256sum --check waf-rejected-0.1.0-beta.6-image.tar.gz.sha256
 
-docker load -i waf-rejected-0.1.0-beta.6-image.tar
+docker load -i waf-rejected-0.1.0-beta.6-image.tar.gz
 # Loaded image: ghcr.io/shift/waf-rejected:v0.1.0-beta.6
 ```
 
@@ -36,7 +40,7 @@ Use the asset name shown on the release page if it differs from the convention
 above. Podman uses the same archive:
 
 ```bash
-podman load -i waf-rejected-0.1.0-beta.6-image.tar
+podman load -i waf-rejected-0.1.0-beta.6-image.tar.gz
 ```
 
 Alternatively pull from the registry:
@@ -54,7 +58,7 @@ docker image inspect --format '{{index .RepoDigests 0}}' \
 
 An image loaded from a local tarball may not carry a `RepoDigests` entry until
 it has been pulled or pushed. In that case compare the image ID in the release
-notes, or the `sha256` of the tarball, instead.
+notes, or verify the tarball against its published `.sha256` file, instead.
 
 ## Run it
 
@@ -134,7 +138,8 @@ Service should expose only `8080`.
    changes. Check the support matrix in
    [`support-policy.md`](support-policy.md).
 2. Pull the new digest and confirm the SBOM attached to the release lists the
-   dependency changes you expect.
+   dependency changes you expect. Verify the release assets with
+   `sha256sum --check *.sha256` before loading or deploying them.
 3. Start the new container alongside the old one if your load balancer allows
    it, or drain the old one first: remove it from the upstream pool, then
    `docker stop waf-rejected` and wait for graceful shutdown.

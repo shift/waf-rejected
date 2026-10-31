@@ -27,8 +27,23 @@ jobs:
         with:
           context: .
           push: true
+          load: true
           tags: |
             ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+      - name: Export image tarball
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_REF_NAME}"
+          docker save "${IMAGE}" | gzip -9 > "waf-rejected-${VERSION}-image.tar.gz"
+          test -s "waf-rejected-${VERSION}-image.tar.gz"
+          ls -l "waf-rejected-${VERSION}-image.tar.gz"
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: image
+          path: waf-rejected-*-image.tar.gz
+          if-no-files-found: error
 
   sbom:
     runs-on: ubuntu-latest
@@ -59,7 +74,9 @@ jobs:
           if-no-files-found: error
 
   build-release:
-    needs: sbom
+    needs:
+      - sbom
+      - build-image
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -70,24 +87,43 @@ jobs:
         with:
           name: sbom
           path: sbom
+      - name: Download image tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: image
+          path: image
       - name: Install Nix
         uses: cachix/install-nix-action@v25
       - name: Build release binary
         run: nix build .#waf-ingress
-      - name: Package artifact
+      - name: Package artifacts
         run: |
+          set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
-          mkdir -p "waf-rejected-v${VERSION}"
+          mkdir -p dist "waf-rejected-v${VERSION}"
           cp result/bin/waf-ingress "waf-rejected-v${VERSION}/"
           cp README.md CHANGELOG.md SECURITY.md LICENSE-* "waf-rejected-v${VERSION}/"
           cp "sbom/waf-rejected-${VERSION}.cdx.json" "waf-rejected-v${VERSION}/"
           cp -r rules "waf-rejected-v${VERSION}/"
-          tar -czf "waf-rejected-v${VERSION}-x86_64-linux.tar.gz" "waf-rejected-v${VERSION}"
+          tar -czf "dist/waf-rejected-v${VERSION}-x86_64-linux.tar.gz" "waf-rejected-v${VERSION}"
+          cp "image/waf-rejected-${VERSION}-image.tar.gz" dist/
+          cp "sbom/waf-rejected-${VERSION}.cdx.json" dist/
+          cd dist
+          for asset in \
+            "waf-rejected-v${VERSION}-x86_64-linux.tar.gz" \
+            "waf-rejected-${VERSION}-image.tar.gz" \
+            "waf-rejected-${VERSION}.cdx.json"; do
+            test -s "${asset}"
+            sha256sum "${asset}" > "${asset}.sha256"
+          done
+          sha256sum --check ./*.sha256
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
           prerelease: true
           generate_release_notes: true
           files: |
-            waf-rejected-*-x86_64-linux.tar.gz
-            sbom/waf-rejected-*.cdx.json
+            dist/waf-rejected-v*-x86_64-linux.tar.gz
+            dist/waf-rejected-*-image.tar.gz
+            dist/waf-rejected-*.cdx.json
+            dist/*.sha256

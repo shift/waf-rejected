@@ -14,11 +14,18 @@ All notable changes to WAF-Rejected are documented here.
   pinning, health/metrics ports, upgrade and rollback.
 - Documented that the project is not certified and that compliance reports are
   evidence, not conformity.
+- `docs/operations/release-checklist.md` and `docs/operations/container.md`
+  now document the automatically attached image tarball and `.sha256`
+  checksum assets, including `sha256sum --check` verification steps.
 
 ### Added
 
 - Release workflow now generates a CycloneDX SBOM with `cargo cyclonedx`,
   attaches it to the GitHub release and includes it in the binary tarball.
+- Release workflow now also exports the pushed container image with
+  `docker save` as `waf-rejected-<version>-image.tar.gz`, attaches it to the
+  GitHub release and publishes a `.sha256` checksum for the binary tarball,
+  the image tarball and the SBOM. GHCR push behaviour is unchanged.
 
 ## [0.1.0-beta.6] - 2026-10-31
 
