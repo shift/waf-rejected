@@ -2,6 +2,20 @@
 
 All notable changes to WAF-Rejected are documented here.
 
+## [Unreleased]
+
+### Added
+
+- EU AI Act, NIS2 and CRA evidence-report generators (evidence only, not
+  certification).
+- `docs/compliance/eu-regulatory-status.md` with the 2026-10-31 validated status
+  of Regulation (EU) 2026/1744, NIS2 transposition/amendments and CRA Article 14.
+
+### Changed
+
+- PCI report status is now `EVIDENCE GENERATED - ASSESSMENT REQUIRED` instead of
+  the misleading `COMPLIANT`.
+
 ## [0.1.0-beta.1] - 2026-10-31
 
 ### Added

@@ -16,9 +16,10 @@ load balancer and will enforce the documented WAF controls.
 - [x] Automated end-to-end proxy tests (allow, query block, body block, 413).
 - [x] Versioned as `0.1.0-beta.1` with `CHANGELOG.md`.
 - [x] Dockerfile, Helm templates, K8s manifests and monitoring wired.
-- [ ] `nix build .#waf-ingress` verified from a clean build.
-- [ ] Release notes published with explicit known limitations.
-- [ ] Tag `v0.1.0-beta.1` and GitHub pre-release created.
+- [x] `nix build .#waf-ingress` verified from a clean build.
+- [x] Release notes published with explicit known limitations.
+- [x] Tag `v0.1.0-beta.1` and GitHub pre-release created.
+- [ ] Container image built and smoke-tested locally (build in progress).
 
 ## Beta scope exclusions (documented)
 
@@ -26,6 +27,15 @@ load balancer and will enforce the documented WAF controls.
 - WebSocket/WebTransport tunneling
 - GeoIP database-backed country blocking
 - HTTP/3
+
+## Post-Beta: EU regulatory validation
+
+- [x] AI Act status validated against Regulation (EU) 2026/1744.
+- [x] NIS2 transposition/amendment status validated (October 2026).
+- [x] CRA Article 14 reporting status validated (in force 11 Sep 2026).
+- [x] Evidence-only AI Act/NIS2/CRA report generators added.
+- [x] Compliance docs and config flags updated (PR #25).
+- [ ] Machine-readable evidence export for the Transparenz CRA workflow.
 
 ---
 
