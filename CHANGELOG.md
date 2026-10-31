@@ -2,7 +2,7 @@
 
 All notable changes to WAF-Rejected are documented here.
 
-## [Unreleased]
+## [0.1.0-beta.5] - 2026-10-31
 
 ### Added
 
