@@ -64,6 +64,9 @@ pub mod modsecurity;
 // The historical `wasm` module is retained in-tree but is not compiled:
 // the Coraza/ModSecurity component ABI is not implemented for Beta.
 // The `wasm-waf` feature is intentionally empty and not enabled by default.
+//
+// `waf::wasm_reactor` is an isolated, non-default spike behind the
+// `wasm-reactor` feature; see docs/wasm-reactor-spike.md.
 
 // Re-export main components for easy access
 pub use config::Config;

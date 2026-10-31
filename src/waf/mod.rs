@@ -14,6 +14,10 @@ pub mod simd_ops;
 pub mod storage;
 pub mod tls_config;
 
+/// Experimental request-in/decision-out WASM reactor ABI (non-default feature).
+#[cfg(feature = "wasm-reactor")]
+pub mod wasm_reactor;
+
 use bytes::Bytes;
 use hyper::{HeaderMap, Method, Uri};
 use std::net::IpAddr;
