@@ -133,8 +133,9 @@ Key points:
 - **ModSecurity/Coraza WASM execution is not implemented.** The WASM runtime
   dependency was removed from the Beta build; the historical module is retained
   in-tree but not compiled. Do not expect OWASP CRS coverage.
-- **WebTransport is not implemented.** HTTP/1.1 WebSocket upgrades are proxied;
-  WebTransport requests are rejected with `501`.
+- **WebTransport is not implemented.** HTTP/1.1 WebSocket upgrades are proxied
+  to `http://` and TLS-secured `https://` upstreams; WebTransport requests are
+  rejected with `501`.
 - **GeoIP requires a MaxMind database.** Set `waf.geo_blocking.database_path` to a
   GeoLite2/GeoIP2 City `.mmdb`; without it only built-in test addresses resolve.
   Tor/VPN/datacenter detection additionally requires a GeoIP2 Anonymous IP

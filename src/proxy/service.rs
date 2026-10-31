@@ -13,10 +13,13 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use ipnetwork::IpNetwork;
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, RootCertStore};
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::protocol::Role;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
@@ -53,6 +56,19 @@ pub struct WafProxyService {
     auth_validator: Option<Arc<ApiKeyValidator>>,
     trusted_proxies: Vec<IpNetwork>,
     metrics: Arc<Metrics>,
+}
+
+/// Upstream byte stream, either plain TCP or TLS over TCP.
+trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
+
+/// Resolve a WebSocket upstream URI to `(use_tls, port)`.
+fn websocket_upstream_transport(upstream: &Uri) -> Result<(bool, u16), ()> {
+    match upstream.scheme_str() {
+        Some("http") => Ok((false, upstream.port_u16().unwrap_or(80))),
+        Some("https") => Ok((true, upstream.port_u16().unwrap_or(443))),
+        _ => Err(()),
+    }
 }
 
 /// IO wrapper that replays bytes already read from the upstream socket during
@@ -555,12 +571,15 @@ impl WafProxyService {
         client_ip: IpAddr,
     ) -> Response<Full<Bytes>> {
         let upstream = &state.upstream_uri;
-        if upstream.scheme_str() != Some("http") {
-            return Self::create_error_response(
-                StatusCode::BAD_GATEWAY,
-                "WebSocket upstream must use http://",
-            );
-        }
+        let (use_tls, port) = match websocket_upstream_transport(upstream) {
+            Ok(transport) => transport,
+            Err(()) => {
+                return Self::create_error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "WebSocket upstream must use http:// or https://",
+                )
+            }
+        };
         let host = match upstream.host() {
             Some(host) => host,
             None => {
@@ -570,7 +589,7 @@ impl WafProxyService {
                 )
             }
         };
-        let port = upstream.port_u16().unwrap_or(80);
+        let default_port = if use_tls { 443 } else { 80 };
         let path = req
             .uri()
             .path_and_query()
@@ -582,7 +601,7 @@ impl WafProxyService {
             .and_then(|value| value.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let upstream_host = if port == 80 {
+        let upstream_host = if port == default_port {
             host.to_string()
         } else {
             format!("{}:{}", host, port)
@@ -608,7 +627,7 @@ impl WafProxyService {
         );
 
         const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-        let mut upstream_stream =
+        let tcp_stream =
             match tokio::time::timeout(HANDSHAKE_TIMEOUT, TcpStream::connect((host, port))).await {
                 Ok(Ok(stream)) => stream,
                 Ok(Err(e)) => {
@@ -627,6 +646,57 @@ impl WafProxyService {
                     );
                 }
             };
+
+        let mut upstream_stream: Box<dyn AsyncStream> = if use_tls {
+            let mut roots = RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            // Select the ring provider explicitly: both ring and aws-lc-rs are
+            // enabled in this crate, so the implicit default is ambiguous.
+            let config = ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .expect("ring provider supports the default TLS protocol versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+            let server_name = match ServerName::try_from(host.to_string()) {
+                Ok(name) => name,
+                Err(e) => {
+                    error!("Invalid WebSocket upstream TLS server name: {}", e);
+                    state.metrics.record_upstream_error();
+                    return Self::create_error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "Invalid WebSocket upstream host",
+                    );
+                }
+            };
+            let connector = TlsConnector::from(Arc::new(config));
+            match tokio::time::timeout(
+                HANDSHAKE_TIMEOUT,
+                connector.connect(server_name, tcp_stream),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => Box::new(stream),
+                Ok(Err(e)) => {
+                    error!("WebSocket upstream TLS handshake failed: {}", e);
+                    state.metrics.record_upstream_error();
+                    return Self::create_error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "WebSocket upstream TLS handshake failed",
+                    );
+                }
+                Err(_) => {
+                    state.metrics.record_upstream_error();
+                    return Self::create_error_response(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "WebSocket upstream TLS handshake timed out",
+                    );
+                }
+            }
+        } else {
+            Box::new(tcp_stream)
+        };
 
         if let Err(e) = upstream_stream.write_all(handshake.as_bytes()).await {
             error!("WebSocket upstream handshake write failed: {}", e);
@@ -1202,6 +1272,21 @@ impl WafProxyService {
 mod tests {
     use super::*;
     use crate::config::ProxyConfig;
+
+    #[test]
+    fn test_websocket_upstream_transport_schemes() {
+        let http: Uri = "http://example.com/socket".parse().unwrap();
+        assert_eq!(websocket_upstream_transport(&http), Ok((false, 80)));
+
+        let https: Uri = "https://example.com/socket".parse().unwrap();
+        assert_eq!(websocket_upstream_transport(&https), Ok((true, 443)));
+
+        let https_port: Uri = "https://example.com:8443/socket".parse().unwrap();
+        assert_eq!(websocket_upstream_transport(&https_port), Ok((true, 8443)));
+
+        let unsupported: Uri = "ws://example.com/socket".parse().unwrap();
+        assert_eq!(websocket_upstream_transport(&unsupported), Err(()));
+    }
 
     #[test]
     fn test_proxy_service_creation() {

@@ -36,7 +36,15 @@ impl TlsManager {
         let key = load_private_key(&config.key_path)?;
 
         let versions = selected_versions(&config.min_version, &config.max_version)?;
-        let builder = RustlsServerConfig::builder_with_protocol_versions(&versions);
+        // Both ring and aws-lc-rs may be enabled by transitive dependencies;
+        // select ring explicitly instead of relying on an ambiguous default.
+        let builder = RustlsServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&versions)
+        .map_err(|e| {
+            WafError::Configuration(format!("TLS protocol version configuration error: {}", e))
+        })?;
 
         let mut server_config = if config.require_client_cert {
             let ca_path = config.client_ca_path.as_deref().ok_or_else(|| {
