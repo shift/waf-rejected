@@ -1,7 +1,23 @@
-# P0-09: Beta Release 0.1.0-beta.1 (NORTH STAR)
+# P0-09: Beta Release (current: 0.1.0-beta.8) (NORTH STAR)
 
 **Target**: ship a usable Beta that can be deployed behind a TLS-terminating
 load balancer and will enforce the documented WAF controls.
+
+## Release log
+
+- `0.1.0-beta.1` — connected core runtime, body inspection, auth, rate limits.
+- `0.1.0-beta.2` — security bypass fixes, container/config/deployment hardening.
+- `0.1.0-beta.3` — WebSocket upgrade tunneling.
+- `0.1.0-beta.4` — MaxMind City database support.
+- `0.1.0-beta.5` — WebSocket frame inspection + Anonymous IP database.
+- `0.1.0-beta.6` — WSS upstreams, frame size limits, image tarball asset.
+- `0.1.0-beta.7` — feature-gated HTTP/3 ingress.
+- `0.1.0-beta.8` — custom TLS WebSocket upstream CA, build provenance.
+
+## Active delegated work
+
+- HTTP/3 security parity tests (query/body block, 413, auth).
+- WebTransport implementation audit (`wtransport 0.7.2`).
 
 ## Beta acceptance criteria
 
