@@ -504,6 +504,23 @@ impl WafProxyService {
         }
 
         let (parts, body) = req.into_parts();
+        if let Some(encoding) = parts
+            .headers
+            .get(hyper::header::CONTENT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+        {
+            if !encoding.eq_ignore_ascii_case("identity") {
+                warn!(
+                    "Rejecting compressed request body from {} (Content-Encoding: {})",
+                    client_ip, encoding
+                );
+                state.metrics.record_blocked();
+                return Ok(Self::create_error_response(
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "Compressed request bodies are not inspected; send identity encoding",
+                ));
+            }
+        }
         let size_hint = parts
             .headers
             .get(hyper::header::CONTENT_LENGTH)
@@ -647,7 +664,14 @@ impl WafProxyService {
             let lower = name.as_str().to_ascii_lowercase();
             if matches!(
                 lower.as_str(),
-                "host" | "connection" | "upgrade" | "proxy-connection" | "x-forwarded-host"
+                "host"
+                    | "connection"
+                    | "upgrade"
+                    | "proxy-connection"
+                    | "x-forwarded-host"
+                    | "x-forwarded-for"
+                    | "x-real-ip"
+                    | "x-forwarded-proto"
             ) {
                 continue;
             }
@@ -657,8 +681,8 @@ impl WafProxyService {
         }
 
         let handshake = format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nX-Forwarded-Host: {}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n{}\r\n",
-            path, upstream_host, client_host, headers
+            "GET {} HTTP/1.1\r\nHost: {}\r\nX-Forwarded-Host: {}\r\nX-Forwarded-For: {}\r\nX-Real-IP: {}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n{}\r\n",
+            path, upstream_host, client_host, client_ip, client_ip, headers
         );
 
         const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);

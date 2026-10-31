@@ -3397,6 +3397,7 @@ dependencies = [
  "hyper-util",
  "ipnetwork 0.20.0",
  "maxminddb",
+ "memchr",
  "notify",
  "num_cpus",
  "once_cell",

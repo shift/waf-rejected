@@ -105,6 +105,20 @@ async fn pipeline_blocks_body_sqli() {
 }
 
 #[tokio::test]
+async fn pipeline_rejects_compressed_request_body() {
+    let upstream = spawn_upstream().await;
+    let proxy = spawn_proxy(upstream).await;
+    let response = reqwest::Client::new()
+        .post(format!("{}/upload", proxy))
+        .header("content-encoding", "gzip")
+        .body("not-really-gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
+#[tokio::test]
 async fn pipeline_rejects_oversized_upstream_response() {
     let upstream = spawn_upstream().await;
     let proxy = spawn_proxy(upstream).await;

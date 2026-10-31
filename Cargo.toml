@@ -108,6 +108,7 @@ serde_bytes = "0.11"
 
 # Additional dependencies for new features
 regex = "1.10"
+memchr = "2.7"
 once_cell = "1.19"
 uuid = { version = "1.6", features = ["v4", "serde"] }
 notify = "6.1"

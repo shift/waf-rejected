@@ -6,6 +6,8 @@ use regex::Regex;
 pub struct ContentInspectionRule {
     name: String,
     enabled: bool,
+    inspect_headers: bool,
+    inspect_body: bool,
     patterns: Vec<ThreatPattern>,
     // Performance optimization: cache compiled patterns by priority
     high_priority_patterns: Vec<ThreatPattern>,
@@ -222,6 +224,8 @@ impl ContentInspectionRule {
         Self {
             name: name.to_string(),
             enabled: true,
+            inspect_headers: true,
+            inspect_body: true,
             patterns,
             high_priority_patterns: high_priority,
             low_priority_patterns: low_priority,
@@ -234,6 +238,8 @@ impl ContentInspectionRule {
         Self {
             name: name.to_string(),
             enabled: true,
+            inspect_headers: true,
+            inspect_body: true,
             patterns,
             high_priority_patterns: high_priority,
             low_priority_patterns: low_priority,
@@ -242,6 +248,12 @@ impl ContentInspectionRule {
 
     pub fn enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
+        self
+    }
+
+    pub fn with_inspection(mut self, inspect_headers: bool, inspect_body: bool) -> Self {
+        self.inspect_headers = inspect_headers;
+        self.inspect_body = inspect_body;
         self
     }
 
@@ -412,8 +424,11 @@ impl WafRule for ContentInspectionRule {
         }
 
         // Check headers (optimized for performance)
-        for pattern in &self.high_priority_patterns {
-            if pattern.check_headers {
+        if self.inspect_headers {
+            for pattern in &self.high_priority_patterns {
+                if !pattern.check_headers {
+                    continue;
+                }
                 for (header_name, header_value) in ctx.headers.iter() {
                     if let Ok(header_str) = header_value.to_str() {
                         if pattern.pattern.is_match(header_str) {
@@ -434,30 +449,32 @@ impl WafRule for ContentInspectionRule {
         // `server.max_body_size`; this hard cap is a final defence against
         // inspecting an unbounded buffer.
         const MAX_BODY_INSPECTION: usize = 16 * 1024 * 1024; // 16 MiB
-        if let Some(body) = &ctx.body {
-            if body.len() > MAX_BODY_INSPECTION {
-                return Decision::Block {
-                    status: 413,
-                    reason: format!(
-                        "Content inspection: body exceeds {} bytes",
-                        MAX_BODY_INSPECTION
-                    ),
-                };
-            }
-            let content = String::from_utf8_lossy(body);
-            let found = self.inspect_body(&content).or_else(|| {
-                percent_decode(&content)
-                    .filter(|decoded| decoded != &content)
-                    .and_then(|decoded| self.inspect_body(&decoded))
-            });
-            if let Some((pattern, matched)) = found {
-                return Decision::Block {
-                    status: self.severity_to_status(&pattern.severity),
-                    reason: format!(
-                        "Content inspection: {} detected in body: {}",
-                        pattern.name, matched
-                    ),
-                };
+        if self.inspect_body {
+            if let Some(body) = &ctx.body {
+                if body.len() > MAX_BODY_INSPECTION {
+                    return Decision::Block {
+                        status: 413,
+                        reason: format!(
+                            "Content inspection: body exceeds {} bytes",
+                            MAX_BODY_INSPECTION
+                        ),
+                    };
+                }
+                let content = String::from_utf8_lossy(body);
+                let found = self.inspect_body(&content).or_else(|| {
+                    percent_decode(&content)
+                        .filter(|decoded| decoded != &content)
+                        .and_then(|decoded| self.inspect_body(&decoded))
+                });
+                if let Some((pattern, matched)) = found {
+                    return Decision::Block {
+                        status: self.severity_to_status(&pattern.severity),
+                        reason: format!(
+                            "Content inspection: {} detected in body: {}",
+                            pattern.name, matched
+                        ),
+                    };
+                }
             }
         }
 
@@ -694,6 +711,25 @@ mod tests {
             rule.evaluate(&ctx),
             Decision::Block { status: 414, .. }
         ));
+    }
+
+    #[test]
+    fn test_body_inspection_can_be_disabled() {
+        let rule = ContentInspectionRuleFactory::sql_injection_rule().with_inspection(true, false);
+        let mut ctx = create_test_context("/login", None);
+        ctx = ctx.with_body(Some(bytes::Bytes::from_static(
+            b"id=1 UNION SELECT * FROM users",
+        )));
+        assert_eq!(rule.evaluate(&ctx), Decision::Allow);
+    }
+
+    #[test]
+    fn test_header_inspection_can_be_disabled() {
+        let rule = ContentInspectionRuleFactory::xss_rule().with_inspection(false, true);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-test", "<script>alert(1)</script>".parse().unwrap());
+        let ctx = create_test_context("/", Some(headers));
+        assert_eq!(rule.evaluate(&ctx), Decision::Allow);
     }
 
     #[test]

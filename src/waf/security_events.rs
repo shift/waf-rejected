@@ -219,6 +219,9 @@ impl SecurityEventLogger {
         decision: &Decision,
         triggered_rules: Vec<String>,
     ) {
+        if !self.config.enabled {
+            return;
+        }
         let event = self.create_security_event(ctx, decision, triggered_rules);
 
         // Skip events below minimum threat level

@@ -125,6 +125,27 @@ async fn handle_request(
     state.metrics.record_request();
 
     let (mut parts, ()) = request.into_parts();
+    if let Some(encoding) = parts
+        .headers
+        .get(http::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+    {
+        if !encoding.eq_ignore_ascii_case("identity") {
+            warn!(
+                "Rejecting compressed HTTP/3 request body from {} (Content-Encoding: {})",
+                peer_ip, encoding
+            );
+            state.metrics.record_blocked();
+            return send_response(
+                &mut stream,
+                WafProxyService::create_error_response(
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "Compressed request bodies are not inspected; send identity encoding",
+                ),
+            )
+            .await;
+        }
+    }
     parts.uri = reconstruct_uri(&parts.uri, &parts.headers);
     ensure_host_header(&mut parts.headers, &parts.uri);
 

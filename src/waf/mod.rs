@@ -116,6 +116,7 @@ pub struct WafEngine {
     rules: Arc<RwLock<Vec<Box<dyn WafRule>>>>,
     event_logger: SecurityEventLogger,
     geoip_service: Arc<GeoIpService>,
+    enabled: bool,
     fail_closed: bool,
     wasm_init_failed: bool,
     #[cfg(feature = "wasm-waf")]
@@ -136,6 +137,7 @@ impl Clone for WafEngine {
             rules: Arc::clone(&self.rules),
             event_logger: SecurityEventLogger::default_logger(),
             geoip_service: Arc::clone(&self.geoip_service),
+            enabled: self.enabled,
             fail_closed: self.fail_closed,
             wasm_init_failed: self.wasm_init_failed,
             #[cfg(feature = "wasm-waf")]
@@ -152,6 +154,7 @@ impl WafEngine {
             rules: Arc::new(RwLock::new(Vec::new())),
             event_logger: SecurityEventLogger::default_logger(),
             geoip_service: Arc::new(GeoIpService::new()),
+            enabled: true,
             fail_closed: true,
             wasm_init_failed: false,
             #[cfg(feature = "wasm-waf")]
@@ -171,6 +174,7 @@ impl WafEngine {
             rules: Arc::new(RwLock::new(Vec::new())),
             event_logger: SecurityEventLogger::new(config.waf.security_events.clone()),
             geoip_service: Self::initialize_geoip(config),
+            enabled: config.waf.enabled,
             fail_closed: config.waf.fail_mode != "open",
             wasm_init_failed,
             #[cfg(feature = "wasm-waf")]
@@ -278,7 +282,11 @@ impl WafEngine {
         // Add content inspection rules
         if config.waf.content_inspection.enabled {
             for pattern in &config.waf.content_inspection.threat_patterns {
-                let rule = ContentInspectionRuleFactory::create_threat_rule(pattern);
+                let rule = ContentInspectionRuleFactory::create_threat_rule(pattern)
+                    .with_inspection(
+                        config.waf.content_inspection.inspect_headers,
+                        config.waf.content_inspection.inspect_body,
+                    );
                 self.add_rule(rule);
             }
         }
@@ -354,6 +362,9 @@ impl WafEngine {
     /// Fast evaluation for performance-critical paths (headers/URI only)
     /// Skips expensive operations like body inspection
     pub async fn fast_evaluate(&self, request: &RequestContext) -> Decision {
+        if !self.enabled {
+            return Decision::Allow;
+        }
         let mut triggered_rules = Vec::new();
         let mut blocking_decision = None;
         let rules_count;
@@ -439,6 +450,9 @@ impl WafEngine {
     /// Evaluate all rules against the request context
     /// Returns the first blocking decision or Allow if all rules pass
     pub async fn evaluate(&self, request: &RequestContext) -> Decision {
+        if !self.enabled {
+            return Decision::Allow;
+        }
         let mut triggered_rules = Vec::new();
         let mut blocking_decision = None;
         let rules_count;
@@ -737,6 +751,17 @@ mod tests {
             HeaderMap::new(),
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn test_waf_disabled_allows_everything() {
+        let mut config = crate::config::Config::default();
+        config.waf.enabled = false;
+        let engine = WafEngine::with_config(&config);
+
+        let mut ctx = create_test_context();
+        ctx.uri = Uri::from_str("/?id=1%20UNION%20SELECT%201").unwrap();
+        assert_eq!(engine.evaluate(&ctx).await, Decision::Allow);
     }
 
     #[tokio::test]
