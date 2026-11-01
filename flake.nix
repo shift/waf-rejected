@@ -29,7 +29,9 @@
           inherit system overlays;
         };
 
-        rustVersion = pkgs.rust-bin.stable.latest.default.override {
+        # Pinned Rust toolchain. wasmtime 49 requires Rust >= 1.96; 1.99.1 is
+        # the newest stable published by the locked rust-overlay input.
+        rustVersion = pkgs.rust-bin.stable."1.99.1".default.override {
           extensions = [ "rust-src" "rustfmt" "clippy" ];
         };
 
@@ -243,6 +245,7 @@
             wrk
             curl
             jq
+            cargo-audit  # Dependency vulnerability scan (cargo audit)
             gnuplot  # Added for Criterion benchmark plotting
             
             # Monitoring and observability

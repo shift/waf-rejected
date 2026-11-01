@@ -1,12 +1,12 @@
 //! Experimental request-in/decision-out WebAssembly reactor ABI.
 //!
 //! This module is compiled only with the non-default `wasm-reactor` feature.
-//! It is a spike: it proves the host/module boundary with a pure-Rust
-//! interpreter ([`wasmi`]) so that a real Coraza/TinyGo reactor can later be
-//! dropped in without the historical Go-JS host. It does not replace any of
-//! the built-in heuristic rules and is never enabled by default.
+//! It hosts the Go/Coraza WASI reactor with [wasmtime](https://wasmtime.dev),
+//! using wasmtime's WASI preview1 implementation for the reactor's imports. It
+//! does not replace any of the built-in heuristic rules and is never enabled
+//! by default.
 //!
-//! See `docs/wasm-reactor-spike.md` for the ABI and migration notes.
+//! See `docs/coraza-wasi-reactor.md` for the ABI, limits and benchmark notes.
 
 use std::cell::RefCell;
 use std::path::Path;
@@ -15,10 +15,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tracing::{info, warn};
-use wasmi::{
-    Caller, Config, Engine, Extern, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder,
-    TypedFunc,
+use wasmtime::{
+    Caller, Config, Engine, Extern, Linker, Memory, Module, OptLevel, Store, StoreLimits,
+    StoreLimitsBuilder, TypedFunc,
 };
+use wasmtime_wasi::p1::{self, WasiP1Ctx};
+use wasmtime_wasi::p2::pipe::SinkOutputStream;
+use wasmtime_wasi::WasiCtxBuilder;
 
 use crate::metrics::Metrics;
 use crate::waf::{Decision, RequestContext, WafRule};
@@ -141,119 +144,49 @@ pub enum ReactorError {
     UnknownDecision(i32),
 }
 
+/// Per-`Store` state. `WasiP1Ctx` supplies the preview1 imports the Go
+/// runtime needs; `StoreLimits` caps linear memory.
+struct ReactorState {
+    wasi: WasiP1Ctx,
+    limits: StoreLimits,
+}
+
 const WASI_SUCCESS: i32 = 0;
 const WASI_BADF: i32 = 8;
 const WASI_INVAL: i32 = 28;
 
-/// Minimal WASI preview1 shim for Go's `wasip1` runtime.
+/// Builds the preview1 linker for the reactor.
 ///
-/// The Coraza reactor is a Go `-buildmode=c-shared` module, so it imports the
-/// handful of preview1 calls the Go runtime needs for start-up and allocation.
-/// This shim deliberately provides no filesystem, clock or entropy authority:
-/// stdio is discarded, clocks read zero, random bytes are deterministic, and
-/// path operations return `EBADF`. Nothing in the WAF rules needs those
-/// capabilities.
-fn wasi_linker(engine: &Engine) -> Linker<StoreLimits> {
-    let mut linker = Linker::new(engine);
+/// The context inherits no preopened directories, no arguments and no
+/// environment, so the reactor cannot read or write files, spawn processes or
+/// observe host configuration. Wall-clock and entropy calls come from
+/// wasmtime-wasi; the Go runtime requires both to make progress.
+///
+/// wasmtime-wasi's synchronous preview1 adapters drive async host functions
+/// through an ambient Tokio runtime (`Handle::block_on`). The proxy evaluates
+/// rules from inside its own Tokio workers, where that call panics with
+/// "Cannot start a runtime from within a runtime". The file/stdio imports are
+/// therefore shadowed with deterministic, authority-free shims. They are the
+/// same imports the previous hand-written shim implemented: stdio is
+/// discarded, descriptors are invalid, and directory/path operations return
+/// `EBADF`. Nothing in the WAF rules needs those capabilities.
+fn wasi_linker(engine: &Engine) -> Result<Linker<ReactorState>, ReactorError> {
+    let mut linker: Linker<ReactorState> = Linker::new(engine);
+    linker.allow_shadowing(true);
+    p1::add_to_linker_sync(&mut linker, |state: &mut ReactorState| &mut state.wasi)
+        .map_err(|err| ReactorError::Compile(err.to_string()))?;
+    install_sync_shims(&mut linker)?;
+    Ok(linker)
+}
 
-    linker
-        .func_wrap("wasi_snapshot_preview1", "sched_yield", || -> i32 {
-            WASI_SUCCESS
-        })
-        .expect("unique WASI import");
-    linker
-        .func_wrap(
-            "wasi_snapshot_preview1",
-            "proc_exit",
-            |_code: i32| -> Result<(), wasmi::Error> {
-                Err(wasmi::Error::new("WASI proc_exit called"))
-            },
-        )
-        .expect("unique WASI import");
-    linker
-        .func_wrap(
-            "wasi_snapshot_preview1",
-            "args_sizes_get",
-            |mut caller: Caller<'_, StoreLimits>, argc: i32, argv_buf: i32| -> i32 {
-                wasi_write_u32(&mut caller, argc, 0).max(wasi_write_u32(&mut caller, argv_buf, 0))
-            },
-        )
-        .expect("unique WASI import");
-    linker
-        .func_wrap(
-            "wasi_snapshot_preview1",
-            "args_get",
-            |_argc: i32, _argv: i32| -> i32 { WASI_SUCCESS },
-        )
-        .expect("unique WASI import");
-    linker
-        .func_wrap(
-            "wasi_snapshot_preview1",
-            "environ_sizes_get",
-            |mut caller: Caller<'_, StoreLimits>, count: i32, size: i32| -> i32 {
-                wasi_write_u32(&mut caller, count, 0).max(wasi_write_u32(&mut caller, size, 0))
-            },
-        )
-        .expect("unique WASI import");
-    linker
-        .func_wrap(
-            "wasi_snapshot_preview1",
-            "environ_get",
-            |_environ: i32, _buf: i32| -> i32 { WASI_SUCCESS },
-        )
-        .expect("unique WASI import");
-    linker
-        .func_wrap(
-            "wasi_snapshot_preview1",
-            "clock_time_get",
-            |mut caller: Caller<'_, StoreLimits>, _clock: i32, _precision: i64, out: i32| -> i32 {
-                // Go's runtime throws "nanotime returning zero" if the
-                // monotonic clock never advances. A deterministic, strictly
-                // increasing counter is sufficient for scheduling timeouts.
-                use std::sync::atomic::{AtomicU64, Ordering};
-                static NOW: AtomicU64 = AtomicU64::new(1);
-                let now = NOW.fetch_add(1_000_000, Ordering::Relaxed);
-                wasi_write_u64(&mut caller, out, now)
-            },
-        )
-        .expect("unique WASI import");
-    linker
-        .func_wrap(
-            "wasi_snapshot_preview1",
-            "random_get",
-            |mut caller: Caller<'_, StoreLimits>, ptr: i32, len: i32| -> i32 {
-                let Some(memory) = wasi_memory(&mut caller) else {
-                    return WASI_INVAL;
-                };
-                let Ok(start) = usize::try_from(ptr) else {
-                    return WASI_INVAL;
-                };
-                let Ok(len) = usize::try_from(len) else {
-                    return WASI_INVAL;
-                };
-                let Some(end) = start.checked_add(len) else {
-                    return WASI_INVAL;
-                };
-                let data = memory.data_mut(&mut caller);
-                if end > data.len() {
-                    return WASI_INVAL;
-                }
-                let mut state = 0x9e37_79b9_u32 ^ len as u32;
-                for byte in &mut data[start..end] {
-                    state ^= state << 13;
-                    state ^= state >> 17;
-                    state ^= state << 5;
-                    *byte = state as u8;
-                }
-                WASI_SUCCESS
-            },
-        )
-        .expect("unique WASI import");
+fn install_sync_shims(linker: &mut Linker<ReactorState>) -> Result<(), ReactorError> {
+    let compile = |err: wasmtime::Error| ReactorError::Compile(err.to_string());
+
     linker
         .func_wrap(
             "wasi_snapshot_preview1",
             "fd_write",
-            |mut caller: Caller<'_, StoreLimits>,
+            |mut caller: Caller<'_, ReactorState>,
              _fd: i32,
              iovs: i32,
              iovs_len: i32,
@@ -265,38 +198,29 @@ fn wasi_linker(engine: &Engine) -> Linker<StoreLimits> {
                     let Some((_ptr, len)) = wasi_read_pair(&mut caller, offset) else {
                         return WASI_INVAL;
                     };
-                    #[cfg(test)]
-                    if _fd == 2 {
-                        if let Some(memory) = wasi_memory(&mut caller) {
-                            let mut bytes = vec![0u8; len as usize];
-                            if memory.read(&caller, _ptr as usize, &mut bytes).is_ok() {
-                                eprint!("{}", String::from_utf8_lossy(&bytes));
-                            }
-                        }
-                    }
                     total = total.saturating_add(len);
                 }
                 wasi_write_u32(&mut caller, nwritten, total)
             },
         )
-        .expect("unique WASI import");
+        .map_err(compile)?;
     linker
         .func_wrap(
             "wasi_snapshot_preview1",
             "fd_read",
-            |mut caller: Caller<'_, StoreLimits>,
+            |mut caller: Caller<'_, ReactorState>,
              _fd: i32,
              _iovs: i32,
              _iovs_len: i32,
              nread: i32|
              -> i32 { wasi_write_u32(&mut caller, nread, 0) },
         )
-        .expect("unique WASI import");
+        .map_err(compile)?;
     linker
         .func_wrap(
             "wasi_snapshot_preview1",
             "fd_pread",
-            |mut caller: Caller<'_, StoreLimits>,
+            |mut caller: Caller<'_, ReactorState>,
              _fd: i32,
              _iovs: i32,
              _iovs_len: i32,
@@ -304,17 +228,17 @@ fn wasi_linker(engine: &Engine) -> Linker<StoreLimits> {
              nread: i32|
              -> i32 { wasi_write_u32(&mut caller, nread, 0) },
         )
-        .expect("unique WASI import");
+        .map_err(compile)?;
     linker
         .func_wrap("wasi_snapshot_preview1", "fd_close", |_fd: i32| -> i32 {
             WASI_SUCCESS
         })
-        .expect("unique WASI import");
+        .map_err(compile)?;
     linker
         .func_wrap(
             "wasi_snapshot_preview1",
             "fd_fdstat_get",
-            |mut caller: Caller<'_, StoreLimits>, _fd: i32, out: i32| -> i32 {
+            |mut caller: Caller<'_, ReactorState>, _fd: i32, out: i32| -> i32 {
                 let Some(memory) = wasi_memory(&mut caller) else {
                     return WASI_INVAL;
                 };
@@ -335,61 +259,54 @@ fn wasi_linker(engine: &Engine) -> Linker<StoreLimits> {
                 WASI_SUCCESS
             },
         )
-        .expect("unique WASI import");
-    linker
-        .func_wrap(
-            "wasi_snapshot_preview1",
-            "fd_fdstat_set_flags",
-            |_fd: i32, _flags: i32| -> i32 { WASI_SUCCESS },
-        )
-        .expect("unique WASI import");
+        .map_err(compile)?;
     linker
         .func_wrap(
             "wasi_snapshot_preview1",
             "fd_prestat_get",
             |_fd: i32, _out: i32| -> i32 { WASI_BADF },
         )
-        .expect("unique WASI import");
+        .map_err(compile)?;
     linker
         .func_wrap(
             "wasi_snapshot_preview1",
             "fd_prestat_dir_name",
             |_fd: i32, _path: i32, _len: i32| -> i32 { WASI_BADF },
         )
-        .expect("unique WASI import");
+        .map_err(compile)?;
     linker
         .func_wrap(
             "wasi_snapshot_preview1",
             "fd_readdir",
             |_fd: i32, _buf: i32, _len: i32, _cookie: i64, _used: i32| -> i32 { WASI_BADF },
         )
-        .expect("unique WASI import");
+        .map_err(compile)?;
     linker
         .func_wrap(
             "wasi_snapshot_preview1",
             "fd_filestat_get",
             |_fd: i32, _out: i32| -> i32 { WASI_BADF },
         )
-        .expect("unique WASI import");
+        .map_err(compile)?;
     linker
         .func_wrap(
             "wasi_snapshot_preview1",
             "poll_oneoff",
-            |mut caller: Caller<'_, StoreLimits>,
+            |mut caller: Caller<'_, ReactorState>,
              _in: i32,
              _out: i32,
              _nsubscriptions: i32,
              nevents: i32|
              -> i32 { wasi_write_u32(&mut caller, nevents, 0) },
         )
-        .expect("unique WASI import");
+        .map_err(compile)?;
     linker
         .func_wrap(
             "wasi_snapshot_preview1",
             "path_filestat_get",
             |_fd: i32, _flags: i32, _path: i32, _len: i32, _out: i32| -> i32 { WASI_BADF },
         )
-        .expect("unique WASI import");
+        .map_err(compile)?;
     linker
         .func_wrap(
             "wasi_snapshot_preview1",
@@ -398,21 +315,21 @@ fn wasi_linker(engine: &Engine) -> Linker<StoreLimits> {
                 WASI_BADF
             },
         )
-        .expect("unique WASI import");
+        .map_err(compile)?;
     linker
         .func_wrap(
             "wasi_snapshot_preview1",
             "path_remove_directory",
             |_fd: i32, _path: i32, _len: i32| -> i32 { WASI_BADF },
         )
-        .expect("unique WASI import");
+        .map_err(compile)?;
     linker
         .func_wrap(
             "wasi_snapshot_preview1",
             "path_unlink_file",
             |_fd: i32, _path: i32, _len: i32| -> i32 { WASI_BADF },
         )
-        .expect("unique WASI import");
+        .map_err(compile)?;
     linker
         .func_wrap(
             "wasi_snapshot_preview1",
@@ -428,22 +345,19 @@ fn wasi_linker(engine: &Engine) -> Linker<StoreLimits> {
              _out: i32|
              -> i32 { WASI_BADF },
         )
-        .expect("unique WASI import");
+        .map_err(compile)?;
 
-    // Unused but listed for clarity; keeps the shim honest if the Go runtime
-    // starts importing them in a future toolchain.
-
-    linker
+    Ok(())
 }
 
-fn wasi_memory(caller: &mut Caller<'_, StoreLimits>) -> Option<Memory> {
+fn wasi_memory(caller: &mut Caller<'_, ReactorState>) -> Option<Memory> {
     match caller.get_export("memory") {
         Some(Extern::Memory(memory)) => Some(memory),
         _ => None,
     }
 }
 
-fn wasi_write_u32(caller: &mut Caller<'_, StoreLimits>, ptr: i32, value: u32) -> i32 {
+fn wasi_write_u32(caller: &mut Caller<'_, ReactorState>, ptr: i32, value: u32) -> i32 {
     let Some(memory) = wasi_memory(caller) else {
         return WASI_INVAL;
     };
@@ -456,20 +370,7 @@ fn wasi_write_u32(caller: &mut Caller<'_, StoreLimits>, ptr: i32, value: u32) ->
     }
 }
 
-fn wasi_write_u64(caller: &mut Caller<'_, StoreLimits>, ptr: i32, value: u64) -> i32 {
-    let Some(memory) = wasi_memory(caller) else {
-        return WASI_INVAL;
-    };
-    let Ok(ptr) = usize::try_from(ptr) else {
-        return WASI_INVAL;
-    };
-    match memory.write(caller, ptr, &value.to_le_bytes()) {
-        Ok(()) => WASI_SUCCESS,
-        Err(_) => WASI_INVAL,
-    }
-}
-
-fn wasi_read_pair(caller: &mut Caller<'_, StoreLimits>, ptr: i32) -> Option<(u32, u32)> {
+fn wasi_read_pair(caller: &mut Caller<'_, ReactorState>, ptr: i32) -> Option<(u32, u32)> {
     let memory = wasi_memory(caller)?;
     let ptr = usize::try_from(ptr).ok()?;
     let mut bytes = [0u8; 8];
@@ -483,7 +384,7 @@ fn wasi_read_pair(caller: &mut Caller<'_, StoreLimits>, ptr: i32) -> Option<(u32
 /// A compiled, reusable reactor module.
 ///
 /// The compiled [`Module`] and [`Engine`] are shared across calls. Each
-/// worker thread keeps its own initialised [`Store`] and instance (wasmi
+/// worker thread keeps its own initialised [`Store`] and instance (wasmtime
 /// stores are not `Send`), so the expensive Go runtime `_initialize` and
 /// Coraza `init` run once per thread and reactor instead of once per request.
 /// A thread only ever borrows its own instance, so evaluations never share
@@ -493,6 +394,7 @@ pub struct WasmReactor {
     id: u64,
     engine: Engine,
     module: Module,
+    linker: Linker<ReactorState>,
     limits: ReactorLimits,
 }
 
@@ -515,7 +417,7 @@ const THREAD_CACHE_CAPACITY: usize = 2;
 /// One initialised reactor instance, owned by a single worker thread.
 struct CachedInstance {
     reactor_id: u64,
-    store: Store<StoreLimits>,
+    store: Store<ReactorState>,
     memory: Memory,
     eval: TypedFunc<(i32, i32), i32>,
     free: TypedFunc<(i32, i32), ()>,
@@ -541,22 +443,26 @@ impl WasmReactor {
         Self::from_bytes(wat.as_bytes(), limits)
     }
 
-    /// Compiles a reactor from Wasm bytes. WAT text is also accepted when the
-    /// `wat` feature of `wasmi` is enabled (it is, for this spike).
+    /// Compiles a reactor from Wasm bytes. WAT text is accepted as well.
     pub fn from_bytes(bytes: &[u8], limits: ReactorLimits) -> Result<Self, ReactorError> {
-        let mut config = Config::default();
+        let mut config = Config::new();
         config.consume_fuel(true);
-        // Bound native stack use per call frame. The Go runtime start-up is
-        // shallow, but an unbounded interpreter stack can overflow the host
-        // thread before wasmi reports a trap.
-        config.set_max_recursion_depth(1024);
-        let engine = Engine::new(&config);
+        config.cranelift_opt_level(OptLevel::Speed);
+        // The Go runtime uses more wasm stack than a typical Rust/C guest.
+        // Exceeding this limit traps in wasm instead of overflowing the host
+        // thread stack. wasmtime requires `max_wasm_stack` to fit inside the
+        // async stack, even for synchronous calls.
+        config.async_stack_size(8 * 1024 * 1024);
+        config.max_wasm_stack(8 * 1024 * 1024);
+        let engine = Engine::new(&config).map_err(|err| ReactorError::Compile(err.to_string()))?;
         let module =
             Module::new(&engine, bytes).map_err(|err| ReactorError::Compile(err.to_string()))?;
+        let linker = wasi_linker(&engine)?;
         let reactor = Self {
             id: NEXT_REACTOR_ID.fetch_add(1, Ordering::Relaxed),
             engine,
             module,
+            linker,
             limits,
         };
         reactor.validate_exports()?;
@@ -664,35 +570,47 @@ impl WasmReactor {
     fn instantiate(&self) -> Result<CachedInstance, ReactorError> {
         let store_limits = StoreLimitsBuilder::new()
             .memory_size(self.limits.memory_limit_bytes)
+            .trap_on_grow_failure(true)
             .build();
-        let mut store = Store::new(&self.engine, store_limits);
-        store.limiter(|limits: &mut StoreLimits| limits);
+        // No preopens, arguments or environment: the reactor has no filesystem
+        // or configuration authority. stdout/stderr are discarded so reactor
+        // logging cannot be used to flood host output.
+        let mut wasi = WasiCtxBuilder::new();
+        wasi.stdout(SinkOutputStream).stderr(SinkOutputStream);
+        let mut store = Store::new(
+            &self.engine,
+            ReactorState {
+                wasi: wasi.build_p1(),
+                limits: store_limits,
+            },
+        );
+        store.limiter(|state: &mut ReactorState| &mut state.limits);
         store
             .set_fuel(self.limits.fuel)
             .map_err(|err| ReactorError::Trap(err.to_string()))?;
 
-        let linker = wasi_linker(&self.engine);
-        let instance = linker
-            .instantiate_and_start(&mut store, &self.module)
+        let instance = self
+            .linker
+            .instantiate(&mut store, &self.module)
             .map_err(|err| ReactorError::Compile(err.to_string()))?;
 
         let memory = instance
-            .get_memory(&store, "memory")
+            .get_memory(&mut store, "memory")
             .ok_or(ReactorError::MissingExport("memory"))?;
         let init = instance
-            .get_typed_func::<(), i32>(&store, "init")
+            .get_typed_func::<(), i32>(&mut store, "init")
             .map_err(|_| ReactorError::MissingExport("init"))?;
         let eval = instance
-            .get_typed_func::<(i32, i32), i32>(&store, "eval")
+            .get_typed_func::<(i32, i32), i32>(&mut store, "eval")
             .map_err(|_| ReactorError::MissingExport("eval"))?;
         let free = instance
-            .get_typed_func::<(i32, i32), ()>(&store, "free")
+            .get_typed_func::<(i32, i32), ()>(&mut store, "free")
             .map_err(|_| ReactorError::MissingExport("free"))?;
 
         // Go's `-buildmode=c-shared` reactor exports `_initialize`, which must
         // run before any `//go:wasmexport` function. Modules without it (the
         // WAT spike) simply skip this step.
-        if let Ok(initialize) = instance.get_typed_func::<(), ()>(&store, "_initialize") {
+        if let Ok(initialize) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
             initialize
                 .call(&mut store, ())
                 .map_err(|err| ReactorError::Trap(err.to_string()))?;
@@ -708,7 +626,7 @@ impl WasmReactor {
         // Reactors whose runtime owns low linear memory advertise a safe
         // write offset through `input_base`; the WAT spike keeps the historical
         // fixed offset.
-        let input_base = match instance.get_typed_func::<(), i32>(&store, "input_base") {
+        let input_base = match instance.get_typed_func::<(), i32>(&mut store, "input_base") {
             Ok(func) => {
                 let base = func
                     .call(&mut store, ())
@@ -751,6 +669,8 @@ impl WasmReactor {
         if end > cached.memory.data_size(&cached.store) {
             return Err(ReactorError::PayloadOutOfBounds);
         }
+        let base_i32 = i32::try_from(input_base).map_err(|_| ReactorError::PayloadOutOfBounds)?;
+        let len_i32 = i32::try_from(payload.len()).map_err(|_| ReactorError::PayloadOutOfBounds)?;
         cached
             .memory
             .write(&mut cached.store, input_base, payload)
@@ -758,14 +678,12 @@ impl WasmReactor {
 
         let code = cached
             .eval
-            .call(&mut cached.store, (input_base as i32, payload.len() as i32))
+            .call(&mut cached.store, (base_i32, len_i32))
             .map_err(|err| ReactorError::Trap(err.to_string()))?;
 
         // `free` is part of the ABI even though the reactors do not allocate
         // per request. A failure here does not invalidate the instance.
-        let _ = cached
-            .free
-            .call(&mut cached.store, (input_base as i32, payload.len() as i32));
+        let _ = cached.free.call(&mut cached.store, (base_i32, len_i32));
 
         let decision = match code {
             DECISION_ALLOW => ReactorDecision::Allow,
@@ -1155,11 +1073,11 @@ mod tests {
         ));
     }
 
-    // Debug-build wasmi interpreter frames are too large to initialise the Go
-    // runtime reliably; the same test passes in release. Run it with:
+    // Initialising the Go runtime and compiling CRS is slow in debug builds,
+    // so this test is kept out of the default run. Run it with:
     //   cargo test --release --lib --features wasm-reactor -- --ignored
     #[test]
-    #[ignore = "Go/WASI reactor requires the release wasmi profile"]
+    #[ignore = "Go/WASI reactor is exercised in release mode"]
     fn coraza_reactor_allows_benign_and_blocks_attacks() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -1230,7 +1148,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Go/WASI reactor requires the release wasmi profile"]
+    #[ignore = "Go/WASI reactor is exercised in release mode"]
     fn coraza_reactor_reuses_instance_without_leaking_state() {
         let reactor = WasmReactor::from_bytes(EMBEDDED_CORAZA_REACTOR, ReactorLimits::coraza())
             .expect("embedded reactor must load");
@@ -1274,7 +1192,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Go/WASI reactor requires the release wasmi profile"]
+    #[ignore = "Go/WASI reactor is exercised in release mode"]
     fn coraza_reactor_isolated_per_thread() {
         let reactor = Arc::new(
             WasmReactor::from_bytes(EMBEDDED_CORAZA_REACTOR, ReactorLimits::coraza())
@@ -1325,7 +1243,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Go/WASI reactor latency measurement requires the release wasmi profile"]
+    #[ignore = "Go/WASI reactor latency measurement runs in release mode"]
     fn measure_coraza_reactor_latency() {
         let load_start = std::time::Instant::now();
         let reactor = WasmReactor::from_bytes(EMBEDDED_CORAZA_REACTOR, ReactorLimits::coraza())

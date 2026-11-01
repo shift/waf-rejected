@@ -228,11 +228,11 @@ Key points:
 
 ## Security limitations (read before production)
 
-- **ModSecurity/Coraza WASM execution is opt-in and not CRS.** The bundled
+- **ModSecurity/Coraza WASM execution is opt-in.** The bundled
   `rules/coraza.wasm` remains a Go-JS demo module. A real Coraza WASI reactor
-  is available behind the non-default `wasm-reactor` feature and
-  `waf.coraza.enabled`; it ships a small embedded rule set, not OWASP CRS, and
-  is disabled by default. See
+  runs on wasmtime 49 behind the non-default `wasm-reactor` feature and
+  `waf.coraza.enabled`; it embeds OWASP CRS 4.14 (request-side, paranoia level
+  1) and is disabled by default. The host is built with Rust 1.99.1. See
   [`docs/coraza-wasi-reactor.md`](docs/coraza-wasi-reactor.md) and
   [`docs/wasm-integration-status.md`](docs/wasm-integration-status.md).
 - **WebTransport is feature-gated and terminating.** Build with

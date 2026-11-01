@@ -367,16 +367,8 @@ impl IoStatsTracker {
             bytes_written: self.bytes_written.load(Ordering::Relaxed),
             read_ops,
             write_ops,
-            avg_read_latency_us: if read_ops > 0 {
-                total_read_latency / read_ops
-            } else {
-                0
-            },
-            avg_write_latency_us: if write_ops > 0 {
-                total_write_latency / write_ops
-            } else {
-                0
-            },
+            avg_read_latency_us: total_read_latency.checked_div(read_ops).unwrap_or(0),
+            avg_write_latency_us: total_write_latency.checked_div(write_ops).unwrap_or(0),
             zero_copy_ops: self.zero_copy_ops.load(Ordering::Relaxed),
         }
     }

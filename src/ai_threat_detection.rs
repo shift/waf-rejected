@@ -864,7 +864,7 @@ impl PatternLearningSystem {
         }
 
         // Trigger pattern learning if buffer is large enough
-        if buffer.len() % 1000 == 0 {
+        if buffer.len().is_multiple_of(1000) {
             // Async pattern learning
             let buffer_snapshot: Vec<ThreatAnalysis> = buffer.iter().cloned().collect();
             let patterns = self.learned_patterns.clone();

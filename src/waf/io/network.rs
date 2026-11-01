@@ -151,7 +151,7 @@ impl NetworkIoHandler {
             total_copied += bytes_read as u64;
 
             // Yield occasionally for fairness
-            if total_copied % (self.config.buffer_size as u64 * 16) == 0 {
+            if total_copied.is_multiple_of(self.config.buffer_size as u64 * 16) {
                 tokio::task::yield_now().await;
             }
         }
@@ -349,16 +349,8 @@ impl NetworkStatsTracker {
             bytes_written: self.bytes_written.load(Ordering::Relaxed),
             read_ops,
             write_ops,
-            avg_read_latency_us: if read_ops > 0 {
-                total_read_latency / read_ops
-            } else {
-                0
-            },
-            avg_write_latency_us: if write_ops > 0 {
-                total_write_latency / write_ops
-            } else {
-                0
-            },
+            avg_read_latency_us: total_read_latency.checked_div(read_ops).unwrap_or(0),
+            avg_write_latency_us: total_write_latency.checked_div(write_ops).unwrap_or(0),
             zero_copy_ops: self.zero_copy_ops.load(Ordering::Relaxed),
             bidirectional_copy_ops: self.bidirectional_copy_ops.load(Ordering::Relaxed),
             bytes_forwarded: self.bytes_forwarded.load(Ordering::Relaxed),

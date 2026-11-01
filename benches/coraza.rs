@@ -37,14 +37,25 @@ fn reactor() -> WasmReactor {
         .expect("committed Coraza reactor must load")
 }
 
-/// Builds the host JSON payload for a POST with an ASCII `A` body.
+/// Builds the host JSON payload for a form POST with a large ASCII body.
+///
+/// CRS blocks bare `text/plain` bodies, so the body is a urlencoded `data=`
+/// field. A valid HTTP/1.1 request also needs Host, User-Agent, Accept and a
+/// matching Content-Length; omitting them raises protocol anomalies that would
+/// turn the "clean body" row into a block.
 fn post_payload(body_len: usize) -> Vec<u8> {
-    let body = "A".repeat(body_len);
+    let body = format!("data={}", "A".repeat(body_len));
     serde_json::to_vec(&serde_json::json!({
         "method": "POST",
         "uri": "/upload",
         "http_version": "1.1",
-        "headers": [["content-type", "text/plain"]],
+        "headers": [
+            ["host", "bench.example"],
+            ["user-agent", "waf-rejected-bench/1.0"],
+            ["accept", "*/*"],
+            ["content-type", "application/x-www-form-urlencoded"],
+            ["content-length", body.len().to_string()],
+        ],
         "body_size": body.len(),
         "body": body,
     }))
@@ -56,7 +67,13 @@ fn attack_payload(body: &str) -> Vec<u8> {
         "method": "POST",
         "uri": "/login",
         "http_version": "1.1",
-        "headers": [["content-type", "application/x-www-form-urlencoded"]],
+        // Include Host and User-Agent: CRS scores requests that omit them as
+        // protocol anomalies, which would make the "allow" row a block.
+        "headers": [
+            ["host", "bench.example"],
+            ["user-agent", "waf-rejected-bench/1.0"],
+            ["content-type", "application/x-www-form-urlencoded"],
+        ],
         "body_size": body.len(),
         "body": body,
     }))

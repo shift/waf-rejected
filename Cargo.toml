@@ -100,9 +100,11 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # ModSecurity WASM Go integration
 
-# Pure-Rust WebAssembly interpreter for the experimental reactor ABI spike.
-# Only pulled in by the non-default `wasm-reactor` feature.
-wasmi = { version = "2.0.0", optional = true, default-features = false, features = ["std", "wat", "validate", "stable"] }
+# WebAssembly runtime for the experimental reactor ABI. Only pulled in by the
+# non-default `wasm-reactor` feature. `p1` provides the WASI preview1 imports
+# used by the Go/Coraza reactor; `wat` keeps the in-tree WAT spike loadable.
+wasmtime = { version = "49.0", optional = true, default-features = false, features = ["std", "runtime", "cranelift", "wat", "parallel-compilation", "async", "component-model"] }
+wasmtime-wasi = { version = "49.0", optional = true, default-features = false, features = ["p1"] }
 
 # Bounded request-body decompression (gzip/deflate via flate2, brotli via brotli)
 flate2 = "1.1"
@@ -182,10 +184,10 @@ wtransport = { version = "0.7.2", default-features = false, features = ["ring", 
 default = ["export-system", "websocket"]
 integration-tests = []
 wasm-waf = []
-# Experimental request-in/decision-out WASM reactor ABI (wasmi host).
+# Experimental request-in/decision-out WASM reactor ABI (wasmtime host).
 # Not enabled by default and does not replace the built-in heuristic rules.
-# See docs/wasm-reactor-spike.md.
-wasm-reactor = ["dep:wasmi"]
+# See docs/coraza-wasi-reactor.md.
+wasm-reactor = ["dep:wasmtime", "dep:wasmtime-wasi"]
 # Protocol support features
 websocket = []
 # HTTP/3 over QUIC. Not part of default features: it pulls in quinn/h3 and
@@ -220,11 +222,13 @@ name = "coraza"
 harness = false
 required-features = ["wasm-reactor"]
 
-# wasmi's debug-build interpreter frames are large enough to overflow a
-# normal test-thread stack when running the Go/Coraza reactor. Optimising only
-# the interpreter keeps `cargo test --features wasm-reactor` usable without
+# wasmtime compiles to native code once per module; optimising it in debug
+# builds keeps `cargo test --features wasm-reactor` responsive without
 # affecting the rest of the development profile.
-[profile.dev.package.wasmi]
+[profile.dev.package.wasmtime]
+opt-level = 3
+
+[profile.dev.package.wasmtime-internal-cranelift]
 opt-level = 3
 
 [profile.release]

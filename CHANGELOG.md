@@ -36,9 +36,18 @@ All notable changes to WAF-Rejected are documented here.
   thread-local, identity-keyed cache instead of being created per request.
   Go runtime `_initialize` and Coraza `init` run once per thread and reactor;
   each request resets fuel and calls only `eval`. Failed instances are
-  discarded and recreated, and concurrent threads never share a wasmi store.
+  discarded and recreated, and concurrent threads never share a wasmtime store.
   Criterion p50 for allow/SQLi/XSS drops from ~61–63 ms to ~2.1–3.0 ms on the
   reference machine.
+- Replaced the `wasmi` interpreter with wasmtime 49 (`wasmtime` +
+  `wasmtime-wasi`) for the Coraza WASI reactor. `Engine`/`Module` compile once,
+  the preview1 imports come from wasmtime-wasi, and each worker thread keeps a
+  cached `Store`/instance/memory with fuel and 256 MiB memory limits.
+  wasmtime-wasi's sync preview1 adapters cannot be called inside the proxy's
+  Tokio workers, so the stdio/path imports are shadowed with the previous
+  authority-free shims; the clock and entropy calls remain wasmtime-wasi's.
+- Raised the pinned Rust toolchain to 1.99.1 (rust-overlay updated) because
+  wasmtime 49 requires Rust >= 1.96.
 - Added reused-instance and per-thread isolation tests for the reactor,
   covering interleaved allow/block decisions and three concurrent threads.
 

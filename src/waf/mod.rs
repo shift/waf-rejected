@@ -1004,7 +1004,7 @@ mod tests {
 
     #[cfg(feature = "wasm-reactor")]
     #[test]
-    #[ignore = "Go/WASI reactor requires the release wasmi profile"]
+    #[ignore = "Go/WASI reactor is exercised in release mode"]
     fn test_coraza_reactor_engine_blocks_attacks_and_allows_benign() {
         std::thread::Builder::new()
             .stack_size(256 * 1024 * 1024)
