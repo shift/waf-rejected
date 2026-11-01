@@ -540,7 +540,9 @@ impl WafProxyService {
         if let Some(validator) = &state.auth_validator {
             if let Err(e) = validator.validate_request(req.headers(), is_https) {
                 warn!("Authentication rejected request from {}: {}", client_ip, e);
+                state.metrics.record_auth_failure();
                 state.metrics.record_blocked();
+                state.metrics.record_request_duration(start_time.elapsed());
                 return Ok(Self::create_error_response(
                     StatusCode::UNAUTHORIZED,
                     "Unauthorized",
@@ -552,6 +554,7 @@ impl WafProxyService {
         if WebSocketHandler::is_websocket_upgrade(req.headers()) {
             if req.version() != hyper::Version::HTTP_11 {
                 state.metrics.record_blocked();
+                state.metrics.record_request_duration(start_time.elapsed());
                 return Ok(Self::create_error_response(
                     StatusCode::NOT_IMPLEMENTED,
                     "WebSocket upgrades require HTTP/1.1",
@@ -575,6 +578,7 @@ impl WafProxyService {
                         client_ip, reason, status
                     );
                     state.metrics.record_blocked();
+                    state.metrics.record_request_duration(start_time.elapsed());
                     return Ok(Self::create_blocked_response(status, &reason));
                 }
                 Decision::RateLimit { reason } => {
@@ -582,7 +586,9 @@ impl WafProxyService {
                         "WAF rate limited WebSocket upgrade from {}: {}",
                         client_ip, reason
                     );
+                    state.metrics.record_rate_limited();
                     state.metrics.record_blocked();
+                    state.metrics.record_request_duration(start_time.elapsed());
                     return Ok(Self::create_rate_limit_response(&reason));
                 }
             }
@@ -593,6 +599,7 @@ impl WafProxyService {
         if is_webtransport_upgrade(req.headers()) {
             warn!("WebTransport request rejected: not implemented");
             state.metrics.record_blocked();
+            state.metrics.record_request_duration(start_time.elapsed());
             return Ok(Self::create_error_response(
                 StatusCode::NOT_IMPLEMENTED,
                 "WebTransport is not implemented",
@@ -623,6 +630,7 @@ impl WafProxyService {
                     client_ip, max_body_size
                 );
                 state.metrics.record_blocked();
+                state.metrics.record_request_duration(start_time.elapsed());
                 return Ok(Self::create_error_response(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "Request body too large",
@@ -706,7 +714,7 @@ impl WafProxyService {
                     client_ip, http_version
                 );
                 state.metrics.record_allowed();
-                Self::forward_to_upstream_with_protocol(
+                let response = Self::forward_to_upstream_with_protocol(
                     parts,
                     body_bytes,
                     state.upstream_client,
@@ -718,7 +726,9 @@ impl WafProxyService {
                     is_https,
                     state.config.server.max_body_size,
                 )
-                .await
+                .await;
+                state.metrics.record_request_duration(start_time.elapsed());
+                response
             }
             Decision::Block { status, reason } => {
                 warn!(
@@ -726,11 +736,14 @@ impl WafProxyService {
                     client_ip, reason, status
                 );
                 state.metrics.record_blocked();
+                state.metrics.record_request_duration(start_time.elapsed());
                 Ok(Self::create_blocked_response(status, &reason))
             }
             Decision::RateLimit { reason } => {
                 warn!("WAF rate limited request from {}: {}", client_ip, reason);
+                state.metrics.record_rate_limited();
                 state.metrics.record_blocked();
+                state.metrics.record_request_duration(start_time.elapsed());
                 Ok(Self::create_rate_limit_response(&reason))
             }
         }

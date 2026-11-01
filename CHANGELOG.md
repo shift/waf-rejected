@@ -20,6 +20,12 @@ All notable changes to WAF-Rejected are documented here.
   encodings return `415`.
 - Integration coverage for decompressed SQLi blocking, clean gzip forwarding,
   malformed gzip, decompression bombs and unsupported/stacked encodings.
+- Runtime metrics for API-key authentication failures
+  (`waf_auth_failures_total`), rate-limit decisions
+  (`waf_rate_limited_total`) and end-to-end request duration
+  (`waf_request_duration_seconds` histogram) across HTTP/1.1, HTTP/2 and
+  HTTP/3 request paths, with matching Prometheus alert rules and monitoring
+  documentation.
 
 ### Changed
 

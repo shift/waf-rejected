@@ -8,12 +8,28 @@ WAF-Rejected provides comprehensive monitoring capabilities through OpenTelemetr
 
 ### Request Metrics
 
-- `waf_requests_total{status, method, path}` - Total requests by status, method, and path
+- `waf_requests_total` - Total requests received
+- `waf_allowed_total` - Requests allowed by the WAF
+- `waf_blocked_total` - Requests blocked or rate limited by the WAF
+- `waf_auth_failures_total` - Requests rejected by API-key authentication
+- `waf_rate_limited_total` - Requests rejected by rate limiting
+- `waf_upstream_errors_total` - Upstream connection/read failures
 - `waf_request_duration_seconds` - Request processing duration histogram
+  (buckets `le="0.001"` through `le="5"`, plus `+Inf`, with `_sum` and `_count`)
+- `waf_uptime_seconds` - Process uptime in seconds
+- `waf_webtransport_sessions_total` - WebTransport sessions accepted
+- `waf_webtransport_allowed_total` - WebTransport sessions allowed by the WAF
+- `waf_webtransport_blocked_total` - WebTransport sessions or payloads blocked
+- `waf_webtransport_streams_total` - WebTransport streams inspected
+- `waf_webtransport_datagrams_total` - WebTransport datagrams inspected
+
+The metrics above are emitted by the built-in `/metrics` endpoint. The
+following extended metrics are planned or emitted by optional integrations:
+
 - `waf_request_size_bytes` - Request body size distribution
 - `waf_response_size_bytes` - Response body size distribution
 
-### Security Metrics
+### Security Metrics (extended integrations)
 
 - `waf_security_events_total{severity, rule, category}` - Security events by severity and category
 - `waf_blocked_requests_total{reason, rule}` - Blocked requests by reason

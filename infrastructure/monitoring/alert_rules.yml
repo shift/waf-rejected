@@ -11,6 +11,36 @@ groups:
           summary: "High rate of WAF-blocked requests"
           description: "WAF-Rejected is blocking {{ $value }} requests per second"
 
+      - alert: HighAuthFailureRate
+        expr: rate(waf_auth_failures_total[5m]) > 1
+        for: 5m
+        labels:
+          severity: warning
+          category: security
+        annotations:
+          summary: "Elevated authentication failures"
+          description: "{{ $value | humanize }} requests per second are failing API-key authentication"
+
+      - alert: HighRateLimitedRate
+        expr: rate(waf_rate_limited_total[5m]) > 10
+        for: 2m
+        labels:
+          severity: warning
+          category: security
+        annotations:
+          summary: "Elevated rate limiting"
+          description: "{{ $value | humanize }} requests per second are being rate limited"
+
+      - alert: HighRequestLatency
+        expr: histogram_quantile(0.95, sum by (le) (rate(waf_request_duration_seconds_bucket[5m]))) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+          category: performance
+        annotations:
+          summary: "High WAF request latency"
+          description: "95th percentile request duration is {{ $value }}s"
+
       - alert: UpstreamErrorRate
         expr: |
           rate(waf_upstream_errors_total[5m])

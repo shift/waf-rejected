@@ -140,6 +140,7 @@ async fn handle_request(
     if !WafProxyService::is_http_version_supported(&http_version, &state.config) {
         warn!("Unsupported HTTP version 3 request from {}", peer_ip);
         state.metrics.record_blocked();
+        state.metrics.record_request_duration(start_time.elapsed());
         return send_response(
             &mut stream,
             WafProxyService::create_error_response(
@@ -161,7 +162,9 @@ async fn handle_request(
                 "Authentication rejected HTTP/3 request from {}: {}",
                 client_ip, e
             );
+            state.metrics.record_auth_failure();
             state.metrics.record_blocked();
+            state.metrics.record_request_duration(start_time.elapsed());
             return send_response(
                 &mut stream,
                 WafProxyService::create_error_response(StatusCode::UNAUTHORIZED, "Unauthorized"),
@@ -184,6 +187,7 @@ async fn handle_request(
                 client_ip, max_body_size
             );
             state.metrics.record_blocked();
+            state.metrics.record_request_duration(start_time.elapsed());
             return send_response(
                 &mut stream,
                 WafProxyService::create_error_response(
@@ -310,6 +314,7 @@ async fn handle_request(
                 Ok(response) => response,
                 Err(never) => match never {},
             };
+            state.metrics.record_request_duration(start_time.elapsed());
             send_response(&mut stream, response).await
         }
         Decision::Block { status, reason } => {
@@ -318,6 +323,7 @@ async fn handle_request(
                 client_ip, reason, status
             );
             state.metrics.record_blocked();
+            state.metrics.record_request_duration(start_time.elapsed());
             send_response(
                 &mut stream,
                 WafProxyService::create_blocked_response(status, &reason),
@@ -329,7 +335,9 @@ async fn handle_request(
                 "WAF rate limited HTTP/3 request from {}: {}",
                 client_ip, reason
             );
+            state.metrics.record_rate_limited();
             state.metrics.record_blocked();
+            state.metrics.record_request_duration(start_time.elapsed());
             send_response(
                 &mut stream,
                 WafProxyService::create_rate_limit_response(&reason),
