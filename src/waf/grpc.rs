@@ -12,7 +12,8 @@
 //! * `content-type` (`application/grpc`, `application/grpc+proto`,
 //!   `application/grpc+json`, `application/grpc-web*`),
 //! * the HTTP/2 `:path` method (`/package.Service/Method`) against
-//!   `waf.grpc.method_allowlist`,
+//!   `waf.grpc.method_allowlist` and the generated
+//!   `waf.grpc.allowlist_file` artifact,
 //! * the 5-byte frame prefix (compressed flag `0`/`1`, 4-byte big-endian
 //!   length), frame count, per-message size and truncation,
 //! * `grpc-encoding` (`identity` only),
@@ -22,7 +23,7 @@
 //! Field-level protobuf inspection is **not** implemented here: it needs the
 //! service descriptor (`FileDescriptorSet`) and is tracked separately.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use base64::Engine as _;
 use hyper::header::HeaderValue;
@@ -30,6 +31,7 @@ use hyper::HeaderMap;
 use tracing::debug;
 
 use crate::config::WafGrpcConfig;
+use crate::waf::grpc_allowlist::{self, GrpcAllowlist, GrpcAllowlistError};
 use crate::waf::{Decision, RequestContext, WafRule};
 
 /// Bytes in a gRPC message prefix: 1 flag byte + 4 length bytes.
@@ -403,25 +405,79 @@ impl std::fmt::Display for GrpcInspectionError {
 #[derive(Debug, Clone)]
 pub struct GrpcInspector {
     allowlist: HashSet<String>,
+    /// Per-method limits from the generated artifact, keyed by method path.
+    method_max_message_bytes: HashMap<String, usize>,
     max_message_bytes: usize,
     max_frames: usize,
     unknown_method_blocked: bool,
 }
 
 impl GrpcInspector {
-    /// Builds an inspector from configuration.
+    /// Builds an inspector from configuration without reading any files.
+    ///
+    /// `waf.grpc.allowlist_file` is ignored here so callers (and tests) can
+    /// build an inspector synchronously. Use [`Self::try_from_config`] to load
+    /// and merge the generated artifact.
     pub fn from_config(config: &WafGrpcConfig) -> Self {
+        Self::build(config, None)
+    }
+
+    /// Builds an inspector from configuration, loading `allowlist_file` when
+    /// it is set.
+    ///
+    /// Artifact methods are merged with `method_allowlist`, artifact
+    /// per-method `max_message_bytes` values win over the global limit, and an
+    /// explicit `unknown_method_action` in the configuration wins over the
+    /// artifact's.
+    pub fn try_from_config(config: &WafGrpcConfig) -> Result<Self, GrpcAllowlistError> {
+        let artifact = match config.allowlist_file.as_deref() {
+            Some(path) => Some(grpc_allowlist::load_allowlist(path)?),
+            None => None,
+        };
+        Ok(Self::build(config, artifact.as_ref()))
+    }
+
+    fn build(config: &WafGrpcConfig, artifact: Option<&GrpcAllowlist>) -> Self {
+        let mut allowlist: HashSet<String> = config
+            .method_allowlist
+            .iter()
+            .filter_map(|entry| parse_method_path(entry).ok())
+            .map(|method| method.path)
+            .collect();
+        let mut method_max_message_bytes = HashMap::new();
+        if let Some(artifact) = artifact {
+            for method in &artifact.methods {
+                allowlist.insert(method.path.clone());
+                method_max_message_bytes.insert(method.path.clone(), method.max_message_bytes);
+            }
+        }
+
+        // Precedence: explicit config value, then the artifact's policy, then
+        // the built-in default (block for a non-empty allowlist).
+        let unknown_method_blocked = match config.unknown_method_action.as_deref() {
+            Some(action) => action == "block",
+            None => match artifact {
+                Some(artifact) => artifact.unknown_method_action == "block",
+                None => config.unknown_method_action() == "block",
+            },
+        };
+
         Self {
-            allowlist: config
-                .method_allowlist
-                .iter()
-                .filter_map(|entry| parse_method_path(entry).ok())
-                .map(|method| method.path)
-                .collect(),
+            allowlist,
+            method_max_message_bytes,
             max_message_bytes: config.max_message_bytes,
             max_frames: config.max_frames,
-            unknown_method_blocked: config.unknown_method_action() == "block",
+            unknown_method_blocked,
         }
+    }
+
+    /// Per-message limit for a method: the artifact's value when present,
+    /// otherwise the global `waf.grpc.max_message_bytes`.
+    fn max_message_bytes_for(&self, path: &str) -> usize {
+        self.method_max_message_bytes
+            .get(path)
+            .copied()
+            .unwrap_or(self.max_message_bytes)
     }
 
     /// Whether this request is gRPC (any `application/grpc*` content type).
@@ -498,7 +554,7 @@ impl GrpcInspector {
                 let report = validate_frames(
                     body,
                     FrameLimits {
-                        max_message_bytes: self.max_message_bytes,
+                        max_message_bytes: self.max_message_bytes_for(&method.path),
                         max_frames: self.max_frames,
                     },
                 )
@@ -882,6 +938,195 @@ mod tests {
                 strip_body: true,
                 monitored: false
             }
+        );
+    }
+
+    /// Writes a generated artifact and returns its directory (kept alive by
+    /// the caller) and path.
+    fn artifact_file(
+        methods: &[(&str, usize)],
+        unknown_method_action: &str,
+    ) -> (tempfile::TempDir, String) {
+        use crate::waf::grpc_allowlist::{
+            AllowlistSource, GrpcAllowlist, GrpcAllowlistMethod, ALLOWLIST_IR_VERSION,
+        };
+
+        let allowlist = GrpcAllowlist {
+            ir_version: ALLOWLIST_IR_VERSION,
+            source: AllowlistSource {
+                kind: "protobuf".to_string(),
+                sha256: "b".repeat(64),
+            },
+            methods: methods
+                .iter()
+                .map(|(path, limit)| GrpcAllowlistMethod {
+                    path: (*path).to_string(),
+                    client_streaming: false,
+                    server_streaming: false,
+                    input: "acme.Request".to_string(),
+                    output: "acme.Response".to_string(),
+                    max_message_bytes: *limit,
+                })
+                .collect(),
+            unknown_method_action: unknown_method_action.to_string(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("allowlist.json");
+        std::fs::write(&path, allowlist.to_canonical_json().unwrap()).unwrap();
+        (dir, path.display().to_string())
+    }
+
+    #[test]
+    fn artifact_allowlist_allows_listed_methods_and_blocks_unknown() {
+        let (_dir, path) = artifact_file(&[("/acme.Service/Method", 1024)], "block");
+        let mut config = WafGrpcConfig::default();
+        config.allowlist_file = Some(path);
+
+        let inspector = GrpcInspector::try_from_config(&config).unwrap();
+        let verdict = inspector
+            .inspect(&grpc_context("/acme.Service/Method", Some(frame(0, b"ok"))))
+            .unwrap();
+        assert_eq!(
+            verdict,
+            GrpcVerdict::Allow {
+                strip_body: true,
+                monitored: false
+            }
+        );
+
+        let verdict = inspector
+            .inspect(&grpc_context("/acme.Service/Other", Some(frame(0, b"ok"))))
+            .unwrap();
+        assert!(matches!(verdict, GrpcVerdict::Block { status: 403, .. }));
+    }
+
+    #[test]
+    fn artifact_methods_merge_with_config_allowlist() {
+        let (_dir, path) = artifact_file(&[("/acme.Service/FromArtifact", 1024)], "block");
+        let mut config = WafGrpcConfig::default();
+        config.allowlist_file = Some(path);
+        config.method_allowlist = vec!["/acme.Service/FromConfig".to_string()];
+
+        let inspector = GrpcInspector::try_from_config(&config).unwrap();
+        for method in ["/acme.Service/FromArtifact", "/acme.Service/FromConfig"] {
+            let verdict = inspector
+                .inspect(&grpc_context(method, Some(frame(0, b"ok"))))
+                .unwrap();
+            assert_eq!(
+                verdict,
+                GrpcVerdict::Allow {
+                    strip_body: true,
+                    monitored: false
+                },
+                "{method} must be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_per_method_limit_overrides_global() {
+        let (_dir, path) = artifact_file(
+            &[("/acme.Service/Upload", 8), ("/acme.Service/Ping", 4096)],
+            "block",
+        );
+        let mut config = WafGrpcConfig::default();
+        config.allowlist_file = Some(path);
+        // Well above the artifact's 8-byte limit for Upload.
+        config.max_message_bytes = 4096;
+
+        let inspector = GrpcInspector::try_from_config(&config).unwrap();
+
+        // The artifact limit is smaller than the global one and is enforced.
+        let error = inspector
+            .inspect(&grpc_context(
+                "/acme.Service/Upload",
+                Some(frame(0, b"0123456789")),
+            ))
+            .unwrap_err();
+        assert!(
+            error.reason.contains("8-byte limit"),
+            "unexpected error: {}",
+            error.reason
+        );
+
+        // Another artifact method keeps its (larger) per-method limit.
+        let verdict = inspector
+            .inspect(&grpc_context(
+                "/acme.Service/Ping",
+                Some(frame(0, b"payload")),
+            ))
+            .unwrap();
+        assert_eq!(
+            verdict,
+            GrpcVerdict::Allow {
+                strip_body: true,
+                monitored: false
+            }
+        );
+
+        // Config-only methods fall back to the global limit.
+        let mut config = config;
+        config.method_allowlist = vec!["/acme.Service/ConfigOnly".to_string()];
+        let config_only = GrpcInspector::try_from_config(&config).unwrap();
+        let verdict = config_only
+            .inspect(&grpc_context(
+                "/acme.Service/ConfigOnly",
+                Some(frame(0, b"payload")),
+            ))
+            .unwrap();
+        assert!(matches!(verdict, GrpcVerdict::Allow { .. }));
+    }
+
+    #[test]
+    fn explicit_config_action_overrides_artifact_action() {
+        let (_dir, path) = artifact_file(&[("/acme.Service/Method", 1024)], "block");
+        let mut config = WafGrpcConfig::default();
+        config.allowlist_file = Some(path);
+        config.unknown_method_action = Some("allow".to_string());
+
+        let inspector = GrpcInspector::try_from_config(&config).unwrap();
+        let verdict = inspector
+            .inspect(&grpc_context("/acme.Service/Other", Some(frame(0, b"ok"))))
+            .unwrap();
+        assert_eq!(
+            verdict,
+            GrpcVerdict::Allow {
+                strip_body: true,
+                monitored: true
+            }
+        );
+    }
+
+    #[test]
+    fn artifact_action_applies_when_config_does_not_set_one() {
+        let (_dir, path) = artifact_file(&[("/acme.Service/Method", 1024)], "allow");
+        let mut config = WafGrpcConfig::default();
+        config.allowlist_file = Some(path);
+        assert!(config.unknown_method_action.is_none());
+
+        let inspector = GrpcInspector::try_from_config(&config).unwrap();
+        let verdict = inspector
+            .inspect(&grpc_context("/acme.Service/Other", Some(frame(0, b"ok"))))
+            .unwrap();
+        assert_eq!(
+            verdict,
+            GrpcVerdict::Allow {
+                strip_body: true,
+                monitored: true
+            }
+        );
+    }
+
+    #[test]
+    fn try_from_config_reports_an_unreadable_artifact() {
+        let mut config = WafGrpcConfig::default();
+        config.allowlist_file = Some("/nonexistent/grpc/allowlist.json".to_string());
+        let error = GrpcInspector::try_from_config(&config).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("/nonexistent/grpc/allowlist.json"),
+            "unexpected error: {error}"
         );
     }
 

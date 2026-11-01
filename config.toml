@@ -100,6 +100,11 @@ enabled = true
 # Empty = monitor only. Entries are fully-qualified gRPC methods and can be
 # generated from a protobuf FileDescriptorSet.
 method_allowlist = []
+# Generated allowlist artifact (JSON). When set, its methods are merged with
+# method_allowlist, per-method max_message_bytes values win over the global
+# limit, and its unknown_method_action applies unless set here explicitly.
+# A configured file that cannot be loaded aborts start-up.
+# allowlist_file = "/etc/waf/grpc/allowlist.json"
 max_message_bytes = 4194304  # 4 MiB
 max_frames = 64
 # "allow" or "block"; unset defaults to block for a non-empty allowlist.

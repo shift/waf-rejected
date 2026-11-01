@@ -55,25 +55,50 @@ limits (`server.max_body_size`) still apply.
 enabled = true
 
 # Fully-qualified methods that may be called. Empty = monitor only.
+# Merged with methods from allowlist_file when both are set.
 method_allowlist = [
   "/acme.billing.v1.Billing/Charge",
   "/acme.billing.v1.Billing/GetInvoice",
 ]
 
-# Maximum decoded size of one message (default 4 MiB).
+# Generated allowlist artifact (JSON) from `grpc-allowlist`. Optional.
+allowlist_file = "/etc/waf/grpc/allowlist.json"
+
+# Maximum decoded size of one message (default 4 MiB). Used for methods that
+# have no per-method limit in the artifact and for config-only entries.
 max_message_bytes = 4194304
 
 # Maximum frames per request body (default 64).
 max_frames = 64
 
-# "allow" or "block". Unset defaults to "block" when the allowlist is
-# non-empty and "allow" when it is empty (monitor mode).
+# "allow" or "block". An explicit value here wins over the artifact's
+# unknown_method_action. Unset falls back to the artifact's value, then to
+# "block" when the effective allowlist is non-empty and "allow" when empty.
 unknown_method_action = "block"
 ```
 
 Validation (`Config::validate`) rejects a zero `max_message_bytes` or
-`max_frames`, an unknown `unknown_method_action`, and allowlist entries that
-are not `/package.Service/Method` paths.
+`max_frames`, an unknown `unknown_method_action`, allowlist entries that are
+not `/package.Service/Method` paths, and an `allowlist_file` that is empty or
+cannot be loaded and validated (the error names the file and the reason).
+
+`allowlist_file` is loaded once by `WafEngine::with_config` (through
+`GrpcInspector::try_from_config`) and never re-read per request. `from_config`
+remains a file-free constructor for callers and tests that supply the policy
+inline.
+
+### Precedence
+
+| Setting | Order |
+| --- | --- |
+| Effective method allowlist | `method_allowlist` **union** artifact methods |
+| `max_message_bytes` | artifact per-method value, else global `waf.grpc.max_message_bytes` |
+| `unknown_method_action` | explicit `waf.grpc.unknown_method_action`, else artifact value, else `block` when the effective allowlist is non-empty |
+
+If `waf.grpc.enabled` is true and the configured `allowlist_file` cannot be
+read, parsed or validated, `WafProxyService::new` aborts with
+`WAF engine initialisation failed`; the process does not start with a silently
+empty allowlist.
 
 ### Generating the allowlist
 
@@ -103,7 +128,11 @@ truncated, oversized, negative-length and wrong-compressed-flag frames,
 allowlist allow/block/monitor behaviour, base64 `-bin` metadata and text
 scanner exclusion, and `grpc-web-text` decoding. `src/waf/mod.rs` verifies
 that a gRPC protobuf body is not delivered to downstream rules while a
-non-gRPC body still is.
+non-gRPC body still is. Artifact tests cover allow/block from a generated
+file, merging with `method_allowlist`, per-method limits smaller than the
+global value, unknown-method action precedence, and an unreadable file.
+`src/config.rs` rejects a missing or invalid `allowlist_file`, and
+`src/proxy/service.rs` verifies that such a file aborts start-up.
 
 ## Generating the allowlist from a descriptor set
 
@@ -161,8 +190,9 @@ methods a build exposes.
    allowlist_file = "/etc/waf/grpc/allowlist.json"
    ```
 
-   `allowlist_file` is the planned loader hook; the inspector integration is
-   tracked separately. The loader interface is documented below.
+   `allowlist_file` is loaded and validated once at start-up; the artifact's
+   methods are merged with `method_allowlist` and its per-method limits and
+   unknown-method action are applied as described in [Precedence](#precedence).
 
 ### Artifact shape
 
@@ -264,7 +294,11 @@ impl GrpcAllowlist {
 kind/hash shape, method paths, types, non-zero limits, duplicate paths, known
 action). The returned struct is immutable data only; `GrpcAllowlist` is
 `Serialize`/`Deserialize` with `deny_unknown_fields`, so a typo in the artifact
-fails loading instead of being ignored. The inspector branch owns the decision
-to call it from `waf.grpc.allowlist_file` and to prefer per-method
-`max_message_bytes` over the global value; this module does not modify
-`src/waf/grpc.rs`.
+fails loading instead of being ignored.
+
+`GrpcInspector::try_from_config` is the runtime integration point: it calls
+`load_allowlist` when `waf.grpc.allowlist_file` is set, merges the artifact
+methods with `method_allowlist`, prefers the artifact's per-method
+`max_message_bytes`, and resolves `unknown_method_action` in the order
+documented above. `GrpcInspector::from_config` never performs I/O and ignores
+`allowlist_file`.

@@ -660,6 +660,14 @@ pub struct WafGrpcConfig {
     /// The list can be generated from a protobuf `FileDescriptorSet`.
     pub method_allowlist: Vec<String>,
 
+    /// Path to a generated allowlist artifact (JSON, see
+    /// [`crate::waf::grpc_allowlist`]). When set, the artifact's methods are
+    /// merged with `method_allowlist`, its per-method `max_message_bytes`
+    /// values take precedence over the global limit, and its
+    /// `unknown_method_action` is used unless this section sets one
+    /// explicitly.
+    pub allowlist_file: Option<String>,
+
     /// Maximum decoded size of a single gRPC message, in bytes.
     pub max_message_bytes: usize,
 
@@ -677,6 +685,7 @@ impl Default for WafGrpcConfig {
         Self {
             enabled: true,
             method_allowlist: Vec::new(),
+            allowlist_file: None,
             max_message_bytes: 4 * 1024 * 1024,
             max_frames: 64,
             unknown_method_action: None,
@@ -699,6 +708,8 @@ impl WafGrpcConfig {
     /// Allowlist entries must be fully-qualified gRPC paths of the form
     /// `/package.Service/Method`; the same structural rules are applied by
     /// [`crate::waf::grpc::parse_method_path`] at request time.
+    /// `allowlist_file`, when set, must be non-empty and load as a valid
+    /// generated artifact.
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.max_message_bytes == 0 {
             anyhow::bail!("waf.grpc.max_message_bytes must be greater than zero");
@@ -719,6 +730,14 @@ impl WafGrpcConfig {
                     "waf.grpc.method_allowlist entry '{method}' must be a fully-qualified gRPC method path like '/package.Service/Method'"
                 );
             }
+        }
+        if let Some(path) = self.allowlist_file.as_deref() {
+            if path.trim().is_empty() {
+                anyhow::bail!("waf.grpc.allowlist_file must not be empty when set");
+            }
+            crate::waf::grpc_allowlist::load_allowlist(path).map_err(|error| {
+                anyhow::anyhow!("waf.grpc.allowlist_file '{path}' could not be loaded: {error}")
+            })?;
         }
         Ok(())
     }
@@ -1530,6 +1549,73 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
         config.waf.grpc.method_allowlist = vec!["/acme.Service/Method".to_string()];
         assert!(config.validate().is_ok());
         assert_eq!(config.waf.grpc.unknown_method_action(), "block");
+    }
+
+    fn write_grpc_allowlist(
+        dir: &std::path::Path,
+        methods: &[(&str, usize)],
+    ) -> std::path::PathBuf {
+        use crate::waf::grpc_allowlist::{
+            AllowlistSource, GrpcAllowlist, GrpcAllowlistMethod, ALLOWLIST_IR_VERSION,
+        };
+
+        let allowlist = GrpcAllowlist {
+            ir_version: ALLOWLIST_IR_VERSION,
+            source: AllowlistSource {
+                kind: "protobuf".to_string(),
+                sha256: "a".repeat(64),
+            },
+            methods: methods
+                .iter()
+                .map(|(path, limit)| GrpcAllowlistMethod {
+                    path: (*path).to_string(),
+                    client_streaming: false,
+                    server_streaming: false,
+                    input: "acme.Request".to_string(),
+                    output: "acme.Response".to_string(),
+                    max_message_bytes: *limit,
+                })
+                .collect(),
+            unknown_method_action: "block".to_string(),
+        };
+        let path = dir.join("allowlist.json");
+        std::fs::write(&path, allowlist.to_canonical_json().unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn grpc_allowlist_file_is_validated() {
+        let mut config = Config::default();
+        config.waf.grpc.allowlist_file = Some(String::new());
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("waf.grpc.allowlist_file must not be empty"),
+            "unexpected error: {error}"
+        );
+
+        let missing = "/nonexistent/grpc/allowlist.json";
+        let mut config = Config::default();
+        config.waf.grpc.allowlist_file = Some(missing.to_string());
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains(missing) && error.contains("could not be loaded"),
+            "unexpected error: {error}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = write_grpc_allowlist(dir.path(), &[("/acme.Service/Method", 1024)]);
+        let mut config = Config::default();
+        config.waf.grpc.allowlist_file = Some(artifact.display().to_string());
+        assert!(config.validate().is_ok());
+
+        let malformed = dir.path().join("malformed.json");
+        std::fs::write(&malformed, b"{not json").unwrap();
+        config.waf.grpc.allowlist_file = Some(malformed.display().to_string());
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("malformed.json") && error.contains("could not be loaded"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

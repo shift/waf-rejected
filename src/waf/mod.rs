@@ -149,11 +149,12 @@ pub struct WafEngine {
     enabled: bool,
     fail_closed: bool,
     wasm_init_failed: bool,
-    /// Start-up failure for the Coraza reactor. This is fatal for
+    /// Start-up failure for a configured WAF component (currently the Coraza
+    /// reactor or the gRPC allowlist artifact). This is fatal for
     /// [`WafProxyService::new`](crate::proxy::WafProxyService::new) rather
     /// than deferred to request time.
     #[cfg(feature = "wasm-reactor")]
-    coraza_init_error: Option<String>,
+    waf_init_error: Option<String>,
     /// Protocol-aware gRPC pre-check; runs before the Coraza reactor and
     /// withholds protobuf bodies from CRS body rules.
     #[cfg(feature = "wasm-reactor")]
@@ -189,7 +190,7 @@ impl Clone for WafEngine {
             fail_closed: self.fail_closed,
             wasm_init_failed: self.wasm_init_failed,
             #[cfg(feature = "wasm-reactor")]
-            coraza_init_error: self.coraza_init_error.clone(),
+            waf_init_error: self.waf_init_error.clone(),
             #[cfg(feature = "wasm-reactor")]
             grpc_inspector: self.grpc_inspector.clone(),
             #[cfg(feature = "wasm-waf")]
@@ -210,7 +211,7 @@ impl WafEngine {
             fail_closed: true,
             wasm_init_failed: false,
             #[cfg(feature = "wasm-reactor")]
-            coraza_init_error: None,
+            waf_init_error: None,
             #[cfg(feature = "wasm-reactor")]
             grpc_inspector: None,
             #[cfg(feature = "wasm-waf")]
@@ -234,7 +235,7 @@ impl WafEngine {
             fail_closed: config.waf.fail_mode != "open",
             wasm_init_failed,
             #[cfg(feature = "wasm-reactor")]
-            coraza_init_error: None,
+            waf_init_error: None,
             #[cfg(feature = "wasm-reactor")]
             grpc_inspector: None,
             #[cfg(feature = "wasm-waf")]
@@ -247,8 +248,16 @@ impl WafEngine {
         // protobuf bytes never reach CRS body rules.
         #[cfg(feature = "wasm-reactor")]
         if config.waf.enabled && config.waf.coraza.enabled && config.waf.grpc.enabled {
-            engine.grpc_inspector = Some(grpc::GrpcInspector::from_config(&config.waf.grpc));
-            info!("Enabled protocol-aware gRPC inspection");
+            match grpc::GrpcInspector::try_from_config(&config.waf.grpc) {
+                Ok(inspector) => {
+                    engine.grpc_inspector = Some(inspector);
+                    info!("Enabled protocol-aware gRPC inspection");
+                }
+                Err(err) => {
+                    warn!(error = %err, "failed to load the gRPC allowlist artifact");
+                    engine.record_init_error(format!("gRPC allowlist failed to load: {err}"));
+                }
+            }
         }
 
         // The Coraza reactor must run before the traditional heuristics.
@@ -275,7 +284,7 @@ impl WafEngine {
             Err(err) => {
                 warn!(error = %err, "failed to initialise Coraza WASI reactor");
                 let reason = format!("Coraza WASI reactor failed to initialise: {err}");
-                self.coraza_init_error = Some(reason.clone());
+                self.record_init_error(reason.clone());
                 if self.fail_closed {
                     // Preserve request-time fail-closed behaviour for callers
                     // that build a WafEngine directly.
@@ -285,12 +294,26 @@ impl WafEngine {
         }
     }
 
-    /// Returns the Coraza start-up error, if the reactor was enabled but could
-    /// not be compiled, validated or warmed. Proxy start-up treats this as
-    /// fatal so the process never serves traffic without its WAF engine.
+    /// Records a start-up failure, keeping earlier ones so the operator sees
+    /// every misconfigured component.
     #[cfg(feature = "wasm-reactor")]
-    pub fn coraza_init_error(&self) -> Option<&str> {
-        self.coraza_init_error.as_deref()
+    fn record_init_error(&mut self, reason: String) {
+        match &mut self.waf_init_error {
+            Some(existing) => {
+                existing.push_str("; ");
+                existing.push_str(&reason);
+            }
+            None => self.waf_init_error = Some(reason),
+        }
+    }
+
+    /// Returns the WAF start-up error, if a configured component (the Coraza
+    /// reactor or the gRPC allowlist artifact) could not be loaded or
+    /// initialised. Proxy start-up treats this as fatal so the process never
+    /// serves traffic without its WAF engine.
+    #[cfg(feature = "wasm-reactor")]
+    pub fn waf_init_error(&self) -> Option<&str> {
+        self.waf_init_error.as_deref()
     }
 
     fn initialize_geoip(config: &Config) -> Arc<GeoIpService> {

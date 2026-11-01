@@ -506,12 +506,13 @@ impl WafProxyService {
 
         let waf_engine = Arc::new(WafEngine::with_config(&config));
 
-        // Coraza is a configured security control: a compile/validation/warm
-        // failure must stop start-up instead of surfacing as a 503 per request.
+        // The WAF engine is a configured security control: a start-up failure
+        // (Coraza compile/validation/warm, or the gRPC allowlist artifact)
+        // must stop start-up instead of surfacing as a 503 per request.
         #[cfg(feature = "wasm-reactor")]
-        if let Some(err) = waf_engine.coraza_init_error() {
+        if let Some(err) = waf_engine.waf_init_error() {
             return Err(WafError::internal(format!(
-                "Coraza WASI reactor initialisation failed (fail-closed): {err}"
+                "WAF engine initialisation failed (fail-closed): {err}"
             )));
         }
 
@@ -2226,7 +2227,40 @@ mod tests {
             .expect("a configured reactor that cannot load must abort start-up")
             .to_string();
         assert!(
-            error.contains("Coraza WASI reactor initialisation failed"),
+            error.contains("WAF engine initialisation failed")
+                && error.contains("Coraza WASI reactor failed to initialise"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    #[test]
+    fn test_grpc_allowlist_init_failure_is_fatal_at_startup() {
+        let mut config = Config {
+            proxy: ProxyConfig {
+                upstream_url: "http://localhost:8080".to_string(),
+                bind_addr: "0.0.0.0:3000".to_string(),
+                timeout_seconds: 30,
+                max_request_size: 10_485_760,
+                upstream_ca_path: None,
+                upstream_client_cert_path: None,
+                upstream_client_key_path: None,
+            },
+            ..Default::default()
+        };
+        // Keep the reactor from loading so the failure under test is the gRPC
+        // allowlist artifact.
+        config.waf.coraza.module_path = Some("/nonexistent/coraza-reactor.wasm".to_string());
+        config.waf.grpc.allowlist_file = Some("/nonexistent/grpc/allowlist.json".to_string());
+
+        let error = WafProxyService::new(config)
+            .err()
+            .expect("an unreadable gRPC allowlist must abort start-up")
+            .to_string();
+        assert!(
+            error.contains("WAF engine initialisation failed")
+                && error.contains("gRPC allowlist failed to load")
+                && error.contains("/nonexistent/grpc/allowlist.json"),
             "unexpected error: {error}"
         );
     }

@@ -26,6 +26,17 @@ All notable changes to WAF-Rejected are documented here.
   reactor payload cap; header and URI rules still run. `waf.grpc` is validated
   at config load. Field-level protobuf inspection is not implemented yet (see
   `docs/grpc-inspection.md`).
+- Generated gRPC allowlists are now wired into runtime configuration:
+  `waf.grpc.allowlist_file` points at the artifact produced by
+  `grpc-allowlist`. The artifact's methods are merged with
+  `method_allowlist`, its per-method `max_message_bytes` values take
+  precedence over the global limit, and its `unknown_method_action` applies
+  unless `waf.grpc.unknown_method_action` is set explicitly. The file is
+  loaded once at start-up; an unreadable or invalid artifact makes
+  `Config::validate` and `WafProxyService::new` fail with the file path and
+  reason instead of starting with an empty allowlist. The start-up failure
+  message is now the neutral `WAF engine initialisation failed` (covers both
+  the Coraza reactor and the gRPC allowlist).
 - The Coraza WASI reactor is now enabled by default: `wasm-reactor` is part of
   the default Cargo features and `WafCorazaConfig::default().enabled` is
   `true`. Default start-up compiles the ~20 MiB module once (~4.5 s) and warms
