@@ -228,11 +228,13 @@ Key points:
 
 ## Security limitations (read before production)
 
-- **ModSecurity/Coraza WASM execution is not implemented.** The bundled
-  `rules/coraza.wasm` is a Go-JS demo module, not Coraza/CRS. The WASM runtime
-  dependency was removed from the Beta build; see
-  [`docs/wasm-integration-status.md`](docs/wasm-integration-status.md). Do not
-  expect OWASP CRS coverage.
+- **ModSecurity/Coraza WASM execution is opt-in and not CRS.** The bundled
+  `rules/coraza.wasm` remains a Go-JS demo module. A real Coraza WASI reactor
+  is available behind the non-default `wasm-reactor` feature and
+  `waf.coraza.enabled`; it ships a small embedded rule set, not OWASP CRS, and
+  is disabled by default. See
+  [`docs/coraza-wasi-reactor.md`](docs/coraza-wasi-reactor.md) and
+  [`docs/wasm-integration-status.md`](docs/wasm-integration-status.md).
 - **WebTransport is feature-gated and terminating.** Build with
   `--features webtransport`, enable `server.webtransport`, and configure Origin
   and path allowlists. It inspects sessions locally; it does **not** proxy

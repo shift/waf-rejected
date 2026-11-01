@@ -19,6 +19,16 @@ All notable changes to WAF-Rejected are documented here.
   construction and init, allow/SQLi/XSS decisions, and 1 KiB/16 KiB/64 KiB
   request bodies. `scripts/bench-coraza.sh` builds the release library and runs
   them.
+- Opt-in live integration of the real Coraza WASI reactor behind the
+  non-default `wasm-reactor` feature. `waf.coraza.enabled = true` registers the
+  reactor before the traditional heuristic rules; `module_path` selects a
+  module file and `None` uses the embedded reactor. Payload, memory and fuel
+  limits are validated at config load.
+- Reactor failures honour `waf.fail_mode`: `503` when closed, log-and-continue
+  when open. Start-up failures use the same policy.
+- Unit coverage for attack blocking (SQLi, XSS, path traversal), benign
+  traffic, disabled configuration, and fail-closed/fail-open behaviour.
+  Release-mode latency measurement reported in `docs/coraza-wasi-reactor.md`.
 
 ### Documentation
 
@@ -27,6 +37,9 @@ All notable changes to WAF-Rejected are documented here.
 - Added measured p50/mean latency and throughput for the Coraza WASI reactor to
   `docs/coraza-wasi-reactor.md`, including hardware, command and the 64 KiB ABI
   payload ceiling.
+- Documented the live wiring, `[waf.coraza]` configuration, failure policy and
+  observed reactor latency in `docs/coraza-wasi-reactor.md`; updated the README
+  security limitations. The reactor remains disabled by default.
 
 ## [0.1.0-beta.10] - 2026-11-01
 

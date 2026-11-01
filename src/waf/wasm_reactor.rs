@@ -50,6 +50,12 @@ pub const CORAZA_FUEL: u64 = 2_000_000_000;
 
 const SPIKE_WAT: &str = include_str!("../../wasm/reactor_spike.wat");
 
+/// Coraza reactor embedded in the binary. Used when
+/// `waf.coraza.module_path` is not set, so deployments need only the WAF
+/// binary.
+pub const EMBEDDED_CORAZA_REACTOR: &[u8] =
+    include_bytes!("../../wasm/coraza_reactor/coraza_reactor.wasm");
+
 /// Resource limits applied to every reactor instance.
 #[derive(Debug, Clone)]
 pub struct ReactorLimits {
@@ -97,6 +103,9 @@ pub enum ReactorError {
     /// The module could not be parsed, validated or instantiated.
     #[error("failed to load reactor module: {0}")]
     Compile(String),
+    /// The configured module file could not be read.
+    #[error("failed to read reactor module `{path}`: {detail}")]
+    Io { path: String, detail: String },
     /// A required ABI export is missing or has the wrong signature.
     #[error("reactor module is missing required export `{0}`")]
     MissingExport(&'static str),
@@ -630,6 +639,7 @@ pub struct WasmReactorRule {
     name: String,
     reactor: Arc<WasmReactor>,
     metrics: Option<Arc<Metrics>>,
+    fail_closed: bool,
 }
 
 impl WasmReactorRule {
@@ -639,6 +649,7 @@ impl WasmReactorRule {
             name: name.into(),
             reactor,
             metrics: None,
+            fail_closed: true,
         }
     }
 
@@ -649,12 +660,62 @@ impl WasmReactorRule {
         self
     }
 
+    /// Sets the failure policy for reactor errors. `true` maps failures to
+    /// `503`; `false` logs and allows the request to continue.
+    pub fn with_fail_closed(mut self, fail_closed: bool) -> Self {
+        self.fail_closed = fail_closed;
+        self
+    }
+
+    /// Creates a Coraza rule from either an explicit module file or the
+    /// embedded reactor, together with the configured limits.
+    pub fn from_module(
+        module_path: Option<&str>,
+        limits: ReactorLimits,
+        fail_closed: bool,
+    ) -> Result<Self, ReactorError> {
+        let reactor = match module_path {
+            Some(path) => {
+                let bytes = std::fs::read(path).map_err(|err| ReactorError::Io {
+                    path: path.to_string(),
+                    detail: err.to_string(),
+                })?;
+                WasmReactor::from_bytes(&bytes, limits)
+            }
+            None => WasmReactor::from_bytes(EMBEDDED_CORAZA_REACTOR, limits),
+        }?;
+
+        Ok(Self::new("coraza-wasi-reactor", Arc::new(reactor)).with_fail_closed(fail_closed))
+    }
+
+    /// Creates a Coraza rule from `waf.coraza` configuration.
+    pub fn from_config(
+        config: &crate::config::WafCorazaConfig,
+        fail_closed: bool,
+    ) -> Result<Self, ReactorError> {
+        Self::from_module(
+            config.module_path.as_deref(),
+            ReactorLimits::from(config),
+            fail_closed,
+        )
+    }
+
     /// Creates a rule backed by the embedded spike module.
     pub fn spike() -> Result<Self, ReactorError> {
         Ok(Self::new(
             "wasm-reactor-spike",
             Arc::new(WasmReactor::spike()?),
         ))
+    }
+}
+
+impl From<&crate::config::WafCorazaConfig> for ReactorLimits {
+    fn from(config: &crate::config::WafCorazaConfig) -> Self {
+        Self {
+            max_payload_bytes: config.max_payload_bytes,
+            memory_limit_bytes: config.memory_limit_bytes,
+            fuel: config.fuel,
+        }
     }
 }
 
@@ -673,10 +734,7 @@ impl WafRule for WasmReactorRule {
                     metrics.record_coraza_evaluation(started.elapsed());
                     metrics.record_coraza_error();
                 }
-                return Decision::Block {
-                    status: 503,
-                    reason: "wasm reactor payload encoding failed".to_string(),
-                };
+                return self.failure_decision(err.to_string());
             }
         };
 
@@ -698,11 +756,26 @@ impl WafRule for WasmReactorRule {
                 if let Some(metrics) = &self.metrics {
                     metrics.record_coraza_error();
                 }
-                Decision::Block {
-                    status: 503,
-                    reason: format!("wasm reactor failure: {err}"),
-                }
+                self.failure_decision(err.to_string())
             }
+        }
+    }
+}
+
+impl WasmReactorRule {
+    fn failure_decision(&self, reason: String) -> Decision {
+        if self.fail_closed {
+            Decision::Block {
+                status: 503,
+                reason: format!("wasm reactor failure: {reason}"),
+            }
+        } else {
+            warn!(
+                rule = %self.name,
+                reason = %reason,
+                "wasm reactor failed; continuing because fail_mode is open"
+            );
+            Decision::Allow
         }
     }
 }
@@ -921,6 +994,65 @@ mod tests {
             .expect("spawn reactor thread")
             .join()
             .expect("reactor thread must not panic");
+    }
+
+    fn trapping_reactor() -> Arc<WasmReactor> {
+        let wat = r#"
+            (module
+              (memory (export "memory") 1)
+              (func (export "init") (result i32) i32.const 0)
+              (func (export "eval") (param i32 i32) (result i32) unreachable)
+              (func (export "free") (param i32 i32)))
+        "#;
+        Arc::new(WasmReactor::from_wat(wat, ReactorLimits::default()).expect("module must load"))
+    }
+
+    #[test]
+    #[ignore = "Go/WASI reactor latency measurement requires the release wasmi profile"]
+    fn measure_coraza_reactor_latency() {
+        let load_start = std::time::Instant::now();
+        let reactor = WasmReactor::from_bytes(EMBEDDED_CORAZA_REACTOR, ReactorLimits::coraza())
+            .expect("embedded reactor must load");
+        let load_elapsed = load_start.elapsed();
+
+        // A fresh Go runtime starts for every evaluation, so latency is
+        // reported, not asserted. This keeps the check robust on shared CI.
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                let payload = benign_payload();
+                let iterations = 5;
+                let start = std::time::Instant::now();
+                for _ in 0..iterations {
+                    reactor.evaluate(&payload).expect("benign payload");
+                }
+                let elapsed = start.elapsed();
+                eprintln!(
+                    "coraza-wasi-reactor: load={:?}, evaluations={}, total={:?}, avg={:?}",
+                    load_elapsed,
+                    iterations,
+                    elapsed,
+                    elapsed / iterations
+                );
+            })
+            .expect("spawn reactor thread")
+            .join()
+            .expect("reactor thread must not panic");
+    }
+
+    #[test]
+    fn rule_fails_closed_on_reactor_error() {
+        let rule = WasmReactorRule::new("trapping", trapping_reactor()).with_fail_closed(true);
+        assert!(matches!(
+            rule.evaluate(&context("/", None)),
+            Decision::Block { status: 503, .. }
+        ));
+    }
+
+    #[test]
+    fn rule_fails_open_when_configured() {
+        let rule = WasmReactorRule::new("trapping", trapping_reactor()).with_fail_closed(false);
+        assert_eq!(rule.evaluate(&context("/", None)), Decision::Allow);
     }
 
     #[test]

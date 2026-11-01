@@ -162,6 +162,37 @@ testing.
 Rules are Coraza SecLang directives in `embeddedRules`; they are compiled once
 per reactor instance (`init`).
 
+## Live WAF integration
+
+The reactor is wired into the live rule chain only when both the
+`wasm-reactor` feature is compiled and `waf.coraza.enabled` is true. It is
+registered **before** the heuristic rules so a Coraza block wins even if a
+later rule would allow the request.
+
+```toml
+[waf]
+fail_mode = "closed"      # "open" logs reactor failures and continues
+
+[waf.coraza]
+enabled = false           # opt-in; never enabled by default
+# module_path = "/etc/waf/coraza_reactor.wasm"  # omit to use the embedded reactor
+max_payload_bytes = 65536
+memory_limit_bytes = 268435456
+fuel = 2000000000
+```
+
+`module_path` is optional: when omitted the Coraza module is embedded in the
+WAF binary. `Config::validate` rejects zero payload/fuel values, a memory limit
+below 64 KiB, a payload limit larger than the memory limit, and an empty module
+path.
+
+If the reactor cannot be constructed at start-up, the engine adds a
+fail-closed placeholder rule when `waf.fail_mode != "open"`; the placeholder
+returns `503`. In `open` mode the failure is logged and the request continues
+through the remaining rules. At request time any reactor error (trap, fuel
+exhaustion, payload overflow) follows the same policy: `503` when closed,
+log-and-allow when open.
+
 ## Memory and limits
 
 Host-side limits for the Coraza reactor (`ReactorLimits::coraza`):
@@ -272,6 +303,21 @@ benchmark. The dominant cost is the per-evaluation Go runtime and Coraza
 engine start-up in `evaluate`, not rule matching or body size. Reusing a
 single instance or pool, or moving to a compiled Wasm runtime, is required
 before this reactor can be considered for the proxy hot path.
+
+### Observed latency
+
+`measure_coraza_reactor_latency` reports load and per-request cost without a
+brittle assertion. Observed on the development machine in release mode:
+
+| Measurement | Observed |
+| --- | --- |
+| Module compile/load | ~581 ms |
+| Per request (benign, fresh Go runtime) | ~207 ms average over 5 runs |
+
+The per-request figure is dominated by starting a fresh Go runtime and
+compiling the embedded SecLang rules for every evaluation. This is why the
+reactor remains opt-in and is not used for the fast path. Treat these numbers
+as an order of magnitude, not a service-level guarantee.
 
 ## Remaining work
 

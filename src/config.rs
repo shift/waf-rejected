@@ -441,6 +441,9 @@ pub struct WafConfig {
     /// WASM ModSecurity configuration
     #[cfg(feature = "wasm-waf")]
     pub wasm: WasmConfig,
+
+    /// Real Coraza WASI reactor configuration (`wasm-reactor` feature).
+    pub coraza: WafCorazaConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -577,6 +580,43 @@ pub struct WasmConfig {
 
     /// Rules configuration file
     pub rules_config: String,
+}
+
+/// Real Coraza WASI reactor configuration.
+///
+/// Disabled by default. When enabled, the reactor is registered as the first
+/// rule in the live WAF chain (requires the non-default `wasm-reactor`
+/// feature). `module_path = None` uses the Coraza module embedded in the
+/// binary; otherwise the path is read at start-up.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WafCorazaConfig {
+    /// Enable the real Coraza WASI reactor.
+    pub enabled: bool,
+
+    /// Optional path to a reactor `.wasm` file. `None` uses the embedded module.
+    pub module_path: Option<String>,
+
+    /// Maximum request payload handed to the reactor.
+    pub max_payload_bytes: usize,
+
+    /// Maximum linear memory the reactor may grow to.
+    pub memory_limit_bytes: usize,
+
+    /// Instruction (fuel) budget for one `_initialize` + `init` + `eval` round trip.
+    pub fuel: u64,
+}
+
+impl Default for WafCorazaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            module_path: None,
+            max_payload_bytes: 64 * 1024,
+            memory_limit_bytes: 256 * 1024 * 1024,
+            fuel: 2_000_000_000,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -864,6 +904,7 @@ impl Default for WafConfig {
             geo_blocking: GeoBlockingConfig::default(),
             #[cfg(feature = "wasm-waf")]
             wasm: WasmConfig::default(),
+            coraza: WafCorazaConfig::default(),
         }
     }
 }
@@ -1006,6 +1047,29 @@ impl Config {
         }
         if self.waf.rate_limit.global_window_secs == 0 && self.waf.rate_limit.global_enabled {
             anyhow::bail!("waf.rate_limit.global_window_secs must be greater than zero");
+        }
+        if self.waf.coraza.max_payload_bytes == 0 {
+            anyhow::bail!("waf.coraza.max_payload_bytes must be greater than zero");
+        }
+        if self.waf.coraza.memory_limit_bytes < 64 * 1024 {
+            anyhow::bail!("waf.coraza.memory_limit_bytes must be at least 65536");
+        }
+        if self.waf.coraza.max_payload_bytes > self.waf.coraza.memory_limit_bytes {
+            anyhow::bail!(
+                "waf.coraza.max_payload_bytes must not exceed waf.coraza.memory_limit_bytes"
+            );
+        }
+        if self.waf.coraza.fuel == 0 {
+            anyhow::bail!("waf.coraza.fuel must be greater than zero");
+        }
+        if self
+            .waf
+            .coraza
+            .module_path
+            .as_deref()
+            .is_some_and(str::is_empty)
+        {
+            anyhow::bail!("waf.coraza.module_path must not be empty when set");
         }
         if self.security.auth.enabled && self.security.auth.api_keys.is_empty() {
             anyhow::bail!("security.auth.enabled is true but security.auth.api_keys is empty");
@@ -1267,6 +1331,32 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
 
         config.server.enable_http3 = false;
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn coraza_limits_are_validated() {
+        let mut config = Config::default();
+        assert!(config.validate().is_ok());
+        assert!(!config.waf.coraza.enabled);
+
+        config.waf.coraza.max_payload_bytes = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.waf.coraza.memory_limit_bytes = 1024;
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.waf.coraza.max_payload_bytes = config.waf.coraza.memory_limit_bytes + 1;
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.waf.coraza.fuel = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.waf.coraza.module_path = Some(String::new());
+        assert!(config.validate().is_err());
     }
 
     #[test]

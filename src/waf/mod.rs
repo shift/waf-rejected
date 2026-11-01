@@ -115,6 +115,26 @@ pub trait WafRule: Send + Sync {
     }
 }
 
+/// Fail-closed placeholder used when a configured reactor cannot be loaded.
+#[cfg(feature = "wasm-reactor")]
+struct UnavailableCorazaRule {
+    reason: String,
+}
+
+#[cfg(feature = "wasm-reactor")]
+impl WafRule for UnavailableCorazaRule {
+    fn name(&self) -> &str {
+        "coraza-wasi-reactor-unavailable"
+    }
+
+    fn evaluate(&self, _ctx: &RequestContext) -> Decision {
+        Decision::Block {
+            status: 503,
+            reason: self.reason.clone(),
+        }
+    }
+}
+
 /// WAF engine for evaluating requests against rules
 pub struct WafEngine {
     rules: Arc<RwLock<Vec<Box<dyn WafRule>>>>,
@@ -187,10 +207,36 @@ impl WafEngine {
             ai_detector: Self::initialize_ai_detector(config),
         };
 
+        // The Coraza reactor must run before the traditional heuristics.
+        #[cfg(feature = "wasm-reactor")]
+        engine.add_coraza_rule(config);
+
         // Add default rules based on configuration
         engine.add_default_rules(config);
 
         engine
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    fn add_coraza_rule(&mut self, config: &Config) {
+        if !config.waf.coraza.enabled {
+            return;
+        }
+
+        match wasm_reactor::WasmReactorRule::from_config(&config.waf.coraza, self.fail_closed) {
+            Ok(rule) => {
+                info!("Added Coraza WASI reactor as the first WAF rule");
+                self.add_rule(rule);
+            }
+            Err(err) => {
+                warn!(error = %err, "failed to initialise Coraza WASI reactor");
+                if self.fail_closed {
+                    self.add_rule(UnavailableCorazaRule {
+                        reason: format!("Coraza WASI reactor failed to initialise: {err}"),
+                    });
+                }
+            }
+        }
     }
 
     fn initialize_geoip(config: &Config) -> Arc<GeoIpService> {
@@ -884,5 +930,114 @@ mod tests {
             }
             _ => panic!("Expected RateLimit decision"),
         }
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    fn reactor_only_config() -> crate::config::Config {
+        let mut config = crate::config::Config::default();
+        config.waf.content_inspection.enabled = false;
+        config.waf.rate_limit.per_ip_enabled = false;
+        config.waf.rate_limit.global_enabled = false;
+        config.waf.geo_blocking.enabled = false;
+        config.waf.coraza.enabled = true;
+        config
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    fn post_context(body: &str) -> RequestContext {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-type",
+            "application/x-www-form-urlencoded".parse().unwrap(),
+        );
+        let mut ctx = RequestContext::new(
+            IpAddr::from_str("192.168.1.100").unwrap(),
+            Method::POST,
+            Uri::from_str("/login").unwrap(),
+            headers,
+            Some(body.len()),
+        );
+        ctx = ctx.with_body(Some(Bytes::from(body.to_string())));
+        ctx
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    #[test]
+    fn test_coraza_disabled_does_not_add_rule() {
+        let mut config = reactor_only_config();
+        config.waf.coraza.enabled = false;
+        let engine = WafEngine::with_config(&config);
+
+        // Only the request-size and dangerous-method rules remain.
+        assert_eq!(engine.rule_count(), 2);
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    #[tokio::test]
+    async fn test_coraza_init_failure_fails_closed() {
+        let mut config = reactor_only_config();
+        config.waf.fail_mode = "closed".to_string();
+        config.waf.coraza.module_path = Some("/nonexistent/coraza-reactor.wasm".to_string());
+        let engine = WafEngine::with_config(&config);
+
+        let decision = engine.evaluate(&create_test_context()).await;
+        assert!(
+            matches!(decision, Decision::Block { status: 503, .. }),
+            "expected fail-closed 503, got {decision:?}"
+        );
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    #[tokio::test]
+    async fn test_coraza_init_failure_fails_open_when_configured() {
+        let mut config = reactor_only_config();
+        config.waf.fail_mode = "open".to_string();
+        config.waf.coraza.module_path = Some("/nonexistent/coraza-reactor.wasm".to_string());
+        let engine = WafEngine::with_config(&config);
+
+        assert_eq!(engine.rule_count(), 2);
+        assert_eq!(
+            engine.evaluate(&create_test_context()).await,
+            Decision::Allow
+        );
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    #[test]
+    #[ignore = "Go/WASI reactor requires the release wasmi profile"]
+    fn test_coraza_reactor_engine_blocks_attacks_and_allows_benign() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime");
+                runtime.block_on(async {
+                    let config = reactor_only_config();
+                    let engine = WafEngine::with_config(&config);
+
+                    assert_eq!(
+                        engine.evaluate(&create_test_context()).await,
+                        Decision::Allow,
+                        "benign request must pass"
+                    );
+
+                    for body in [
+                        "username=admin&password=x union select password from users",
+                        "<script>alert(1)</script>",
+                        "../../etc/passwd",
+                    ] {
+                        let decision = engine.evaluate(&post_context(body)).await;
+                        assert!(
+                            matches!(decision, Decision::Block { status: 403, .. }),
+                            "expected Coraza to block {body:?}, got {decision:?}"
+                        );
+                    }
+                });
+            })
+            .expect("spawn reactor thread")
+            .join()
+            .expect("reactor thread must not panic");
     }
 }
