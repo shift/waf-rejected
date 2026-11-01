@@ -6,6 +6,7 @@
 
 pub mod buffer_pool;
 pub(crate) mod decompression;
+pub mod framing;
 #[cfg(feature = "http3")]
 pub(crate) mod http3;
 pub mod service;

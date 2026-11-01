@@ -115,6 +115,16 @@ recomputed for the new body). This ensures the upstream cannot re-interpret
 already-inspected bytes as a different representation. Requests without a
 `Content-Encoding`, or with an explicit `identity`, are forwarded unchanged.
 
+### Request framing and smuggling defenses
+
+Before any request body is read, the proxy validates request framing on
+HTTP/1.1, HTTP/2 and HTTP/3. Requests are rejected with a generic `400` when
+they contain both `Content-Length` and `Transfer-Encoding`, multiple
+`Content-Length` header fields, comma-separated conflicting `Content-Length`
+values, a non-numeric or malformed `Content-Length`, or a
+`Transfer-Encoding` value other than a single `chunked` token. Rejection
+details are logged server-side but never sent to the client.
+
 ## Build and test
 
 ```bash

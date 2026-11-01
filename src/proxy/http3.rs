@@ -156,6 +156,22 @@ async fn handle_request(
     let client_ip =
         WafProxyService::resolve_client_ip(peer_ip, &parts.headers, &state.trusted_proxies);
 
+    // Reject ambiguous request framing before any body is read. Details are
+    // intentionally not exposed to the client.
+    if let Err(e) = crate::proxy::framing::validate_request_framing(&parts.headers) {
+        warn!(
+            "Rejected ambiguous HTTP/3 request framing from {}: {}",
+            client_ip, e
+        );
+        state.metrics.record_blocked();
+        state.metrics.record_request_duration(start_time.elapsed());
+        return send_response(
+            &mut stream,
+            WafProxyService::create_error_response(StatusCode::BAD_REQUEST, "Bad Request"),
+        )
+        .await;
+    }
+
     if let Some(validator) = &state.auth_validator {
         if let Err(e) = validator.validate_request(&parts.headers, true) {
             warn!(

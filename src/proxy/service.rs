@@ -34,6 +34,7 @@ use crate::proxy::buffer_pool::{BodyReadError, BufferPool};
 use crate::proxy::decompression::{
     decompress_request_body, strip_encoding_headers, DecompressionError,
 };
+use crate::proxy::framing::validate_request_framing;
 use crate::proxy::websocket::WebSocketHandler;
 use crate::waf::auth::{ApiKeyValidator, InMemoryKeyStore};
 use crate::waf::tls_config::TlsManager;
@@ -535,6 +536,21 @@ impl WafProxyService {
         }
 
         let client_ip = Self::resolve_client_ip(peer_ip, req.headers(), &state.trusted_proxies);
+
+        // Reject ambiguous request framing before any body is read. Details are
+        // intentionally not exposed to the client.
+        if let Err(e) = validate_request_framing(req.headers()) {
+            warn!(
+                "Rejected ambiguous request framing from {}: {}",
+                client_ip, e
+            );
+            state.metrics.record_blocked();
+            state.metrics.record_request_duration(start_time.elapsed());
+            return Ok(Self::create_error_response(
+                StatusCode::BAD_REQUEST,
+                "Bad Request",
+            ));
+        }
 
         // Authentication is a first-class pipeline stage, not an unused module.
         if let Some(validator) = &state.auth_validator {

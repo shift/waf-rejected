@@ -6,6 +6,12 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Added
 
+- Request-framing validation on HTTP/1.1, HTTP/2 and HTTP/3 that rejects
+  ambiguous or malformed framing before a body is read: `Content-Length` with
+  `Transfer-Encoding`, multiple `Content-Length` fields, conflicting
+  comma-separated lengths, invalid lengths, and any `Transfer-Encoding` other
+  than a single `chunked` token. Rejections return a generic `400`.
+- Unit coverage for each request-framing rejection case.
 - HTTPS upstream support: the proxy now uses a rustls-backed connector for both
   `http://` and `https://` upstreams over HTTP/1.1 and HTTP/2. HTTPS upstreams
   are verified against the public WebPKI roots, and `proxy.upstream_ca_path`
