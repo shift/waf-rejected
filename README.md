@@ -228,11 +228,15 @@ Key points:
 
 ## Security limitations (read before production)
 
-- **ModSecurity/Coraza WASM execution is opt-in.** The bundled
-  `rules/coraza.wasm` remains a Go-JS demo module. A real Coraza WASI reactor
-  runs on wasmtime 49 behind the non-default `wasm-reactor` feature and
-  `waf.coraza.enabled`; it embeds OWASP CRS 4.14 (request-side, paranoia level
-  1) and is disabled by default. The host is built with Rust 1.99.1. See
+- **ModSecurity/Coraza WASM execution is on by default.** The bundled
+  `rules/coraza.wasm` remains a Go-JS demo module. The live engine is a real
+  Coraza WASI reactor on wasmtime 49, compiled by the default `wasm-reactor`
+  feature; it embeds OWASP CRS 4.14 (request-side, paranoia level 1) and runs
+  before the built-in heuristic rules. `waf.coraza.enabled = false` (or
+  `--no-default-features`) disables it. Start-up compiles the ~20 MiB module
+  once (~4.5 s) and warms the reactor pool (~1.1 s) before readiness; measured
+  steady-state cost is ~8–10 ms p50 per request with full CRS. The host is
+  built with Rust 1.99.1. See
   [`docs/coraza-wasi-reactor.md`](docs/coraza-wasi-reactor.md) and
   [`docs/wasm-integration-status.md`](docs/wasm-integration-status.md).
 - **WebTransport is feature-gated and terminating.** Build with

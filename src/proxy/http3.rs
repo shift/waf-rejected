@@ -688,6 +688,9 @@ F4s3IuSi44rR0CGaogZ+O/I=
         config.server.tls.key_path = key_path;
         config.waf.rate_limit.per_ip_enabled = false;
         config.waf.rate_limit.global_enabled = false;
+        // Protocol tests exercise HTTP/3, not the Coraza reactor; keep them
+        // from compiling and warming the 20 MiB module.
+        config.waf.coraza.enabled = false;
         configure(&mut config);
 
         let service = Arc::new(WafProxyService::new(config).unwrap());

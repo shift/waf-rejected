@@ -99,18 +99,20 @@ Notes:
 
 ### Coraza reactor artifact
 
-The image bundles the experimental Coraza WASI reactor at
+The image bundles the Coraza WASI reactor at
 `/usr/share/waf/wasm/coraza_reactor.wasm`, with `LICENSE-CRS`,
 `PROVENANCE.md` and `SHA256SUMS` in the same directory. The image build
-verifies the digest and that the module is at most 32 MiB (the current build
-is about 18 MiB).
+enables the default `wasm-reactor` feature explicitly, verifies the digest and
+checks that the module is at most 32 MiB (the current build is about 18 MiB).
 
-The reactor is only active in builds compiled with the non-default
-`wasm-reactor` feature. Such a build validates the module at startup and
-fails closed if it is missing, malformed, over budget or missing required
-exports. `WAF_CORAZA_REACTOR_PATH` overrides the module path;
-`WAF_CORAZA_REACTOR_ENABLED=false` disables validation for local experiments
-only.
+The reactor is enabled by default and validates the module at startup, failing
+closed if it is missing, malformed, over budget, missing required exports or
+fails pool warm-up. Start-up pays about 4.5 s to compile the module and about
+1.1 s to warm the pool before readiness; steady-state cost is about 8–10 ms
+p50 per request with the full CRS. Set `waf.coraza.enabled = false` in the
+configuration file/environment to skip validation and warm-up entirely.
+`waf.coraza.module_path` selects an alternate module file;
+the embedded module is used when it is unset.
 
 ```bash
 docker run --rm --entrypoint sha256sum \

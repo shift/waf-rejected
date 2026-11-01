@@ -143,6 +143,11 @@ pub struct WafEngine {
     enabled: bool,
     fail_closed: bool,
     wasm_init_failed: bool,
+    /// Start-up failure for the Coraza reactor. This is fatal for
+    /// [`WafProxyService::new`](crate::proxy::WafProxyService::new) rather
+    /// than deferred to request time.
+    #[cfg(feature = "wasm-reactor")]
+    coraza_init_error: Option<String>,
     #[cfg(feature = "wasm-waf")]
     wasm_engine: Option<Arc<WasmEngine>>,
     #[cfg(feature = "ai-threat-detection")]
@@ -164,6 +169,8 @@ impl Clone for WafEngine {
             enabled: self.enabled,
             fail_closed: self.fail_closed,
             wasm_init_failed: self.wasm_init_failed,
+            #[cfg(feature = "wasm-reactor")]
+            coraza_init_error: self.coraza_init_error.clone(),
             #[cfg(feature = "wasm-waf")]
             wasm_engine: self.wasm_engine.clone(),
             #[cfg(feature = "ai-threat-detection")]
@@ -181,6 +188,8 @@ impl WafEngine {
             enabled: true,
             fail_closed: true,
             wasm_init_failed: false,
+            #[cfg(feature = "wasm-reactor")]
+            coraza_init_error: None,
             #[cfg(feature = "wasm-waf")]
             wasm_engine: None,
         }
@@ -201,6 +210,8 @@ impl WafEngine {
             enabled: config.waf.enabled,
             fail_closed: config.waf.fail_mode != "open",
             wasm_init_failed,
+            #[cfg(feature = "wasm-reactor")]
+            coraza_init_error: None,
             #[cfg(feature = "wasm-waf")]
             wasm_engine,
             #[cfg(feature = "ai-threat-detection")]
@@ -219,7 +230,7 @@ impl WafEngine {
 
     #[cfg(feature = "wasm-reactor")]
     fn add_coraza_rule(&mut self, config: &Config) {
-        if !config.waf.coraza.enabled {
+        if !config.waf.enabled || !config.waf.coraza.enabled {
             return;
         }
 
@@ -230,13 +241,23 @@ impl WafEngine {
             }
             Err(err) => {
                 warn!(error = %err, "failed to initialise Coraza WASI reactor");
+                let reason = format!("Coraza WASI reactor failed to initialise: {err}");
+                self.coraza_init_error = Some(reason.clone());
                 if self.fail_closed {
-                    self.add_rule(UnavailableCorazaRule {
-                        reason: format!("Coraza WASI reactor failed to initialise: {err}"),
-                    });
+                    // Preserve request-time fail-closed behaviour for callers
+                    // that build a WafEngine directly.
+                    self.add_rule(UnavailableCorazaRule { reason });
                 }
             }
         }
+    }
+
+    /// Returns the Coraza start-up error, if the reactor was enabled but could
+    /// not be compiled, validated or warmed. Proxy start-up treats this as
+    /// fatal so the process never serves traffic without its WAF engine.
+    #[cfg(feature = "wasm-reactor")]
+    pub fn coraza_init_error(&self) -> Option<&str> {
+        self.coraza_init_error.as_deref()
     }
 
     fn initialize_geoip(config: &Config) -> Arc<GeoIpService> {

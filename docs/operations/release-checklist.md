@@ -17,8 +17,13 @@
       package, alongside `LICENSE-CRS`, `PROVENANCE.md` and `SHA256SUMS`
 - [ ] Container image contains `/usr/share/waf/wasm/coraza_reactor.wasm` and
       the module digest matches `SHA256SUMS`
+- [ ] The default release build includes `wasm-reactor` and a default
+      `Config` has `waf.coraza.enabled = true`
 - [ ] A `wasm-reactor` build fails closed when the module is missing or has
       broken exports (see `docs/coraza-wasi-reactor.md`)
+- [ ] Startup smoke test: with default config the binary compiles/warms the
+      reactor before readiness (~5.6 s) and serves; setting
+      `waf.coraza.enabled = false` skips the warm-up
 - [ ] Container image starts and answers `/health` on port 8081
 
 ### Verify provenance

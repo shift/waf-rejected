@@ -267,6 +267,15 @@ impl WafProxyService {
 
         let waf_engine = Arc::new(WafEngine::with_config(&config));
 
+        // Coraza is a configured security control: a compile/validation/warm
+        // failure must stop start-up instead of surfacing as a 503 per request.
+        #[cfg(feature = "wasm-reactor")]
+        if let Some(err) = waf_engine.coraza_init_error() {
+            return Err(WafError::internal(format!(
+                "Coraza WASI reactor initialisation failed (fail-closed): {err}"
+            )));
+        }
+
         // Initialize high-performance buffer pool for zero-allocation HTTP processing
         let buffer_pool = BufferPool::new();
         info!(
@@ -1649,7 +1658,7 @@ mod tests {
 
     #[test]
     fn test_proxy_service_creation() {
-        let config = Config {
+        let mut config = Config {
             proxy: ProxyConfig {
                 upstream_url: "http://localhost:8080".to_string(),
                 bind_addr: "0.0.0.0:3000".to_string(),
@@ -1661,9 +1670,37 @@ mod tests {
             },
             ..Default::default()
         };
+        config.waf.coraza.enabled = false;
 
         let service = WafProxyService::new(config);
         assert!(service.is_ok());
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    #[test]
+    fn test_coraza_init_failure_is_fatal_at_startup() {
+        let mut config = Config {
+            proxy: ProxyConfig {
+                upstream_url: "http://localhost:8080".to_string(),
+                bind_addr: "0.0.0.0:3000".to_string(),
+                timeout_seconds: 30,
+                max_request_size: 10_485_760,
+                upstream_ca_path: None,
+                upstream_client_cert_path: None,
+                upstream_client_key_path: None,
+            },
+            ..Default::default()
+        };
+        config.waf.coraza.module_path = Some("/nonexistent/coraza-reactor.wasm".to_string());
+
+        let error = WafProxyService::new(config)
+            .err()
+            .expect("a configured reactor that cannot load must abort start-up")
+            .to_string();
+        assert!(
+            error.contains("Coraza WASI reactor initialisation failed"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

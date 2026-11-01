@@ -51,6 +51,7 @@ async fn spawn_proxy(origin_allowlist: Vec<String>) -> u16 {
     config.server.webtransport.allowed_paths = vec!["/echo".to_string()];
     config.waf.rate_limit.per_ip_enabled = false;
     config.waf.rate_limit.global_enabled = false;
+    config.waf.coraza.enabled = false;
 
     let service = Arc::new(WafProxyService::new(config).unwrap());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

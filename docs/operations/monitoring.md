@@ -27,8 +27,10 @@ WAF-Rejected provides comprehensive monitoring capabilities through OpenTelemetr
 
 These metrics are emitted by the built-in `/metrics` endpoint when a
 `WasmReactorRule` is registered with the process metrics registry
-(`with_metrics`). They remain at zero when the experimental `wasm-reactor`
-feature is not in use.
+(`with_metrics`). The reactor is enabled by default, so these series are
+populated in normal deployments; they remain at zero only when
+`waf.coraza.enabled = false` or the binary is built without the
+`wasm-reactor` feature.
 
 - `waf_coraza_evaluations_total` - Coraza reactor evaluations
 - `waf_coraza_blocks_total` - Requests blocked by the Coraza reactor

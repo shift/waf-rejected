@@ -49,6 +49,7 @@ mod auth_integration_tests {
 
     fn create_config_with_auth() -> Config {
         let mut config = Config::default();
+        config.waf.coraza.enabled = false;
         config.security.auth.enabled = true;
         config.security.auth.api_keys =
             vec!["test-api-key-123".to_string(), "admin-key-456".to_string()];

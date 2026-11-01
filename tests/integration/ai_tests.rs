@@ -15,6 +15,8 @@ mod ai_integration_tests {
 
     fn create_config_with_ai() -> Config {
         let mut config = Config::default();
+        // AI integration tests do not exercise the Coraza reactor.
+        config.waf.coraza.enabled = false;
         config.security.ai.enabled = true;
         config.security.ai.threat_threshold = 0.7;
         config.security.ai.timeout_ms = 2000;
@@ -79,6 +81,7 @@ mod ai_integration_tests {
     #[tokio::test]
     async fn test_waf_engine_with_ai_disabled() {
         let mut config = Config::default();
+        config.waf.coraza.enabled = false;
         config.security.ai.enabled = false; // Explicitly disable AI
 
         let engine = WafEngine::with_config(&config);
@@ -142,18 +145,21 @@ mod ai_integration_tests {
         let configs = vec![
             {
                 let mut c = Config::default();
+                c.waf.coraza.enabled = false;
                 c.security.ai.enabled = true;
                 c.security.ai.threat_threshold = 0.0; // Very low threshold
                 c
             },
             {
                 let mut c = Config::default();
+                c.waf.coraza.enabled = false;
                 c.security.ai.enabled = true;
                 c.security.ai.threat_threshold = 1.0; // Very high threshold
                 c
             },
             {
                 let mut c = Config::default();
+                c.waf.coraza.enabled = false;
                 c.security.ai.enabled = true;
                 c.security.ai.timeout_ms = 10000; // Long timeout
                 c

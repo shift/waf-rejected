@@ -33,7 +33,9 @@ async fn assert_blocked(engine: &WafEngine, ctx: &RequestContext, label: &str) {
 
 #[tokio::test]
 async fn test_comprehensive_waf_protection() {
-    let config = Config::default();
+    let mut config = Config::default();
+    // These assertions cover the built-in heuristic rules, not Coraza.
+    config.waf.coraza.enabled = false;
     let engine = WafEngine::with_config(&config);
 
     assert_blocked(

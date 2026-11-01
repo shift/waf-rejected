@@ -181,11 +181,12 @@ rcgen = "0.14"
 wtransport = { version = "0.7.2", default-features = false, features = ["ring", "quinn", "dangerous-configuration"] }
 
 [features]
-default = ["export-system", "websocket"]
+default = ["export-system", "websocket", "wasm-reactor"]
 integration-tests = []
 wasm-waf = []
-# Experimental request-in/decision-out WASM reactor ABI (wasmtime host).
-# Not enabled by default and does not replace the built-in heuristic rules.
+# Request-in/decision-out WASM reactor ABI (wasmtime host) that runs the
+# real Coraza/CRS module before the built-in heuristic rules. Enabled by
+# default; `--no-default-features` or `waf.coraza.enabled = false` opts out.
 # See docs/coraza-wasi-reactor.md.
 wasm-reactor = ["dep:wasmtime", "dep:wasmtime-wasi"]
 # Protocol support features

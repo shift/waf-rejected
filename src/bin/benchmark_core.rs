@@ -93,7 +93,10 @@ impl CoreBenchmarkSuite {
         println!("================================================");
 
         // Initialize core WAF engine with standard configuration
-        let waf_config = Config::default();
+        let mut waf_config = Config::default();
+        // Benchmarks measure the built-in rule path; warming the Coraza pool
+        // would dominate and distort the measured request latency.
+        waf_config.waf.coraza.enabled = false;
         let mut engine = WafEngine::with_config(&waf_config);
 
         // Load additional rules for benchmarking

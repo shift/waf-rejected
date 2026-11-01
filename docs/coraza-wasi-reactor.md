@@ -1,6 +1,6 @@
 # Coraza WASI Reactor
 
-**Status:** experimental, behind the non-default `wasm-reactor` feature
+**Status:** enabled by default (`wasm-reactor` feature, `waf.coraza.enabled = true`)
 **Module:** `wasm/coraza_reactor/coraza_reactor.wasm`
 **Source:** `wasm/coraza_reactor/main.go`
 
@@ -11,10 +11,17 @@ WASI reactor. It has no `syscall/js` imports and no runtime dependency on
 the binary. The host embeds [wasmtime](https://wasmtime.dev) 49 (Cranelift)
 and uses wasmtime-wasi's preview1 imports for the Go runtime.
 
-The reactor is **not** enabled by default and does not replace the built-in
-heuristic rules. It ships the full **request-side** CRS 4.14.0 rule set
-(anomaly scoring, paranoia level 1); response inspection is disabled because
-the host does not forward response bodies.
+The reactor is **enabled by default**: the `wasm-reactor` Cargo feature is part
+of `default`, and `WafCorazaConfig::default().enabled` is `true`. It runs
+before the built-in heuristic rules, which remain as defence in depth. It ships
+the full **request-side** CRS 4.14.0 rule set (anomaly scoring, paranoia level
+1); response inspection is disabled because the host does not forward response
+bodies. To opt out, set `waf.coraza.enabled = false` (the documented switch)
+or build with `--no-default-features`.
+
+Measured production cost: about **4.5 s** to compile the ~20 MiB module once at
+start-up, about **1.1 s** to warm the reactor pool before readiness, and about
+**8–10 ms p50** added per request with the full CRS.
 
 ## Packaging and stable path
 
@@ -52,21 +59,27 @@ desirable, but the budget leaves headroom for a pinned CRS bundle.
 
 ## Startup validation (fail closed)
 
-With the `wasm-reactor` feature compiled in, `waf-ingress` validates the
-reactor during startup, before it starts listening:
+With the `wasm-reactor` feature compiled in (the default), `waf-ingress`
+validates the reactor during startup, before it starts listening:
 
-1. read the module from `WAF_CORAZA_REACTOR_PATH` (default
-   `/usr/share/waf/wasm/coraza_reactor.wasm`);
-2. reject a missing file, unreadable file, malformed module or module over the
-   32 MiB budget;
-3. require `memory`, `_initialize`, `input_base`, `init`, `eval` and `free`;
-4. run `_initialize`/`init` and one benign evaluation.
+1. `validate_startup(&config)` returns immediately when `waf.enabled` or
+   `waf.coraza.enabled` is false;
+2. otherwise it resolves the same module source the engine uses: the
+   `waf.coraza.module_path` file when set, or the embedded reactor when
+   `None`. It rejects a missing/unreadable file or a module over the 32 MiB
+   budget;
+3. `WafEngine::with_config` compiles that module once, requires
+   `memory`, `_initialize`, `input_base`, `init`, `eval` and `free`, and warms
+   the worker pool (`_initialize`/`init` on every worker);
+4. `WafProxyService::new` treats any reactor compile, export-validation or
+   warm-up failure as fatal and aborts start-up.
 
-Any failure is fatal and prints a `Coraza reactor startup validation failed
-(fail-closed): ...` error. Set `WAF_CORAZA_REACTOR_ENABLED=false` only for
-local experiments; disabling the check means the module is not validated at
-startup. Feature builds without the module therefore fail closed rather than
-serving traffic with an unvalidated Coraza control.
+There is no environment-variable escape hatch: `waf.coraza.enabled = false`
+is the documented switch, and it also skips module validation and pool
+warm-up. `validate_startup` never builds a second reactor or pool, so the
+module is compiled and warmed exactly once. Feature builds without a valid
+module therefore fail closed rather than serving traffic with an unvalidated
+Coraza control.
 
 ## Toolchain
 
@@ -188,8 +201,8 @@ wasmtime-wasi.
 
 ## ABI
 
-The host keeps one initialised instance per worker thread and reactor. On the
-first evaluation on a thread it:
+`WasmReactor::warm()` starts a fixed-size pool of dedicated OS threads and
+blocks until every one of them has finished start-up:
 
 1. instantiates the module with the WASI shim;
 2. calls `_initialize` (Go runtime start-up);
@@ -198,19 +211,43 @@ first evaluation on a thread it:
 
 Every request then only:
 
-1. resets the fuel budget;
-2. copies the JSON payload to `input_base`;
-3. calls `eval(base, len)`;
-4. calls `free(base, len)`.
+1. hands the payload to an idle pool worker;
+2. resets the fuel budget;
+3. copies the JSON payload to `input_base`;
+4. calls `eval(base, len)`;
+5. calls `free(base, len)`.
 
-The instance is reused for later requests on that thread; `eval` creates and
-closes a Coraza transaction per request, so decisions do not leak between
-requests. A failed evaluation (trap, fuel exhaustion, failed init) discards the
-instance and the next request recreates it. Instances live in a thread-local
-cache keyed by reactor identity (`WasmReactor::id`) with a small bounded
-capacity, which is required because wasmtime `Store`/`Instance`/`Memory` are
-not `Send`. One thread never shares its instance with another, and a re-entrant
-call on the same thread is rejected rather than aliasing a live store.
+`eval` creates and closes a Coraza transaction per request, so decisions do not
+leak between requests. A failed evaluation (trap, fuel exhaustion, failed init)
+discards that worker's instance, returns the error to the caller and the
+worker's next job rebuilds it. Each worker owns one wasmtime
+`Store`/`Instance`/`Memory`, which are not `Send`, so instances never migrate
+between threads and no thread ever aliases another's store.
+
+If `warm()` was never called, the first `evaluate` warms the pool lazily and
+pays its cost; production callers should warm during start-up. Rule
+construction (`WasmReactorRule::from_module`/`from_config`) calls `warm()`, so
+engine start-up is the only place that pays Go/CRS initialisation.
+`validate_startup()` only checks the module source and size budget; it
+deliberately does not compile or warm a second reactor.
+
+### Pool design
+
+- **Size:** `std::thread::available_parallelism()` clamped to `1..=8`, or an
+  explicit `waf.coraza.pool_size` (`0` selects auto). Each worker reserves a
+  32 MiB native stack and may grow to the 256 MiB wasm memory limit.
+- **Dispatch:** the pool keeps idle workers in a mutex-guarded stack with a
+  condition variable. `evaluate` checks one out, sends the payload over a
+  channel, waits for the decision and returns the worker. Contention beyond the
+  pool size queues on the condition variable rather than blocking a Tokio
+  worker inside Go.
+- **Fail closed:** a worker that panics or exits drops its reply channel;
+  `evaluate` observes the disconnect (or a 60 s reply timeout), discards the
+  worker and returns `ReactorError::Trap` instead of hanging. A replacement
+  thread is started for the next job.
+- **Idempotence:** `warm()` is serialised by a mutex and becomes a no-op after
+  the pool exists. A failed warm-up leaves no pool installed, so start-up fails
+  closed and a later call retries.
 
 The historical spike modules without `_initialize` or `input_base` still work:
 the host only calls them when exported and otherwise uses the fixed
@@ -284,26 +321,27 @@ out of scope.
 ## Live WAF integration
 
 The reactor is wired into the live rule chain only when both the
-`wasm-reactor` feature is compiled and `waf.coraza.enabled` is true. It is
-registered **before** the heuristic rules so a Coraza block wins even if a
-later rule would allow the request.
+`wasm-reactor` feature is compiled and `waf.coraza.enabled` is true. Both are
+true by default. It is registered **before** the heuristic rules so a Coraza
+block wins even if a later rule would allow the request.
 
 ```toml
 [waf]
-fail_mode = "closed"      # "open" logs reactor failures and continues
+fail_mode = "closed"      # "open" logs request-time reactor failures and continues
 
 [waf.coraza]
-enabled = false           # opt-in; never enabled by default
+enabled = true            # default; set false to skip compilation/warm-up entirely
 # module_path = "/etc/waf/coraza_reactor.wasm"  # omit to use the embedded reactor
 max_payload_bytes = 65536
 memory_limit_bytes = 268435456
 fuel = 2000000000
+pool_size = 0             # 0 = one worker per core, clamped to 1..=8
 ```
 
 `module_path` is optional: when omitted the Coraza module is embedded in the
 WAF binary. `Config::validate` rejects zero payload/fuel values, a memory limit
-below 64 KiB, a payload limit larger than the memory limit, and an empty module
-path.
+below 64 KiB, a payload limit larger than the memory limit, an empty module
+path, and a `pool_size` above 8.
 
 If the reactor cannot be constructed at start-up, the engine adds a
 fail-closed placeholder rule when `waf.fail_mode != "open"`; the placeholder
@@ -323,16 +361,16 @@ Host-side limits for the Coraza reactor (`ReactorLimits::coraza`):
 | `fuel` | 200,000,000,000 | Bounds `_initialize` + `init` on first use; reset before every `eval`. |
 | `max_wasm_stack` | 8 MiB | Bounds native stack used by compiled wasm frames; traps instead of overflowing the host thread. |
 | `async_stack_size` | 8 MiB | Must be at least `max_wasm_stack`; required by wasmtime even for sync calls. |
+| `pool_size` | cores clamped to `1..=8` (`0` = auto) | Number of pre-warmed reactor instances, one dedicated OS thread each. Each reserves a 32 MiB native stack. |
 
 Module-side constants: `maxInputBytes = 64 * 1024`. The input buffer is a Go
 global; `input_base` exposes its address so the host never writes over Go
 runtime data at a fixed low offset.
 
-The thread-local instance cache holds at most two initialised reactors per
-thread (roughly one production configuration plus headroom for rotation).
 Because a Go reactor can grow to the 256 MiB memory limit, budget up to that
-amount per worker thread that evaluates Coraza traffic. `clear_thread_cache()`
-releases cached instances for the current thread.
+amount per pool worker. The default pool of one worker per core (at most eight)
+therefore caps the reactor's worst-case linear-memory footprint at
+`pool_size * memory_limit_bytes`, but typical resident usage is far lower.
 
 ## Observability
 
@@ -374,10 +412,18 @@ asserts that a benign request and two ordinary query/form bodies are allowed,
 and asserts SQLi, XSS, path traversal (`../../etc/passwd`) and command
 injection (`cmd=/bin/cat /etc/passwd`) payloads are blocked with `403`.
 `coraza_reactor_reuses_instance_without_leaking_state` interleaves
-allow/block/allow/XSS decisions repeatedly on one reactor to prove the cached
+allow/block/allow/XSS decisions repeatedly on one reactor to prove a warmed
 instance does not carry state between evaluations, and
 `coraza_reactor_isolated_per_thread` runs the same `Arc<WasmReactor>` on three
-threads to prove each thread gets its own instance.
+threads to prove concurrent dispatch is safe.
+
+Fast tests cover the pool itself: `warm_prepares_pool_and_keeps_decisions_correct`
+warms twice and checks allow/block/allow, `warm_fails_closed_when_a_worker_cannot_init`
+asserts a failed worker aborts warm-up, `concurrent_evaluations_return_correct_decisions`
+runs eight threads against a two-worker pool, and
+`worker_trap_discards_instance_without_hanging_or_corrupting` interleaves
+trapping and clean payloads to prove a failed instance is rebuilt and later
+evaluations stay correct.
 
 The tests are ignored in debug builds because Go runtime start-up and CRS
 compilation are slow without optimisation. Release builds pass:
@@ -402,16 +448,16 @@ The benchmark loads the committed 20 MiB module once, then measures:
 - `reactor_construction/compile_instantiate_and_init`: compilation plus a cold
   `_initialize` + `init` + `eval`;
 - `reactor_decision/{allow,block_sqli,block_xss}`: full `evaluate` calls on a
-  pre-compiled reactor, reusing the thread-local initialised instance (only
-  `eval` runs after the first warm-up call);
+  pre-compiled, warmed reactor (dispatch plus `eval`; no initialisation);
 - `reactor_body/allow_body/{1kb,16kb,64kb}`: clean POST bodies of 1 KiB and
   16 KiB, plus the largest body that fits the ABI's fixed 64 KiB payload
   buffer (`64kb` row, about 65.4 KB after the JSON envelope). A literal 64 KiB
   body cannot be represented because the JSON envelope would exceed
   `CORAZA_MAX_PAYLOAD_BYTES`.
 
-Recorded on 2026-11-01 in the Nix development shell, after the thread-local
-instance cache was introduced:
+Recorded on 2026-11-01 in the Nix development shell, after the reactor moved to
+wasmtime; dispatch now goes through the pre-warmed pool, which adds ~15 µs per
+evaluation to these figures:
 
 | Component | Value |
 | --- | --- |
@@ -434,25 +480,32 @@ instance cache was introduced:
 wasmtime is **5–8× faster than wasmi with the CRS module** (wasmi/CRS measured
 40.4 ms allow and 75.3 ms SQLi). It is still not sub-millisecond: the Go/Coraza
 transaction and full-payload JSON decoding dominate. The compiled module is
-created once per process and shared across threads; each worker thread still
-pays Go `_initialize`/CRS `init` once (~0.5 s after the shared 4.5 s compile),
-so default enablement needs startup pre-warming.
+created once per process and shared across threads; each pool worker pays Go
+`_initialize`/CRS `init` during `warm()` (about 0.6 s per worker, run in
+parallel), so start-up pays the cost and requests do not.
 
 ### Observed latency
 
-`measure_coraza_reactor_latency` reports load and per-request cost without a
-brittle assertion. Observed on the development machine in release mode:
+`measure_coraza_reactor_latency` warms a two-worker pool, then reports load,
+warm-up, the first post-warm evaluation and steady state without a brittle
+assertion. Two runs on the development machine in release mode:
 
-| Measurement | Observed |
-| --- | --- |
-| Module compile/load (Cranelift) | ~4.5 s |
-| First evaluation on a thread (includes Go/CRS init) | ~0.49 s |
-| Subsequent evaluations, CRS allow | ~8.4 ms p50 |
-| Subsequent evaluations, CRS SQLi | ~10.6 ms p50 |
+| Measurement | Run 1 (cold page cache) | Run 2 (warm page cache) |
+| --- | ---: | ---: |
+| Module compile/load (Cranelift) | 46.9 s | 10.4 s |
+| `warm()` for 2 workers (Go `_initialize` + CRS `init`) | 3.62 s | 1.14 s |
+| First evaluation after warm | 23.0 ms | 3.3 ms |
+| Steady-state evaluation, CRS allow (avg of 5) | 7.38 ms | 2.72 ms |
+| Pool dispatch overhead (trivial reactor, 10k avg) | — | 15 µs |
 
-The per-request figure no longer includes Go runtime start-up or SecLang rule
-compilation; those run once per thread and reactor. Treat these numbers as an
-order of magnitude, not a service-level guarantee.
+The previous first-request path paid Go/CRS initialisation inside the request
+(~0.49 s on a warm page cache). After pre-warming, the first request only pays
+the normal `eval` cost; observed first-evaluation overhead over steady state
+ranged from ~0.5 ms to ~16 ms across runs, depending on allocator/page-cache
+warm-up inside the worker. The pool hand-off itself adds ~15 µs per evaluation,
+well under the 1 ms budget. Warm-up itself is a start-up cost: with the default
+pool size it runs one Go/CRS init per core (at most eight), in parallel. Treat
+these numbers as an order of magnitude, not a service-level guarantee.
 
 ## Remaining work
 
@@ -471,12 +524,14 @@ order of magnitude, not a service-level guarantee.
   a future wasmtime-wasi release offers a runtime-free sync surface, the shims
   can be removed.
 - **Native stack:** the 8 MiB wasm stack is validated by the release test
-  suite. The thread-local cache keeps initialisation on whichever worker
-  thread first evaluates Coraza traffic; confirm worker stack size before
-  enabling the reactor on a small-stack executor.
+  suite. Pool threads are created by the host with an explicit 32 MiB native
+  stack, so initialisation no longer depends on the stack size of the calling
+  Tokio worker.
 - **Module size:** run `wasm-opt -Oz` and/or split unused Coraza features;
   20 MiB is large for an embedded security control.
-- **Default enablement:** keep `wasm-reactor` non-default until CRS,
-  performance and an explicit fail-open/fail-closed policy are agreed.
+- **Default enablement:** `wasm-reactor` is now default-on. Watch the
+  ~4.5 s compile + ~1.1 s pool warm at start-up and the ~8–10 ms p50
+  per-request cost; provide a lighter CRS profile if that is too expensive for
+  edge deployments.
 - **Body fidelity:** the ABI is UTF-8/lossy; binary-safe inspection needs a
   byte-oriented payload format.

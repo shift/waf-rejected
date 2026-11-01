@@ -605,18 +605,24 @@ pub struct WafCorazaConfig {
 
     /// Instruction (fuel) budget for one `_initialize` + `init` + `eval` round trip.
     pub fuel: u64,
+
+    /// Number of pre-warmed reactor instances, one dedicated OS thread each.
+    /// `0` selects the number of available cores clamped to `1..=8`.
+    pub pool_size: usize,
 }
 
 impl Default for WafCorazaConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             module_path: None,
             max_payload_bytes: 64 * 1024,
             memory_limit_bytes: 256 * 1024 * 1024,
             // OWASP CRS initialisation needs the larger budget used by the
             // Coraza reactor defaults.
             fuel: 200_000_000_000,
+            // Auto: one pre-warmed reactor per available core (clamped).
+            pool_size: 0,
         }
     }
 }
@@ -1064,6 +1070,10 @@ impl Config {
         if self.waf.coraza.fuel == 0 {
             anyhow::bail!("waf.coraza.fuel must be greater than zero");
         }
+        // Each pre-warmed reactor owns a Go runtime and its own OS thread.
+        if self.waf.coraza.pool_size > 8 {
+            anyhow::bail!("waf.coraza.pool_size must be between 0 (auto) and 8");
+        }
         if self
             .waf
             .coraza
@@ -1339,7 +1349,7 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
     fn coraza_limits_are_validated() {
         let mut config = Config::default();
         assert!(config.validate().is_ok());
-        assert!(!config.waf.coraza.enabled);
+        assert!(config.waf.coraza.enabled);
 
         config.waf.coraza.max_payload_bytes = 0;
         assert!(config.validate().is_err());
@@ -1359,6 +1369,12 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
         let mut config = Config::default();
         config.waf.coraza.module_path = Some(String::new());
         assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.waf.coraza.pool_size = 9;
+        assert!(config.validate().is_err());
+        config.waf.coraza.pool_size = 4;
+        assert!(config.validate().is_ok());
     }
 
     #[test]

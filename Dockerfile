@@ -1,8 +1,8 @@
-FROM rust:1.89-bookworm AS builder
+FROM rust:1.99-bookworm AS builder
 
 WORKDIR /build
 COPY . .
-RUN cargo build --release --bin waf-ingress --features http3,webtransport
+RUN cargo build --release --bin waf-ingress --features http3,webtransport,wasm-reactor
 
 FROM debian:bookworm-slim
 

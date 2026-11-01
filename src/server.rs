@@ -22,7 +22,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
 
     #[cfg(feature = "wasm-reactor")]
     {
-        crate::waf::wasm_reactor::validate_startup().map_err(|err| {
+        crate::waf::wasm_reactor::validate_startup(&config).map_err(|err| {
             format!("Coraza reactor startup validation failed (fail-closed): {err}")
         })?;
     }
