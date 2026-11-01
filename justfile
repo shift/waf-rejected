@@ -163,3 +163,21 @@ update-coraza:
         echo "📦 Coraza not found, building fresh..."
         just build-coraza-wasm
     fi
+
+# Experimental native Go Coraza sidecar (non-default backend)
+build-coraza-sidecar:
+    ./scripts/build-coraza-sidecar.sh
+
+test-coraza-sidecar: build-coraza-sidecar
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd native/coraza-sidecar
+    GOOS=linux GOARCH=amd64 CGO_ENABLED=0 GOFLAGS=-mod=vendor go test -count=1 ./...
+
+# Start the sidecar for local development; Ctrl-C stops it.
+run-coraza-sidecar: build-coraza-sidecar
+    ./target/native/coraza-sidecar --socket /tmp/coraza-native.sock --rules wasm/coraza_reactor/rules/crs/crs.conf
+
+# Measure wasm vs native latency. Start `just run-coraza-sidecar` first.
+bench-coraza-backends: build-coraza-sidecar
+    cargo run --release --example coraza_backend_bench --features coraza-native

@@ -195,6 +195,53 @@
           cargoBuildCommand = "cargo build --release --all-targets";
           cargoCheckCommand = "cargo check --release --all-targets";
         });
+
+        # Native Go Coraza sidecar (experimental, non-default backend). It
+        # reuses the vendored Coraza module and CRS bundle from
+        # wasm/coraza_reactor, so no rule material is duplicated.
+        coraza-native-sidecar = pkgs.stdenv.mkDerivation {
+          pname = "coraza-native-sidecar";
+          version = "0.1.0";
+          src = pkgs.lib.cleanSourceWith {
+            src = ./.;
+            filter = path: _:
+              let p = toString path; in
+              !(pkgs.lib.hasPrefix (toString ./target) p)
+              && !(pkgs.lib.hasPrefix (toString ./.git) p)
+              && !(pkgs.lib.hasPrefix (toString ./.worktrees) p);
+          };
+          nativeBuildInputs = [ pkgs.go ];
+          dontConfigure = true;
+          buildPhase = ''
+            runHook preBuild
+            cd native/coraza-sidecar
+            export HOME="$NIX_BUILD_TOP"
+            export GOCACHE="$TMPDIR/go-cache"
+            export GOOS=linux
+            export GOARCH=${if pkgs.stdenv.hostPlatform.isAarch64 then "arm64" else "amd64"}
+            export CGO_ENABLED=0
+            export GOFLAGS=-mod=vendor
+            go build -trimpath -ldflags="-s -w" -o coraza-sidecar .
+            runHook postBuild
+          '';
+          installPhase = ''
+            runHook preInstall
+            mkdir -p "$out/bin" "$out/share/waf/coraza"
+            install -m755 coraza-sidecar "$out/bin/coraza-sidecar"
+            cp -r ../../wasm/coraza_reactor/rules/crs "$out/share/waf/coraza/crs"
+            install -m644 ../../wasm/coraza_reactor/LICENSE-CRS \
+              "$out/share/waf/coraza/LICENSE-CRS"
+            install -m644 ../../wasm/coraza_reactor/PROVENANCE.md \
+              "$out/share/waf/coraza/PROVENANCE.md"
+            runHook postInstall
+          '';
+          meta = with pkgs.lib; {
+            description = "Native Go Coraza/OWASP CRS sidecar for WAF-Rejected";
+            homepage = "https://github.com/shift/waf-rejected";
+            license = with licenses; [ asl20 ];
+            mainProgram = "coraza-sidecar";
+          };
+        };
       in
       {
         packages = {
@@ -220,6 +267,9 @@
 
           # Convenience package that builds all binaries
           all = all-binaries;
+
+          # Experimental native Go Coraza sidecar (not part of default builds)
+          coraza-native-sidecar = coraza-native-sidecar;
         };
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [

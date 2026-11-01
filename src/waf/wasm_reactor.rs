@@ -16,7 +16,6 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use base64::Engine as _;
 use tracing::{info, warn};
 use wasmtime::{
     Caller, Config, Engine, Extern, Linker, Memory, Module, OptLevel, Store, StoreLimits,
@@ -27,6 +26,7 @@ use wasmtime_wasi::p2::pipe::SinkOutputStream;
 use wasmtime_wasi::WasiCtxBuilder;
 
 use crate::metrics::Metrics;
+use crate::waf::coraza_payload::build_payload;
 use crate::waf::{Decision, RequestContext, WafRule};
 
 /// Decision code returned by the reactor for "allow".
@@ -1279,50 +1279,6 @@ impl WasmReactorRule {
             Decision::Allow
         }
     }
-}
-
-/// Serialises the request context into the reactor's JSON payload.
-///
-/// Bodies that are valid UTF-8 keep the `utf8` fast path. Binary bodies
-/// (protobuf/gRPC, msgpack, compressed payloads) are base64-encoded and marked
-/// `base64` so invalid UTF-8 bytes are never replaced with U+FFFD before
-/// inspection. `body_size` is always the raw byte length; payloads that omit
-/// `body_encoding` are treated as `utf8` by the guest for backwards
-/// compatibility.
-fn build_payload(ctx: &RequestContext) -> Result<Vec<u8>, serde_json::Error> {
-    let headers: Vec<(String, String)> = ctx
-        .headers
-        .iter()
-        .map(|(name, value)| {
-            (
-                name.as_str().to_string(),
-                String::from_utf8_lossy(value.as_bytes()).into_owned(),
-            )
-        })
-        .collect();
-
-    let (body, body_encoding) = match ctx.body.as_deref() {
-        None => (None, BODY_ENCODING_UTF8),
-        Some(bytes) => match std::str::from_utf8(bytes) {
-            Ok(text) => (Some(text.to_string()), BODY_ENCODING_UTF8),
-            Err(_) => (
-                Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
-                BODY_ENCODING_BASE64,
-            ),
-        },
-    };
-    // The wire size is the raw body length, not the encoded JSON string length.
-    let body_size = ctx.body.as_deref().map(<[u8]>::len).or(ctx.body_size);
-
-    serde_json::to_vec(&serde_json::json!({
-        "method": ctx.method.as_str(),
-        "uri": ctx.uri.to_string(),
-        "http_version": ctx.http_version,
-        "headers": headers,
-        "body_size": body_size,
-        "body_encoding": body_encoding,
-        "body": body,
-    }))
 }
 
 #[cfg(test)]

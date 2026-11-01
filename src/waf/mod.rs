@@ -19,6 +19,14 @@ pub mod tls_config;
 #[cfg(feature = "wasm-reactor")]
 pub mod wasm_reactor;
 
+/// Shared JSON payload envelope for the wasm reactor and native sidecar.
+#[cfg(any(feature = "wasm-reactor", feature = "coraza-native"))]
+pub mod coraza_payload;
+
+/// Experimental native Go Coraza sidecar client (non-default feature).
+#[cfg(all(feature = "coraza-native", unix))]
+pub mod native_coraza;
+
 /// Protocol-aware gRPC inspection (protobuf frames are not sent to CRS body
 /// rules).
 #[cfg(feature = "wasm-reactor")]
@@ -126,15 +134,15 @@ pub trait WafRule: Send + Sync {
 }
 
 /// Fail-closed placeholder used when a configured reactor cannot be loaded.
-#[cfg(feature = "wasm-reactor")]
+#[cfg(any(feature = "wasm-reactor", feature = "coraza-native"))]
 struct UnavailableCorazaRule {
     reason: String,
 }
 
-#[cfg(feature = "wasm-reactor")]
+#[cfg(any(feature = "wasm-reactor", feature = "coraza-native"))]
 impl WafRule for UnavailableCorazaRule {
     fn name(&self) -> &str {
-        "coraza-wasi-reactor-unavailable"
+        "coraza-backend-unavailable"
     }
 
     fn evaluate(&self, _ctx: &RequestContext) -> Decision {
@@ -265,7 +273,7 @@ impl WafEngine {
         }
 
         // The Coraza reactor must run before the traditional heuristics.
-        #[cfg(feature = "wasm-reactor")]
+        #[cfg(any(feature = "wasm-reactor", feature = "coraza-native"))]
         engine.add_coraza_rule(config);
 
         // Add default rules based on configuration
@@ -274,20 +282,53 @@ impl WafEngine {
         engine
     }
 
-    #[cfg(feature = "wasm-reactor")]
+    #[cfg(any(feature = "wasm-reactor", feature = "coraza-native"))]
     fn add_coraza_rule(&mut self, config: &Config) {
         if !config.waf.enabled || !config.waf.coraza.enabled {
             return;
         }
 
-        match wasm_reactor::WasmReactorRule::from_config(&config.waf.coraza, self.fail_closed) {
+        let backend = config.waf.coraza.backend;
+        let result = match backend {
+            #[cfg(feature = "wasm-reactor")]
+            crate::config::CorazaBackend::Wasm => {
+                wasm_reactor::WasmReactorRule::from_config(&config.waf.coraza, self.fail_closed)
+                    .map(|rule| Box::new(rule) as Box<dyn WafRule>)
+                    .map_err(|err| err.to_string())
+            }
+            #[cfg(not(feature = "wasm-reactor"))]
+            crate::config::CorazaBackend::Wasm => Err(
+                "waf.coraza.backend = \"wasm\" requires a build with the `wasm-reactor` feature"
+                    .to_string(),
+            ),
+            #[cfg(all(feature = "coraza-native", unix))]
+            crate::config::CorazaBackend::Native => {
+                native_coraza::NativeCorazaRule::from_config(&config.waf.coraza, self.fail_closed)
+                    .map(|rule| Box::new(rule) as Box<dyn WafRule>)
+                    .map_err(|err| err.to_string())
+            }
+            #[cfg(not(all(feature = "coraza-native", unix)))]
+            crate::config::CorazaBackend::Native => Err(
+                "waf.coraza.backend = \"native\" requires a Unix build with the `coraza-native` feature"
+                    .to_string(),
+            ),
+        };
+
+        match result {
             Ok(rule) => {
-                info!("Added Coraza WASI reactor as the first WAF rule");
-                self.add_rule(rule);
+                info!(backend = ?backend, "Added Coraza backend as the first WAF rule");
+                self.add_rule_boxed(rule);
             }
             Err(err) => {
-                warn!(error = %err, "failed to initialise Coraza WASI reactor");
-                let reason = format!("Coraza WASI reactor failed to initialise: {err}");
+                warn!(backend = ?backend, error = %err, "failed to initialise Coraza backend");
+                let reason = match backend {
+                    crate::config::CorazaBackend::Wasm => {
+                        format!("Coraza WASI reactor failed to initialise: {err}")
+                    }
+                    crate::config::CorazaBackend::Native => {
+                        format!("Coraza native sidecar failed to initialise: {err}")
+                    }
+                };
                 self.record_init_error(reason.clone());
                 if self.fail_closed {
                     // Preserve request-time fail-closed behaviour for callers
@@ -486,8 +527,12 @@ impl WafEngine {
     }
 
     pub fn add_rule<R: WafRule + 'static>(&mut self, rule: R) {
+        self.add_rule_boxed(Box::new(rule));
+    }
+
+    fn add_rule_boxed(&mut self, rule: Box<dyn WafRule>) {
         let mut rules = self.rules.write().unwrap();
-        rules.push(Box::new(rule));
+        rules.push(rule);
     }
 
     /// Outcome of the gRPC protocol pre-check.

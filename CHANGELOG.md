@@ -18,6 +18,16 @@ All notable changes to WAF-Rejected are documented here.
   artifacts and methods without metadata keep envelope-only behaviour; raw
   protobuf is still never sent to CRS. See `docs/grpc-inspection.md`.
 
+- Experimental native Go Coraza sidecar (`native/coraza-sidecar/`) and Rust
+  client (`src/waf/native_coraza.rs`) behind the non-default `coraza-native`
+  feature. Selected with `waf.coraza.backend = "native"` and
+  `waf.coraza.native_socket_path`; the default remains `wasm`. The sidecar
+  reuses the vendored Coraza/OWASP CRS bundle from `wasm/coraza_reactor/` and
+  speaks length-prefixed JSON over a Unix domain socket. Removes the ~5–6×
+  Go-to-wasm body-inspection penalty (8 KiB p50 358 → 61 ms, 60 KiB 2779 →
+  457 ms on the research laptop). See `docs/coraza-native-sidecar.md`.
+
+
 ## [0.1.0-beta.11] - 2026-11-01
 
 ### Added

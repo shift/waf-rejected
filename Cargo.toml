@@ -193,6 +193,11 @@ wasm-waf = []
 # default; `--no-default-features` or `waf.coraza.enabled = false` opts out.
 # See docs/coraza-wasi-reactor.md.
 wasm-reactor = ["dep:wasmtime", "dep:wasmtime-wasi"]
+# Experimental native Go Coraza sidecar client over a Unix domain socket.
+# Non-default: select with `waf.coraza.backend = "native"`. The sidecar lives
+# in native/coraza-sidecar and is built separately. See
+# docs/coraza-native-sidecar.md.
+coraza-native = []
 # Protocol support features
 websocket = []
 # HTTP/3 over QUIC. Not part of default features: it pulls in quinn/h3 and

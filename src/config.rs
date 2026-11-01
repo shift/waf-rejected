@@ -601,11 +601,28 @@ pub struct WasmConfig {
 /// rule in the live WAF chain (requires the non-default `wasm-reactor`
 /// feature). `module_path = None` uses the Coraza module embedded in the
 /// binary; otherwise the path is read at start-up.
+/// Selects which Coraza backend evaluates requests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CorazaBackend {
+    /// In-process WASI reactor hosted by wasmtime (default).
+    #[default]
+    Wasm,
+    /// Native Go sidecar over a Unix domain socket (`coraza-native` feature).
+    Native,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WafCorazaConfig {
     /// Enable the real Coraza WASI reactor.
     pub enabled: bool,
+
+    /// Evaluation backend: `wasm` (default) or `native`.
+    pub backend: CorazaBackend,
+
+    /// Unix domain socket for the native sidecar. Ignored by the wasm backend.
+    pub native_socket_path: Option<String>,
 
     /// Optional path to a reactor `.wasm` file. `None` uses the embedded module.
     pub module_path: Option<String>,
@@ -630,6 +647,8 @@ impl Default for WafCorazaConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            backend: CorazaBackend::Wasm,
+            native_socket_path: None,
             module_path: None,
             max_payload_bytes: 64 * 1024,
             memory_limit_bytes: 256 * 1024 * 1024,
@@ -1270,6 +1289,18 @@ impl Config {
         {
             anyhow::bail!("waf.coraza.module_path must not be empty when set");
         }
+        if self.waf.coraza.backend == CorazaBackend::Native
+            && self
+                .waf
+                .coraza
+                .native_socket_path
+                .as_deref()
+                .is_none_or(str::is_empty)
+        {
+            anyhow::bail!(
+                "waf.coraza.native_socket_path is required when waf.coraza.backend = \"native\""
+            );
+        }
         self.waf.grpc.validate()?;
         if self.security.auth.enabled && self.security.auth.api_keys.is_empty() {
             anyhow::bail!("security.auth.enabled is true but security.auth.api_keys is empty");
@@ -1562,6 +1593,22 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
         config.waf.coraza.pool_size = 9;
         assert!(config.validate().is_err());
         config.waf.coraza.pool_size = 4;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn native_coraza_backend_requires_a_socket() {
+        let mut config = Config::default();
+        assert_eq!(config.waf.coraza.backend, CorazaBackend::Wasm);
+        assert!(config.validate().is_ok());
+
+        config.waf.coraza.backend = CorazaBackend::Native;
+        assert!(config.validate().is_err());
+
+        config.waf.coraza.native_socket_path = Some(String::new());
+        assert!(config.validate().is_err());
+
+        config.waf.coraza.native_socket_path = Some("/run/waf/coraza.sock".to_string());
         assert!(config.validate().is_ok());
     }
 
