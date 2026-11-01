@@ -30,6 +30,18 @@ All notable changes to WAF-Rejected are documented here.
   traffic, disabled configuration, and fail-closed/fail-open behaviour.
   Release-mode latency measurement reported in `docs/coraza-wasi-reactor.md`.
 
+### Changed
+
+- Coraza WASI reactor instances are now reused per worker thread behind a
+  thread-local, identity-keyed cache instead of being created per request.
+  Go runtime `_initialize` and Coraza `init` run once per thread and reactor;
+  each request resets fuel and calls only `eval`. Failed instances are
+  discarded and recreated, and concurrent threads never share a wasmi store.
+  Criterion p50 for allow/SQLi/XSS drops from ~61–63 ms to ~2.1–3.0 ms on the
+  reference machine.
+- Added reused-instance and per-thread isolation tests for the reactor,
+  covering interleaved allow/block decisions and three concurrent threads.
+
 ### Documentation
 
 - Documented Coraza metrics, alert rules and recording overhead in

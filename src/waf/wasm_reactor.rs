@@ -8,13 +8,16 @@
 //!
 //! See `docs/wasm-reactor-spike.md` for the ABI and migration notes.
 
+use std::cell::RefCell;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use tracing::{info, warn};
 use wasmi::{
     Caller, Config, Engine, Extern, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder,
+    TypedFunc,
 };
 
 use crate::metrics::Metrics;
@@ -479,10 +482,15 @@ fn wasi_read_pair(caller: &mut Caller<'_, StoreLimits>, ptr: i32) -> Option<(u32
 
 /// A compiled, reusable reactor module.
 ///
-/// The compiled [`Module`] and [`Engine`] are shared across calls; a fresh
-/// [`Store`] (and therefore a fresh linear memory) is created per evaluation,
-/// which keeps evaluations isolated without sharing mutable state.
+/// The compiled [`Module`] and [`Engine`] are shared across calls. Each
+/// worker thread keeps its own initialised [`Store`] and instance (wasmi
+/// stores are not `Send`), so the expensive Go runtime `_initialize` and
+/// Coraza `init` run once per thread and reactor instead of once per request.
+/// A thread only ever borrows its own instance, so evaluations never share
+/// mutable state; a failed instance is discarded and recreated on the next
+/// call.
 pub struct WasmReactor {
+    id: u64,
     engine: Engine,
     module: Module,
     limits: ReactorLimits,
@@ -491,9 +499,40 @@ pub struct WasmReactor {
 impl std::fmt::Debug for WasmReactor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WasmReactor")
+            .field("id", &self.id)
             .field("limits", &self.limits)
             .finish_non_exhaustive()
     }
+}
+
+static NEXT_REACTOR_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Maximum number of initialised reactors cached per thread. Bounds memory
+/// when a process rotates through more than one reactor configuration while
+/// keeping the common single-reactor case allocation-free after warm-up.
+const THREAD_CACHE_CAPACITY: usize = 2;
+
+/// One initialised reactor instance, owned by a single worker thread.
+struct CachedInstance {
+    reactor_id: u64,
+    store: Store<StoreLimits>,
+    memory: Memory,
+    eval: TypedFunc<(i32, i32), i32>,
+    free: TypedFunc<(i32, i32), ()>,
+    input_base: usize,
+}
+
+thread_local! {
+    /// Thread-local, identity-keyed cache of initialised reactor instances.
+    /// `Store`/`Memory`/`TypedFunc` are not `Send`, so this is the only place
+    /// they live.
+    static INSTANCE_CACHE: RefCell<Vec<CachedInstance>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Drops every cached instance on the current thread. Primarily useful for
+/// tests and for releasing Go heap memory after a configuration change.
+pub fn clear_thread_cache() {
+    INSTANCE_CACHE.with(|cache| cache.borrow_mut().clear());
 }
 
 impl WasmReactor {
@@ -515,6 +554,7 @@ impl WasmReactor {
         let module =
             Module::new(&engine, bytes).map_err(|err| ReactorError::Compile(err.to_string()))?;
         let reactor = Self {
+            id: NEXT_REACTOR_ID.fetch_add(1, Ordering::Relaxed),
             engine,
             module,
             limits,
@@ -582,6 +622,11 @@ impl WasmReactor {
     }
 
     /// Runs `init` and `eval` for one request payload.
+    ///
+    /// The first call on a thread (for a given reactor) pays the Go runtime
+    /// and Coraza start-up cost; later calls reuse the initialised instance.
+    /// If an evaluation fails, the instance is evicted so the next call starts
+    /// from a clean store.
     pub fn evaluate(&self, payload: &[u8]) -> Result<ReactorDecision, ReactorError> {
         if payload.len() > self.limits.max_payload_bytes {
             return Err(ReactorError::PayloadTooLarge {
@@ -590,6 +635,33 @@ impl WasmReactor {
             });
         }
 
+        INSTANCE_CACHE.with(|cell| {
+            let mut cache = cell.try_borrow_mut().map_err(|_| {
+                ReactorError::Trap("reactor instance is already in use".to_string())
+            })?;
+
+            let cached = match cache.iter().position(|entry| entry.reactor_id == self.id) {
+                Some(index) => cache.swap_remove(index),
+                None => self.instantiate()?,
+            };
+
+            match self.evaluate_on(cached, payload) {
+                Ok((decision, cached)) => {
+                    if cache.len() >= THREAD_CACHE_CAPACITY {
+                        cache.pop();
+                    }
+                    cache.push(cached);
+                    Ok(decision)
+                }
+                // Drop the instance on any failure: a trap, fuel exhaustion
+                // or failed init may leave the runtime inconsistent.
+                Err(err) => Err(err),
+            }
+        })
+    }
+
+    /// Creates and fully initialises a fresh instance for this thread.
+    fn instantiate(&self) -> Result<CachedInstance, ReactorError> {
         let store_limits = StoreLimitsBuilder::new()
             .memory_size(self.limits.memory_limit_bytes)
             .build();
@@ -649,32 +721,61 @@ impl WasmReactor {
             Err(_) => INPUT_BASE,
         };
 
+        Ok(CachedInstance {
+            reactor_id: self.id,
+            store,
+            memory,
+            eval,
+            free,
+            input_base,
+        })
+    }
+
+    /// Runs one `eval` against an initialised instance and returns it for
+    /// reuse on success. Fuel is reset per request so one evaluation cannot
+    /// starve the next.
+    fn evaluate_on(
+        &self,
+        mut cached: CachedInstance,
+        payload: &[u8],
+    ) -> Result<(ReactorDecision, CachedInstance), ReactorError> {
+        cached
+            .store
+            .set_fuel(self.limits.fuel)
+            .map_err(|err| ReactorError::Trap(err.to_string()))?;
+
+        let input_base = cached.input_base;
         let end = input_base
             .checked_add(payload.len())
             .ok_or(ReactorError::PayloadOutOfBounds)?;
-        if end > memory.data_size(&store) {
+        if end > cached.memory.data_size(&cached.store) {
             return Err(ReactorError::PayloadOutOfBounds);
         }
-        memory
-            .write(&mut store, input_base, payload)
+        cached
+            .memory
+            .write(&mut cached.store, input_base, payload)
             .map_err(|err| ReactorError::Trap(err.to_string()))?;
 
-        let code = eval
-            .call(&mut store, (input_base as i32, payload.len() as i32))
+        let code = cached
+            .eval
+            .call(&mut cached.store, (input_base as i32, payload.len() as i32))
             .map_err(|err| ReactorError::Trap(err.to_string()))?;
 
-        // `free` is part of the ABI even though the spike does not allocate.
-        // Ignore failures here: the store is discarded immediately afterwards.
-        let _ = free.call(&mut store, (input_base as i32, payload.len() as i32));
+        // `free` is part of the ABI even though the reactors do not allocate
+        // per request. A failure here does not invalidate the instance.
+        let _ = cached
+            .free
+            .call(&mut cached.store, (input_base as i32, payload.len() as i32));
 
-        match code {
-            DECISION_ALLOW => Ok(ReactorDecision::Allow),
-            DECISION_BLOCK => Ok(ReactorDecision::Block {
+        let decision = match code {
+            DECISION_ALLOW => ReactorDecision::Allow,
+            DECISION_BLOCK => ReactorDecision::Block {
                 status: 403,
                 reason: "blocked by wasm reactor".to_string(),
-            }),
-            other => Err(ReactorError::UnknownDecision(other)),
-        }
+            },
+            other => return Err(ReactorError::UnknownDecision(other)),
+        };
+        Ok((decision, cached))
     }
 }
 
@@ -1128,6 +1229,90 @@ mod tests {
             .expect("reactor thread must not panic");
     }
 
+    #[test]
+    #[ignore = "Go/WASI reactor requires the release wasmi profile"]
+    fn coraza_reactor_reuses_instance_without_leaking_state() {
+        let reactor = WasmReactor::from_bytes(EMBEDDED_CORAZA_REACTOR, ReactorLimits::coraza())
+            .expect("embedded reactor must load");
+
+        let benign = benign_payload();
+        let sqli = payload(&serde_json::json!({
+            "method": "POST",
+            "uri": "/login",
+            "headers": [["content-type", "application/x-www-form-urlencoded"]],
+            "body": "username=admin&password=x union select password from users",
+        }));
+        let xss = payload(&serde_json::json!({
+            "method": "GET",
+            "uri": "/search?q=<script>alert(1)</script>",
+            "headers": [["accept", "text/html"]],
+            "body": null,
+        }));
+
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                // The first call initialises the Go runtime and Coraza; the
+                // rest must reuse that instance. Interleaving decisions proves
+                // a block does not poison or leak into later evaluations.
+                for _ in 0..3 {
+                    assert_eq!(reactor.evaluate(&benign).unwrap(), ReactorDecision::Allow);
+                    assert!(matches!(
+                        reactor.evaluate(&sqli).unwrap(),
+                        ReactorDecision::Block { status: 403, .. }
+                    ));
+                    assert_eq!(reactor.evaluate(&benign).unwrap(), ReactorDecision::Allow);
+                    assert!(matches!(
+                        reactor.evaluate(&xss).unwrap(),
+                        ReactorDecision::Block { status: 403, .. }
+                    ));
+                }
+            })
+            .expect("spawn reactor thread")
+            .join()
+            .expect("reactor thread must not panic");
+    }
+
+    #[test]
+    #[ignore = "Go/WASI reactor requires the release wasmi profile"]
+    fn coraza_reactor_isolated_per_thread() {
+        let reactor = Arc::new(
+            WasmReactor::from_bytes(EMBEDDED_CORAZA_REACTOR, ReactorLimits::coraza())
+                .expect("embedded reactor must load"),
+        );
+        let benign = Arc::new(benign_payload());
+        let sqli = Arc::new(payload(&serde_json::json!({
+            "method": "POST",
+            "uri": "/login",
+            "headers": [["content-type", "application/x-www-form-urlencoded"]],
+            "body": "username=admin&password=x union select password from users",
+        })));
+
+        let handles: Vec<_> = (0..3)
+            .map(|_| {
+                let reactor = Arc::clone(&reactor);
+                let benign = Arc::clone(&benign);
+                let sqli = Arc::clone(&sqli);
+                std::thread::Builder::new()
+                    .stack_size(256 * 1024 * 1024)
+                    .spawn(move || {
+                        for _ in 0..2 {
+                            assert_eq!(reactor.evaluate(&benign).unwrap(), ReactorDecision::Allow);
+                            assert!(matches!(
+                                reactor.evaluate(&sqli).unwrap(),
+                                ReactorDecision::Block { status: 403, .. }
+                            ));
+                        }
+                    })
+                    .expect("spawn reactor thread")
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("reactor thread must not panic");
+        }
+    }
+
     fn trapping_reactor() -> Arc<WasmReactor> {
         let wat = r#"
             (module
@@ -1147,8 +1332,9 @@ mod tests {
             .expect("embedded reactor must load");
         let load_elapsed = load_start.elapsed();
 
-        // A fresh Go runtime starts for every evaluation, so latency is
-        // reported, not asserted. This keeps the check robust on shared CI.
+        // The first evaluation initialises the Go runtime and Coraza; later
+        // ones reuse the thread-local instance. Latency is reported, not
+        // asserted, to stay robust on shared CI.
         std::thread::Builder::new()
             .stack_size(256 * 1024 * 1024)
             .spawn(move || {

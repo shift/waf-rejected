@@ -174,15 +174,28 @@ entropy source.
 
 ## ABI
 
-The host calls, for every request:
+The host keeps one initialised instance per worker thread and reactor. On the
+first evaluation on a thread it:
 
-1. instantiate the module with the WASI shim;
-2. call `_initialize` (Go runtime start-up);
-3. call `init`;
-4. resolve `input_base`, copy the JSON payload there;
-5. call `eval(base, len)`;
-6. call `free(base, len)`;
-7. discard the store (and its linear memory).
+1. instantiates the module with the WASI shim;
+2. calls `_initialize` (Go runtime start-up);
+3. calls `init` (compiles the embedded SecLang rules);
+4. resolves `input_base`.
+
+Every request then only:
+
+1. resets the fuel budget;
+2. copies the JSON payload to `input_base`;
+3. calls `eval(base, len)`;
+4. calls `free(base, len)`.
+
+The instance is reused for later requests on that thread; `eval` creates and
+closes a Coraza transaction per request, so decisions do not leak between
+requests. A failed evaluation (trap, fuel exhaustion, failed init) discards the
+instance and the next request recreates it. Instances live in a thread-local
+cache keyed by reactor identity (`WasmReactor::id`) with a small bounded
+capacity, which is required because wasmi `Store`/`Instance`/`Memory` are not
+`Send`. One thread never shares its instance with another.
 
 The historical spike modules without `_initialize` or `input_base` still work:
 the host only calls them when exported and otherwise uses the fixed
@@ -292,12 +305,18 @@ Host-side limits for the Coraza reactor (`ReactorLimits::coraza`):
 | --- | --- | --- |
 | `max_payload_bytes` | 64 KiB | Host rejects larger payloads; matches the module's static buffer. |
 | `memory_limit_bytes` | 256 MiB | wasmi `StoreLimits`; Go starts near 10 MiB and grows. |
-| `fuel` | 200,000,000,000 | Bounds `_initialize` + `init` + `eval`. |
+| `fuel` | 200,000,000,000 | Bounds `_initialize` + `init` on first use; reset before every `eval`. |
 | `max_recursion_depth` | 1024 | Bounds native interpreter stack usage. |
 
 Module-side constants: `maxInputBytes = 64 * 1024`. The input buffer is a Go
 global; `input_base` exposes its address so the host never writes over Go
 runtime data at a fixed low offset.
+
+The thread-local instance cache holds at most two initialised reactors per
+thread (roughly one production configuration plus headroom for rotation).
+Because a Go reactor can grow to the 256 MiB memory limit, budget up to that
+amount per worker thread that evaluates Coraza traffic. `clear_thread_cache()`
+releases cached instances for the current thread.
 
 ## Observability
 
@@ -338,8 +357,13 @@ nix develop -c cargo test --release --lib --features wasm-reactor -- --ignored
 asserts that a benign request and two ordinary query/form bodies are allowed,
 and asserts SQLi, XSS, path traversal (`../../etc/passwd`) and command
 injection (`cmd=/bin/cat /etc/passwd`) payloads are blocked with `403`.
+`coraza_reactor_reuses_instance_without_leaking_state` interleaves
+allow/block/allow/XSS decisions repeatedly on one reactor to prove the cached
+instance does not carry state between evaluations, and
+`coraza_reactor_isolated_per_thread` runs the same `Arc<WasmReactor>` on three
+threads to prove each thread gets its own instance.
 
-The test is ignored in debug builds: wasmi's unoptimised interpreter frames
+The tests are ignored in debug builds: wasmi's unoptimised interpreter frames
 are large enough to overflow a normal test-thread stack during Go runtime
 start-up. Release builds pass. The production host should run reactor
 evaluations on a dedicated thread with a large stack (see remaining work).
@@ -362,15 +386,16 @@ The benchmark loads the committed 20 MiB module once, then measures:
 - `reactor_construction/compile_instantiate_and_init`: compilation plus a cold
   `_initialize` + `init` + `eval`;
 - `reactor_decision/{allow,block_sqli,block_xss}`: full `evaluate` calls on a
-  pre-compiled reactor, including a fresh store, Go runtime `_initialize`,
-  Coraza `init` and `eval`;
+  pre-compiled reactor, reusing the thread-local initialised instance (only
+  `eval` runs after the first warm-up call);
 - `reactor_body/allow_body/{1kb,16kb,64kb}`: clean POST bodies of 1 KiB and
   16 KiB, plus the largest body that fits the ABI's fixed 64 KiB payload
   buffer (`64kb` row, about 65.4 KB after the JSON envelope). A literal 64 KiB
   body cannot be represented because the JSON envelope would exceed
   `CORAZA_MAX_PAYLOAD_BYTES`.
 
-Recorded on 2026-11-01 in the Nix development shell:
+Recorded on 2026-11-01 in the Nix development shell, after the thread-local
+instance cache was introduced:
 
 | Component | Value |
 | --- | --- |
@@ -381,20 +406,20 @@ Recorded on 2026-11-01 in the Nix development shell:
 
 | Benchmark | p50 | mean | Throughput |
 | --- | ---: | ---: | ---: |
-| compile module | 126.9 ms | 129.6 ms | — |
-| compile + cold init + eval | 234.1 ms | 244.8 ms | — |
-| allow decision | 63.1 ms | 66.3 ms | 15.1 ops/s |
-| SQLi block | 60.6 ms | 61.4 ms | 16.3 ops/s |
-| XSS block | 60.9 ms | 61.4 ms | 16.3 ops/s |
-| 1 KiB body (allow) | 60.8 ms | 61.3 ms | 18.3 KiB/s |
-| 16 KiB body (allow) | 63.7 ms | 64.3 ms | 250.8 KiB/s |
-| 64 KiB body ceiling (allow) | 73.7 ms | 80.4 ms | 795.6 KiB/s |
+| compile module | 110.6 ms | 111.0 ms | — |
+| compile + cold init + eval | 212.4 ms | 213.2 ms | — |
+| allow decision | 2.98 ms | 2.97 ms | 336 ops/s |
+| SQLi block | 2.10 ms | 2.14 ms | 468 ops/s |
+| XSS block | 2.45 ms | 2.48 ms | 400 ops/s |
+| 1 KiB body (allow) | 1.47 ms | 1.47 ms | 762 KiB/s |
+| 16 KiB body (allow) | 4.38 ms | 4.47 ms | 3.53 MiB/s |
+| 64 KiB body ceiling (allow) | 14.43 ms | 15.51 ms | 4.03 MiB/s |
 
-These numbers are informational only; there are no latency assertions in the
-benchmark. The dominant cost is the per-evaluation Go runtime and Coraza
-engine start-up in `evaluate`, not rule matching or body size. Reusing a
-single instance or pool, or moving to a compiled Wasm runtime, is required
-before this reactor can be considered for the proxy hot path.
+Allow and block decisions are now below the 5 ms p50 target; the interpreter
+overhead grows with body size because the Go/Coraza JSON decoder and request
+body handling copy the whole payload. Warm-up cost (module compilation plus
+first-thread `_initialize`/`init`, about 210 ms) is paid once per process and
+once per worker thread rather than per request.
 
 ### Observed latency
 
@@ -403,13 +428,13 @@ brittle assertion. Observed on the development machine in release mode:
 
 | Measurement | Observed |
 | --- | --- |
-| Module compile/load | ~581 ms |
-| Per request (benign, fresh Go runtime) | ~207 ms average over 5 runs |
+| Module compile/load | ~195–333 ms |
+| First evaluation on a thread (includes init) | ~20–70 ms |
+| Subsequent evaluations | ~2–3 ms |
 
-The per-request figure is dominated by starting a fresh Go runtime and
-compiling the embedded SecLang rules for every evaluation. This is why the
-reactor remains opt-in and is not used for the fast path. Treat these numbers
-as an order of magnitude, not a service-level guarantee.
+The per-request figure no longer includes Go runtime start-up or SecLang rule
+compilation; those run once per thread and reactor. Treat these numbers as an
+order of magnitude, not a service-level guarantee.
 
 ## Remaining work
 
@@ -418,13 +443,14 @@ as an order of magnitude, not a service-level guarantee.
 - **CRS tuning:** add deployment-specific exclusions (`REQUEST-900` /
   `REQUEST-999`) and raise the paranoia level only with application-specific
   false-positive testing.
-- **Performance:** a fresh Go runtime start-up per evaluation is unacceptable
-  for sub-millisecond proxying. Reuse a single instance (or a pool) behind a
-  mutex, or replace the interpreter with a compiled Wasm runtime. Measure
-  start-up, per-request latency and memory growth.
+- **Performance:** instance reuse brings decisions to ~2–3 ms p50. Large
+  bodies (16–64 KiB) still cost 4–15 ms, so moving to a compiled Wasm runtime
+  remains the path to sub-millisecond proxying if required.
 - **Native stack:** confirm a dedicated reactor thread with a known stack size
   in release, and remove the test-only `#[ignore]` once a debug-friendly
-  runtime path exists.
+  runtime path exists. The thread-local cache keeps initialisation on whichever
+  worker thread first evaluates Coraza traffic, so worker stack size must be
+  validated before enabling the reactor on a small-stack executor.
 - **Module size:** run `wasm-opt -Oz` and/or split unused Coraza features;
   20 MiB is large for an embedded security control.
 - **Default enablement:** keep `wasm-reactor` non-default until CRS,
