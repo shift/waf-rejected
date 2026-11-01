@@ -39,7 +39,16 @@
         craneLib = crane.mkLib pkgs;
 
         # Filter source files
-        src = craneLib.cleanCargoSource ./.;
+        # `cleanCargoSource` keeps only Cargo inputs, which drops the reactor
+        # modules that are embedded with `include_bytes!`/`include_str!`.
+        # Keep `wasm/` as well or the package build fails to compile.
+        src = pkgs.lib.cleanSourceWith {
+          src = ./.;
+          filter =
+            path: type:
+            (craneLib.filterCargoSources path type)
+            || (builtins.match ".*/wasm/.*" path != null);
+        };
 
         # Common arguments for all derivations
         commonArgs = {
