@@ -454,6 +454,9 @@ pub struct WafConfig {
 
     /// Real Coraza WASI reactor configuration (`wasm-reactor` feature).
     pub coraza: WafCorazaConfig,
+
+    /// Protocol-aware gRPC inspection (`wasm-reactor` feature).
+    pub grpc: WafGrpcConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -637,6 +640,107 @@ impl Default for WafCorazaConfig {
             pool_size: 0,
         }
     }
+}
+
+/// Protocol-aware gRPC inspection policy (`wasm-reactor` feature).
+///
+/// gRPC request bodies are protobuf frames. Running CRS body rules over those
+/// bytes is meaningless and expensive, so gRPC requests are validated at the
+/// protocol level before Coraza runs and their bodies are withheld from CRS
+/// body rules (header and URI rules still apply).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WafGrpcConfig {
+    /// Enable gRPC protocol-aware inspection. Effective only when the WAF and
+    /// the Coraza reactor are enabled as well.
+    pub enabled: bool,
+
+    /// Fully-qualified methods (`/package.Service/Method`) that may be
+    /// called. Empty means monitor-only: methods are logged, never blocked.
+    /// The list can be generated from a protobuf `FileDescriptorSet`.
+    pub method_allowlist: Vec<String>,
+
+    /// Maximum decoded size of a single gRPC message, in bytes.
+    pub max_message_bytes: usize,
+
+    /// Maximum number of length-prefixed messages in one request body.
+    pub max_frames: usize,
+
+    /// What to do with a method that is not in a non-empty allowlist:
+    /// `allow` (monitor) or `block`. When unset, it defaults to `block` for a
+    /// non-empty allowlist and `allow` for an empty one.
+    pub unknown_method_action: Option<String>,
+}
+
+impl Default for WafGrpcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            method_allowlist: Vec::new(),
+            max_message_bytes: 4 * 1024 * 1024,
+            max_frames: 64,
+            unknown_method_action: None,
+        }
+    }
+}
+
+impl WafGrpcConfig {
+    /// Resolved unknown-method policy. An empty allowlist is monitor-only.
+    pub fn unknown_method_action(&self) -> &str {
+        match self.unknown_method_action.as_deref() {
+            Some(action) => action,
+            None if self.method_allowlist.is_empty() => "allow",
+            None => "block",
+        }
+    }
+
+    /// Validates the gRPC inspection policy.
+    ///
+    /// Allowlist entries must be fully-qualified gRPC paths of the form
+    /// `/package.Service/Method`; the same structural rules are applied by
+    /// [`crate::waf::grpc::parse_method_path`] at request time.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.max_message_bytes == 0 {
+            anyhow::bail!("waf.grpc.max_message_bytes must be greater than zero");
+        }
+        if self.max_frames == 0 {
+            anyhow::bail!("waf.grpc.max_frames must be greater than zero");
+        }
+        if let Some(action) = self.unknown_method_action.as_deref() {
+            if action != "allow" && action != "block" {
+                anyhow::bail!(
+                    "waf.grpc.unknown_method_action must be 'allow' or 'block', got '{action}'"
+                );
+            }
+        }
+        for method in &self.method_allowlist {
+            if !is_valid_grpc_method_path(method) {
+                anyhow::bail!(
+                    "waf.grpc.method_allowlist entry '{method}' must be a fully-qualified gRPC method path like '/package.Service/Method'"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Structural gRPC method-path check shared with request-time parsing.
+fn is_valid_grpc_method_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix('/') else {
+        return false;
+    };
+    let mut parts = rest.split('/');
+    let (Some(service), Some(method), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    !service.is_empty()
+        && !method.is_empty()
+        && service
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        && method
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -927,6 +1031,7 @@ impl Default for WafConfig {
             #[cfg(feature = "wasm-waf")]
             wasm: WasmConfig::default(),
             coraza: WafCorazaConfig::default(),
+            grpc: WafGrpcConfig::default(),
         }
     }
 }
@@ -1103,6 +1208,7 @@ impl Config {
         {
             anyhow::bail!("waf.coraza.module_path must not be empty when set");
         }
+        self.waf.grpc.validate()?;
         if self.security.auth.enabled && self.security.auth.api_keys.is_empty() {
             anyhow::bail!("security.auth.enabled is true but security.auth.api_keys is empty");
         }
@@ -1395,6 +1501,35 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
         assert!(config.validate().is_err());
         config.waf.coraza.pool_size = 4;
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn grpc_config_is_validated() {
+        let mut config = Config::default();
+        assert!(config.waf.grpc.enabled);
+        assert_eq!(config.waf.grpc.max_message_bytes, 4 * 1024 * 1024);
+        assert_eq!(config.waf.grpc.max_frames, 64);
+        assert_eq!(config.waf.grpc.unknown_method_action(), "allow");
+        assert!(config.validate().is_ok());
+
+        config.waf.grpc.max_message_bytes = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.waf.grpc.max_frames = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.waf.grpc.unknown_method_action = Some("maybe".to_string());
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.waf.grpc.method_allowlist = vec!["acme.Service/Method".to_string()];
+        assert!(config.validate().is_err());
+
+        config.waf.grpc.method_allowlist = vec!["/acme.Service/Method".to_string()];
+        assert!(config.validate().is_ok());
+        assert_eq!(config.waf.grpc.unknown_method_action(), "block");
     }
 
     #[test]

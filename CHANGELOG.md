@@ -15,6 +15,17 @@ All notable changes to WAF-Rejected are documented here.
   bounded by the new `server.grpc_max_stream_bytes` (default 4 MiB) and
   `server.grpc_max_stream_seconds` (default 300). See
   `docs/architecture/grpc-transport.md`.
+- Protocol-aware gRPC inspection (`src/waf/grpc.rs`, `wasm-reactor` feature,
+  enabled when Coraza is enabled). gRPC requests are validated before the
+  Coraza reactor runs: `content-type` family detection, HTTP/2 `:path`
+  (`/package.Service/Method`) against `waf.grpc.method_allowlist`, 5-byte frame
+  prefix validation (compressed flag, big-endian length, truncation, message
+  size, frame count), `grpc-encoding` (`identity` only), and base64 syntax for
+  binary `-bin` metadata (excluded from text scanning). Protobuf bodies are
+  withheld from CRS body rules, so large messages no longer hit the 64 KiB
+  reactor payload cap; header and URI rules still run. `waf.grpc` is validated
+  at config load. Field-level protobuf inspection is not implemented yet (see
+  `docs/grpc-inspection.md`).
 - The Coraza WASI reactor is now enabled by default: `wasm-reactor` is part of
   the default Cargo features and `WafCorazaConfig::default().enabled` is
   `true`. Default start-up compiles the ~20 MiB module once (~4.5 s) and warms

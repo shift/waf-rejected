@@ -92,6 +92,19 @@ instance_pool_size = 10
 hot_reload = true
 rules_config = "rules/coraza.conf"
 
+[waf.grpc]
+# Protocol-aware gRPC inspection (active when waf.coraza.enabled is true).
+# Protobuf bodies are validated at the frame level and never sent to CRS body
+# rules. See docs/grpc-inspection.md.
+enabled = true
+# Empty = monitor only. Entries are fully-qualified gRPC methods and can be
+# generated from a protobuf FileDescriptorSet.
+method_allowlist = []
+max_message_bytes = 4194304  # 4 MiB
+max_frames = 64
+# "allow" or "block"; unset defaults to block for a non-empty allowlist.
+# unknown_method_action = "block"
+
 [security.auth]
 enabled = false
 api_keys = []

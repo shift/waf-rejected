@@ -275,6 +275,11 @@ UTF-8 JSON, matching `build_payload` in `src/waf/wasm_reactor.rs`:
 current form; the module also accepts a `{"name": "value"}` object for manual
 testing.
 
+gRPC requests are the exception: the protocol-aware pre-check in
+`src/waf/grpc.rs` validates the frame envelope first and sets `body` to `null`
+so CRS never scans protobuf bytes (header and URI rules still run). See
+[`docs/grpc-inspection.md`](grpc-inspection.md).
+
 ### Embedded rules
 
 The reactor embeds OWASP CRS **4.14.0**, commit

@@ -18,6 +18,11 @@ pub mod tls_config;
 #[cfg(feature = "wasm-reactor")]
 pub mod wasm_reactor;
 
+/// Protocol-aware gRPC inspection (protobuf frames are not sent to CRS body
+/// rules).
+#[cfg(feature = "wasm-reactor")]
+pub mod grpc;
+
 use bytes::Bytes;
 use hyper::{HeaderMap, Method, Uri};
 use std::net::IpAddr;
@@ -148,10 +153,23 @@ pub struct WafEngine {
     /// than deferred to request time.
     #[cfg(feature = "wasm-reactor")]
     coraza_init_error: Option<String>,
+    /// Protocol-aware gRPC pre-check; runs before the Coraza reactor and
+    /// withholds protobuf bodies from CRS body rules.
+    #[cfg(feature = "wasm-reactor")]
+    grpc_inspector: Option<grpc::GrpcInspector>,
     #[cfg(feature = "wasm-waf")]
     wasm_engine: Option<Arc<WasmEngine>>,
     #[cfg(feature = "ai-threat-detection")]
     ai_detector: Option<Arc<ai::AiThreatDetector>>,
+}
+
+/// Outcome of the gRPC protocol pre-check.
+#[cfg(feature = "wasm-reactor")]
+enum GrpcPrecheck {
+    /// Continue evaluation with the supplied (possibly body-stripped) context.
+    Continue(Box<RequestContext>),
+    /// Return this decision immediately.
+    Reject(Decision),
 }
 
 impl Default for WafEngine {
@@ -171,6 +189,8 @@ impl Clone for WafEngine {
             wasm_init_failed: self.wasm_init_failed,
             #[cfg(feature = "wasm-reactor")]
             coraza_init_error: self.coraza_init_error.clone(),
+            #[cfg(feature = "wasm-reactor")]
+            grpc_inspector: self.grpc_inspector.clone(),
             #[cfg(feature = "wasm-waf")]
             wasm_engine: self.wasm_engine.clone(),
             #[cfg(feature = "ai-threat-detection")]
@@ -190,6 +210,8 @@ impl WafEngine {
             wasm_init_failed: false,
             #[cfg(feature = "wasm-reactor")]
             coraza_init_error: None,
+            #[cfg(feature = "wasm-reactor")]
+            grpc_inspector: None,
             #[cfg(feature = "wasm-waf")]
             wasm_engine: None,
         }
@@ -212,11 +234,21 @@ impl WafEngine {
             wasm_init_failed,
             #[cfg(feature = "wasm-reactor")]
             coraza_init_error: None,
+            #[cfg(feature = "wasm-reactor")]
+            grpc_inspector: None,
             #[cfg(feature = "wasm-waf")]
             wasm_engine,
             #[cfg(feature = "ai-threat-detection")]
             ai_detector: Self::initialize_ai_detector(config),
         };
+
+        // gRPC is protocol-aware: validate the envelope before Coraza runs so
+        // protobuf bytes never reach CRS body rules.
+        #[cfg(feature = "wasm-reactor")]
+        if config.waf.enabled && config.waf.coraza.enabled && config.waf.grpc.enabled {
+            engine.grpc_inspector = Some(grpc::GrpcInspector::from_config(&config.waf.grpc));
+            info!("Enabled protocol-aware gRPC inspection");
+        }
 
         // The Coraza reactor must run before the traditional heuristics.
         #[cfg(feature = "wasm-reactor")]
@@ -430,12 +462,88 @@ impl WafEngine {
         rules.push(Box::new(rule));
     }
 
+    /// Outcome of the gRPC protocol pre-check.
+    #[cfg(feature = "wasm-reactor")]
+    async fn grpc_precheck(&self, request: &RequestContext) -> Option<GrpcPrecheck> {
+        let inspector = self.grpc_inspector.as_ref()?;
+        if !inspector.matches(request) {
+            return None;
+        }
+
+        match inspector.inspect(request) {
+            Ok(grpc::GrpcVerdict::Allow {
+                strip_body,
+                monitored,
+            }) => {
+                if monitored {
+                    debug!(
+                        uri = %request.uri,
+                        "gRPC method not in allowlist; monitor mode allows the request"
+                    );
+                }
+                if strip_body {
+                    Some(GrpcPrecheck::Continue(Box::new(grpc::strip_body(request))))
+                } else {
+                    None
+                }
+            }
+            Ok(grpc::GrpcVerdict::Block { status, reason }) => {
+                let decision = Decision::Block { status, reason };
+                self.event_logger
+                    .log_event(
+                        request,
+                        &decision,
+                        vec!["grpc-protocol-inspection".to_string()],
+                    )
+                    .await;
+                Some(GrpcPrecheck::Reject(decision))
+            }
+            Err(err) => {
+                if self.fail_closed {
+                    let decision = Decision::Block {
+                        status: 503,
+                        reason: format!("gRPC inspection unavailable: {err}"),
+                    };
+                    self.event_logger
+                        .log_event(
+                            request,
+                            &decision,
+                            vec!["grpc-protocol-inspection".to_string()],
+                        )
+                        .await;
+                    Some(GrpcPrecheck::Reject(decision))
+                } else {
+                    warn!(
+                        error = %err,
+                        "gRPC inspection failed; continuing because fail_mode is open"
+                    );
+                    // Never hand protobuf bytes to CRS body rules even when
+                    // fail-open tolerates the inspection failure.
+                    Some(GrpcPrecheck::Continue(Box::new(grpc::strip_body(request))))
+                }
+            }
+        }
+    }
+
     /// Fast evaluation for performance-critical paths (headers/URI only)
     /// Skips expensive operations like body inspection
     pub async fn fast_evaluate(&self, request: &RequestContext) -> Decision {
         if !self.enabled {
             return Decision::Allow;
         }
+
+        #[cfg(feature = "wasm-reactor")]
+        let grpc_context;
+        #[cfg(feature = "wasm-reactor")]
+        let request: &RequestContext = match self.grpc_precheck(request).await {
+            Some(GrpcPrecheck::Reject(decision)) => return decision,
+            Some(GrpcPrecheck::Continue(context)) => {
+                grpc_context = *context;
+                &grpc_context
+            }
+            None => request,
+        };
+
         let mut triggered_rules = Vec::new();
         let mut blocking_decision = None;
         let rules_count;
@@ -524,6 +632,19 @@ impl WafEngine {
         if !self.enabled {
             return Decision::Allow;
         }
+
+        #[cfg(feature = "wasm-reactor")]
+        let grpc_context;
+        #[cfg(feature = "wasm-reactor")]
+        let request: &RequestContext = match self.grpc_precheck(request).await {
+            Some(GrpcPrecheck::Reject(decision)) => return decision,
+            Some(GrpcPrecheck::Continue(context)) => {
+                grpc_context = *context;
+                &grpc_context
+            }
+            None => request,
+        };
+
         let mut triggered_rules = Vec::new();
         let mut blocking_decision = None;
         let rules_count;
@@ -980,6 +1101,111 @@ mod tests {
         );
         ctx = ctx.with_body(Some(Bytes::from(body.to_string())));
         ctx
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    struct BodyProbeRule {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<Option<usize>>>>,
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    impl WafRule for BodyProbeRule {
+        fn name(&self) -> &str {
+            "body-probe"
+        }
+
+        fn evaluate(&self, ctx: &RequestContext) -> Decision {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(ctx.body.as_ref().map(|body| body.len()));
+            Decision::Allow
+        }
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    fn grpc_body() -> Bytes {
+        let payload = b"protobuf-bytes";
+        let mut frame = Vec::with_capacity(5 + payload.len());
+        frame.push(0u8);
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(payload);
+        Bytes::from(frame)
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    #[tokio::test]
+    async fn grpc_body_is_withheld_from_downstream_rules() {
+        let mut engine = WafEngine::new();
+        engine.grpc_inspector = Some(crate::waf::grpc::GrpcInspector::from_config(
+            &crate::config::WafGrpcConfig::default(),
+        ));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        engine.add_rule(BodyProbeRule {
+            seen: std::sync::Arc::clone(&seen),
+        });
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            hyper::header::CONTENT_TYPE,
+            hyper::header::HeaderValue::from_static("application/grpc+proto"),
+        );
+        let grpc_request = RequestContext::new(
+            IpAddr::from_str("192.168.1.100").unwrap(),
+            Method::POST,
+            Uri::from_str("/acme.Service/Method").unwrap(),
+            headers.clone(),
+            Some(grpc_body().len()),
+        )
+        .with_body(Some(grpc_body()));
+
+        assert_eq!(engine.evaluate(&grpc_request).await, Decision::Allow);
+        assert_eq!(seen.lock().unwrap().as_slice(), &[None]);
+
+        // Non-gRPC bodies are still inspected.
+        headers.insert(
+            hyper::header::CONTENT_TYPE,
+            hyper::header::HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+        let form_request = RequestContext::new(
+            IpAddr::from_str("192.168.1.100").unwrap(),
+            Method::POST,
+            Uri::from_str("/login").unwrap(),
+            headers,
+            Some(5),
+        )
+        .with_body(Some(Bytes::from_static(b"a=b&c")));
+
+        assert_eq!(engine.evaluate(&form_request).await, Decision::Allow);
+        assert_eq!(seen.lock().unwrap().as_slice(), &[None, Some(5)]);
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    #[tokio::test]
+    async fn grpc_precheck_blocks_unknown_method_before_rules() {
+        let mut config = crate::config::WafGrpcConfig::default();
+        config.method_allowlist = vec!["/acme.Service/Allowed".to_string()];
+        let mut engine = WafEngine::new();
+        engine.grpc_inspector = Some(crate::waf::grpc::GrpcInspector::from_config(&config));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            hyper::header::CONTENT_TYPE,
+            hyper::header::HeaderValue::from_static("application/grpc"),
+        );
+        let request = RequestContext::new(
+            IpAddr::from_str("192.168.1.100").unwrap(),
+            Method::POST,
+            Uri::from_str("/acme.Service/Denied").unwrap(),
+            headers,
+            Some(grpc_body().len()),
+        )
+        .with_body(Some(grpc_body()));
+
+        assert!(matches!(
+            engine.evaluate(&request).await,
+            Decision::Block { status: 403, .. }
+        ));
     }
 
     #[cfg(feature = "wasm-reactor")]
