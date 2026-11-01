@@ -267,6 +267,7 @@ UTF-8 JSON, matching `build_payload` in `src/waf/wasm_reactor.rs`:
   "http_version": "1.1",
   "headers": [["content-type", "application/x-www-form-urlencoded"]],
   "body_size": 38,
+  "body_encoding": "utf8",
   "body": "username=admin&password=not-a-real-password"
 }
 ```
@@ -279,6 +280,30 @@ gRPC requests are the exception: the protocol-aware pre-check in
 `src/waf/grpc.rs` validates the frame envelope first and sets `body` to `null`
 so CRS never scans protobuf bytes (header and URI rules still run). See
 [`docs/grpc-inspection.md`](grpc-inspection.md).
+
+`body_encoding` is a discriminator for the `body` string:
+
+| Value | Meaning |
+| --- | --- |
+| `utf8` | `body` is the raw body and is valid UTF-8. This is the fast path. |
+| `base64` | `body` is the raw body encoded with standard base64. |
+
+The host chooses `base64` whenever the captured body is not valid UTF-8
+(protobuf/gRPC frames, msgpack, compressed payloads), so invalid bytes are
+never replaced with U+FFFD before inspection. The guest decodes base64 before
+`WriteRequestBody`; if the encoding is unknown, the base64 is malformed, or the
+decoded length disagrees with `body_size`, `eval` returns `-5`, which the host
+surfaces as `ReactorError::InvalidBodyEncoding` (fail-closed `503` by default,
+and the worker rebuilds its instance for the next request).
+
+`body_size` is always the raw, unencoded byte length. Payloads that omit
+`body_encoding` are treated as `utf8` for backwards compatibility.
+
+Base64 costs four wire bytes per three raw bytes, so a 64 KiB payload budget
+carries at most about 48 KiB of binary body once the JSON envelope and headers
+are accounted for. The payload limit itself is unchanged
+(`CORAZA_MAX_PAYLOAD_BYTES = 64 KiB`); `ReactorError::PayloadTooLarge` remains
+the distinguishable error for exceeding it.
 
 ### Embedded rules
 
@@ -604,5 +629,6 @@ freshly created instance, and the rule maps the timeout to `503` when
   per-request cost (~2 ms bodyless, ~350 ms per 8 KiB body); provide a
   lighter CRS profile or a body-size policy if that is too expensive for edge
   deployments.
-- **Body fidelity:** the ABI is UTF-8/lossy; binary-safe inspection needs a
-  byte-oriented payload format.
+- **Body fidelity:** binary bodies are now carried losslessly as base64 in the
+  ABI; the remaining gap is response-body inspection (the reactor still only
+  sees request bodies) and the ~33 % wire overhead for binary payloads.

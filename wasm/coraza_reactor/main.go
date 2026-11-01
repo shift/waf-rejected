@@ -8,6 +8,7 @@ package main
 
 import (
 	"embed"
+	"encoding/base64"
 	"encoding/json"
 	"io/fs"
 	"runtime/debug"
@@ -73,13 +74,66 @@ var (
 // Request is the JSON payload shape produced by src/waf/wasm_reactor.rs.
 // Headers are accepted both as [[name, value], ...] (the host's current
 // form) and as {"name": "value"} for manual testing.
+//
+// BodyEncoding distinguishes text bodies from binary ones. The host sends
+// "utf8" (or omits the field, which is treated as "utf8") when the raw body is
+// valid UTF-8 and "base64" otherwise, so invalid UTF-8 bytes survive
+// inspection instead of being replaced with U+FFFD. BodySize is a pointer so
+// payloads that omit it stay compatible; when present it must equal the
+// decoded body length.
 type Request struct {
-	Method      string          `json:"method"`
-	URI         string          `json:"uri"`
-	HTTPVersion string          `json:"http_version"`
-	Headers     json.RawMessage `json:"headers"`
-	Body        *string         `json:"body"`
-	BodySize    int             `json:"body_size"`
+	Method       string          `json:"method"`
+	URI          string          `json:"uri"`
+	HTTPVersion  string          `json:"http_version"`
+	Headers      json.RawMessage `json:"headers"`
+	Body         *string         `json:"body"`
+	BodySize     *int            `json:"body_size"`
+	BodyEncoding string          `json:"body_encoding"`
+}
+
+// Guest error codes. The host maps -5 to a body-encoding error.
+const (
+	errPayload      = -2
+	errBounds       = -3
+	errBody         = -4
+	errBodyEncoding = -5
+)
+
+const (
+	bodyEncodingUTF8   = "utf8"
+	bodyEncodingBase64 = "base64"
+)
+
+// decodeBody resolves the request body according to its encoding and validates
+// the declared raw length. An empty encoding means "utf8" for backwards
+// compatibility with payloads built before body encodings existed.
+func decodeBody(req *Request) ([]byte, int) {
+	if req.Body == nil {
+		return nil, 0
+	}
+	encoding := req.BodyEncoding
+	if encoding == "" {
+		encoding = bodyEncodingUTF8
+	}
+
+	var body []byte
+	switch encoding {
+	case bodyEncodingUTF8:
+		body = []byte(*req.Body)
+	case bodyEncodingBase64:
+		decoded, err := base64.StdEncoding.DecodeString(*req.Body)
+		if err != nil {
+			return nil, errBodyEncoding
+		}
+		body = decoded
+	default:
+		return nil, errBodyEncoding
+	}
+
+	if req.BodySize != nil && *req.BodySize >= 0 && *req.BodySize != len(body) {
+		return nil, errBodyEncoding
+	}
+	return body, 0
 }
 
 func decodeHeaders(raw json.RawMessage) [][2]string {
@@ -146,22 +200,22 @@ func wafEval(ptr int32, length int32) int32 {
 		}
 	}
 	if length < 0 || int(length) > maxInputBytes {
-		return -3
+		return errBounds
 	}
 	if ptr < 0 {
-		return -2
+		return errPayload
 	}
 
 	base := uintptr(unsafe.Pointer(&inputBuf[0]))
 	p := uintptr(uint32(ptr))
 	if p < base || p+uintptr(length) > base+uintptr(maxInputBytes) {
-		return -3
+		return errBounds
 	}
 
 	payload := unsafe.Slice((*byte)(unsafe.Pointer(p)), int(length))
 	var req Request
 	if err := json.Unmarshal(payload, &req); err != nil {
-		return -2
+		return errPayload
 	}
 
 	tx := engine.NewTransaction()
@@ -190,12 +244,16 @@ func wafEval(ptr int32, length int32) int32 {
 	}
 
 	if req.Body != nil && *req.Body != "" {
-		if _, _, err := tx.WriteRequestBody([]byte(*req.Body)); err != nil {
-			return -4
+		body, code := decodeBody(&req)
+		if code != 0 {
+			return int32(code)
+		}
+		if _, _, err := tx.WriteRequestBody(body); err != nil {
+			return errBody
 		}
 	}
 	if it, err := tx.ProcessRequestBody(); err != nil {
-		return -4
+		return errBody
 	} else if it != nil {
 		return 1
 	}

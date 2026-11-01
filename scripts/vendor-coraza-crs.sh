@@ -21,6 +21,14 @@ curl -sSL --fail --max-time 120 "$TARBALL" -o "$WORK/crs.tar.gz"
 tar xzf "$WORK/crs.tar.gz" -C "$WORK" --strip-components=1
 SRC="$WORK"
 
+# The reactor inspects gRPC envelopes before Coraza sees the request, but CRS
+# rule 920420 still rejects `application/grpc*` unless the media types are in
+# the allowed content-type policy. Add them here so a regenerated bundle does
+# not block every gRPC call. Only the default initialisation rule is patched;
+# the operator-facing crs-setup.conf.example stays upstream-clean.
+perl -0pi -e "s#setvar:'tx\\.allowed_request_content_type=\\|application/x-www-form-urlencoded\\| \\|multipart/form-data\\| \\|text/xml\\| \\|application/xml\\| \\|application/soap\\+xml\\| \\|application/json\\|'#setvar:'tx.allowed_request_content_type=|application/x-www-form-urlencoded| |multipart/form-data| |text/xml| |application/xml| |application/soap+xml| |application/json| |application/grpc| |application/grpc+proto| |application/grpc+json| |application/grpc-web| |application/grpc-web+proto| |application/grpc-web-text|'#g" \
+  "$SRC/rules/REQUEST-901-INITIALIZATION.conf"
+
 rm -rf "$DEST"
 mkdir -p "$DEST/rules"
 

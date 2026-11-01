@@ -69,6 +69,16 @@ All notable changes to WAF-Rejected are documented here.
   and fuel limits are validated at config load.
 - Reactor failures honour `waf.fail_mode`: `503` when closed, log-and-continue
   when open. Start-up failures use the same policy.
+- Binary-safe request bodies in the Coraza WASI reactor ABI. The JSON payload
+  gains `body_encoding` (`utf8` or `base64`); UTF-8 bodies keep the existing
+  fast path and non-UTF-8 bodies (protobuf/gRPC, msgpack, compressed payloads)
+  are base64-encoded so invalid bytes are no longer replaced with U+FFFD
+  before inspection. `body_size` remains the raw byte length. Payloads that
+  omit `body_encoding` are treated as `utf8`. The guest rejects malformed
+  base64, unknown encodings and `body_size` mismatches with `eval` code `-5`,
+  surfaced as `ReactorError::InvalidBodyEncoding`; the `64 KiB` payload limit
+  (and `ReactorError::PayloadTooLarge`) is unchanged, which leaves roughly
+  48 KiB of binary body per payload after base64 and JSON overhead.
 - Unit coverage for attack blocking (SQLi, XSS, path traversal), benign
   traffic, disabled configuration, and fail-closed/fail-open behaviour.
   Release-mode latency measurement reported in `docs/coraza-wasi-reactor.md`.

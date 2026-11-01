@@ -16,6 +16,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use tracing::{info, warn};
 use wasmtime::{
     Caller, Config, Engine, Extern, Linker, Memory, Module, OptLevel, Store, StoreLimits,
@@ -32,6 +33,15 @@ use crate::waf::{Decision, RequestContext, WafRule};
 pub const DECISION_ALLOW: i32 = 0;
 /// Decision code returned by the reactor for "block".
 pub const DECISION_BLOCK: i32 = 1;
+
+/// Guest error code for invalid base64, an unknown `body_encoding`, or a
+/// `body` whose decoded length does not match `body_size`.
+pub const GUEST_ERROR_BODY_ENCODING: i32 = -5;
+
+/// Payload `body_encoding` value for a body that is valid UTF-8.
+pub const BODY_ENCODING_UTF8: &str = "utf8";
+/// Payload `body_encoding` value for a base64-encoded binary body.
+pub const BODY_ENCODING_BASE64: &str = "base64";
 
 /// Offset in linear memory where the host writes the request payload.
 pub const INPUT_BASE: usize = 1024;
@@ -181,6 +191,10 @@ pub enum ReactorError {
     /// The reactor returned a decision code the host does not understand.
     #[error("reactor returned unknown decision code {0}")]
     UnknownDecision(i32),
+    /// The guest rejected the payload body: invalid base64, an unknown
+    /// `body_encoding`, or a decoded length that disagrees with `body_size`.
+    #[error("reactor rejected request body encoding: {0}")]
+    InvalidBodyEncoding(&'static str),
 }
 
 /// Per-`Store` state. `WasiP1Ctx` supplies the preview1 imports the Go
@@ -890,6 +904,11 @@ impl WorkerConfig {
                 status: 403,
                 reason: "blocked by wasm reactor".to_string(),
             },
+            GUEST_ERROR_BODY_ENCODING => {
+                return Err(ReactorError::InvalidBodyEncoding(
+                    "guest rejected base64 body or body_size mismatch",
+                ))
+            }
             other => return Err(ReactorError::UnknownDecision(other)),
         };
         Ok((decision, cached))
@@ -1263,6 +1282,13 @@ impl WasmReactorRule {
 }
 
 /// Serialises the request context into the reactor's JSON payload.
+///
+/// Bodies that are valid UTF-8 keep the `utf8` fast path. Binary bodies
+/// (protobuf/gRPC, msgpack, compressed payloads) are base64-encoded and marked
+/// `base64` so invalid UTF-8 bytes are never replaced with U+FFFD before
+/// inspection. `body_size` is always the raw byte length; payloads that omit
+/// `body_encoding` are treated as `utf8` by the guest for backwards
+/// compatibility.
 fn build_payload(ctx: &RequestContext) -> Result<Vec<u8>, serde_json::Error> {
     let headers: Vec<(String, String)> = ctx
         .headers
@@ -1275,17 +1301,26 @@ fn build_payload(ctx: &RequestContext) -> Result<Vec<u8>, serde_json::Error> {
         })
         .collect();
 
-    let body = ctx
-        .body
-        .as_deref()
-        .map(|bytes| String::from_utf8_lossy(bytes).into_owned());
+    let (body, body_encoding) = match ctx.body.as_deref() {
+        None => (None, BODY_ENCODING_UTF8),
+        Some(bytes) => match std::str::from_utf8(bytes) {
+            Ok(text) => (Some(text.to_string()), BODY_ENCODING_UTF8),
+            Err(_) => (
+                Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
+                BODY_ENCODING_BASE64,
+            ),
+        },
+    };
+    // The wire size is the raw body length, not the encoded JSON string length.
+    let body_size = ctx.body.as_deref().map(<[u8]>::len).or(ctx.body_size);
 
     serde_json::to_vec(&serde_json::json!({
         "method": ctx.method.as_str(),
         "uri": ctx.uri.to_string(),
         "http_version": ctx.http_version,
         "headers": headers,
-        "body_size": ctx.body_size,
+        "body_size": body_size,
+        "body_encoding": body_encoding,
         "body": body,
     }))
 }
@@ -1323,6 +1358,25 @@ mod tests {
         }))
     }
 
+    /// Context with an arbitrary raw body, used to exercise binary payloads.
+    fn binary_context(uri: &str, body: &[u8]) -> RequestContext {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "example.com".parse().unwrap());
+        headers.insert(
+            "content-type",
+            "application/x-www-form-urlencoded".parse().unwrap(),
+        );
+        headers.insert("content-length", body.len().to_string().parse().unwrap());
+        RequestContext::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            Method::POST,
+            uri.parse::<Uri>().unwrap(),
+            headers,
+            Some(body.len()),
+        )
+        .with_body(Some(Bytes::copy_from_slice(body)))
+    }
+
     fn context(uri: &str, body: Option<&str>) -> RequestContext {
         let mut headers = HeaderMap::new();
         headers.insert("user-agent", "spike-test".parse().unwrap());
@@ -1337,6 +1391,45 @@ mod tests {
             ctx = ctx.with_body(Some(Bytes::from(body.to_string())));
         }
         ctx
+    }
+
+    #[test]
+    fn build_payload_keeps_utf8_bodies_on_the_fast_path() {
+        let body = "<script>alert(1)</script>";
+        let encoded = build_payload(&context("/search", Some(body))).expect("payload must encode");
+        let value: serde_json::Value =
+            serde_json::from_slice(&encoded).expect("payload must be JSON");
+
+        assert_eq!(value["body_encoding"], BODY_ENCODING_UTF8);
+        assert_eq!(value["body"], body);
+        assert_eq!(value["body_size"].as_u64(), Some(body.len() as u64));
+    }
+
+    #[test]
+    fn build_payload_base64_encodes_binary_bodies_losslessly() {
+        use base64::Engine as _;
+
+        // Leading invalid UTF-8 bytes model a protobuf/gRPC frame prefix; the
+        // attack follows so the test covers both the preserved framing bytes
+        // and the inspected payload.
+        let raw: &[u8] = b"\xff\xfe\x00\x01q=<script>alert(1)</script>";
+        let encoded = build_payload(&binary_context("/search", raw)).expect("payload must encode");
+        let value: serde_json::Value =
+            serde_json::from_slice(&encoded).expect("payload must be JSON");
+
+        assert_eq!(value["body_encoding"], BODY_ENCODING_BASE64);
+        assert_eq!(value["body_size"].as_u64(), Some(raw.len() as u64));
+        let text = value["body"].as_str().expect("body must be a string");
+        assert!(
+            !text.contains('\u{FFFD}'),
+            "binary body must not contain replacement characters"
+        );
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(text)
+                .expect("body must be valid base64"),
+            raw
+        );
     }
 
     #[test]
@@ -1660,6 +1753,26 @@ mod tests {
                     ReactorDecision::Allow
                 );
 
+                // gRPC media types must be allowed by the CRS content-type
+                // policy (920420); the protocol-aware pre-check validates the
+                // envelope and strips the protobuf body before this point.
+                let grpc = payload(&serde_json::json!({
+                    "method": "POST",
+                    "uri": "/acme.Echo/Echo",
+                    "http_version": "2.0",
+                    "headers": [
+                        ["content-type", "application/grpc+proto"],
+                        ["te", "trailers"],
+                    ],
+                    "body": null,
+                    "body_size": 0,
+                }));
+                assert_eq!(
+                    reactor.evaluate(&grpc).unwrap(),
+                    ReactorDecision::Allow,
+                    "gRPC content-type must not trip CRS 920420"
+                );
+
                 // False-positive checks: ordinary query strings and form bodies
                 // must not trip CRS at the default paranoia level.
                 let benign_cases = [
@@ -1704,6 +1817,134 @@ mod tests {
                         "expected Coraza CRS to block {kind} payload: {body}"
                     );
                 }
+            })
+            .expect("spawn reactor thread")
+            .join()
+            .expect("reactor thread must not panic");
+    }
+
+    #[test]
+    #[ignore = "Go/WASI reactor is exercised in release mode"]
+    fn coraza_reactor_inspects_binary_bodies_after_invalid_utf8() {
+        let reactor = WasmReactor::from_bytes(EMBEDDED_CORAZA_REACTOR, ReactorLimits::coraza())
+            .expect("embedded reactor must load");
+
+        // Invalid UTF-8 prefix (as found in protobuf/gRPC or compressed
+        // bodies) followed by the attack payload. With the old lossy host the
+        // prefix became U+FFFD bytes before the guest ever saw the body.
+        let benign = build_payload(&binary_context("/search", b"\xff\xfeq=wireless+keyboard"))
+            .expect("payload must encode");
+        let xss = build_payload(&binary_context(
+            "/search",
+            b"\xff\xfeq=<script>alert(1)</script>",
+        ))
+        .expect("payload must encode");
+        let sqli = build_payload(&binary_context("/login", b"\xff\xfeq=admin' OR '1'='1"))
+            .expect("payload must encode");
+
+        let wire: serde_json::Value = serde_json::from_slice(&xss).expect("payload must be JSON");
+        assert_eq!(wire["body_encoding"], BODY_ENCODING_BASE64);
+
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                assert_eq!(
+                    reactor.evaluate(&benign).unwrap(),
+                    ReactorDecision::Allow,
+                    "benign binary body must not be blocked"
+                );
+                assert!(
+                    matches!(
+                        reactor.evaluate(&xss).unwrap(),
+                        ReactorDecision::Block { status: 403, .. }
+                    ),
+                    "Coraza must inspect the binary body and block the embedded XSS"
+                );
+                assert!(
+                    matches!(
+                        reactor.evaluate(&sqli).unwrap(),
+                        ReactorDecision::Block { status: 403, .. }
+                    ),
+                    "Coraza must inspect the binary body and block the embedded SQLi"
+                );
+            })
+            .expect("spawn reactor thread")
+            .join()
+            .expect("reactor thread must not panic");
+    }
+
+    #[test]
+    #[ignore = "Go/WASI reactor is exercised in release mode"]
+    fn coraza_reactor_rejects_invalid_body_encoding_and_recovers() {
+        use base64::Engine as _;
+
+        let reactor = WasmReactor::from_bytes(EMBEDDED_CORAZA_REACTOR, ReactorLimits::coraza())
+            .expect("embedded reactor must load");
+        let headers = serde_json::json!([["content-type", "application/x-www-form-urlencoded"]]);
+
+        let invalid_base64 = payload(&serde_json::json!({
+            "method": "POST",
+            "uri": "/search",
+            "headers": headers.clone(),
+            "body_encoding": "base64",
+            "body": "!!!not-base64!!!",
+            "body_size": 4,
+        }));
+        let mismatched_size = payload(&serde_json::json!({
+            "method": "POST",
+            "uri": "/search",
+            "headers": headers.clone(),
+            "body_encoding": "base64",
+            "body": base64::engine::general_purpose::STANDARD
+                .encode(b"q=<script>alert(1)</script>"),
+            "body_size": 1,
+        }));
+        let unknown_encoding = payload(&serde_json::json!({
+            "method": "POST",
+            "uri": "/search",
+            "headers": headers.clone(),
+            "body_encoding": "latin1",
+            "body": "abc",
+            "body_size": 3,
+        }));
+        let valid_binary = build_payload(&binary_context(
+            "/search",
+            b"\xff\xfeq=<script>alert(1)</script>",
+        ))
+        .expect("payload must encode");
+        let benign = benign_payload();
+
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                for (kind, bad) in [
+                    ("invalid base64", invalid_base64),
+                    ("mismatched body_size", mismatched_size),
+                    ("unknown body_encoding", unknown_encoding),
+                ] {
+                    assert!(
+                        matches!(
+                            reactor.evaluate(&bad),
+                            Err(ReactorError::InvalidBodyEncoding(_))
+                        ),
+                        "expected {kind} to be rejected with a body-encoding error"
+                    );
+                    // The failed worker instance is discarded, so the next
+                    // evaluation rebuilds and must still produce decisions.
+                    assert_eq!(
+                        reactor.evaluate(&benign).unwrap(),
+                        ReactorDecision::Allow,
+                        "reactor must recover after {kind}"
+                    );
+                }
+
+                assert!(
+                    matches!(
+                        reactor.evaluate(&valid_binary).unwrap(),
+                        ReactorDecision::Block { status: 403, .. }
+                    ),
+                    "valid base64 bodies must still be inspected and blocked"
+                );
             })
             .expect("spawn reactor thread")
             .join()
