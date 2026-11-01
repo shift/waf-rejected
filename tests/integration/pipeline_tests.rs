@@ -1,10 +1,11 @@
 //! End-to-end pipeline tests: real proxy, real upstream, real HTTP client.
 
 use std::convert::Infallible;
+use std::io::Write;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -28,8 +29,17 @@ async fn spawn_upstream() -> std::net::SocketAddr {
                     .serve_connection(
                         TokioIo::new(stream),
                         service_fn(|req: Request<hyper::body::Incoming>| async move {
-                            let body = if req.uri().path() == "/large" {
+                            let path = req.uri().path().to_string();
+                            let received = req
+                                .into_body()
+                                .collect()
+                                .await
+                                .map(|body| body.to_bytes())
+                                .unwrap_or_default();
+                            let body = if path == "/large" {
                                 Bytes::from("A".repeat(4096))
+                            } else if path == "/echo" {
+                                received
                             } else {
                                 Bytes::from_static(b"upstream-ok")
                             };
@@ -104,14 +114,91 @@ async fn pipeline_blocks_body_sqli() {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
+fn gzip(data: &[u8]) -> Vec<u8> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(data).unwrap();
+    encoder.finish().unwrap()
+}
+
 #[tokio::test]
-async fn pipeline_rejects_compressed_request_body() {
+async fn pipeline_blocks_decompressed_gzip_sqli_body() {
+    let upstream = spawn_upstream().await;
+    let proxy = spawn_proxy(upstream).await;
+    let response = reqwest::Client::new()
+        .post(format!("{}/login", proxy))
+        .header("content-encoding", "gzip")
+        .body(gzip(b"id=1 UNION SELECT * FROM users"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn pipeline_forwards_decompressed_gzip_body() {
+    let upstream = spawn_upstream().await;
+    let proxy = spawn_proxy(upstream).await;
+    let response = reqwest::Client::new()
+        .post(format!("{}/echo", proxy))
+        .header("content-encoding", "gzip")
+        .body(gzip(b"clean request body"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), "clean request body");
+}
+
+#[tokio::test]
+async fn pipeline_rejects_malformed_gzip_body() {
     let upstream = spawn_upstream().await;
     let proxy = spawn_proxy(upstream).await;
     let response = reqwest::Client::new()
         .post(format!("{}/upload", proxy))
         .header("content-encoding", "gzip")
         .body("not-really-gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn pipeline_rejects_oversized_decompressed_body() {
+    let upstream = spawn_upstream().await;
+    let proxy = spawn_proxy(upstream).await;
+    let response = reqwest::Client::new()
+        .post(format!("{}/upload", proxy))
+        .header("content-encoding", "gzip")
+        .body(gzip(&vec![b'A'; 4096]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn pipeline_rejects_unsupported_request_encoding() {
+    let upstream = spawn_upstream().await;
+    let proxy = spawn_proxy(upstream).await;
+    let response = reqwest::Client::new()
+        .post(format!("{}/upload", proxy))
+        .header("content-encoding", "zstd")
+        .body("encoded-body")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
+#[tokio::test]
+async fn pipeline_rejects_stacked_request_encoding() {
+    let upstream = spawn_upstream().await;
+    let proxy = spawn_proxy(upstream).await;
+    let response = reqwest::Client::new()
+        .post(format!("{}/upload", proxy))
+        .header("content-encoding", "gzip, gzip")
+        .body(gzip(b"clean request body"))
         .send()
         .await
         .unwrap();

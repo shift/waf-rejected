@@ -13,6 +13,19 @@ All notable changes to WAF-Rejected are documented here.
   WebSocket upstreams).
 - Integration tests for forwarding to a self-signed TLS upstream using
   `proxy.upstream_ca_path`, plus a plain HTTP regression test.
+- Bounded `gzip`, `deflate` (zlib-wrapped) and `br` request-body
+  decompression before WAF inspection on HTTP/1.1, HTTP/2 and HTTP/3.
+  Decompressed output is capped at `server.max_body_size` (`413` when
+  exceeded); malformed compressed data returns `400`, unsupported or stacked
+  encodings return `415`.
+- Integration coverage for decompressed SQLi blocking, clean gzip forwarding,
+  malformed gzip, decompression bombs and unsupported/stacked encodings.
+
+### Changed
+
+- Allowed compressed request bodies are forwarded upstream in their
+  decompressed `identity` form. `Content-Encoding` is dropped and
+  `Content-Length` is recomputed for the decompressed body.
 
 ## [0.1.0-beta.9] - 2026-10-31
 

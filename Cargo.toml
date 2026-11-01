@@ -104,6 +104,10 @@ chrono = { version = "0.4", features = ["serde"] }
 # Only pulled in by the non-default `wasm-reactor` feature.
 wasmi = { version = "2.0.0", optional = true, default-features = false, features = ["std", "wat", "validate", "stable"] }
 
+# Bounded request-body decompression (gzip/deflate via flate2, brotli via brotli)
+flate2 = "1.1"
+brotli = "7.0"
+
 # Streaming body processing
 async-stream = "0.3"
 

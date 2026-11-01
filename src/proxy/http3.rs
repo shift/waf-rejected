@@ -18,6 +18,9 @@ use quinn::crypto::rustls::QuicServerConfig;
 use tracing::{debug, info, warn};
 
 use crate::error::WafError;
+use crate::proxy::decompression::{
+    decompress_request_body, strip_encoding_headers, DecompressionError,
+};
 use crate::proxy::service::{ProxyState, WafProxyService};
 use crate::waf::tls_config::TlsManager;
 use crate::waf::{Decision, RequestContext};
@@ -125,27 +128,7 @@ async fn handle_request(
     state.metrics.record_request();
 
     let (mut parts, ()) = request.into_parts();
-    if let Some(encoding) = parts
-        .headers
-        .get(http::header::CONTENT_ENCODING)
-        .and_then(|value| value.to_str().ok())
-    {
-        if !encoding.eq_ignore_ascii_case("identity") {
-            warn!(
-                "Rejecting compressed HTTP/3 request body from {} (Content-Encoding: {})",
-                peer_ip, encoding
-            );
-            state.metrics.record_blocked();
-            return send_response(
-                &mut stream,
-                WafProxyService::create_error_response(
-                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                    "Compressed request bodies are not inspected; send identity encoding",
-                ),
-            )
-            .await;
-        }
-    }
+    let has_content_encoding = parts.headers.contains_key(http::header::CONTENT_ENCODING);
     parts.uri = reconstruct_uri(&parts.uri, &parts.headers);
     ensure_host_header(&mut parts.headers, &parts.uri);
 
@@ -235,6 +218,62 @@ async fn handle_request(
             )
             .await;
         }
+    };
+
+    let body_bytes = if has_content_encoding {
+        match decompress_request_body(&parts.headers, body_bytes, max_body_size) {
+            Ok(decoded) => {
+                strip_encoding_headers(&mut parts.headers);
+                decoded
+            }
+            Err(DecompressionError::UnsupportedEncoding(encoding)) => {
+                warn!(
+                    "Rejecting unsupported HTTP/3 request encoding from {} (Content-Encoding: {})",
+                    client_ip, encoding
+                );
+                state.metrics.record_blocked();
+                return send_response(
+                    &mut stream,
+                    WafProxyService::create_error_response(
+                        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                        "Unsupported request Content-Encoding",
+                    ),
+                )
+                .await;
+            }
+            Err(DecompressionError::TooLarge) => {
+                warn!(
+                    "Decompressed HTTP/3 request body from {} exceeds limit {}",
+                    client_ip, max_body_size
+                );
+                state.metrics.record_blocked();
+                return send_response(
+                    &mut stream,
+                    WafProxyService::create_error_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "Decompressed request body too large",
+                    ),
+                )
+                .await;
+            }
+            Err(DecompressionError::Malformed) => {
+                warn!(
+                    "Malformed compressed HTTP/3 request body from {}",
+                    client_ip
+                );
+                state.metrics.record_blocked();
+                return send_response(
+                    &mut stream,
+                    WafProxyService::create_error_response(
+                        StatusCode::BAD_REQUEST,
+                        "Malformed compressed request body",
+                    ),
+                )
+                .await;
+            }
+        }
+    } else {
+        body_bytes
     };
 
     let request_context = RequestContext::with_http_version(

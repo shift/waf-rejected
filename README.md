@@ -16,6 +16,8 @@ request-size and rate limits) before being forwarded to an upstream service.
 - TLS WebSocket upstreams (`https://`) verified against `webpki-roots`, with an
   optional private CA bundle via `proxy.upstream_ca_path`.
 - URI, query-string, header and **request-body** inspection.
+- Bounded `gzip`, `deflate` and `br` request decompression before WAF
+  inspection, capped at `server.max_body_size`.
 - Percent-encoded payload decoding (`%20`, `%27`, `%3C`, ...).
 - API-key authentication (`X-API-Key` by default).
 - Per-IP and global token-bucket rate limiting.
@@ -97,6 +99,21 @@ api_keys = ["replace-me"]      # prefer injecting from a secret
 header_name = "X-API-Key"
 require_https = true
 ```
+
+### Request decompression
+
+Requests may use a single `Content-Encoding` of `gzip`, `deflate`
+(zlib-wrapped DEFLATE) or `br`. The body is decompressed before WAF inspection,
+and the decompressed output must not exceed `server.max_body_size`; larger
+output is rejected with `413`. Malformed compressed data returns `400` and any
+other coding returns `415`. Stacked encodings such as `gzip, gzip` are rejected
+with `415` rather than decoded recursively.
+
+Successful requests are forwarded in their decompressed `identity` form: the
+proxy removes `Content-Encoding` (and the stale `Content-Length`, which is
+recomputed for the new body). This ensures the upstream cannot re-interpret
+already-inspected bytes as a different representation. Requests without a
+`Content-Encoding`, or with an explicit `identity`, are forwarded unchanged.
 
 ## Build and test
 
