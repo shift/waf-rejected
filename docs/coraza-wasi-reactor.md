@@ -221,6 +221,58 @@ are large enough to overflow a normal test-thread stack during Go runtime
 start-up. Release builds pass. The production host should run reactor
 evaluations on a dedicated thread with a large stack (see remaining work).
 
+## Benchmarks
+
+The reactor has a feature-gated Criterion benchmark:
+
+```sh
+nix develop
+./scripts/bench-coraza.sh
+# equivalent
+cargo bench --features wasm-reactor --bench coraza
+```
+
+The benchmark loads the committed 18 MiB module once, then measures:
+
+- `reactor_construction/compile_module`: wasmi validation/compilation of the
+  module bytes;
+- `reactor_construction/compile_instantiate_and_init`: compilation plus a cold
+  `_initialize` + `init` + `eval`;
+- `reactor_decision/{allow,block_sqli,block_xss}`: full `evaluate` calls on a
+  pre-compiled reactor, including a fresh store, Go runtime `_initialize`,
+  Coraza `init` and `eval`;
+- `reactor_body/allow_body/{1kb,16kb,64kb}`: clean POST bodies of 1 KiB and
+  16 KiB, plus the largest body that fits the ABI's fixed 64 KiB payload
+  buffer (`64kb` row, about 65.4 KB after the JSON envelope). A literal 64 KiB
+  body cannot be represented because the JSON envelope would exceed
+  `CORAZA_MAX_PAYLOAD_BYTES`.
+
+Recorded on 2026-11-01 in the Nix development shell:
+
+| Component | Value |
+| --- | --- |
+| CPU | Intel Core i5-8400T (6 threads, 1.70 GHz base) |
+| OS / kernel | Linux 6.18.36 x86_64 |
+| Rust | 1.89.0 |
+| Profile | Cargo `bench` (opt-level 3, LTO, codegen-units 1) |
+
+| Benchmark | p50 | mean | Throughput |
+| --- | ---: | ---: | ---: |
+| compile module | 126.9 ms | 129.6 ms | — |
+| compile + cold init + eval | 234.1 ms | 244.8 ms | — |
+| allow decision | 63.1 ms | 66.3 ms | 15.1 ops/s |
+| SQLi block | 60.6 ms | 61.4 ms | 16.3 ops/s |
+| XSS block | 60.9 ms | 61.4 ms | 16.3 ops/s |
+| 1 KiB body (allow) | 60.8 ms | 61.3 ms | 18.3 KiB/s |
+| 16 KiB body (allow) | 63.7 ms | 64.3 ms | 250.8 KiB/s |
+| 64 KiB body ceiling (allow) | 73.7 ms | 80.4 ms | 795.6 KiB/s |
+
+These numbers are informational only; there are no latency assertions in the
+benchmark. The dominant cost is the per-evaluation Go runtime and Coraza
+engine start-up in `evaluate`, not rule matching or body size. Reusing a
+single instance or pool, or moving to a compiled Wasm runtime, is required
+before this reactor can be considered for the proxy hot path.
+
 ## Remaining work
 
 - **OWASP CRS:** embed a pinned CRS bundle and raise the payload/body limits;

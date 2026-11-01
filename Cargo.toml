@@ -213,6 +213,13 @@ compliance = ["sled"]
 name = "security_performance"
 harness = false
 
+# Coraza WASI reactor benchmarks; only built with the non-default feature.
+#   cargo bench --features wasm-reactor --bench coraza
+[[bench]]
+name = "coraza"
+harness = false
+required-features = ["wasm-reactor"]
+
 # wasmi's debug-build interpreter frames are large enough to overflow a
 # normal test-thread stack when running the Go/Coraza reactor. Optimising only
 # the interpreter keeps `cargo test --features wasm-reactor` usable without

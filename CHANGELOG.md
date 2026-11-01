@@ -14,11 +14,19 @@ All notable changes to WAF-Rejected are documented here.
   (`with_metrics`).
 - Prometheus alerts for Coraza evaluation error rate and block spikes, using
   only the emitted Coraza metrics.
+- Feature-gated Criterion benchmarks for the experimental Coraza WASI reactor
+  (`cargo bench --features wasm-reactor --bench coraza`), covering module
+  construction and init, allow/SQLi/XSS decisions, and 1 KiB/16 KiB/64 KiB
+  request bodies. `scripts/bench-coraza.sh` builds the release library and runs
+  them.
 
 ### Documentation
 
 - Documented Coraza metrics, alert rules and recording overhead in
   `docs/operations/monitoring.md` and `docs/coraza-wasi-reactor.md`.
+- Added measured p50/mean latency and throughput for the Coraza WASI reactor to
+  `docs/coraza-wasi-reactor.md`, including hardware, command and the 64 KiB ABI
+  payload ceiling.
 
 ## [0.1.0-beta.10] - 2026-11-01
 
