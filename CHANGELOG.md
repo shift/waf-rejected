@@ -4,6 +4,8 @@ All notable changes to WAF-Rejected are documented here.
 
 ## [Unreleased]
 
+## [0.1.0-beta.11] - 2026-11-01
+
 ### Added
 
 - gRPC-correct proxy transport. gRPC requests (`application/grpc*`, including
@@ -37,24 +39,44 @@ All notable changes to WAF-Rejected are documented here.
   reason instead of starting with an empty allowlist. The start-up failure
   message is now the neutral `WAF engine initialisation failed` (covers both
   the Coraza reactor and the gRPC allowlist).
-- The Coraza WASI reactor is now enabled by default: `wasm-reactor` is part of
-  the default Cargo features and `WafCorazaConfig::default().enabled` is
-  `true`. Default start-up compiles the ~20 MiB module once (~4.5 s) and warms
-  the reactor pool (~1.1 s) before readiness; measured steady-state cost is
-  ~8–10 ms p50 per request with the full CRS. Opt out with
-  `waf.coraza.enabled = false` or `--no-default-features`. Start-up module or
-  warm-up failures are now fatal to `WafProxyService::new` (request-time
+- The real Coraza v3.3.3 WASI reactor, built with Go 1.24 and running on
+  wasmtime 49 (pinned Rust 1.99.1), replaces the non-functional reactor spike.
+  The reactor is now enabled by default: `wasm-reactor` is part of the default
+  Cargo features and `WafCorazaConfig::default().enabled` is `true`. Opt out
+  with `waf.coraza.enabled = false` or `--no-default-features`. Start-up module
+  or warm-up failures are fatal to `WafProxyService::new` (request-time
   failures remain fail-closed per `waf.fail_mode`), and `validate_startup`
   takes the loaded config without building a second reactor/pool. The
   `WAF_CORAZA_REACTOR_ENABLED` and `WAF_CORAZA_REACTOR_PATH` environment
   escape hatches are removed in favour of `waf.coraza.enabled` and
   `waf.coraza.module_path`.
+- OWASP Core Rule Set (CRS) 4.14.0 (commit
+  `b5b788b5bc50e68836e17995b191f72e848fed75`) embedded in the Coraza WASI
+  reactor, replacing the four starter rules. Coverage is the complete
+  request-side CRS: protocol enforcement, LFI/RFI, RCE, PHP/Java/generic
+  injection, XSS, SQLi, session fixation and anomaly-score blocking at
+  paranoia level 1. Response rules are excluded because response bodies are not
+  available over the host ABI; deployment-specific exclusion files, plugins and
+  the upstream regression corpus are also excluded. See
+  `wasm/coraza_reactor/rules/crs/PROVENANCE.md` and
+  `docs/coraza-wasi-reactor.md`.
+- Deterministic pre-warmed reactor pool. `WasmReactor::warm()` creates a fixed
+  pool of dedicated OS threads (available parallelism clamped to `1..=8`,
+  configurable through `waf.coraza.pool_size`; `0` = auto) and blocks until
+  every worker has completed Go `_initialize` + Coraza `init`. `evaluate`
+  dispatches each payload to an idle worker over a channel, so the first
+  production request no longer pays ~0.5 s of initialisation; measured
+  first-evaluation latency after warm-up is ~3 ms versus ~2.7 ms steady state,
+  with ~15 µs of pool dispatch overhead. Traps discard the worker's instance
+  for the next job; a panicking or wedged worker is detected via channel
+  disconnect or a reply timeout, returns an error instead of hanging, and is
+  replaced. Rule construction warms the pool, so it is the only place that
+  pays initialisation.
 - Coraza reactor observability behind the `wasm-reactor` feature:
   `waf_coraza_evaluations_total`, `waf_coraza_blocks_total`,
   `waf_coraza_errors_total` and the
   `waf_coraza_evaluation_duration_seconds` histogram. `WasmReactorRule`
-  records them through an optional shared metrics registry
-  (`with_metrics`).
+  records them through an optional shared metrics registry (`with_metrics`).
 - Prometheus alerts for Coraza evaluation error rate and block spikes, using
   only the emitted Coraza metrics.
 - Feature-gated Criterion benchmarks for the Coraza WASI reactor
@@ -62,11 +84,6 @@ All notable changes to WAF-Rejected are documented here.
   construction and init, allow/SQLi/XSS decisions, and 1 KiB/16 KiB/64 KiB
   request bodies. `scripts/bench-coraza.sh` builds the release library and runs
   them.
-- Live integration of the real Coraza WASI reactor, default-on when the
-  `wasm-reactor` feature is compiled (the default). `waf.coraza.enabled`
-  registers the reactor before the traditional heuristic rules; `module_path`
-  selects a module file and `None` uses the embedded reactor. Payload, memory
-  and fuel limits are validated at config load.
 - Reactor failures honour `waf.fail_mode`: `503` when closed, log-and-continue
   when open. Start-up failures use the same policy.
 - Binary-safe request bodies in the Coraza WASI reactor ABI. The JSON payload
@@ -79,9 +96,9 @@ All notable changes to WAF-Rejected are documented here.
   surfaced as `ReactorError::InvalidBodyEncoding`; the `64 KiB` payload limit
   (and `ReactorError::PayloadTooLarge`) is unchanged, which leaves roughly
   48 KiB of binary body per payload after base64 and JSON overhead.
-- Unit coverage for attack blocking (SQLi, XSS, path traversal), benign
-  traffic, disabled configuration, and fail-closed/fail-open behaviour.
-  Release-mode latency measurement reported in `docs/coraza-wasi-reactor.md`.
+- Unit coverage for attack blocking (SQLi, XSS, path traversal, command
+  injection), benign traffic, disabled configuration, fail-closed/fail-open
+  behaviour, reused-instance isolation and concurrent threads.
 - `FileDescriptorSet`-driven gRPC allowlist generation:
   `grpc-allowlist` (`src/bin/grpc-allowlist.rs`,
   `scripts/grpc-allowlist.sh`) reads a binary or JSON descriptor set and emits
@@ -110,66 +127,30 @@ All notable changes to WAF-Rejected are documented here.
   collections land mid-evaluation (observed 8 KiB p50 ~830 ms versus ~347 ms
   steady state); the larger growth target and a soft limit below the 256 MiB
   store cap remove the tail without raising 60 KiB steady-state cost.
-- Coraza WASI reactor instances are reused instead of being created per
-  request, and start-up is now deterministic. `WasmReactor::warm()` creates a
-  fixed pool of dedicated OS threads (available parallelism clamped to `1..=8`,
-  configurable through `waf.coraza.pool_size`; `0` = auto) and blocks until
-  every worker has completed Go `_initialize` + Coraza `init`. `evaluate`
-  dispatches each payload to an idle worker over a channel, so the first
-  production request no longer pays ~0.5 s of initialisation; measured
-  first-evaluation latency after warm-up is ~3 ms versus ~2.7 ms steady state,
-  with ~15 µs of pool dispatch overhead. Traps/fuel exhaustion discard the
-  worker's instance for the next job; a panicking or wedged worker is detected
-  via channel disconnect or a 60 s reply timeout, returns an error instead of
-  hanging, and is replaced. Rule construction (engine start-up) warms the
-  pool, so it is the only place that pays initialisation; `validate_startup()`
-  only checks the module source and size budget without a second compile.
-  `clear_thread_cache()` is removed because instances are pool-owned. Criterion
-  p50 for allow/SQLi/XSS drops from ~61–63 ms to ~2.1–3.0 ms on the reference
-  machine.
 - Replaced the `wasmi` interpreter with wasmtime 49 (`wasmtime` +
   `wasmtime-wasi`) for the Coraza WASI reactor. `Engine`/`Module` compile once,
   the preview1 imports come from wasmtime-wasi, and each worker thread keeps a
-  cached `Store`/instance/memory with fuel and 256 MiB memory limits.
-  wasmtime-wasi's sync preview1 adapters cannot be called inside the proxy's
-  Tokio workers, so the stdio/path imports are shadowed with the previous
-  authority-free shims; the clock and entropy calls remain wasmtime-wasi's.
+  cached `Store`/instance/memory with a 256 MiB memory limit. wasmtime-wasi's
+  sync preview1 adapters cannot be called inside the proxy's Tokio workers, so
+  the stdio/path imports are shadowed with the previous authority-free shims;
+  the clock and entropy calls remain wasmtime-wasi's.
 - Raised the pinned Rust toolchain to 1.99.1 (rust-overlay updated) because
   wasmtime 49 requires Rust >= 1.96.
-- Added reused-instance and per-thread isolation tests for the reactor,
-  covering interleaved allow/block decisions and three concurrent threads.
-
-### Documentation
-
-- Documented Coraza metrics, alert rules and recording overhead in
-  `docs/operations/monitoring.md` and `docs/coraza-wasi-reactor.md`.
-- Added measured p50/mean latency and throughput for the Coraza WASI reactor to
-  `docs/coraza-wasi-reactor.md`, including hardware, command and the 64 KiB ABI
-  payload ceiling.
-- Documented the live wiring, `[waf.coraza]` configuration, failure policy and
-  observed reactor latency in `docs/coraza-wasi-reactor.md`; updated the README
-  security limitations. The reactor is enabled by default and documents the
-  measured start-up and per-request cost.
-- Embedded OWASP Core Rule Set (CRS) 4.14.0 (commit
-  `b5b788b5bc50e68836e17995b191f72e848fed75`) in the Coraza WASI reactor,
-  replacing the four starter rules. Coverage is the complete request-side CRS:
-  protocol enforcement, LFI/RFI, RCE, PHP/Java/generic injection, XSS, SQLi,
-  session fixation and anomaly-score blocking at paranoia level 1. Response
-  rules are excluded because response bodies are not available over the host
-  ABI; deployment-specific exclusion files, plugins and the upstream regression
-  corpus are also excluded. See `wasm/coraza_reactor/rules/crs/PROVENANCE.md`
-  and `docs/coraza-wasi-reactor.md`.
-- `scripts/vendor-coraza-crs.sh` reproduces the pinned CRS vendoring and
-  directive flattening.
-- Reactor tests now cover SQLi, XSS, path traversal, command injection and two
-  benign false-positive cases.
-
-### Changed
-
 - The Coraza reactor module grows to about 20 MiB (from 18 MiB) because it now
-  contains the CRS rules and `@pmFromFile` data. The reactor fuel budget and
-  wasmi recursion depth are raised to 200 billion and 1024 respectively so the
-  larger rule bundle can initialise and evaluate.
+  contains the CRS rules and `@pmFromFile` data.
+
+### Performance and limitations
+
+- Measured on the reference machine: bodyless/small-body evaluations cost
+  ~2–6 ms, an 8 KiB body ~350 ms and a 60 KiB body ~2.6 s. The ABI payload
+  ceiling is 64 KiB.
+- Each pre-warmed worker holds roughly 127 MiB RSS, so the default pool (cores
+  clamped to `1..=8`) is not free; size `waf.coraza.pool_size` accordingly.
+- CRS evaluation through the WASI reactor is **not sub-millisecond**. The
+  wasm boundary and Go/CRS work dominate; wasmtime's compiled execution did not
+  remove that cost. The traditional Rust heuristic rules remain the cheap
+  first line of defence.
+- Response bodies are not inspected: the host ABI exposes request data only.
 
 ### Release packaging
 
@@ -188,14 +169,21 @@ All notable changes to WAF-Rejected are documented here.
   is the documented switch that skips validation and warm-up.
 - A 32 MiB module size budget is enforced by the host loader, Nix package,
   container build, release workflow and
-  `scripts/check-coraza-reactor-size.sh`. The current module is about 18 MiB;
+  `scripts/check-coraza-reactor-size.sh`. The current module is about 20 MiB;
   the tradeoff is documented in `docs/coraza-wasi-reactor.md`.
+- `scripts/vendor-coraza-crs.sh` reproduces the pinned CRS vendoring and
+  directive flattening.
 
 ### Documentation
 
-- Updated `docs/coraza-wasi-reactor.md`, the release checklist, container guide
-  and SBOM notes with the stable reactor path, startup validation and size
-  budget.
+- Added `docs/coraza-wasi-reactor.md` covering live wiring, the
+  `[waf.coraza]` configuration, failure policy, start-up and per-request
+  latency, hardware, benchmark commands and the 64 KiB ABI payload ceiling;
+  updated the README security limitations.
+- Documented Coraza metrics, alert rules and recording overhead in
+  `docs/operations/monitoring.md` and `docs/coraza-wasi-reactor.md`.
+- Updated the release checklist, container guide and SBOM notes with the
+  stable reactor path, startup validation and size budget.
 
 ## [0.1.0-beta.10] - 2026-11-01
 
