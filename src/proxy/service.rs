@@ -504,7 +504,11 @@ impl WafProxyService {
     pub fn new(config: Config) -> Result<Self, WafError> {
         info!("Initializing WAF Proxy Service with performance optimizations");
 
-        let waf_engine = Arc::new(WafEngine::with_config(&config));
+        let metrics = Arc::new(Metrics::new());
+        let waf_engine = Arc::new(WafEngine::with_config_and_metrics(
+            &config,
+            Some(Arc::clone(&metrics)),
+        ));
 
         // The WAF engine is a configured security control: a start-up failure
         // (Coraza compile/validation/warm, or the gRPC allowlist artifact)
@@ -598,8 +602,6 @@ impl WafProxyService {
                 }
             })
             .collect();
-
-        let metrics = Arc::new(Metrics::new());
 
         info!(
             "WAF Proxy Service initialized with {} rules",
@@ -2049,7 +2051,7 @@ impl WafProxyService {
         let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::FORBIDDEN);
         let body = format!("Request blocked by WAF: {}", reason);
 
-        Response::builder()
+        let mut builder = Response::builder()
             .status(status)
             .header("content-type", "text/plain")
             .header("x-waf-decision", "block")
@@ -2061,9 +2063,12 @@ impl WafProxyService {
             .header(
                 "x-waf-supported-protocols",
                 "HTTP/1.0,HTTP/1.1,HTTP/2,HTTP/3",
-            )
-            .body(ProxyBody::full(body))
-            .unwrap()
+            );
+        // Admission rejection is transient: advertise a short retry hint.
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            builder = builder.header("retry-after", "1");
+        }
+        builder.body(ProxyBody::full(body)).unwrap()
     }
 
     /// Create rate limit response with protocol information

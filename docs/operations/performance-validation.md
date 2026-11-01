@@ -233,11 +233,42 @@ directly:
 | 90% bodyless + 10% 60 KiB at c=64 | bodyless p95 **6.49 s** vs 51.1 ms baseline |
 | 60 KiB at c=16 | p95 13.82 s |
 
-This is the most important beta finding. Mitigations would include a lower
-body-size limit for untrusted routes, a separate reactor pool/queue for large
-bodies, admission control on concurrent large scans, or an async/streaming
-inspection path. None of these are implemented here; changing defaults or
-security policy is out of scope for this task.
+This is the most important beta finding. Heavy-inspection admission control is
+implemented in `feat/coraza-admission` (see below). A lower body-size limit for
+untrusted routes or an async/streaming inspection path remain possible future
+mitigations; changing defaults or security policy is out of scope.
+
+### Admission control: 60 KiB isolation after the fix
+
+`[waf.admission]` classifies evaluations as cheap (no body, or a gRPC/GraphQL
+body withheld from CRS) or heavy (CRS body scan). Heavy evaluations are capped
+at `heavy_permits`; auto reserves about half the reactor pool, capped at
+`pool_size - 1`. Cheap requests bypass the heavy queue. A saturated heavy queue
+rejects with `503 + Retry-After`, never `Allow`.
+
+Measured on 2026-11-01 from the `feat/coraza-admission` working tree, release
+build, warm-up 1 s + measurement 5 s for the heavy matrix and 1 s + 3 s for the
+light cells, seed 42, pool auto = 6 (heavy permits = 3). The host was **not
+idle**: 1-minute load average was **9.03** on 6 logical CPUs during the light
+run and ~8.2 during the heavy matrix, versus 7.37 in the baseline. Absolute
+light latencies are therefore not directly comparable; the isolation ratio is.
+
+| case | before | after |
+|---|---|---|
+| 90% bodyless + 10% 60 KiB, c=64: bodyless p95 | **6 492 ms** | **240.8 ms** |
+| 90% bodyless + 10% 60 KiB, c=64: bodyless errors/503 | 0 / 0 | 0 / 0 |
+| bodyless only, c=64: p95 | 51.1 ms | 83.7 ms (load 9.03) |
+| gRPC 1 KiB only, c=64: p95 | 68.2 ms | 114.0 ms (load 9.03) |
+| gRPC 256 KiB only, c=64: p95 | 71.0 ms | 156.6 ms (load 9.03) |
+| form-60k, c=6 | six workers occupied; bodyless starves | admitted p95 ~5.0 s, excess heavy requests 503 after 250 ms |
+
+The mixed-DoS bodyless tail improves by ~27x with zero bodyless errors or
+503s and zero false allows/blocks. `dos-isolation-bodyless-c64` still fails its
+100 ms gate on this host under sustained 10% 60 KiB load, because the reserved
+cheap capacity is finite; it is no longer a multi-second starvation. Heavy
+requests above the permit count are deliberately rejected rather than queued
+indefinitely, which is why heavy-only cells now show 503s. Operators who value
+heavy throughput over cheap latency can raise `heavy_permits` explicitly.
 
 ### Memory
 

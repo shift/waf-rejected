@@ -6,6 +6,18 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Added
 
+- Heavy-inspection admission control (`[waf.admission]`). Each evaluation is
+  classified as cheap (no body, or a gRPC/GraphQL body withheld from CRS) or
+  heavy (CRS body scan) from the context the protocol pre-checks already
+  produce. Heavy requests need one of `heavy_permits` slots (auto reserves
+  about half the pool, capped at `pool_size - 1`, keeping reactor workers for
+  cheap traffic), wait
+  asynchronously up to `queue_timeout_ms` in a bounded `max_queued` queue, and
+  fail closed with `503 + Retry-After` on saturation or timeout. Cheap requests
+  bypass the queue. New metrics (`waf_admission_*`) and Prometheus alerts cover
+  queue depth, admissions, rejections, wait duration and per-class in-flight.
+  Inspection is never skipped or reduced. See `docs/coraza-wasi-reactor.md`.
+
 - Descriptor-driven gRPC field-level inspection. The generated allowlist
   artifact now carries an `ir_version` 2 `messages` section with request
   message field metadata (reachable nested messages and enum values, bounded

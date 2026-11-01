@@ -460,6 +460,64 @@ pub struct WafConfig {
 
     /// Protocol-aware GraphQL-over-HTTP inspection (`wasm-reactor` feature).
     pub graphql: WafGraphqlConfig,
+
+    /// Admission control for expensive (CRS body) inspections.
+    pub admission: WafAdmissionConfig,
+}
+
+/// Admission control for expensive inspections.
+///
+/// Cheap requests (no body, or a body withheld from CRS by the gRPC/GraphQL
+/// pre-checks) bypass the heavy queue entirely. Heavy requests need one of
+/// `heavy_permits` slots, wait at most `queue_timeout_ms` when saturated, and
+/// are rejected with `503 + Retry-After` when the queue is full or the wait
+/// expires. Admission never skips or reduces inspection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WafAdmissionConfig {
+    /// Enable heavy-inspection admission control. Enabling this does not
+    /// weaken inspection: heavy requests are still fully evaluated or
+    /// rejected, never allowed.
+    pub enabled: bool,
+
+    /// Number of concurrent heavy evaluations allowed. `0` selects about half
+    /// the reactor pool, capped at `pool_size - 1` (at least 1), reserving
+    /// reactor workers for cheap requests.
+    pub heavy_permits: usize,
+
+    /// Maximum time a heavy request may wait for a permit before a `503`.
+    pub queue_timeout_ms: u64,
+
+    /// Maximum number of heavy requests waiting for a permit. `0` disables
+    /// queueing: a saturated pool rejects immediately.
+    pub max_queued: usize,
+}
+
+impl Default for WafAdmissionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            heavy_permits: 0,
+            queue_timeout_ms: 250,
+            max_queued: 64,
+        }
+    }
+}
+
+impl WafAdmissionConfig {
+    /// Resolve `heavy_permits = 0` against the reactor pool size, keeping at
+    /// least one worker free for cheap requests when the pool has more than
+    /// one worker. Reserving about half the pool keeps cheap traffic useful
+    /// under sustained heavy load while still admitting large-body scans.
+    pub fn resolved_heavy_permits(&self, pool_size: usize) -> usize {
+        let pool_size = pool_size.max(1);
+        if self.heavy_permits == 0 {
+            let half = (pool_size / 2).max(1);
+            half.min(pool_size.saturating_sub(1).max(1))
+        } else {
+            self.heavy_permits.min(pool_size)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -644,6 +702,21 @@ pub struct WafCorazaConfig {
     /// Number of pre-warmed reactor instances, one dedicated OS thread each.
     /// `0` selects the number of available cores clamped to `1..=8`.
     pub pool_size: usize,
+}
+
+impl WafCorazaConfig {
+    /// Resolve `pool_size = 0` to one worker per available core, clamped to
+    /// `1..=8`.
+    pub fn resolved_pool_size(&self) -> usize {
+        if self.pool_size == 0 {
+            std::thread::available_parallelism()
+                .map(std::num::NonZeroUsize::get)
+                .unwrap_or(1)
+                .clamp(1, 8)
+        } else {
+            self.pool_size
+        }
+    }
 }
 
 impl Default for WafCorazaConfig {
@@ -1316,6 +1389,7 @@ impl Default for WafConfig {
             coraza: WafCorazaConfig::default(),
             grpc: WafGrpcConfig::default(),
             graphql: WafGraphqlConfig::default(),
+            admission: WafAdmissionConfig::default(),
         }
     }
 }
@@ -1503,6 +1577,12 @@ impl Config {
             anyhow::bail!(
                 "waf.coraza.native_socket_path is required when waf.coraza.backend = \"native\""
             );
+        }
+        if self.waf.admission.enabled && self.waf.admission.queue_timeout_ms == 0 {
+            anyhow::bail!("waf.admission.queue_timeout_ms must be greater than zero");
+        }
+        if self.waf.admission.heavy_permits > 8 {
+            anyhow::bail!("waf.admission.heavy_permits must be between 0 (auto) and 8");
         }
         self.waf.grpc.validate()?;
         self.waf.graphql.validate()?;

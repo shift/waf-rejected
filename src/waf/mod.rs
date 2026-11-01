@@ -1,3 +1,4 @@
+pub mod admission;
 pub mod ai;
 pub mod auth;
 pub mod content_inspection;
@@ -47,6 +48,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
+use self::admission::AdmissionController;
 use self::content_inspection::ContentInspectionRuleFactory;
 use self::geoip::{GeoBlockingRuleFactory, GeoIpService};
 use self::rate_limit::{GlobalRateLimiter, RateLimiter};
@@ -183,6 +185,11 @@ pub struct WafEngine {
     wasm_engine: Option<Arc<WasmEngine>>,
     #[cfg(feature = "ai-threat-detection")]
     ai_detector: Option<Arc<ai::AiThreatDetector>>,
+    /// Bounds concurrent heavy (CRS body) inspections so cheap traffic keeps
+    /// at least one reactor worker.
+    admission: AdmissionController,
+    /// Shared runtime metrics, when the caller supplied them.
+    metrics: Option<Arc<crate::metrics::Metrics>>,
 }
 
 /// Outcome of the gRPC protocol pre-check.
@@ -228,6 +235,8 @@ impl Clone for WafEngine {
             wasm_engine: self.wasm_engine.clone(),
             #[cfg(feature = "ai-threat-detection")]
             ai_detector: self.ai_detector.clone(),
+            admission: self.admission.clone(),
+            metrics: self.metrics.clone(),
         }
     }
 }
@@ -249,10 +258,24 @@ impl WafEngine {
             graphql_inspector: None,
             #[cfg(feature = "wasm-waf")]
             wasm_engine: None,
+            #[cfg(feature = "ai-threat-detection")]
+            ai_detector: None,
+            admission: AdmissionController::disabled(),
+            metrics: None,
         }
     }
 
     pub fn with_config(config: &Config) -> Self {
+        Self::with_config_and_metrics(config, None)
+    }
+
+    /// Build an engine and attach the process metrics registry. Admission
+    /// counters, reactor metrics and per-class in-flight gauges are then
+    /// exposed through `/metrics`.
+    pub fn with_config_and_metrics(
+        config: &Config,
+        metrics: Option<Arc<crate::metrics::Metrics>>,
+    ) -> Self {
         #[cfg(feature = "wasm-waf")]
         let wasm_engine = Self::initialize_wasm_engine(config);
         #[cfg(feature = "wasm-waf")]
@@ -277,6 +300,12 @@ impl WafEngine {
             wasm_engine,
             #[cfg(feature = "ai-threat-detection")]
             ai_detector: Self::initialize_ai_detector(config),
+            admission: AdmissionController::from_config(
+                &config.waf.admission,
+                config.waf.coraza.resolved_pool_size(),
+                metrics.clone(),
+            ),
+            metrics,
         };
 
         // gRPC is protocol-aware: validate the envelope before Coraza runs so
@@ -338,7 +367,13 @@ impl WafEngine {
             #[cfg(feature = "wasm-reactor")]
             crate::config::CorazaBackend::Wasm => {
                 wasm_reactor::WasmReactorRule::from_config(&config.waf.coraza, self.fail_closed)
-                    .map(|rule| Box::new(rule) as Box<dyn WafRule>)
+                    .map(|rule| {
+                        let rule = match &self.metrics {
+                            Some(metrics) => rule.with_metrics(Arc::clone(metrics)),
+                            None => rule,
+                        };
+                        Box::new(rule) as Box<dyn WafRule>
+                    })
                     .map_err(|err| err.to_string())
             }
             #[cfg(not(feature = "wasm-reactor"))]
@@ -571,6 +606,17 @@ impl WafEngine {
         info!("Added {} default WAF rules", self.rule_count());
     }
 
+    /// Replace the admission controller. Primarily for embedding and tests.
+    pub fn with_admission(mut self, admission: AdmissionController) -> Self {
+        self.admission = admission;
+        self
+    }
+
+    /// The admission controller used for heavy inspections.
+    pub fn admission(&self) -> &AdmissionController {
+        &self.admission
+    }
+
     pub fn add_rule<R: WafRule + 'static>(&mut self, rule: R) {
         self.add_rule_boxed(Box::new(rule));
     }
@@ -757,6 +803,28 @@ impl WafEngine {
         if let Some(_wasm_engine) = &self.wasm_engine {
             debug!("Skipping WASM evaluation for fast path (performance optimization)");
         }
+
+        // Admission control wraps the rule chain that contains the reactor.
+        let _admission_guard = match self.admission.admit(admission::classify(request)).await {
+            Ok(guard) => guard,
+            Err(rejection) => {
+                let decision = Decision::Block {
+                    status: 503,
+                    reason: format!(
+                        "WAF admission control rejected heavy inspection: {rejection}; retry later"
+                    ),
+                };
+                warn!(
+                    client_ip = %request.client_ip,
+                    reason = %rejection,
+                    "heavy inspection rejected by admission control"
+                );
+                self.event_logger
+                    .log_event(request, &decision, vec!["admission-control".to_string()])
+                    .await;
+                return decision;
+            }
+        };
 
         // PHASE 2: Optimized traditional rule evaluation
         {
@@ -970,6 +1038,30 @@ impl WafEngine {
                 }
             }
         }
+
+        // Admission control wraps the rule chain that contains the reactor.
+        // Classification uses the post-precheck context, so a body withheld
+        // by gRPC/GraphQL is cheap and never waits behind CRS body scans.
+        let _admission_guard = match self.admission.admit(admission::classify(request)).await {
+            Ok(guard) => guard,
+            Err(rejection) => {
+                let decision = Decision::Block {
+                    status: 503,
+                    reason: format!(
+                        "WAF admission control rejected heavy inspection: {rejection}; retry later"
+                    ),
+                };
+                warn!(
+                    client_ip = %request.client_ip,
+                    reason = %rejection,
+                    "heavy inspection rejected by admission control"
+                );
+                self.event_logger
+                    .log_event(request, &decision, vec!["admission-control".to_string()])
+                    .await;
+                return decision;
+            }
+        };
 
         // PHASE 3: Traditional rule evaluation
         {
@@ -1591,6 +1683,177 @@ mod tests {
             engine.evaluate(&create_test_context()).await,
             Decision::Allow
         );
+    }
+
+    struct SlowRule {
+        started: Arc<std::sync::atomic::AtomicBool>,
+        delay: std::time::Duration,
+        heavy_only: bool,
+    }
+
+    impl WafRule for SlowRule {
+        fn name(&self) -> &str {
+            "slow-inspection"
+        }
+
+        fn evaluate(&self, ctx: &RequestContext) -> Decision {
+            let heavy = ctx.body.as_ref().is_some_and(|body| !body.is_empty());
+            if heavy || !self.heavy_only {
+                self.started
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(self.delay);
+            }
+            Decision::Allow
+        }
+    }
+
+    fn admission_context(body: &str) -> RequestContext {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-type",
+            "application/x-www-form-urlencoded".parse().unwrap(),
+        );
+        RequestContext::new(
+            IpAddr::from_str("192.168.1.100").unwrap(),
+            Method::POST,
+            Uri::from_str("/login").unwrap(),
+            headers,
+            Some(body.len()),
+        )
+        .with_body(Some(Bytes::from(body.to_string())))
+    }
+
+    async fn wait_for_slow_rule(started: &std::sync::atomic::AtomicBool) {
+        for _ in 0..200 {
+            if started.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        panic!("slow rule did not start");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cheap_request_bypasses_saturated_heavy_admission() {
+        use std::sync::atomic::AtomicBool;
+
+        let started = Arc::new(AtomicBool::new(false));
+        let admission = AdmissionController::with_permits(
+            true,
+            1,
+            std::time::Duration::from_millis(50),
+            4,
+            None,
+        );
+        let mut engine = WafEngine::new().with_admission(admission);
+        engine.add_rule(SlowRule {
+            started: Arc::clone(&started),
+            delay: std::time::Duration::from_millis(250),
+            heavy_only: true,
+        });
+
+        let heavy_engine = engine.clone();
+        let heavy =
+            tokio::spawn(async move { heavy_engine.evaluate(&admission_context("a=1")).await });
+        wait_for_slow_rule(&started).await;
+
+        let cheap_started = std::time::Instant::now();
+        let decision = engine.evaluate(&create_test_context()).await;
+        assert_eq!(decision, Decision::Allow);
+        assert!(
+            cheap_started.elapsed() < std::time::Duration::from_millis(100),
+            "cheap request waited behind heavy inspection: {:?}",
+            cheap_started.elapsed()
+        );
+
+        assert_eq!(heavy.await.unwrap(), Decision::Allow);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn heavy_request_times_out_with_503_metrics_and_recovers() {
+        use std::sync::atomic::AtomicBool;
+
+        let metrics = Arc::new(crate::metrics::Metrics::new());
+        let started = Arc::new(AtomicBool::new(false));
+        let admission = AdmissionController::with_permits(
+            true,
+            1,
+            std::time::Duration::from_millis(50),
+            2,
+            Some(Arc::clone(&metrics)),
+        );
+        let mut engine = WafEngine::new().with_admission(admission);
+        engine.add_rule(SlowRule {
+            started: Arc::clone(&started),
+            delay: std::time::Duration::from_millis(250),
+            heavy_only: true,
+        });
+
+        let heavy_engine = engine.clone();
+        let heavy =
+            tokio::spawn(async move { heavy_engine.evaluate(&admission_context("a=1")).await });
+        wait_for_slow_rule(&started).await;
+
+        let decision = engine.evaluate(&admission_context("b=2")).await;
+        match &decision {
+            Decision::Block { status, reason } => {
+                assert_eq!(*status, 503);
+                assert!(
+                    reason.contains("admission control"),
+                    "reason must name admission control: {reason}"
+                );
+            }
+            other => panic!("admission rejection must never Allow: {other:?}"),
+        }
+
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered.contains("waf_admission_queued_total 1"),
+            "queued metric missing:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("waf_admission_rejected_total{reason=\"timeout\"} 1"),
+            "rejection metric missing:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("waf_admission_queue_depth 0"),
+            "queue depth must return to zero:\n{rendered}"
+        );
+
+        assert_eq!(heavy.await.unwrap(), Decision::Allow);
+        assert_eq!(
+            engine.evaluate(&admission_context("c=3")).await,
+            Decision::Allow,
+            "admission must recover after the permit is released"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_admission_admits_heavy_requests_without_queueing() {
+        let metrics = Arc::new(crate::metrics::Metrics::new());
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let admission = AdmissionController::with_permits(
+            false,
+            1,
+            std::time::Duration::from_millis(1),
+            0,
+            Some(Arc::clone(&metrics)),
+        );
+        let mut engine = WafEngine::new().with_admission(admission);
+        engine.add_rule(SlowRule {
+            started,
+            delay: std::time::Duration::from_millis(20),
+            heavy_only: true,
+        });
+
+        assert_eq!(
+            engine.evaluate(&admission_context("a=1")).await,
+            Decision::Allow
+        );
+        let rendered = metrics.render_prometheus();
+        assert!(rendered.contains("waf_admission_queued_total 0"));
+        assert!(rendered.contains("waf_admission_rejected_total{reason=\"timeout\"} 0"));
+        assert!(rendered.contains("waf_admission_rejected_total{reason=\"queue_full\"} 0"));
     }
 
     #[cfg(feature = "wasm-reactor")]

@@ -256,6 +256,41 @@ The historical spike modules without `_initialize` or `input_base` still work:
 the host only calls them when exported and otherwise uses the fixed
 `INPUT_BASE = 1024` offset.
 
+### Capacity and admission control
+
+A CRS body scan holds one reactor worker for the whole evaluation (about 3 s
+for a 60 KiB form on the reference host), while a bodyless or gRPC/GraphQL
+body-withheld request is ~2.5 ms. The pool is intentionally fixed; admission
+control sits in front of it so expensive evaluations cannot occupy every
+worker:
+
+- **Classification.** After the gRPC/GraphQL pre-checks, a request is `heavy`
+  when it still has a non-empty body and `cheap` otherwise. A body stripped by
+  a pre-check is therefore cheap without a second parse. Classification is
+  never used to skip or reduce inspection.
+- **Heavy permits.** `waf.admission.heavy_permits` bounds concurrent body
+  scans. `0` (default) resolves to about half the pool, capped at
+  `pool_size - 1` (at least 1), so reactor workers remain available for cheap
+  requests.
+- **Bounded async queue.** When all heavy permits are held, a heavy request
+  waits on a `tokio::sync::Semaphore` for at most
+  `waf.admission.queue_timeout_ms` (default 250 ms). At most
+  `waf.admission.max_queued` (default 64) requests may wait; `0` rejects
+  immediately. Waiting never blocks a Tokio worker.
+- **Fail closed.** A full queue or an expired wait returns `503` with
+  `Retry-After: 1` and a reason naming admission control. It never returns
+  `Allow`. Cheap requests bypass the heavy queue entirely.
+- **Observability.** `waf_admission_queued_total`,
+  `waf_admission_queue_depth`, `waf_admission_admitted_total`,
+  `waf_admission_rejected_total{reason="queue_full|timeout"}`,
+  `waf_admission_wait_duration_seconds` and
+  `waf_admission_inflight{class="cheap|heavy"}` are exposed through
+  `/metrics`. Prometheus alerts fire on sustained heavy rejections and a
+  persistently non-empty queue.
+
+Set `waf.admission.enabled = false` to restore the historical behaviour
+(unbounded waiting on the reactor pool). The default is `true`.
+
 ### Payload
 
 UTF-8 JSON, matching `build_payload` in `src/waf/wasm_reactor.rs`:

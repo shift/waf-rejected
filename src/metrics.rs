@@ -37,6 +37,17 @@ pub struct Metrics {
     coraza_duration_inf: AtomicU64,
     coraza_duration_sum_nanos: AtomicU64,
     coraza_duration_count: AtomicU64,
+    admission_queued_total: AtomicU64,
+    admission_queue_depth: AtomicU64,
+    admission_admitted_total: AtomicU64,
+    admission_rejected_queue_full_total: AtomicU64,
+    admission_rejected_timeout_total: AtomicU64,
+    admission_wait_buckets: [AtomicU64; 11],
+    admission_wait_inf: AtomicU64,
+    admission_wait_sum_nanos: AtomicU64,
+    admission_wait_count: AtomicU64,
+    admission_cheap_inflight: AtomicU64,
+    admission_heavy_inflight: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -71,6 +82,17 @@ impl Metrics {
             coraza_duration_inf: AtomicU64::new(0),
             coraza_duration_sum_nanos: AtomicU64::new(0),
             coraza_duration_count: AtomicU64::new(0),
+            admission_queued_total: AtomicU64::new(0),
+            admission_queue_depth: AtomicU64::new(0),
+            admission_admitted_total: AtomicU64::new(0),
+            admission_rejected_queue_full_total: AtomicU64::new(0),
+            admission_rejected_timeout_total: AtomicU64::new(0),
+            admission_wait_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            admission_wait_inf: AtomicU64::new(0),
+            admission_wait_sum_nanos: AtomicU64::new(0),
+            admission_wait_count: AtomicU64::new(0),
+            admission_cheap_inflight: AtomicU64::new(0),
+            admission_heavy_inflight: AtomicU64::new(0),
         }
     }
 
@@ -142,6 +164,67 @@ impl Metrics {
 
     pub fn record_coraza_error(&self) {
         self.coraza_errors_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn admission_queued(&self) {
+        self.admission_queued_total.fetch_add(1, Ordering::Relaxed);
+        self.admission_queue_depth.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn admission_dequeued(&self) {
+        self.admission_queue_depth.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn admission_admitted(&self) {
+        self.admission_admitted_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn admission_rejected_queue_full(&self) {
+        self.admission_rejected_queue_full_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn admission_rejected_timeout(&self) {
+        self.admission_rejected_timeout_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Observe how long a heavy request waited for an admission permit.
+    pub fn record_admission_wait(&self, duration: Duration) {
+        let seconds = duration.as_secs_f64();
+        self.admission_wait_count.fetch_add(1, Ordering::Relaxed);
+        self.admission_wait_sum_nanos.fetch_add(
+            duration.as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+        for (index, bound) in DURATION_BUCKETS.iter().enumerate() {
+            if seconds <= *bound {
+                self.admission_wait_buckets[index].fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        self.admission_wait_inf.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn admission_cheap_started(&self) {
+        self.admission_cheap_inflight
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn admission_cheap_finished(&self) {
+        self.admission_cheap_inflight
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn admission_heavy_started(&self) {
+        self.admission_heavy_inflight
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn admission_heavy_finished(&self) {
+        self.admission_heavy_inflight
+            .fetch_sub(1, Ordering::Relaxed);
     }
 
     pub fn record_webtransport_session(&self) {
@@ -236,6 +319,62 @@ impl Metrics {
             self.coraza_evaluations_total.load(Ordering::Relaxed),
             self.coraza_blocks_total.load(Ordering::Relaxed),
             self.coraza_errors_total.load(Ordering::Relaxed),
+        ));
+
+        out.push_str(&format!(
+            "# HELP waf_admission_queued_total Heavy inspections that had to wait for a permit.\n\
+             # TYPE waf_admission_queued_total counter\n\
+             waf_admission_queued_total {}\n\
+             # HELP waf_admission_queue_depth Heavy inspections currently waiting for a permit.\n\
+             # TYPE waf_admission_queue_depth gauge\n\
+             waf_admission_queue_depth {}\n\
+             # HELP waf_admission_admitted_total Heavy inspections admitted after waiting.\n\
+             # TYPE waf_admission_admitted_total counter\n\
+             waf_admission_admitted_total {}\n\
+             # HELP waf_admission_rejected_total Heavy inspections rejected by admission control, by reason.\n\
+             # TYPE waf_admission_rejected_total counter\n\
+             waf_admission_rejected_total{{reason=\"queue_full\"}} {}\n\
+             waf_admission_rejected_total{{reason=\"timeout\"}} {}\n\
+             # HELP waf_admission_inflight In-flight evaluations by inspection class.\n\
+             # TYPE waf_admission_inflight gauge\n\
+             waf_admission_inflight{{class=\"cheap\"}} {}\n\
+             waf_admission_inflight{{class=\"heavy\"}} {}\n",
+            self.admission_queued_total.load(Ordering::Relaxed),
+            self.admission_queue_depth.load(Ordering::Relaxed),
+            self.admission_admitted_total.load(Ordering::Relaxed),
+            self.admission_rejected_queue_full_total.load(Ordering::Relaxed),
+            self.admission_rejected_timeout_total.load(Ordering::Relaxed),
+            self.admission_cheap_inflight.load(Ordering::Relaxed),
+            self.admission_heavy_inflight.load(Ordering::Relaxed),
+        ));
+
+        out.push_str(
+            "# HELP waf_admission_wait_duration_seconds Time heavy inspections waited for a permit.\n\
+             # TYPE waf_admission_wait_duration_seconds histogram\n",
+        );
+        let mut admission_cumulative = 0u64;
+        for (index, bound) in DURATION_BUCKETS.iter().enumerate() {
+            admission_cumulative = admission_cumulative
+                .saturating_add(self.admission_wait_buckets[index].load(Ordering::Relaxed));
+            out.push_str(&format!(
+                "waf_admission_wait_duration_seconds_bucket{{le=\"{}\"}} {}\n",
+                format_bucket(*bound),
+                admission_cumulative
+            ));
+        }
+        let admission_total =
+            admission_cumulative.saturating_add(self.admission_wait_inf.load(Ordering::Relaxed));
+        out.push_str(&format!(
+            "waf_admission_wait_duration_seconds_bucket{{le=\"+Inf\"}} {}\n",
+            admission_total
+        ));
+        out.push_str(&format!(
+            "waf_admission_wait_duration_seconds_sum {}\n",
+            self.admission_wait_sum_nanos.load(Ordering::Relaxed) as f64 / 1_000_000_000.0
+        ));
+        out.push_str(&format!(
+            "waf_admission_wait_duration_seconds_count {}\n",
+            self.admission_wait_count.load(Ordering::Relaxed)
         ));
 
         out.push_str(

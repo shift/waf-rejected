@@ -80,6 +80,20 @@ block_tor = false
 block_vpn = false
 block_datacenter = false
 
+[waf.admission]
+# Bound concurrent heavy (CRS body) inspections so a few large bodies cannot
+# starve cheap requests. Cheap requests (no body, or a gRPC/GraphQL body
+# withheld from CRS) bypass this queue. Saturation or timeout fails closed with
+# 503 + Retry-After; inspection is never skipped or reduced.
+enabled = true
+# 0 = auto: about half the reactor pool, capped at pool_size - 1 (at least
+# 1), reserving reactor workers for cheap traffic. Set explicitly to tune.
+heavy_permits = 0
+# Maximum time a heavy request may wait for a permit before a 503.
+queue_timeout_ms = 250
+# Maximum heavy requests waiting; 0 rejects immediately when saturated.
+max_queued = 64
+
 [waf.wasm]
 # The component ABI is not wired up yet; enabling this uses the built-in
 # heuristic fallback, not the actual Coraza module.

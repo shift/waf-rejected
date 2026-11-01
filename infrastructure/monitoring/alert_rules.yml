@@ -118,3 +118,27 @@ groups:
         annotations:
           summary: "High CPU usage"
           description: "Pod {{ $labels.pod }} CPU usage is high"
+
+      - alert: CorazaAdmissionHeavyRejections
+        expr: |
+          rate(waf_admission_rejected_total[5m])
+          /
+          clamp_min(rate(waf_coraza_evaluations_total[5m]), 0.001)
+          > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          category: performance
+        annotations:
+          summary: "Sustained heavy-inspection admission rejections"
+          description: "{{ $value | humanizePercentage }} of Coraza evaluations are being rejected by admission control; heavy bodies are saturating the pool"
+
+      - alert: CorazaAdmissionQueueSaturated
+        expr: waf_admission_queue_depth > 0
+        for: 2m
+        labels:
+          severity: warning
+          category: performance
+        annotations:
+          summary: "Heavy-inspection admission queue saturated"
+          description: "{{ $value }} heavy inspections have been waiting for a permit for 2 minutes; heavy bodies are saturating the pool"
