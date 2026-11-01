@@ -4,6 +4,20 @@ All notable changes to WAF-Rejected are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- Descriptor-driven gRPC field-level inspection. The generated allowlist
+  artifact now carries an `ir_version` 2 `messages` section with request
+  message field metadata (reachable nested messages and enum values, bounded
+  to depth 16). A dependency-free protobuf wire decoder in
+  `src/waf/protobuf.rs` enforces `[waf.grpc]` field limits
+  (`max_string_bytes`, `max_bytes_len`, `max_repeated`, `max_depth`,
+  `max_decoded_fields`), optional unknown-field rejection
+  (`reject_unknown_fields`), enum membership and basic string sanity checks,
+  reporting the fully-qualified field path in the decision reason. Version 1
+  artifacts and methods without metadata keep envelope-only behaviour; raw
+  protobuf is still never sent to CRS. See `docs/grpc-inspection.md`.
+
 ## [0.1.0-beta.11] - 2026-11-01
 
 ### Added

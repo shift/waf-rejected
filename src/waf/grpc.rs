@@ -18,10 +18,14 @@
 //!   length), frame count, per-message size and truncation,
 //! * `grpc-encoding` (`identity` only),
 //! * base64 syntax of binary `-bin` metadata, which is excluded from text
-//!   (regex) scanning.
+//!   (regex) scanning,
+//! * when the artifact carries descriptor metadata, the request message is
+//!   decoded and each field is checked against `[waf.grpc]` field limits,
+//!   unknown-field policy, enum declarations and string sanity rules.
 //!
-//! Field-level protobuf inspection is **not** implemented here: it needs the
-//! service descriptor (`FileDescriptorSet`) and is tracked separately.
+//! Field-level inspection only uses the descriptor metadata in the artifact.
+//! Methods without metadata keep envelope-only behaviour, and the raw
+//! protobuf body is still never handed to CRS.
 
 use std::collections::{HashMap, HashSet};
 
@@ -31,7 +35,8 @@ use hyper::HeaderMap;
 use tracing::debug;
 
 use crate::config::WafGrpcConfig;
-use crate::waf::grpc_allowlist::{self, GrpcAllowlist, GrpcAllowlistError};
+use crate::waf::grpc_allowlist::{self, GrpcAllowlist, GrpcAllowlistError, GrpcMessage};
+use crate::waf::protobuf::{self, DecodeLimits};
 use crate::waf::{Decision, RequestContext, WafRule};
 
 /// Bytes in a gRPC message prefix: 1 flag byte + 4 length bytes.
@@ -306,6 +311,27 @@ pub fn validate_frames(body: &[u8], limits: FrameLimits) -> Result<FrameReport, 
     Ok(report)
 }
 
+/// Iterates over message payloads in a frame sequence already accepted by
+/// [`validate_frames`].
+fn frame_payloads(body: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut offset = 0usize;
+    std::iter::from_fn(move || {
+        if offset + FRAME_PREFIX_LEN > body.len() {
+            return None;
+        }
+        let length = u32::from_be_bytes([
+            body[offset + 1],
+            body[offset + 2],
+            body[offset + 3],
+            body[offset + 4],
+        ]) as usize;
+        let start = offset + FRAME_PREFIX_LEN;
+        let end = start + length;
+        offset = end;
+        body.get(start..end)
+    })
+}
+
 /// A binary metadata header (`-bin` suffix).
 pub fn is_binary_metadata(name: &str) -> bool {
     name.len() > BINARY_METADATA_SUFFIX.len() && name.ends_with(BINARY_METADATA_SUFFIX)
@@ -407,9 +433,14 @@ pub struct GrpcInspector {
     allowlist: HashSet<String>,
     /// Per-method limits from the generated artifact, keyed by method path.
     method_max_message_bytes: HashMap<String, usize>,
+    /// Request type per artifact method, used to select field metadata.
+    method_input_types: HashMap<String, String>,
+    /// Reachable request message metadata from the artifact.
+    messages: HashMap<String, GrpcMessage>,
     max_message_bytes: usize,
     max_frames: usize,
     unknown_method_blocked: bool,
+    decode_limits: DecodeLimits,
 }
 
 impl GrpcInspector {
@@ -445,10 +476,16 @@ impl GrpcInspector {
             .map(|method| method.path)
             .collect();
         let mut method_max_message_bytes = HashMap::new();
+        let mut method_input_types = HashMap::new();
+        let mut messages = HashMap::new();
         if let Some(artifact) = artifact {
             for method in &artifact.methods {
                 allowlist.insert(method.path.clone());
                 method_max_message_bytes.insert(method.path.clone(), method.max_message_bytes);
+                method_input_types.insert(method.path.clone(), method.input.clone());
+            }
+            for message in &artifact.messages {
+                messages.insert(message.message.clone(), message.clone());
             }
         }
 
@@ -465,9 +502,20 @@ impl GrpcInspector {
         Self {
             allowlist,
             method_max_message_bytes,
+            method_input_types,
+            messages,
             max_message_bytes: config.max_message_bytes,
             max_frames: config.max_frames,
             unknown_method_blocked,
+            decode_limits: DecodeLimits {
+                max_string_bytes: config.max_string_bytes,
+                max_bytes_len: config.max_bytes_len,
+                max_repeated: config.max_repeated,
+                max_depth: config.max_depth,
+                max_decoded_fields: config.max_decoded_fields,
+                reject_unknown_fields: config.reject_unknown_fields,
+                validate_strings: config.validate_strings,
+            },
         }
     }
 
@@ -571,6 +619,27 @@ impl GrpcInspector {
                         reason: "gRPC frame is marked compressed but grpc-encoding is identity"
                             .to_string(),
                     });
+                }
+
+                // Field inspection requires descriptor metadata in the
+                // artifact. Methods without it (or version 1 artifacts) keep
+                // the envelope-only behaviour.
+                if let Some(input_type) = self.method_input_types.get(&method.path) {
+                    if self.messages.contains_key(input_type) {
+                        for payload in frame_payloads(body) {
+                            if let Err(error) = protobuf::decode_message(
+                                payload,
+                                input_type,
+                                &self.messages,
+                                &self.decode_limits,
+                            ) {
+                                return Ok(GrpcVerdict::Block {
+                                    status: error.status(),
+                                    reason: error.to_string(),
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -968,12 +1037,310 @@ mod tests {
                     max_message_bytes: *limit,
                 })
                 .collect(),
+            messages: Vec::new(),
             unknown_method_action: unknown_method_action.to_string(),
         };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("allowlist.json");
         std::fs::write(&path, allowlist.to_canonical_json().unwrap()).unwrap();
         (dir, path.display().to_string())
+    }
+
+    fn artifact_file_with_messages(
+        methods: &[(&str, usize)],
+        messages: Vec<crate::waf::grpc_allowlist::GrpcMessage>,
+    ) -> (tempfile::TempDir, String) {
+        use crate::waf::grpc_allowlist::{
+            AllowlistSource, GrpcAllowlist, GrpcAllowlistMethod, ALLOWLIST_IR_VERSION,
+        };
+
+        let allowlist = GrpcAllowlist {
+            ir_version: ALLOWLIST_IR_VERSION,
+            source: AllowlistSource {
+                kind: "protobuf".to_string(),
+                sha256: "c".repeat(64),
+            },
+            methods: methods
+                .iter()
+                .map(|(path, limit)| GrpcAllowlistMethod {
+                    path: (*path).to_string(),
+                    client_streaming: false,
+                    server_streaming: false,
+                    input: "acme.Request".to_string(),
+                    output: "acme.Response".to_string(),
+                    max_message_bytes: *limit,
+                })
+                .collect(),
+            messages,
+            unknown_method_action: "block".to_string(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("allowlist.json");
+        std::fs::write(&path, allowlist.to_canonical_json().unwrap()).unwrap();
+        (dir, path.display().to_string())
+    }
+
+    fn request_field(
+        name: &str,
+        number: u32,
+        field_type: &str,
+        repeated: bool,
+    ) -> crate::waf::grpc_allowlist::GrpcMessageField {
+        crate::waf::grpc_allowlist::GrpcMessageField {
+            name: name.to_string(),
+            number,
+            field_type: field_type.to_string(),
+            repeated,
+            required: false,
+            message_type: None,
+            enum_values: None,
+        }
+    }
+
+    fn request_message(
+        fields: Vec<crate::waf::grpc_allowlist::GrpcMessageField>,
+    ) -> crate::waf::grpc_allowlist::GrpcMessage {
+        crate::waf::grpc_allowlist::GrpcMessage {
+            message: "acme.Request".to_string(),
+            fields,
+        }
+    }
+
+    fn put_varint(mut value: u64, out: &mut Vec<u8>) {
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                return;
+            }
+        }
+    }
+
+    fn put_tag(number: u32, wire: u8, out: &mut Vec<u8>) {
+        put_varint((u64::from(number) << 3) | u64::from(wire), out);
+    }
+
+    fn put_string(number: u32, value: &str, out: &mut Vec<u8>) {
+        put_tag(number, 2, out);
+        put_varint(value.len() as u64, out);
+        out.extend_from_slice(value.as_bytes());
+    }
+
+    fn field_inspector(
+        config: &mut WafGrpcConfig,
+        messages: Vec<crate::waf::grpc_allowlist::GrpcMessage>,
+    ) -> (tempfile::TempDir, GrpcInspector) {
+        let (dir, path) = artifact_file_with_messages(&[("/acme.Service/Method", 4096)], messages);
+        config.allowlist_file = Some(path);
+        let inspector = GrpcInspector::try_from_config(config).unwrap();
+        (dir, inspector)
+    }
+
+    #[test]
+    fn valid_descriptor_backed_message_is_allowed() {
+        let mut config = WafGrpcConfig::default();
+        let (_dir, inspector) = field_inspector(
+            &mut config,
+            vec![request_message(vec![request_field(
+                "name", 1, "string", false,
+            )])],
+        );
+        let mut payload = Vec::new();
+        put_string(1, "alice", &mut payload);
+        let verdict = inspector
+            .inspect(&grpc_context(
+                "/acme.Service/Method",
+                Some(frame(0, &payload)),
+            ))
+            .unwrap();
+        assert_eq!(
+            verdict,
+            GrpcVerdict::Allow {
+                strip_body: true,
+                monitored: false
+            }
+        );
+    }
+
+    #[test]
+    fn oversized_string_is_blocked_with_field_path() {
+        let mut config = WafGrpcConfig::default();
+        config.max_string_bytes = 4;
+        let (_dir, inspector) = field_inspector(
+            &mut config,
+            vec![request_message(vec![request_field(
+                "name", 1, "string", false,
+            )])],
+        );
+        let mut payload = Vec::new();
+        put_string(1, "abcdefgh", &mut payload);
+        let verdict = inspector
+            .inspect(&grpc_context(
+                "/acme.Service/Method",
+                Some(frame(0, &payload)),
+            ))
+            .unwrap();
+        match verdict {
+            GrpcVerdict::Block { status, reason } => {
+                assert_eq!(status, 413);
+                assert!(reason.contains("acme.Request.name"), "{reason}");
+            }
+            other => panic!("expected block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_fields_follow_configuration() {
+        let messages = vec![request_message(Vec::new())];
+        let mut payload = Vec::new();
+        put_string(99, "value", &mut payload);
+
+        let mut config = WafGrpcConfig::default();
+        let (_dir, inspector) = field_inspector(&mut config, messages.clone());
+        let verdict = inspector
+            .inspect(&grpc_context(
+                "/acme.Service/Method",
+                Some(frame(0, &payload)),
+            ))
+            .unwrap();
+        assert!(matches!(verdict, GrpcVerdict::Allow { .. }));
+
+        let mut config = WafGrpcConfig::default();
+        config.reject_unknown_fields = true;
+        let (_dir, inspector) = field_inspector(&mut config, messages);
+        let verdict = inspector
+            .inspect(&grpc_context(
+                "/acme.Service/Method",
+                Some(frame(0, &payload)),
+            ))
+            .unwrap();
+        match verdict {
+            GrpcVerdict::Block { status, reason } => {
+                assert_eq!(status, 400);
+                assert!(reason.contains("acme.Request.<field 99>"), "{reason}");
+            }
+            other => panic!("expected block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_depth_limit_is_enforced() {
+        use crate::waf::grpc_allowlist::GrpcMessage;
+
+        let mut parent_field = request_field("child", 1, "message", false);
+        parent_field.message_type = Some("acme.Child".to_string());
+        let mut child_field = request_field("grandchild", 1, "message", false);
+        child_field.message_type = Some("acme.Grandchild".to_string());
+        let leaf_field = request_field("leaf", 1, "string", false);
+        let mut config = WafGrpcConfig::default();
+        config.max_depth = 1;
+        let (_dir, inspector) = field_inspector(
+            &mut config,
+            vec![
+                request_message(vec![parent_field]),
+                GrpcMessage {
+                    message: "acme.Child".to_string(),
+                    fields: vec![child_field],
+                },
+                GrpcMessage {
+                    message: "acme.Grandchild".to_string(),
+                    fields: vec![leaf_field],
+                },
+            ],
+        );
+
+        let mut grandchild = Vec::new();
+        put_string(1, "leaf", &mut grandchild);
+        let mut child = Vec::new();
+        put_tag(1, 2, &mut child);
+        put_varint(grandchild.len() as u64, &mut child);
+        child.extend_from_slice(&grandchild);
+        let mut payload = Vec::new();
+        put_tag(1, 2, &mut payload);
+        put_varint(child.len() as u64, &mut payload);
+        payload.extend_from_slice(&child);
+
+        assert_eq!(inspector.decode_limits.max_depth, 1);
+        assert!(inspector.messages.contains_key("acme.Child"));
+        assert!(inspector.messages.contains_key("acme.Grandchild"));
+        assert_eq!(
+            inspector.messages["acme.Request"].fields[0]
+                .message_type
+                .as_deref(),
+            Some("acme.Child")
+        );
+        assert_eq!(
+            inspector.messages["acme.Child"].fields[0]
+                .message_type
+                .as_deref(),
+            Some("acme.Grandchild")
+        );
+        let direct = protobuf::decode_message(
+            &payload,
+            "acme.Request",
+            &inspector.messages,
+            &inspector.decode_limits,
+        );
+        assert!(direct.is_err(), "direct decode unexpectedly passed");
+        let verdict = inspector
+            .inspect(&grpc_context(
+                "/acme.Service/Method",
+                Some(frame(0, &payload)),
+            ))
+            .unwrap();
+        assert!(
+            matches!(verdict, GrpcVerdict::Block { status: 413, .. }),
+            "unexpected verdict: {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_wire_data_is_blocked_with_400() {
+        let mut config = WafGrpcConfig::default();
+        let (_dir, inspector) = field_inspector(
+            &mut config,
+            vec![request_message(vec![request_field(
+                "name", 1, "string", false,
+            )])],
+        );
+        // Field 1 claims 5 bytes but only 1 remains.
+        let payload = vec![0x0a, 0x05, 0x01];
+        let verdict = inspector
+            .inspect(&grpc_context(
+                "/acme.Service/Method",
+                Some(frame(0, &payload)),
+            ))
+            .unwrap();
+        assert!(
+            matches!(verdict, GrpcVerdict::Block { status: 400, .. }),
+            "unexpected verdict: {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn missing_descriptor_metadata_falls_back_to_envelope_checks() {
+        let mut config = WafGrpcConfig::default();
+        config.reject_unknown_fields = true;
+        let (_dir, inspector) = field_inspector(&mut config, Vec::new());
+        let mut payload = Vec::new();
+        put_string(99, "value", &mut payload);
+        let verdict = inspector
+            .inspect(&grpc_context(
+                "/acme.Service/Method",
+                Some(frame(0, &payload)),
+            ))
+            .unwrap();
+        assert_eq!(
+            verdict,
+            GrpcVerdict::Allow {
+                strip_body: true,
+                monitored: false
+            }
+        );
     }
 
     #[test]

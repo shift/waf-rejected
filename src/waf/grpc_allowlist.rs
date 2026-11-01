@@ -8,12 +8,17 @@
 //!
 //! ```json
 //! {
-//!   "ir_version": 1,
+//!   "ir_version": 2,
 //!   "source": {"kind": "protobuf", "sha256": "..."},
 //!   "methods": [
 //!     {"path": "/pkg.Service/Method", "client_streaming": false,
 //!      "server_streaming": false, "input": "pkg.Request",
 //!      "output": "pkg.Response", "max_message_bytes": 4194304}
+//!   ],
+//!   "messages": [
+//!     {"message": "pkg.Request", "fields": [
+//!       {"name": "name", "number": 1, "type": "string", "repeated": false}
+//!     ]}
 //!   ],
 //!   "unknown_method_action": "block"
 //! }
@@ -49,10 +54,23 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Version of the allowlist document produced by this module.
-pub const ALLOWLIST_IR_VERSION: u32 = 1;
+///
+/// Version 2 adds the `messages` field metadata used for field-level
+/// inspection. Version 1 artifacts are still accepted and fall back to
+/// envelope-only inspection.
+pub const ALLOWLIST_IR_VERSION: u32 = 2;
+
+/// Oldest artifact schema version accepted by the loader.
+pub const MIN_ALLOWLIST_IR_VERSION: u32 = 1;
 
 /// Default per-message size limit, matching `[waf.grpc]`.
 pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Maximum nesting depth emitted for reachable request message types.
+///
+/// The encoder stops adding nested message definitions at this depth; deeper
+/// messages remain opaque length-delimited fields at request time.
+pub const MAX_MESSAGE_FIELD_DEPTH: usize = 16;
 
 /// Source descriptor format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +191,42 @@ pub struct GrpcAllowlistMethod {
     pub max_message_bytes: usize,
 }
 
+/// Field metadata for one reachable request message type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrpcMessage {
+    /// Fully-qualified message type without the leading dot.
+    pub message: String,
+    /// Fields sorted by field number.
+    #[serde(default)]
+    pub fields: Vec<GrpcMessageField>,
+}
+
+/// One protobuf field declaration from the descriptor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrpcMessageField {
+    /// Protobuf field name.
+    pub name: String,
+    /// Wire field number.
+    pub number: u32,
+    /// Normalised protobuf scalar type (`double`, `string`, `message`, ...).
+    #[serde(rename = "type")]
+    pub field_type: String,
+    /// Whether the field is repeated.
+    #[serde(default)]
+    pub repeated: bool,
+    /// Whether the descriptor marks the field as required (proto2 only).
+    #[serde(default)]
+    pub required: bool,
+    /// Fully-qualified target type for `message` fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_type: Option<String>,
+    /// Valid numeric values for `enum` fields, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enum_values: Option<Vec<i32>>,
+}
+
 /// Parsed allowlist artifact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -183,6 +237,9 @@ pub struct GrpcAllowlist {
     pub source: AllowlistSource,
     /// Allowed methods, in canonical path order.
     pub methods: Vec<GrpcAllowlistMethod>,
+    /// Field metadata for message types reachable from request types.
+    #[serde(default)]
+    pub messages: Vec<GrpcMessage>,
     /// `allow` or `block` for methods outside the list.
     pub unknown_method_action: String,
 }
@@ -201,14 +258,21 @@ impl GrpcAllowlist {
         self.methods.iter().any(|method| method.path == path)
     }
 
+    /// Returns the field metadata for a message type, when present.
+    pub fn message_for(&self, message: &str) -> Option<&GrpcMessage> {
+        self.messages
+            .iter()
+            .find(|definition| definition.message == message)
+    }
+
     /// Validates every field of the artifact.
     ///
     /// Loaded artifacts are always validated; the generator validates its own
     /// output before writing it.
     pub fn validate(&self) -> Result<(), GrpcAllowlistError> {
-        if self.ir_version != ALLOWLIST_IR_VERSION {
+        if !(MIN_ALLOWLIST_IR_VERSION..=ALLOWLIST_IR_VERSION).contains(&self.ir_version) {
             return Err(GrpcAllowlistError::InvalidAllowlist(format!(
-                "unsupported ir_version {} (expected {ALLOWLIST_IR_VERSION})",
+                "unsupported ir_version {} (expected {MIN_ALLOWLIST_IR_VERSION}..={ALLOWLIST_IR_VERSION})",
                 self.ir_version
             )));
         }
@@ -275,6 +339,85 @@ impl GrpcAllowlist {
             }
         }
 
+        let mut seen_messages = BTreeSet::new();
+        for message in &self.messages {
+            validate_type_name(&message.message).map_err(|reason| {
+                GrpcAllowlistError::InvalidAllowlist(format!(
+                    "message type '{}': {reason}",
+                    message.message
+                ))
+            })?;
+            if !seen_messages.insert(message.message.as_str()) {
+                return Err(GrpcAllowlistError::InvalidAllowlist(format!(
+                    "duplicate message type '{}'",
+                    message.message
+                )));
+            }
+            let mut seen_fields = BTreeSet::new();
+            for field in &message.fields {
+                validate_ident(&field.name).map_err(|reason| {
+                    GrpcAllowlistError::InvalidAllowlist(format!(
+                        "message '{}' field '{}': {reason}",
+                        message.message, field.name
+                    ))
+                })?;
+                if field.number == 0 || field.number > 536_870_911 {
+                    return Err(GrpcAllowlistError::InvalidAllowlist(format!(
+                        "message '{}' field '{}': number {} is outside 1..=536870911",
+                        message.message, field.name, field.number
+                    )));
+                }
+                if !seen_fields.insert(field.number) {
+                    return Err(GrpcAllowlistError::InvalidAllowlist(format!(
+                        "message '{}': duplicate field number {}",
+                        message.message, field.number
+                    )));
+                }
+                if !is_grpc_field_type(&field.field_type) {
+                    return Err(GrpcAllowlistError::InvalidAllowlist(format!(
+                        "message '{}' field '{}': unsupported type '{}'",
+                        message.message, field.name, field.field_type
+                    )));
+                }
+                if field.field_type == "message" {
+                    let target = field.message_type.as_deref().ok_or_else(|| {
+                        GrpcAllowlistError::InvalidAllowlist(format!(
+                            "message '{}' field '{}': message fields require message_type",
+                            message.message, field.name
+                        ))
+                    })?;
+                    validate_type_name(target).map_err(|reason| {
+                        GrpcAllowlistError::InvalidAllowlist(format!(
+                            "message '{}' field '{}': message_type '{target}' {reason}",
+                            message.message, field.name
+                        ))
+                    })?;
+                } else if field.message_type.is_some() {
+                    return Err(GrpcAllowlistError::InvalidAllowlist(format!(
+                        "message '{}' field '{}': message_type is only valid for message fields",
+                        message.message, field.name
+                    )));
+                }
+                if let Some(values) = &field.enum_values {
+                    if values.is_empty() {
+                        return Err(GrpcAllowlistError::InvalidAllowlist(format!(
+                            "message '{}' field '{}': enum_values must not be empty when set",
+                            message.message, field.name
+                        )));
+                    }
+                    let mut seen_values = BTreeSet::new();
+                    for value in values {
+                        if !seen_values.insert(*value) {
+                            return Err(GrpcAllowlistError::InvalidAllowlist(format!(
+                                "message '{}' field '{}': duplicate enum value {value}",
+                                message.message, field.name
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -287,6 +430,12 @@ impl GrpcAllowlist {
         sorted
             .methods
             .sort_by(|left, right| left.path.cmp(&right.path));
+        sorted
+            .messages
+            .sort_by(|left, right| left.message.cmp(&right.message));
+        for message in &mut sorted.messages {
+            message.fields.sort_by_key(|field| field.number);
+        }
         sorted.validate()?;
         let mut json = serde_json::to_string_pretty(&sorted).map_err(|error| {
             GrpcAllowlistError::InvalidAllowlist(format!("failed to serialize: {error}"))
@@ -378,6 +527,7 @@ pub fn build_allowlist(
     options.validate()?;
     let descriptor_set = parse_descriptor_set(descriptor, format)?;
     let methods = collect_methods(&descriptor_set)?;
+    let messages = collect_request_messages(&descriptor_set, &methods)?;
 
     let mut allowlist = GrpcAllowlist {
         ir_version: ALLOWLIST_IR_VERSION,
@@ -386,6 +536,7 @@ pub fn build_allowlist(
             sha256: hex::encode(Sha256::digest(descriptor)),
         },
         methods,
+        messages,
         unknown_method_action: options.unknown_method_action.clone(),
     };
 
@@ -476,13 +627,37 @@ struct FileDescriptorProto {
     name: Option<String>,
     package: Option<String>,
     messages: Vec<DescriptorProto>,
+    enums: Vec<EnumDescriptorProto>,
     services: Vec<ServiceDescriptorProto>,
 }
 
 #[derive(Debug, Default)]
 struct DescriptorProto {
     name: Option<String>,
+    fields: Vec<FieldDescriptorProto>,
     nested: Vec<DescriptorProto>,
+    enums: Vec<EnumDescriptorProto>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FieldDescriptorProto {
+    name: Option<String>,
+    number: Option<u32>,
+    label: Option<u32>,
+    field_type: Option<u32>,
+    type_name: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct EnumDescriptorProto {
+    name: Option<String>,
+    values: Vec<EnumValueDescriptorProto>,
+}
+
+#[derive(Debug, Default)]
+struct EnumValueDescriptorProto {
+    name: Option<String>,
+    number: Option<i32>,
 }
 
 #[derive(Debug, Default)]
@@ -667,6 +842,249 @@ fn collect_message_types(
     Ok(())
 }
 
+#[derive(Debug, Default)]
+struct MessageDefinition {
+    fields: Vec<FieldDescriptorProto>,
+}
+
+fn collect_request_messages(
+    descriptor_set: &FileDescriptorSet,
+    methods: &[GrpcAllowlistMethod],
+) -> Result<Vec<GrpcMessage>, GrpcAllowlistError> {
+    let mut message_definitions: BTreeMap<String, MessageDefinition> = BTreeMap::new();
+    let mut enum_definitions: BTreeMap<String, Vec<i32>> = BTreeMap::new();
+
+    for (index, file) in descriptor_set.files.iter().enumerate() {
+        let package = package_name(file, index)?;
+        collect_definitions(
+            &file.label(index),
+            &package,
+            &file.messages,
+            &file.enums,
+            &mut message_definitions,
+            &mut enum_definitions,
+        )?;
+    }
+
+    let mut reachable = BTreeMap::new();
+    for method in methods {
+        collect_reachable_message(
+            &method.input,
+            &message_definitions,
+            &enum_definitions,
+            &mut reachable,
+            0,
+            MAX_MESSAGE_FIELD_DEPTH,
+        )?;
+    }
+
+    Ok(reachable.into_values().collect())
+}
+
+fn collect_definitions(
+    context: &str,
+    prefix: &str,
+    messages: &[DescriptorProto],
+    enums: &[EnumDescriptorProto],
+    message_definitions: &mut BTreeMap<String, MessageDefinition>,
+    enum_definitions: &mut BTreeMap<String, Vec<i32>>,
+) -> Result<(), GrpcAllowlistError> {
+    for (index, enumeration) in enums.iter().enumerate() {
+        let name = enumeration.name.as_deref().ok_or_else(|| {
+            GrpcAllowlistError::Descriptor(format!("{context}: enum #{index} is missing a name"))
+        })?;
+        validate_ident(name).map_err(|reason| {
+            GrpcAllowlistError::Descriptor(format!(
+                "{context}: enum #{index} name '{name}' {reason}"
+            ))
+        })?;
+        let full_name = if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{prefix}.{name}")
+        };
+        let mut values = Vec::new();
+        for (value_index, value) in enumeration.values.iter().enumerate() {
+            let value_name = value.name.as_deref().ok_or_else(|| {
+                GrpcAllowlistError::Descriptor(format!(
+                    "{context}: enum '{full_name}' value #{value_index} is missing a name"
+                ))
+            })?;
+            validate_ident(value_name).map_err(|reason| {
+                GrpcAllowlistError::Descriptor(format!(
+                    "{context}: enum '{full_name}' value name '{value_name}' {reason}"
+                ))
+            })?;
+            let number = value.number.ok_or_else(|| {
+                GrpcAllowlistError::Descriptor(format!(
+                    "{context}: enum '{full_name}' value '{value_name}' is missing a number"
+                ))
+            })?;
+            values.push(number);
+        }
+        values.sort_unstable();
+        values.dedup();
+        if enum_definitions.insert(full_name.clone(), values).is_some() {
+            return Err(GrpcAllowlistError::Descriptor(format!(
+                "{context}: duplicate enum type '{full_name}'"
+            )));
+        }
+    }
+
+    for (index, message) in messages.iter().enumerate() {
+        let name = message.name.as_deref().ok_or_else(|| {
+            GrpcAllowlistError::Descriptor(format!("{context}: message #{index} is missing a name"))
+        })?;
+        let full_name = if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{prefix}.{name}")
+        };
+        if message_definitions
+            .insert(
+                full_name.clone(),
+                MessageDefinition {
+                    fields: message.fields.clone(),
+                },
+            )
+            .is_some()
+        {
+            return Err(GrpcAllowlistError::Descriptor(format!(
+                "{context}: duplicate message type '{full_name}'"
+            )));
+        }
+        collect_definitions(
+            context,
+            &full_name,
+            &message.nested,
+            &message.enums,
+            message_definitions,
+            enum_definitions,
+        )?;
+    }
+    Ok(())
+}
+
+fn collect_reachable_message(
+    name: &str,
+    message_definitions: &BTreeMap<String, MessageDefinition>,
+    enum_definitions: &BTreeMap<String, Vec<i32>>,
+    reachable: &mut BTreeMap<String, GrpcMessage>,
+    depth: usize,
+    max_depth: usize,
+) -> Result<(), GrpcAllowlistError> {
+    if reachable.contains_key(name) {
+        return Ok(());
+    }
+    let Some(definition) = message_definitions.get(name) else {
+        return Ok(());
+    };
+
+    let mut fields = Vec::with_capacity(definition.fields.len());
+    for field in &definition.fields {
+        let field_name = field.name.as_deref().ok_or_else(|| {
+            GrpcAllowlistError::Descriptor(format!("message '{name}': field is missing a name"))
+        })?;
+        let number = field.number.ok_or_else(|| {
+            GrpcAllowlistError::Descriptor(format!(
+                "message '{name}' field '{field_name}' is missing a number"
+            ))
+        })?;
+        let field_type = field.field_type.ok_or_else(|| {
+            GrpcAllowlistError::Descriptor(format!(
+                "message '{name}' field '{field_name}' is missing a type"
+            ))
+        })?;
+        let normalized = normalize_field_type(field_type).ok_or_else(|| {
+            GrpcAllowlistError::Descriptor(format!(
+                "message '{name}' field '{field_name}' has unsupported type {field_type}"
+            ))
+        })?;
+        let type_name = field
+            .type_name
+            .as_deref()
+            .map(|value| value.strip_prefix('.').unwrap_or(value))
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+
+        let mut message_type = None;
+        let mut enum_values = None;
+        match normalized {
+            "message" => {
+                let target = type_name.clone().ok_or_else(|| {
+                    GrpcAllowlistError::Descriptor(format!(
+                        "message '{name}' field '{field_name}' is missing type_name"
+                    ))
+                })?;
+                if depth < max_depth {
+                    collect_reachable_message(
+                        &target,
+                        message_definitions,
+                        enum_definitions,
+                        reachable,
+                        depth + 1,
+                        max_depth,
+                    )?;
+                }
+                message_type = Some(target);
+            }
+            "enum" => {
+                if let Some(target) = type_name.as_deref() {
+                    enum_values = enum_definitions.get(target).cloned();
+                }
+            }
+            _ => {}
+        }
+
+        fields.push(GrpcMessageField {
+            name: field_name.to_string(),
+            number,
+            field_type: normalized.to_string(),
+            repeated: field.label == Some(3),
+            required: field.label == Some(2),
+            message_type,
+            enum_values,
+        });
+    }
+    fields.sort_by_key(|field| field.number);
+
+    reachable.insert(
+        name.to_string(),
+        GrpcMessage {
+            message: name.to_string(),
+            fields,
+        },
+    );
+    Ok(())
+}
+
+fn normalize_field_type(value: u32) -> Option<&'static str> {
+    Some(match value {
+        1 => "double",
+        2 => "float",
+        3 => "int64",
+        4 => "uint64",
+        5 => "int32",
+        6 => "fixed64",
+        7 => "fixed32",
+        8 => "bool",
+        // Groups are legacy message fields; wire handling matches messages.
+        9 => "string",
+        10 => "message",
+        11 => "message",
+        12 => "bytes",
+        13 => "uint32",
+        14 => "enum",
+        // Signed fixed-width fields use the same wire representation.
+        15 => "fixed32",
+        16 => "fixed64",
+        // Zig-zag fields use the varint wire representation.
+        17 => "int32",
+        18 => "int64",
+        _ => return None,
+    })
+}
+
 fn method_type_name(
     value: Option<&str>,
     field: &str,
@@ -697,6 +1115,25 @@ fn validate_ident(value: &str) -> Result<(), String> {
         return Err("may only contain ASCII letters, digits and underscores".to_string());
     }
     Ok(())
+}
+
+fn is_grpc_field_type(value: &str) -> bool {
+    matches!(
+        value,
+        "double"
+            | "float"
+            | "int64"
+            | "uint64"
+            | "int32"
+            | "fixed64"
+            | "fixed32"
+            | "bool"
+            | "string"
+            | "bytes"
+            | "uint32"
+            | "enum"
+            | "message"
+    )
 }
 
 fn validate_type_name(value: &str) -> Result<(), String> {
@@ -762,6 +1199,10 @@ fn parse_file_descriptor(bytes: &[u8]) -> Result<FileDescriptorProto, GrpcAllowl
                 file.messages
                     .push(parse_descriptor_proto(reader.read_length_delimited()?)?);
             }
+            (5, WIRE_LENGTH_DELIMITED) => {
+                file.enums
+                    .push(parse_enum_descriptor(reader.read_length_delimited()?)?);
+            }
             (6, WIRE_LENGTH_DELIMITED) => {
                 file.services
                     .push(parse_service_descriptor(reader.read_length_delimited()?)?);
@@ -780,15 +1221,87 @@ fn parse_descriptor_proto(bytes: &[u8]) -> Result<DescriptorProto, GrpcAllowlist
             (1, WIRE_LENGTH_DELIMITED) => {
                 message.name = Some(reader.read_string()?);
             }
+            (2, WIRE_LENGTH_DELIMITED) => {
+                message
+                    .fields
+                    .push(parse_field_descriptor(reader.read_length_delimited()?)?);
+            }
             (3, WIRE_LENGTH_DELIMITED) => {
                 message
                     .nested
                     .push(parse_descriptor_proto(reader.read_length_delimited()?)?);
             }
+            (4, WIRE_LENGTH_DELIMITED) => {
+                message
+                    .enums
+                    .push(parse_enum_descriptor(reader.read_length_delimited()?)?);
+            }
             (_, wire) => reader.skip(wire)?,
         }
     }
     Ok(message)
+}
+
+fn parse_field_descriptor(bytes: &[u8]) -> Result<FieldDescriptorProto, GrpcAllowlistError> {
+    let mut reader = WireReader::new(bytes);
+    let mut field = FieldDescriptorProto::default();
+    while let Some((tag, wire)) = reader.read_tag()? {
+        match (tag, wire) {
+            (1, WIRE_LENGTH_DELIMITED) => field.name = Some(reader.read_string()?),
+            (3, WIRE_VARINT) => {
+                field.number = Some(u32::try_from(reader.read_varint()?).map_err(|_| {
+                    GrpcAllowlistError::Descriptor(
+                        "field number does not fit in 32 bits".to_string(),
+                    )
+                })?);
+            }
+            (4, WIRE_VARINT) => {
+                field.label = Some(u32::try_from(reader.read_varint()?).map_err(|_| {
+                    GrpcAllowlistError::Descriptor(
+                        "field label does not fit in 32 bits".to_string(),
+                    )
+                })?);
+            }
+            (5, WIRE_VARINT) => {
+                field.field_type = Some(u32::try_from(reader.read_varint()?).map_err(|_| {
+                    GrpcAllowlistError::Descriptor("field type does not fit in 32 bits".to_string())
+                })?);
+            }
+            (6, WIRE_LENGTH_DELIMITED) => field.type_name = Some(reader.read_string()?),
+            (_, wire) => reader.skip(wire)?,
+        }
+    }
+    Ok(field)
+}
+
+fn parse_enum_descriptor(bytes: &[u8]) -> Result<EnumDescriptorProto, GrpcAllowlistError> {
+    let mut reader = WireReader::new(bytes);
+    let mut enumeration = EnumDescriptorProto::default();
+    while let Some((tag, wire)) = reader.read_tag()? {
+        match (tag, wire) {
+            (1, WIRE_LENGTH_DELIMITED) => enumeration.name = Some(reader.read_string()?),
+            (2, WIRE_LENGTH_DELIMITED) => enumeration.values.push(parse_enum_value_descriptor(
+                reader.read_length_delimited()?,
+            )?),
+            (_, wire) => reader.skip(wire)?,
+        }
+    }
+    Ok(enumeration)
+}
+
+fn parse_enum_value_descriptor(
+    bytes: &[u8],
+) -> Result<EnumValueDescriptorProto, GrpcAllowlistError> {
+    let mut reader = WireReader::new(bytes);
+    let mut value = EnumValueDescriptorProto::default();
+    while let Some((tag, wire)) = reader.read_tag()? {
+        match (tag, wire) {
+            (1, WIRE_LENGTH_DELIMITED) => value.name = Some(reader.read_string()?),
+            (2, WIRE_VARINT) => value.number = Some(reader.read_varint()? as i32),
+            (_, wire) => reader.skip(wire)?,
+        }
+    }
+    Ok(value)
 }
 
 fn parse_service_descriptor(bytes: &[u8]) -> Result<ServiceDescriptorProto, GrpcAllowlistError> {
@@ -1002,6 +1515,7 @@ fn parse_json_file(
         name: json_string(object, &["name"], &context)?,
         package: json_string(object, &["package"], &context)?,
         messages: Vec::new(),
+        enums: Vec::new(),
         services: Vec::new(),
     };
     for (message_index, message) in
@@ -1012,6 +1526,15 @@ fn parse_json_file(
         file.messages.push(parse_json_message(
             message,
             &format!("{context}: message #{message_index}"),
+        )?);
+    }
+    for (enum_index, enumeration) in json_array_field(object, &["enumType", "enum_type"], &context)?
+        .iter()
+        .enumerate()
+    {
+        file.enums.push(parse_json_enum(
+            enumeration,
+            &format!("{context}: enum #{enum_index}"),
         )?);
     }
     for (service_index, service) in json_array_field(object, &["service"], &context)?
@@ -1033,8 +1556,19 @@ fn parse_json_message(
     let object = json_object(value, context)?;
     let mut message = DescriptorProto {
         name: json_string(object, &["name"], context)?,
+        fields: Vec::new(),
         nested: Vec::new(),
+        enums: Vec::new(),
     };
+    for (index, field) in json_array_field(object, &["field"], context)?
+        .iter()
+        .enumerate()
+    {
+        message.fields.push(parse_json_field(
+            field,
+            &format!("{context}: field #{index}"),
+        )?);
+    }
     for (index, nested) in json_array_field(object, &["nestedType", "nested_type"], context)?
         .iter()
         .enumerate()
@@ -1044,7 +1578,62 @@ fn parse_json_message(
             &format!("{context}: nested message #{index}"),
         )?);
     }
+    for (index, enumeration) in json_array_field(object, &["enumType", "enum_type"], context)?
+        .iter()
+        .enumerate()
+    {
+        message.enums.push(parse_json_enum(
+            enumeration,
+            &format!("{context}: enum #{index}"),
+        )?);
+    }
     Ok(message)
+}
+
+fn parse_json_field(
+    value: &serde_json::Value,
+    context: &str,
+) -> Result<FieldDescriptorProto, GrpcAllowlistError> {
+    let object = json_object(value, context)?;
+    Ok(FieldDescriptorProto {
+        name: json_string(object, &["name"], context)?,
+        number: json_u32(object, &["number"], context)?,
+        label: json_label(object, &["label"], context)?,
+        field_type: json_field_type(object, &["type"], context)?,
+        type_name: json_string(object, &["typeName", "type_name"], context)?,
+    })
+}
+
+fn parse_json_enum(
+    value: &serde_json::Value,
+    context: &str,
+) -> Result<EnumDescriptorProto, GrpcAllowlistError> {
+    let object = json_object(value, context)?;
+    let mut enumeration = EnumDescriptorProto {
+        name: json_string(object, &["name"], context)?,
+        values: Vec::new(),
+    };
+    for (index, value) in json_array_field(object, &["value"], context)?
+        .iter()
+        .enumerate()
+    {
+        enumeration.values.push(parse_json_enum_value(
+            value,
+            &format!("{context}: value #{index}"),
+        )?);
+    }
+    Ok(enumeration)
+}
+
+fn parse_json_enum_value(
+    value: &serde_json::Value,
+    context: &str,
+) -> Result<EnumValueDescriptorProto, GrpcAllowlistError> {
+    let object = json_object(value, context)?;
+    Ok(EnumValueDescriptorProto {
+        name: json_string(object, &["name"], context)?,
+        number: json_i32(object, &["number"], context)?,
+    })
 }
 
 fn parse_json_service(
@@ -1135,6 +1724,149 @@ fn json_bool(
         Some(serde_json::Value::Bool(value)) => Ok(*value),
         Some(_) => Err(GrpcAllowlistError::Descriptor(format!(
             "{context}: field '{}' must be a boolean",
+            names[0]
+        ))),
+    }
+}
+
+fn json_u32(
+    object: &serde_json::Map<String, serde_json::Value>,
+    names: &[&str],
+    context: &str,
+) -> Result<Option<u32>, GrpcAllowlistError> {
+    match json_lookup(object, names, context)? {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(value)) => value
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .map(Some)
+            .ok_or_else(|| {
+                GrpcAllowlistError::Descriptor(format!(
+                    "{context}: field '{}' must be a non-negative 32-bit integer",
+                    names[0]
+                ))
+            }),
+        Some(_) => Err(GrpcAllowlistError::Descriptor(format!(
+            "{context}: field '{}' must be an integer",
+            names[0]
+        ))),
+    }
+}
+
+fn json_i32(
+    object: &serde_json::Map<String, serde_json::Value>,
+    names: &[&str],
+    context: &str,
+) -> Result<Option<i32>, GrpcAllowlistError> {
+    match json_lookup(object, names, context)? {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(value)) => value
+            .as_i64()
+            .and_then(|value| i32::try_from(value).ok())
+            .map(Some)
+            .ok_or_else(|| {
+                GrpcAllowlistError::Descriptor(format!(
+                    "{context}: field '{}' must be a 32-bit integer",
+                    names[0]
+                ))
+            }),
+        Some(_) => Err(GrpcAllowlistError::Descriptor(format!(
+            "{context}: field '{}' must be an integer",
+            names[0]
+        ))),
+    }
+}
+
+fn json_label(
+    object: &serde_json::Map<String, serde_json::Value>,
+    names: &[&str],
+    context: &str,
+) -> Result<Option<u32>, GrpcAllowlistError> {
+    match json_lookup(object, names, context)? {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(value)) => value
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .map(Some)
+            .ok_or_else(|| {
+                GrpcAllowlistError::Descriptor(format!(
+                    "{context}: field '{}' must be a label number",
+                    names[0]
+                ))
+            }),
+        Some(serde_json::Value::String(value)) => {
+            let upper = value.to_ascii_uppercase();
+            let normalised = upper.strip_prefix("LABEL_").unwrap_or(&upper);
+            let label = match normalised {
+                "OPTIONAL" => 1,
+                "REQUIRED" => 2,
+                "REPEATED" => 3,
+                other => {
+                    return Err(GrpcAllowlistError::Descriptor(format!(
+                        "{context}: field '{}' has unknown label '{other}'",
+                        names[0]
+                    )))
+                }
+            };
+            Ok(Some(label))
+        }
+        Some(_) => Err(GrpcAllowlistError::Descriptor(format!(
+            "{context}: field '{}' must be a label number or name",
+            names[0]
+        ))),
+    }
+}
+
+fn json_field_type(
+    object: &serde_json::Map<String, serde_json::Value>,
+    names: &[&str],
+    context: &str,
+) -> Result<Option<u32>, GrpcAllowlistError> {
+    match json_lookup(object, names, context)? {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(value)) => value
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .map(Some)
+            .ok_or_else(|| {
+                GrpcAllowlistError::Descriptor(format!(
+                    "{context}: field '{}' must be a type number",
+                    names[0]
+                ))
+            }),
+        Some(serde_json::Value::String(value)) => {
+            let upper = value.to_ascii_uppercase();
+            let normalised = upper.strip_prefix("TYPE_").unwrap_or(&upper);
+            let field_type = match normalised {
+                "DOUBLE" => 1,
+                "FLOAT" => 2,
+                "INT64" => 3,
+                "UINT64" => 4,
+                "INT32" => 5,
+                "FIXED64" => 6,
+                "FIXED32" => 7,
+                "BOOL" => 8,
+                "STRING" => 9,
+                "GROUP" => 10,
+                "MESSAGE" => 11,
+                "BYTES" => 12,
+                "UINT32" => 13,
+                "ENUM" => 14,
+                "SFIXED32" => 15,
+                "SFIXED64" => 16,
+                "SINT32" => 17,
+                "SINT64" => 18,
+                other => {
+                    return Err(GrpcAllowlistError::Descriptor(format!(
+                        "{context}: field '{}' has unknown type '{other}'",
+                        names[0]
+                    )))
+                }
+            };
+            Ok(Some(field_type))
+        }
+        Some(_) => Err(GrpcAllowlistError::Descriptor(format!(
+            "{context}: field '{}' must be a type number or name",
             names[0]
         ))),
     }
@@ -1279,6 +2011,60 @@ mod tests {
         put_string(1, name, &mut out);
         for child in nested {
             put_bytes(3, child, &mut out);
+        }
+        out
+    }
+
+    fn field_descriptor(
+        name: &str,
+        number: u32,
+        label: u32,
+        field_type: u32,
+        type_name: Option<&str>,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_string(1, name, &mut out);
+        put_tag(3, WIRE_VARINT, &mut out);
+        put_varint(u64::from(number), &mut out);
+        put_tag(4, WIRE_VARINT, &mut out);
+        put_varint(u64::from(label), &mut out);
+        put_tag(5, WIRE_VARINT, &mut out);
+        put_varint(u64::from(field_type), &mut out);
+        if let Some(type_name) = type_name {
+            put_string(6, type_name, &mut out);
+        }
+        out
+    }
+
+    fn enum_descriptor(name: &str, values: &[(&str, i32)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_string(1, name, &mut out);
+        for (value_name, number) in values {
+            let mut value = Vec::new();
+            put_string(1, value_name, &mut value);
+            put_tag(2, WIRE_VARINT, &mut value);
+            put_varint(*number as i64 as u64, &mut value);
+            put_bytes(2, &value, &mut out);
+        }
+        out
+    }
+
+    fn message_with_fields(
+        name: &str,
+        fields: &[Vec<u8>],
+        nested: &[Vec<u8>],
+        enums: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_string(1, name, &mut out);
+        for field in fields {
+            put_bytes(2, field, &mut out);
+        }
+        for child in nested {
+            put_bytes(3, child, &mut out);
+        }
+        for enumeration in enums {
+            put_bytes(4, enumeration, &mut out);
         }
         out
     }
@@ -1453,6 +2239,85 @@ mod tests {
             allowlist.max_message_bytes_for("/acme.billing.v1.Billing/Watch"),
             Some(DEFAULT_MAX_MESSAGE_BYTES)
         );
+    }
+
+    #[test]
+    fn request_field_metadata_is_generated() {
+        let request = message_with_fields(
+            "Request",
+            &[
+                field_descriptor("state", 1, 1, 14, Some(".acme.billing.v1.Request.State")),
+                field_descriptor("payload", 2, 3, 12, None),
+                field_descriptor("child", 3, 1, 11, Some(".acme.billing.v1.Request.Child")),
+            ],
+            &[message_with_fields(
+                "Child",
+                &[field_descriptor("name", 1, 1, 9, None)],
+                &[],
+                &[],
+            )],
+            &[enum_descriptor("State", &[("UNKNOWN", 0), ("READY", 2)])],
+        );
+        let descriptor = descriptor_set(&[file(
+            "acme/billing.proto",
+            "acme.billing.v1",
+            &[request, message_with_fields("Response", &[], &[], &[])],
+            &[service(
+                "Billing",
+                &[method(
+                    "Charge",
+                    ".acme.billing.v1.Request",
+                    ".acme.billing.v1.Response",
+                    false,
+                    false,
+                )],
+            )],
+        )]);
+        let allowlist = build_allowlist(
+            &descriptor,
+            DescriptorFormat::Binary,
+            &AllowlistOptions::default(),
+        )
+        .expect("field metadata fixture must parse");
+
+        assert_eq!(allowlist.ir_version, ALLOWLIST_IR_VERSION);
+        let request = allowlist
+            .message_for("acme.billing.v1.Request")
+            .expect("request metadata");
+        assert_eq!(
+            request
+                .fields
+                .iter()
+                .map(|field| (field.name.as_str(), field.number, field.field_type.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("state", 1, "enum"),
+                ("payload", 2, "bytes"),
+                ("child", 3, "message"),
+            ]
+        );
+        assert_eq!(request.fields[0].enum_values, Some(vec![0, 2]));
+        assert!(request.fields[1].repeated);
+        assert_eq!(
+            request.fields[2].message_type.as_deref(),
+            Some("acme.billing.v1.Request.Child")
+        );
+        let child = allowlist
+            .message_for("acme.billing.v1.Request.Child")
+            .expect("nested request metadata");
+        assert_eq!(child.fields[0].field_type, "string");
+
+        let first = allowlist.to_canonical_json().unwrap();
+        let second = build_allowlist(
+            &descriptor,
+            DescriptorFormat::Binary,
+            &AllowlistOptions::default(),
+        )
+        .unwrap()
+        .to_canonical_json()
+        .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(parse_allowlist(first.as_bytes()).unwrap(), allowlist);
     }
 
     #[test]
@@ -1839,11 +2704,18 @@ max_message_bytes = 4096
         let valid = valid_json();
         parse_allowlist(valid.as_bytes()).expect("generated artifact must load");
 
+        let mut legacy: serde_json::Value = serde_json::from_str(&valid).unwrap();
+        legacy["ir_version"] = serde_json::json!(1);
+        legacy.as_object_mut().unwrap().remove("messages");
+        let legacy = parse_allowlist(serde_json::to_string(&legacy).unwrap().as_bytes())
+            .expect("version 1 artifacts must still load");
+        assert!(legacy.messages.is_empty());
+
         let cases: Vec<(serde_json::Value, &str)> = vec![
             (
                 {
                     let mut value: serde_json::Value = serde_json::from_str(&valid).unwrap();
-                    value["ir_version"] = serde_json::json!(2);
+                    value["ir_version"] = serde_json::json!(3);
                     value
                 },
                 "unsupported ir_version",

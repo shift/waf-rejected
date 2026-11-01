@@ -24,6 +24,7 @@ and their bodies are withheld from CRS body rules.
 | `grpc-encoding` | `identity` accepted; every other encoding is rejected |
 | `-bin` metadata | Base64 syntax validated; never passed to regex/text scanners |
 | `grpc-web-text` | Body base64-decoded before frame validation |
+| Protobuf fields | Decoded against descriptor metadata from the artifact: per-field string/bytes/repeated/depth limits, unknown-field policy, enum values, string sanity checks |
 
 An empty body is accepted as a zero-frame body: streaming requests whose
 payload is not buffered by the host are not rejected by this check.
@@ -34,8 +35,8 @@ payload is not buffered by the host are not rejected by this check.
 | --- | --- |
 | Envelope valid, method allowed (or monitor mode) | allow; body withheld from CRS body rules |
 | Method not in a non-empty allowlist, `unknown_method_action = block` | `403` |
-| Malformed frame, bad base64 metadata, unsupported encoding | `400` |
-| Message larger than `max_message_bytes` or too many frames | `413` |
+| Malformed frame/wire data, bad base64 metadata, unsupported encoding, unknown field (when rejected), invalid enum or string | `400` |
+| Message larger than `max_message_bytes`, too many frames, or a field limit exceeded | `413` |
 | Request cannot be inspected and `fail_mode = closed` | `503` |
 | Request cannot be inspected and `fail_mode = open` | allow (body still withheld) |
 
@@ -75,12 +76,23 @@ max_frames = 64
 # unknown_method_action. Unset falls back to the artifact's value, then to
 # "block" when the effective allowlist is non-empty and "allow" when empty.
 unknown_method_action = "block"
+
+# Field-level policy (applies when the artifact carries message metadata).
+max_string_bytes = 1048576      # one string value
+max_bytes_len = 1048576         # one bytes value
+max_repeated = 1024             # values for one repeated field
+max_depth = 32                  # nested message depth (request = 0)
+max_decoded_fields = 100000     # total wire fields per message tree
+reject_unknown_fields = false   # true = reject field numbers absent from descriptor
+validate_strings = true         # reject invalid UTF-8, NUL and control bytes
 ```
 
-Validation (`Config::validate`) rejects a zero `max_message_bytes` or
-`max_frames`, an unknown `unknown_method_action`, allowlist entries that are
-not `/package.Service/Method` paths, and an `allowlist_file` that is empty or
-cannot be loaded and validated (the error names the file and the reason).
+Validation (`Config::validate`) rejects a zero `max_message_bytes`,
+`max_frames`, `max_string_bytes`, `max_bytes_len`, `max_repeated`, `max_depth`
+or `max_decoded_fields`, an unknown `unknown_method_action`, allowlist entries
+that are not `/package.Service/Method` paths, and an `allowlist_file` that is
+empty or cannot be loaded and validated (the error names the file and the
+reason).
 
 `allowlist_file` is loaded once by `WafEngine::with_config` (through
 `GrpcInspector::try_from_config`) and never re-read per request. `from_config`
@@ -100,6 +112,34 @@ read, parsed or validated, `WafProxyService::new` aborts with
 `WAF engine initialisation failed`; the process does not start with a silently
 empty allowlist.
 
+### Field-level inspection
+
+When the artifact contains message metadata for the method's input type,
+`GrpcInspector` decodes each request frame with a minimal wire-format decoder
+(`src/waf/protobuf.rs`) and applies this policy:
+
+* `string` values are limited by `max_string_bytes`; with `validate_strings`
+  enabled they must be valid UTF-8 and must not contain NUL, C0 control bytes
+  (tab, LF and CR are allowed) or DEL.
+* `bytes` values are limited by `max_bytes_len`.
+* repeated fields (including packed scalars) are limited by `max_repeated`.
+* nested `message` fields recurse up to `max_depth`; the request message is
+  depth 0.
+* `max_decoded_fields` caps the total number of wire fields in the tree.
+* field numbers absent from the descriptor are skipped by default, or rejected
+  with `400` when `reject_unknown_fields = true`.
+* `enum` fields are checked against the `enum_values` recorded from the
+  descriptor when present. Enums without recorded values are accepted.
+* failures report the fully-qualified field path (for example
+  `acme.billing.v1.Request.customer_name` or
+  `acme.billing.v1.Request.items[2].sku`) in the decision reason.
+
+The raw protobuf bytes are still never given to CRS. If the artifact has no
+message metadata for the input type (for example a version 1 artifact or a
+method added only to `method_allowlist`), inspection falls back cleanly to the
+envelope checks above. Unknown nested message types are treated as opaque
+length-delimited fields rather than decoded.
+
 ### Generating the allowlist
 
 Do not hand-maintain `method_allowlist`. Generate it from the protobuf
@@ -108,16 +148,19 @@ Do not hand-maintain `method_allowlist`. Generate it from the protobuf
 
 ## Limitations
 
-* **No protobuf field-level inspection.** Values are not decoded, so a
-  malicious string inside a protobuf field is not matched by CRS rules.
-  Field-level inspection requires the service descriptor (`FileDescriptorSet`)
-  and is tracked separately. The frame cap and the method allowlist are the
-  current controls.
-* gRPC-Web text bodies are decoded here for validation; the transport/decoding
-  branch owns the request path for binary-safe frames.
+* Field-level inspection checks type, size, structure, enum membership and
+  basic string sanity. It is **not** a content scanner: malicious text inside a
+  field is not matched by CRS rules because the protobuf body is deliberately
+  withheld from CRS.
+* Metadata is emitted for messages reachable from request types to
+  `MAX_MESSAGE_FIELD_DEPTH` (16) in the generator. Deeper messages are treated
+  as opaque length-delimited fields at runtime. Methods without descriptor
+  metadata keep envelope-only behaviour.
 * `grpc-encoding` values other than `identity` are rejected rather than
   decompressed. Supporting compression requires decompression limits and is
   deliberately out of scope.
+* gRPC-Web text bodies are decoded here for validation; the transport/decoding
+  branch owns the request path for binary-safe frames.
 * Frame validation applies when a body is available. Streaming request bodies
   are inspected header/URI/method-only, consistent with `fast_evaluate`.
 
@@ -126,13 +169,18 @@ Do not hand-maintain `method_allowlist`. Generate it from the protobuf
 `src/waf/grpc.rs` covers content-type detection, method-path parsing, valid,
 truncated, oversized, negative-length and wrong-compressed-flag frames,
 allowlist allow/block/monitor behaviour, base64 `-bin` metadata and text
-scanner exclusion, and `grpc-web-text` decoding. `src/waf/mod.rs` verifies
-that a gRPC protobuf body is not delivered to downstream rules while a
-non-gRPC body still is. Artifact tests cover allow/block from a generated
-file, merging with `method_allowlist`, per-method limits smaller than the
-global value, unknown-method action precedence, and an unreadable file.
-`src/config.rs` rejects a missing or invalid `allowlist_file`, and
-`src/proxy/service.rs` verifies that such a file aborts start-up.
+scanner exclusion, and `grpc-web-text` decoding. Field tests cover a valid
+descriptor-backed message, oversized strings with the field path in the
+reason, unknown fields allowed/rejected by config, nested depth limits,
+malformed wire data (`400`), enum values, string control bytes, packed repeated
+counts, and the missing-metadata fallback. `src/waf/mod.rs` verifies that a
+gRPC protobuf body is not delivered to downstream rules while a non-gRPC body
+still is. Artifact tests cover allow/block from a generated file, merging with
+`method_allowlist`, per-method limits smaller than the global value,
+unknown-method action precedence, an unreadable file, and deterministic
+generation of field metadata. `src/config.rs` rejects a missing or invalid
+`allowlist_file` and zero field limits, and `src/proxy/service.rs` verifies
+that such a file aborts start-up.
 
 ## Generating the allowlist from a descriptor set
 
@@ -179,7 +227,11 @@ methods a build exposes.
 
    The format is detected from the extension (`.binpb`/`.pb` binary, `.json`
    JSON); use `--format binpb|json|auto` to override. Without `--output` the
-   artifact is written to stdout.
+   artifact is written to stdout. Alongside the method allowlist the generator
+   emits `messages` field metadata for every type reachable from a request
+   type (up to `MAX_MESSAGE_FIELD_DEPTH`), including nested messages and enum
+   numeric values. No flags are needed: regenerating an existing descriptor
+   upgrades the artifact to `ir_version` 2 deterministically.
 
 3. Review the diff and commit `grpc/allowlist.json` next to the descriptor.
 
@@ -198,7 +250,7 @@ methods a build exposes.
 
 ```json
 {
-  "ir_version": 1,
+  "ir_version": 2,
   "source": {"kind": "protobuf", "sha256": "438b9d3d..."},
   "methods": [
     {
@@ -210,17 +262,36 @@ methods a build exposes.
       "max_message_bytes": 4194304
     }
   ],
+  "messages": [
+    {
+      "message": "acme.billing.v1.Request",
+      "fields": [
+        {"name": "customer_name", "number": 1, "type": "string",
+         "repeated": false, "required": false},
+        {"name": "items", "number": 2, "type": "message", "repeated": true,
+         "required": false, "message_type": "acme.billing.v1.Request.Item"},
+        {"name": "state", "number": 3, "type": "enum", "repeated": false,
+         "required": false, "enum_values": [0, 1, 2]}
+      ]
+    }
+  ],
   "unknown_method_action": "block"
 }
 ```
 
-* `ir_version` — artifact schema version; the loader accepts `1` only.
+* `ir_version` — artifact schema version; the loader accepts `1` and `2`.
+  Version 1 artifacts have no `messages` metadata and fall back to
+  envelope-only inspection.
 * `source.kind` — always `protobuf`.
 * `source.sha256` — SHA-256 of the descriptor bytes exactly as ingested, so a
   reviewer can prove the artifact came from a specific compiled descriptor.
 * `methods` — sorted by `path`. Streaming flags and fully-qualified types come
   straight from the descriptor; nested message types are resolved
   (`acme.billing.v1.Request.Item`).
+* `messages` — sorted by message name; fields are sorted by number. Contains
+  message types reachable from request (input) types up to
+  `MAX_MESSAGE_FIELD_DEPTH`. `message_type` is present for `message` fields and
+  `enum_values` for `enum` fields when the descriptor defines them.
 * `unknown_method_action` — `allow` (monitor) or `block`; the generator
   defaults to `block`.
 
@@ -286,6 +357,7 @@ pub fn load_allowlist(path: impl AsRef<Path>) -> Result<GrpcAllowlist, GrpcAllow
 impl GrpcAllowlist {
     pub fn allows(&self, path: &str) -> bool;
     pub fn max_message_bytes_for(&self, path: &str) -> Option<usize>;
+    pub fn message_for(&self, message: &str) -> Option<&GrpcMessage>;
     pub fn validate(&self) -> Result<(), GrpcAllowlistError>;
 }
 ```

@@ -24,6 +24,10 @@ pub mod wasm_reactor;
 #[cfg(feature = "wasm-reactor")]
 pub mod grpc;
 
+/// Minimal protobuf wire decoder used by gRPC field-level inspection.
+#[cfg(feature = "wasm-reactor")]
+pub mod protobuf;
+
 use bytes::Bytes;
 use hyper::{HeaderMap, Method, Uri};
 use std::net::IpAddr;

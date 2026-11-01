@@ -678,6 +678,27 @@ pub struct WafGrpcConfig {
     /// `allow` (monitor) or `block`. When unset, it defaults to `block` for a
     /// non-empty allowlist and `allow` for an empty one.
     pub unknown_method_action: Option<String>,
+
+    /// Maximum length of one decoded `string` field value.
+    pub max_string_bytes: usize,
+
+    /// Maximum length of one decoded `bytes` field value.
+    pub max_bytes_len: usize,
+
+    /// Maximum number of values for one repeated field.
+    pub max_repeated: usize,
+
+    /// Maximum nested message depth during field decoding.
+    pub max_depth: usize,
+
+    /// Maximum total number of wire fields decoded per request message.
+    pub max_decoded_fields: usize,
+
+    /// Reject field numbers absent from the descriptor metadata.
+    pub reject_unknown_fields: bool,
+
+    /// Validate string values (UTF-8, NUL and control characters).
+    pub validate_strings: bool,
 }
 
 impl Default for WafGrpcConfig {
@@ -689,6 +710,13 @@ impl Default for WafGrpcConfig {
             max_message_bytes: 4 * 1024 * 1024,
             max_frames: 64,
             unknown_method_action: None,
+            max_string_bytes: 1024 * 1024,
+            max_bytes_len: 1024 * 1024,
+            max_repeated: 1024,
+            max_depth: 32,
+            max_decoded_fields: 100_000,
+            reject_unknown_fields: false,
+            validate_strings: true,
         }
     }
 }
@@ -716,6 +744,21 @@ impl WafGrpcConfig {
         }
         if self.max_frames == 0 {
             anyhow::bail!("waf.grpc.max_frames must be greater than zero");
+        }
+        if self.max_string_bytes == 0 {
+            anyhow::bail!("waf.grpc.max_string_bytes must be greater than zero");
+        }
+        if self.max_bytes_len == 0 {
+            anyhow::bail!("waf.grpc.max_bytes_len must be greater than zero");
+        }
+        if self.max_repeated == 0 {
+            anyhow::bail!("waf.grpc.max_repeated must be greater than zero");
+        }
+        if self.max_depth == 0 {
+            anyhow::bail!("waf.grpc.max_depth must be greater than zero");
+        }
+        if self.max_decoded_fields == 0 {
+            anyhow::bail!("waf.grpc.max_decoded_fields must be greater than zero");
         }
         if let Some(action) = self.unknown_method_action.as_deref() {
             if action != "allow" && action != "block" {
@@ -1528,6 +1571,13 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
         assert!(config.waf.grpc.enabled);
         assert_eq!(config.waf.grpc.max_message_bytes, 4 * 1024 * 1024);
         assert_eq!(config.waf.grpc.max_frames, 64);
+        assert_eq!(config.waf.grpc.max_string_bytes, 1024 * 1024);
+        assert_eq!(config.waf.grpc.max_bytes_len, 1024 * 1024);
+        assert_eq!(config.waf.grpc.max_repeated, 1024);
+        assert_eq!(config.waf.grpc.max_depth, 32);
+        assert_eq!(config.waf.grpc.max_decoded_fields, 100_000);
+        assert!(!config.waf.grpc.reject_unknown_fields);
+        assert!(config.waf.grpc.validate_strings);
         assert_eq!(config.waf.grpc.unknown_method_action(), "allow");
         assert!(config.validate().is_ok());
 
@@ -1537,6 +1587,19 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
         let mut config = Config::default();
         config.waf.grpc.max_frames = 0;
         assert!(config.validate().is_err());
+
+        let zeroers: [fn(&mut WafGrpcConfig); 5] = [
+            |grpc| grpc.max_string_bytes = 0,
+            |grpc| grpc.max_bytes_len = 0,
+            |grpc| grpc.max_repeated = 0,
+            |grpc| grpc.max_depth = 0,
+            |grpc| grpc.max_decoded_fields = 0,
+        ];
+        for zero in zeroers {
+            let mut config = Config::default();
+            zero(&mut config.waf.grpc);
+            assert!(config.validate().is_err());
+        }
 
         let mut config = Config::default();
         config.waf.grpc.unknown_method_action = Some("maybe".to_string());
@@ -1576,6 +1639,7 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
                     max_message_bytes: *limit,
                 })
                 .collect(),
+            messages: Vec::new(),
             unknown_method_action: "block".to_string(),
         };
         let path = dir.join("allowlist.json");
