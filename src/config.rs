@@ -614,7 +614,9 @@ impl Default for WafCorazaConfig {
             module_path: None,
             max_payload_bytes: 64 * 1024,
             memory_limit_bytes: 256 * 1024 * 1024,
-            fuel: 2_000_000_000,
+            // OWASP CRS initialisation needs the larger budget used by the
+            // Coraza reactor defaults.
+            fuel: 200_000_000_000,
         }
     }
 }

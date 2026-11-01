@@ -40,6 +40,26 @@ All notable changes to WAF-Rejected are documented here.
 - Documented the live wiring, `[waf.coraza]` configuration, failure policy and
   observed reactor latency in `docs/coraza-wasi-reactor.md`; updated the README
   security limitations. The reactor remains disabled by default.
+- Embedded OWASP Core Rule Set (CRS) 4.14.0 (commit
+  `b5b788b5bc50e68836e17995b191f72e848fed75`) in the Coraza WASI reactor,
+  replacing the four starter rules. Coverage is the complete request-side CRS:
+  protocol enforcement, LFI/RFI, RCE, PHP/Java/generic injection, XSS, SQLi,
+  session fixation and anomaly-score blocking at paranoia level 1. Response
+  rules are excluded because response bodies are not available over the host
+  ABI; deployment-specific exclusion files, plugins and the upstream regression
+  corpus are also excluded. See `wasm/coraza_reactor/rules/crs/PROVENANCE.md`
+  and `docs/coraza-wasi-reactor.md`.
+- `scripts/vendor-coraza-crs.sh` reproduces the pinned CRS vendoring and
+  directive flattening.
+- Reactor tests now cover SQLi, XSS, path traversal, command injection and two
+  benign false-positive cases.
+
+### Changed
+
+- The Coraza reactor module grows to about 20 MiB (from 18 MiB) because it now
+  contains the CRS rules and `@pmFromFile` data. The reactor fuel budget and
+  wasmi recursion depth are raised to 200 billion and 1024 respectively so the
+  larger rule bundle can initialise and evaluate.
 
 ## [0.1.0-beta.10] - 2026-11-01
 

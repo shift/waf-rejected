@@ -44,9 +44,9 @@ pub const CORAZA_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const CORAZA_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 
 /// Fuel budget for one Coraza `_initialize` + `init` + `eval` round trip.
-/// Go runtime start-up dominates this budget; see the performance notes in
-/// `docs/coraza-wasi-reactor.md`.
-pub const CORAZA_FUEL: u64 = 2_000_000_000;
+/// Go runtime start-up and compilation of the CRS directive bundle dominate
+/// this budget; see the performance notes in `docs/coraza-wasi-reactor.md`.
+pub const CORAZA_FUEL: u64 = 200_000_000_000;
 
 const SPIKE_WAT: &str = include_str!("../../wasm/reactor_spike.wat");
 
@@ -498,7 +498,7 @@ impl WasmReactor {
         // Bound native stack use per call frame. The Go runtime start-up is
         // shallow, but an unbounded interpreter stack can overflow the host
         // thread before wasmi reports a trap.
-        config.set_max_recursion_depth(128);
+        config.set_max_recursion_depth(1024);
         let engine = Engine::new(&config);
         let module =
             Module::new(&engine, bytes).map_err(|err| ReactorError::Compile(err.to_string()))?;
@@ -823,8 +823,21 @@ mod tests {
         payload(&serde_json::json!({
             "method": "GET",
             "uri": "/index.html",
-            "headers": [["accept", "text/html"]],
+            "headers": [["host", "example.com"], ["accept", "text/html"]],
             "body": null,
+        }))
+    }
+
+    fn form_payload(uri: &str, body: &str) -> Vec<u8> {
+        payload(&serde_json::json!({
+            "method": "POST",
+            "uri": uri,
+            "headers": [
+                ["host", "example.com"],
+                ["content-type", "application/x-www-form-urlencoded"],
+                ["content-length", body.len().to_string()],
+            ],
+            "body": body,
         }))
     }
 
@@ -971,23 +984,48 @@ mod tests {
                     ReactorDecision::Allow
                 );
 
-                for body in [
-                    "username=admin&password=x union select password from users",
-                    "<script>alert(1)</script>",
-                    "../../etc/passwd",
-                ] {
-                    let payload = payload(&serde_json::json!({
-                        "method": "POST",
-                        "uri": "/login",
-                        "headers": [["content-type", "application/x-www-form-urlencoded"]],
-                        "body": body,
-                    }));
+                // False-positive checks: ordinary query strings and form bodies
+                // must not trip CRS at the default paranoia level.
+                let benign_cases = [
+                    (
+                        "plain search query",
+                        payload(&serde_json::json!({
+                            "method": "GET",
+                            "uri": "/search?q=wireless+keyboard&page=2&sort=price",
+                            "headers": [["host", "example.com"], ["accept", "text/html"]],
+                            "body": null,
+                        })),
+                    ),
+                    (
+                        "login form body",
+                        form_payload(
+                            "/login",
+                            "username=alice&password=CorrectHorseBattery123&remember=1",
+                        ),
+                    ),
+                ];
+                for (kind, payload_bytes) in benign_cases {
+                    assert_eq!(
+                        reactor.evaluate(&payload_bytes).unwrap(),
+                        ReactorDecision::Allow,
+                        "expected benign {kind} to be allowed"
+                    );
+                }
+
+                let attacks = [
+                    ("SQLi", "/login", "username=admin' OR '1'='1"),
+                    ("XSS", "/search", "<script>alert(1)</script>"),
+                    ("path traversal", "/download", "../../etc/passwd"),
+                    ("command injection", "/run", "cmd=/bin/cat /etc/passwd"),
+                ];
+                for (kind, uri, body) in attacks {
+                    let payload = form_payload(uri, body);
                     assert!(
                         matches!(
                             reactor.evaluate(&payload).unwrap(),
                             ReactorDecision::Block { status: 403, .. }
                         ),
-                        "expected Coraza to block payload: {body}"
+                        "expected Coraza CRS to block {kind} payload: {body}"
                     );
                 }
             })
