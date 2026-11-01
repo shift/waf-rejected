@@ -28,6 +28,22 @@ All notable changes to WAF-Rejected are documented here.
   457 ms on the research laptop). See `docs/coraza-native-sidecar.md`.
 
 
+- Protocol-aware GraphQL-over-HTTP inspection (`src/waf/graphql.rs`,
+  `wasm-reactor` feature). Detects `POST` JSON/GraphQL and `GET ?query=`
+  requests, parses `query`/`operationName`/`variables`, extracts the operation
+  type and a SHA-256 of the normalised query, and enforces operation allowlists
+  (name or persisted-query hash, monitor/block), byte/variable/depth/alias/field
+  limits, and mutation/subscription policy before Coraza runs. New
+  `[waf.graphql]` configuration is validated at load; persisted-query
+  allowlists use a documented JSON list of `{name, sha256}` and are loaded once
+  at start-up. `waf.graphql.body_scan` selects `crs` (default, full CRS JSON
+  body scan), `graphql-only` (wraps the GraphQL checks and withholds the raw
+  body from CRS body rules, requires a non-empty allowlist), or `off`.
+  `graphql-only` removes ~0.2–1.4 s of JSON body scanning per request at the
+  cost of CRS body-rule coverage; header and URI rules still run. Security
+  events are emitted for blocks and inspection failures. See
+  `docs/graphql-inspection.md`.
+
 ## [0.1.0-beta.11] - 2026-11-01
 
 ### Added

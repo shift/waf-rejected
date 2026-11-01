@@ -457,6 +457,9 @@ pub struct WafConfig {
 
     /// Protocol-aware gRPC inspection (`wasm-reactor` feature).
     pub grpc: WafGrpcConfig,
+
+    /// Protocol-aware GraphQL-over-HTTP inspection (`wasm-reactor` feature).
+    pub graphql: WafGraphqlConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -824,6 +827,205 @@ fn is_valid_grpc_method_path(path: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// How much of the raw GraphQL body is exposed to CRS body rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WafGraphqlScanMode {
+    /// Full CRS JSON body scan (default; no security change).
+    Crs,
+    /// GraphQL checks only; the raw body is withheld from CRS body rules.
+    GraphqlOnly,
+    /// Disable GraphQL-specific checks; CRS still scans the body.
+    Off,
+}
+
+impl WafGraphqlScanMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Crs => "crs",
+            Self::GraphqlOnly => "graphql-only",
+            Self::Off => "off",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "crs" => Some(Self::Crs),
+            "graphql-only" => Some(Self::GraphqlOnly),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
+
+/// Protocol-aware GraphQL-over-HTTP inspection policy (`wasm-reactor` feature).
+///
+/// GraphQL bodies are JSON envelopes around a query. CRS JSON body rules are
+/// byte-linear and can cost hundreds of milliseconds on a few kilobytes, so
+/// the request can instead be validated at the GraphQL level and its raw body
+/// withheld from CRS. That trade-off is opt-in through `body_scan`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WafGraphqlConfig {
+    /// Enable GraphQL-aware inspection. Effective only when the WAF is
+    /// enabled and `body_scan` is not `off`.
+    pub enabled: bool,
+
+    /// `crs` (default), `graphql-only` or `off`.
+    pub body_scan: String,
+
+    /// Operation names (GraphQL names) or SHA-256 query hashes (64 hex
+    /// characters) that may execute. Empty means monitor-only, except in
+    /// `graphql-only` mode where a non-empty allowlist is required.
+    pub operation_allowlist: Vec<String>,
+
+    /// Path to a persisted-query allowlist artifact (JSON list of
+    /// `{ "name", "sha256" }`). Merged with `operation_allowlist`.
+    pub allowlist_file: Option<String>,
+
+    /// Unknown-operation policy: `monitor` or `block`. Unset defaults to
+    /// `block` when the effective allowlist is non-empty and `monitor`
+    /// otherwise.
+    pub unknown_operation_action: Option<String>,
+
+    /// Maximum raw request body size.
+    pub max_body_bytes: usize,
+    /// Maximum GraphQL query size.
+    pub max_query_bytes: usize,
+    /// Maximum serialised `variables` size.
+    pub max_variables_bytes: usize,
+    /// Maximum number of top-level `variables` entries.
+    pub max_variables: usize,
+    /// Maximum approximate selection-set depth.
+    pub max_depth: usize,
+    /// Maximum approximate alias count.
+    pub max_aliases: usize,
+    /// Maximum approximate field count.
+    pub max_fields: usize,
+
+    /// Allow mutation operations.
+    pub allow_mutations: bool,
+    /// Allow subscription operations.
+    pub allow_subscriptions: bool,
+}
+
+impl Default for WafGraphqlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            body_scan: "crs".to_string(),
+            operation_allowlist: Vec::new(),
+            allowlist_file: None,
+            unknown_operation_action: None,
+            // Deliberately generous so the default `crs` mode does not change
+            // behaviour for ordinary GraphQL requests.
+            max_body_bytes: 8 * 1024 * 1024,
+            max_query_bytes: 1024 * 1024,
+            max_variables_bytes: 1024 * 1024,
+            max_variables: 128,
+            max_depth: 128,
+            max_aliases: 1024,
+            max_fields: 8192,
+            allow_mutations: true,
+            allow_subscriptions: true,
+        }
+    }
+}
+
+impl WafGraphqlConfig {
+    /// Resolved scan mode. An invalid value falls back to the safe default;
+    /// validation rejects it at config load.
+    pub fn scan_mode(&self) -> WafGraphqlScanMode {
+        WafGraphqlScanMode::parse(&self.body_scan).unwrap_or(WafGraphqlScanMode::Crs)
+    }
+
+    /// Validates the GraphQL inspection policy.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if WafGraphqlScanMode::parse(&self.body_scan).is_none() {
+            anyhow::bail!(
+                "waf.graphql.body_scan must be 'crs', 'graphql-only' or 'off', got '{}'",
+                self.body_scan
+            );
+        }
+        for (name, value) in [
+            ("max_body_bytes", self.max_body_bytes),
+            ("max_query_bytes", self.max_query_bytes),
+            ("max_variables_bytes", self.max_variables_bytes),
+            ("max_variables", self.max_variables),
+            ("max_depth", self.max_depth),
+        ] {
+            if value == 0 {
+                anyhow::bail!("waf.graphql.{name} must be greater than zero");
+            }
+        }
+        if let Some(action) = self.unknown_operation_action.as_deref() {
+            if action != "monitor" && action != "block" {
+                anyhow::bail!(
+                    "waf.graphql.unknown_operation_action must be 'monitor' or 'block', got '{action}'"
+                );
+            }
+        }
+        for entry in &self.operation_allowlist {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                anyhow::bail!("waf.graphql.operation_allowlist entries must not be empty");
+            }
+            if !is_sha256_hex(entry) && !is_valid_graphql_name(entry) {
+                anyhow::bail!(
+                    "waf.graphql.operation_allowlist entry '{entry}' must be a GraphQL operation name or a 64-character SHA-256 hex digest"
+                );
+            }
+        }
+
+        let mut artifact_entries = 0usize;
+        if let Some(path) = self.allowlist_file.as_deref() {
+            if path.trim().is_empty() {
+                anyhow::bail!("waf.graphql.allowlist_file must not be empty when set");
+            }
+            #[cfg(feature = "wasm-reactor")]
+            {
+                let operations =
+                    crate::waf::graphql::load_operation_allowlist(path).map_err(|error| {
+                        anyhow::anyhow!(
+                            "waf.graphql.allowlist_file '{path}' could not be loaded: {error}"
+                        )
+                    })?;
+                artifact_entries = operations.len();
+            }
+            #[cfg(not(feature = "wasm-reactor"))]
+            {
+                if !std::path::Path::new(path).is_file() {
+                    anyhow::bail!(
+                        "waf.graphql.allowlist_file '{path}' could not be read: file does not exist"
+                    );
+                }
+            }
+        }
+
+        if self.scan_mode() == WafGraphqlScanMode::GraphqlOnly
+            && self.operation_allowlist.is_empty()
+            && artifact_entries == 0
+        {
+            anyhow::bail!(
+                "waf.graphql.body_scan = 'graphql-only' requires a non-empty operation_allowlist or allowlist_file"
+            );
+        }
+        Ok(())
+    }
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_valid_graphql_name(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AiConfig {
@@ -1113,6 +1315,7 @@ impl Default for WafConfig {
             wasm: WasmConfig::default(),
             coraza: WafCorazaConfig::default(),
             grpc: WafGrpcConfig::default(),
+            graphql: WafGraphqlConfig::default(),
         }
     }
 }
@@ -1302,6 +1505,7 @@ impl Config {
             );
         }
         self.waf.grpc.validate()?;
+        self.waf.graphql.validate()?;
         if self.security.auth.enabled && self.security.auth.api_keys.is_empty() {
             anyhow::bail!("security.auth.enabled is true but security.auth.api_keys is empty");
         }
@@ -1725,6 +1929,81 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
         let error = config.validate().unwrap_err().to_string();
         assert!(
             error.contains("malformed.json") && error.contains("could not be loaded"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn graphql_config_is_validated() {
+        let mut config = Config::default();
+        assert!(config.waf.graphql.enabled);
+        assert_eq!(config.waf.graphql.scan_mode(), WafGraphqlScanMode::Crs);
+        assert!(config.validate().is_ok());
+
+        config.waf.graphql.body_scan = "everything".to_string();
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.waf.graphql.max_depth = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.waf.graphql.unknown_operation_action = Some("deny".to_string());
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.waf.graphql.operation_allowlist = vec!["not a name".to_string()];
+        assert!(config.validate().is_err());
+
+        config.waf.graphql.operation_allowlist = vec!["GetUser".to_string()];
+        assert!(config.validate().is_ok());
+
+        let mut config = Config::default();
+        config.waf.graphql.body_scan = "graphql-only".to_string();
+        assert!(config.validate().is_err());
+        config.waf.graphql.operation_allowlist = vec!["GetUser".to_string()];
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn graphql_allowlist_file_is_validated() {
+        let mut config = Config::default();
+        config.waf.graphql.allowlist_file = Some(String::new());
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("waf.graphql.allowlist_file must not be empty"),
+            "unexpected error: {error}"
+        );
+
+        let missing = "/nonexistent/graphql/allowlist.json";
+        let mut config = Config::default();
+        config.waf.graphql.allowlist_file = Some(missing.to_string());
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains(missing) && error.contains("could not be loaded"),
+            "unexpected error: {error}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = dir.path().join("allowlist.json");
+        std::fs::write(
+            &artifact,
+            serde_json::to_vec(&vec![serde_json::json!({
+                "name": "GetUser",
+                "sha256": "b".repeat(64),
+            })])
+            .unwrap(),
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.waf.graphql.allowlist_file = Some(artifact.display().to_string());
+        config.waf.graphql.body_scan = "graphql-only".to_string();
+        assert!(config.validate().is_ok());
+
+        std::fs::write(&artifact, b"{not json").unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("allowlist.json") && error.contains("could not be loaded"),
             "unexpected error: {error}"
         );
     }

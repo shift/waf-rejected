@@ -35,6 +35,10 @@ pub mod grpc;
 /// Minimal protobuf wire decoder used by gRPC field-level inspection.
 #[cfg(feature = "wasm-reactor")]
 pub mod protobuf;
+/// Protocol-aware GraphQL-over-HTTP inspection (raw JSON bodies can be
+/// withheld from CRS body rules in `graphql-only` mode).
+#[cfg(feature = "wasm-reactor")]
+pub mod graphql;
 
 use bytes::Bytes;
 use hyper::{HeaderMap, Method, Uri};
@@ -171,6 +175,10 @@ pub struct WafEngine {
     /// withholds protobuf bodies from CRS body rules.
     #[cfg(feature = "wasm-reactor")]
     grpc_inspector: Option<grpc::GrpcInspector>,
+    /// Protocol-aware GraphQL pre-check; runs before Coraza and can withhold
+    /// the raw body from CRS body rules in `graphql-only` mode.
+    #[cfg(feature = "wasm-reactor")]
+    graphql_inspector: Option<graphql::GraphqlInspector>,
     #[cfg(feature = "wasm-waf")]
     wasm_engine: Option<Arc<WasmEngine>>,
     #[cfg(feature = "ai-threat-detection")]
@@ -180,6 +188,15 @@ pub struct WafEngine {
 /// Outcome of the gRPC protocol pre-check.
 #[cfg(feature = "wasm-reactor")]
 enum GrpcPrecheck {
+    /// Continue evaluation with the supplied (possibly body-stripped) context.
+    Continue(Box<RequestContext>),
+    /// Return this decision immediately.
+    Reject(Decision),
+}
+
+/// Outcome of the GraphQL protocol pre-check.
+#[cfg(feature = "wasm-reactor")]
+enum GraphqlPrecheck {
     /// Continue evaluation with the supplied (possibly body-stripped) context.
     Continue(Box<RequestContext>),
     /// Return this decision immediately.
@@ -205,6 +222,8 @@ impl Clone for WafEngine {
             waf_init_error: self.waf_init_error.clone(),
             #[cfg(feature = "wasm-reactor")]
             grpc_inspector: self.grpc_inspector.clone(),
+            #[cfg(feature = "wasm-reactor")]
+            graphql_inspector: self.graphql_inspector.clone(),
             #[cfg(feature = "wasm-waf")]
             wasm_engine: self.wasm_engine.clone(),
             #[cfg(feature = "ai-threat-detection")]
@@ -226,6 +245,8 @@ impl WafEngine {
             waf_init_error: None,
             #[cfg(feature = "wasm-reactor")]
             grpc_inspector: None,
+            #[cfg(feature = "wasm-reactor")]
+            graphql_inspector: None,
             #[cfg(feature = "wasm-waf")]
             wasm_engine: None,
         }
@@ -250,6 +271,8 @@ impl WafEngine {
             waf_init_error: None,
             #[cfg(feature = "wasm-reactor")]
             grpc_inspector: None,
+            #[cfg(feature = "wasm-reactor")]
+            graphql_inspector: None,
             #[cfg(feature = "wasm-waf")]
             wasm_engine,
             #[cfg(feature = "ai-threat-detection")]
@@ -268,6 +291,28 @@ impl WafEngine {
                 Err(err) => {
                     warn!(error = %err, "failed to load the gRPC allowlist artifact");
                     engine.record_init_error(format!("gRPC allowlist failed to load: {err}"));
+                }
+            }
+        }
+
+        // GraphQL is protocol-aware too: validate the operation before Coraza
+        // runs so `graphql-only` mode can withhold the raw JSON body.
+        #[cfg(feature = "wasm-reactor")]
+        if config.waf.enabled
+            && config.waf.graphql.enabled
+            && config.waf.graphql.scan_mode() != crate::config::WafGraphqlScanMode::Off
+        {
+            match graphql::GraphqlInspector::try_from_config(&config.waf.graphql) {
+                Ok(inspector) => {
+                    engine.graphql_inspector = Some(inspector);
+                    info!(
+                        mode = config.waf.graphql.scan_mode().as_str(),
+                        "Enabled protocol-aware GraphQL inspection"
+                    );
+                }
+                Err(err) => {
+                    warn!(error = %err, "failed to load the GraphQL allowlist artifact");
+                    engine.record_init_error(format!("GraphQL allowlist failed to load: {err}"));
                 }
             }
         }
@@ -598,6 +643,81 @@ impl WafEngine {
         }
     }
 
+    /// Outcome of the GraphQL protocol pre-check.
+    #[cfg(feature = "wasm-reactor")]
+    async fn graphql_precheck(&self, request: &RequestContext) -> Option<GraphqlPrecheck> {
+        let inspector = self.graphql_inspector.as_ref()?;
+        if !inspector.matches(request) {
+            return None;
+        }
+
+        match inspector.inspect(request) {
+            Ok(graphql::GraphqlVerdict::Allow {
+                strip_body,
+                monitored,
+                operation_type,
+                operation_name,
+                query_hash,
+            }) => {
+                debug!(
+                    operation_type = operation_type.as_str(),
+                    operation = operation_name.as_deref().unwrap_or("<anonymous>"),
+                    hash = %query_hash,
+                    monitored,
+                    strip_body,
+                    "GraphQL pre-check passed"
+                );
+                if strip_body {
+                    Some(GraphqlPrecheck::Continue(Box::new(graphql::strip_body(
+                        request,
+                    ))))
+                } else {
+                    None
+                }
+            }
+            Ok(graphql::GraphqlVerdict::Block { status, reason }) => {
+                let decision = Decision::Block { status, reason };
+                self.event_logger
+                    .log_event(request, &decision, vec![graphql::RULE_NAME.to_string()])
+                    .await;
+                Some(GraphqlPrecheck::Reject(decision))
+            }
+            Err(err) => {
+                if self.fail_closed {
+                    let decision = Decision::Block {
+                        status: 503,
+                        reason: format!("GraphQL inspection unavailable: {err}"),
+                    };
+                    self.event_logger
+                        .log_event(request, &decision, vec![graphql::RULE_NAME.to_string()])
+                        .await;
+                    Some(GraphqlPrecheck::Reject(decision))
+                } else {
+                    warn!(
+                        error = %err,
+                        "GraphQL inspection failed; continuing because fail_mode is open"
+                    );
+                    // `graphql-only` promised to keep the raw body away from
+                    // CRS; `crs` mode should keep scanning it.
+                    if inspector.matches(request) && self.graphql_strips_body() {
+                        Some(GraphqlPrecheck::Continue(Box::new(graphql::strip_body(
+                            request,
+                        ))))
+                    } else {
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    fn graphql_strips_body(&self) -> bool {
+        self.graphql_inspector
+            .as_ref()
+            .is_some_and(|inspector| inspector.strips_body())
+    }
+
     /// Fast evaluation for performance-critical paths (headers/URI only)
     /// Skips expensive operations like body inspection
     pub async fn fast_evaluate(&self, request: &RequestContext) -> Decision {
@@ -605,6 +725,17 @@ impl WafEngine {
             return Decision::Allow;
         }
 
+        #[cfg(feature = "wasm-reactor")]
+        let graphql_context;
+        #[cfg(feature = "wasm-reactor")]
+        let request: &RequestContext = match self.graphql_precheck(request).await {
+            Some(GraphqlPrecheck::Reject(decision)) => return decision,
+            Some(GraphqlPrecheck::Continue(context)) => {
+                graphql_context = *context;
+                &graphql_context
+            }
+            None => request,
+        };
         #[cfg(feature = "wasm-reactor")]
         let grpc_context;
         #[cfg(feature = "wasm-reactor")]
@@ -706,6 +837,17 @@ impl WafEngine {
             return Decision::Allow;
         }
 
+        #[cfg(feature = "wasm-reactor")]
+        let graphql_context;
+        #[cfg(feature = "wasm-reactor")]
+        let request: &RequestContext = match self.graphql_precheck(request).await {
+            Some(GraphqlPrecheck::Reject(decision)) => return decision,
+            Some(GraphqlPrecheck::Continue(context)) => {
+                graphql_context = *context;
+                &graphql_context
+            }
+            None => request,
+        };
         #[cfg(feature = "wasm-reactor")]
         let grpc_context;
         #[cfg(feature = "wasm-reactor")]
@@ -1279,6 +1421,135 @@ mod tests {
             engine.evaluate(&request).await,
             Decision::Block { status: 403, .. }
         ));
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    fn graphql_context(body: &str) -> RequestContext {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            hyper::header::CONTENT_TYPE,
+            hyper::header::HeaderValue::from_static("application/json"),
+        );
+        RequestContext::new(
+            IpAddr::from_str("192.168.1.100").unwrap(),
+            Method::POST,
+            Uri::from_str("/graphql").unwrap(),
+            headers,
+            Some(body.len()),
+        )
+        .with_body(Some(Bytes::from(body.to_string())))
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    fn graphql_config(mode: crate::config::WafGraphqlScanMode) -> crate::config::WafGraphqlConfig {
+        let mut config = crate::config::WafGraphqlConfig::default();
+        config.body_scan = mode.as_str().to_string();
+        config.operation_allowlist = vec!["GetUser".to_string()];
+        config
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    #[tokio::test]
+    async fn graphql_only_withholds_body_but_header_and_uri_rules_still_run() {
+        let mut engine = WafEngine::new();
+        engine.graphql_inspector = Some(crate::waf::graphql::GraphqlInspector::from_config(
+            &graphql_config(crate::config::WafGraphqlScanMode::GraphqlOnly),
+        ));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        engine.add_rule(BodyProbeRule {
+            seen: std::sync::Arc::clone(&seen),
+        });
+        let uri_seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        engine.add_rule(UriProbeRule {
+            seen: std::sync::Arc::clone(&uri_seen),
+        });
+
+        let body = r#"{"query":"query GetUser { user { id } }","operationName":"GetUser"}"#;
+        assert_eq!(
+            engine.evaluate(&graphql_context(body)).await,
+            Decision::Allow
+        );
+        assert_eq!(seen.lock().unwrap().as_slice(), &[None]);
+        assert_eq!(
+            uri_seen.lock().unwrap().as_slice(),
+            &["/graphql".to_string()]
+        );
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    #[tokio::test]
+    async fn graphql_crs_mode_keeps_the_body_visible_to_rules() {
+        let mut engine = WafEngine::new();
+        engine.graphql_inspector = Some(crate::waf::graphql::GraphqlInspector::from_config(
+            &graphql_config(crate::config::WafGraphqlScanMode::Crs),
+        ));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        engine.add_rule(BodyProbeRule {
+            seen: std::sync::Arc::clone(&seen),
+        });
+
+        let body = r#"{"query":"query GetUser { user { id } }","operationName":"GetUser"}"#;
+        assert_eq!(
+            engine.evaluate(&graphql_context(body)).await,
+            Decision::Allow
+        );
+        assert_eq!(seen.lock().unwrap().as_slice(), &[Some(body.len())]);
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    #[tokio::test]
+    async fn graphql_malformed_body_fails_closed_only_in_graphql_only_mode() {
+        let body = "{ this is not json";
+
+        let mut crs_engine = WafEngine::new();
+        crs_engine.graphql_inspector = Some(crate::waf::graphql::GraphqlInspector::from_config(
+            &graphql_config(crate::config::WafGraphqlScanMode::Crs),
+        ));
+        assert_eq!(
+            crs_engine.evaluate(&graphql_context(body)).await,
+            Decision::Allow
+        );
+
+        let mut only_engine = WafEngine::new();
+        only_engine.graphql_inspector = Some(crate::waf::graphql::GraphqlInspector::from_config(
+            &graphql_config(crate::config::WafGraphqlScanMode::GraphqlOnly),
+        ));
+        assert!(matches!(
+            only_engine.evaluate(&graphql_context(body)).await,
+            Decision::Block { status: 503, .. }
+        ));
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    #[tokio::test]
+    async fn graphql_allowlist_blocked_operation_is_rejected_before_rules() {
+        let mut config = graphql_config(crate::config::WafGraphqlScanMode::GraphqlOnly);
+        config.unknown_operation_action = Some("block".to_string());
+        let mut engine = WafEngine::new();
+        engine.graphql_inspector =
+            Some(crate::waf::graphql::GraphqlInspector::from_config(&config));
+        let body = r#"{"query":"query Other { user { id } }","operationName":"Other"}"#;
+        assert!(matches!(
+            engine.evaluate(&graphql_context(body)).await,
+            Decision::Block { status: 403, .. }
+        ));
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    struct UriProbeRule {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    impl WafRule for UriProbeRule {
+        fn name(&self) -> &str {
+            "uri-probe"
+        }
+
+        fn evaluate(&self, ctx: &RequestContext) -> Decision {
+            self.seen.lock().unwrap().push(ctx.uri.path().to_string());
+            Decision::Allow
+        }
     }
 
     #[cfg(feature = "wasm-reactor")]

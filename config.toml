@@ -110,6 +110,35 @@ max_frames = 64
 # "allow" or "block"; unset defaults to block for a non-empty allowlist.
 # unknown_method_action = "block"
 
+[waf.graphql]
+# Protocol-aware GraphQL-over-HTTP inspection. The default `crs` mode keeps the
+# full CRS JSON body scan (no security change). `graphql-only` runs the GraphQL
+# checks and withholds the raw body from CRS body rules (header/URI rules still
+# run); it requires a non-empty allowlist and gives up CRS body-rule coverage
+# for these requests. `off` disables GraphQL-specific checks; CRS still scans.
+# See docs/graphql-inspection.md.
+enabled = true
+body_scan = "crs"
+
+# Operation names and/or 64-character SHA-256 query hashes that may execute.
+# Empty = monitor-only (except graphql-only, which requires an entry).
+operation_allowlist = []
+# Persisted-query artifact: JSON list of { "name": "...", "sha256": "..." }.
+# A configured file that cannot be loaded aborts start-up.
+# allowlist_file = "/etc/waf/graphql/allowlist.json"
+# "monitor" or "block"; unset defaults to block for a non-empty allowlist.
+# unknown_operation_action = "block"
+
+max_body_bytes = 8388608       # 8 MiB
+max_query_bytes = 1048576      # 1 MiB
+max_variables_bytes = 1048576  # 1 MiB
+max_variables = 128
+max_depth = 128
+max_aliases = 1024
+max_fields = 8192
+allow_mutations = true
+allow_subscriptions = true
+
 [security.auth]
 enabled = false
 api_keys = []
