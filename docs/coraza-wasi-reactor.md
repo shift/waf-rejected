@@ -27,25 +27,55 @@ also enables the reactor's `_initialize` export).
 
 ## Build
 
+The reactor is built from the committed vendor tree
+(`wasm/coraza_reactor/vendor`, populated with `go mod vendor`), so the build
+needs no network access or module cache. `scripts/build-coraza-reactor.sh`
+enforces the pinned toolchain and flags:
+
 ```sh
 nix develop
-./scripts/build-coraza-reactor.sh
+./scripts/build-coraza-reactor.sh            # build + export/checksum verification
+./scripts/build-coraza-reactor.sh --verify   # rebuild and compare to checksum
 ```
 
-Equivalent manual command:
+The script requires Go 1.24.x (`GOTOOLCHAIN=local`), sets
+`GOOS=wasip1 GOARCH=wasm`, `CGO_ENABLED=0`, `GOFLAGS=-mod=vendor` and
+`GOPROXY=off`, and builds with `-buildmode=c-shared -trimpath -buildvcs=false
+-ldflags="-s -w -buildid="`. Equivalent manual command:
 
 ```sh
 cd wasm/coraza_reactor
-GOOS=wasip1 GOARCH=wasm go build \
+GOOS=wasip1 GOARCH=wasm CGO_ENABLED=0 GOFLAGS=-mod=vendor GOPROXY=off \
+GOTOOLCHAIN=local go build \
   -tags no_fs_access \
   -buildmode=c-shared \
   -trimpath \
-  -ldflags="-s -w" \
+  -buildvcs=false \
+  -ldflags="-s -w -buildid=" \
   -o coraza_reactor.wasm .
 ```
 
 `no_fs_access` prevents Coraza from probing the filesystem at start-up. The
 output is about 18 MiB because it contains the Go runtime and Coraza.
+
+### Reproducibility and checksum
+
+Go's Wasm builds are byte-reproducible with the flags above: the build ID is
+empty, paths are trimmed, VCS metadata is excluded, and all inputs come from
+the committed `go.mod`, `go.sum` and `vendor/` tree. Two clean builds on the
+same `linux/amd64` host with Go 1.24.5 produce identical bytes.
+
+The build writes `wasm/coraza_reactor/coraza_reactor.wasm.sha256` next to the
+artifact. `--verify` rebuilds from scratch and fails if the SHA-256 differs
+from that sidecar, which makes toolchain or dependency drift explicit:
+
+```sh
+(cd wasm/coraza_reactor && sha256sum -c coraza_reactor.wasm.sha256)
+```
+
+Reproducibility is across the pinned Go toolchain and host architecture, not
+across different Go patch releases; changing Go or `go.mod` requires
+regenerating the module and checksum in the same commit.
 
 ### Verify exports
 
