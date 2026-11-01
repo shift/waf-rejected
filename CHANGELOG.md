@@ -61,6 +61,16 @@ All notable changes to WAF-Rejected are documented here.
 - Unit coverage for attack blocking (SQLi, XSS, path traversal), benign
   traffic, disabled configuration, and fail-closed/fail-open behaviour.
   Release-mode latency measurement reported in `docs/coraza-wasi-reactor.md`.
+- `FileDescriptorSet`-driven gRPC allowlist generation:
+  `grpc-allowlist` (`src/bin/grpc-allowlist.rs`,
+  `scripts/grpc-allowlist.sh`) reads a binary or JSON descriptor set and emits
+  a deterministic JSON artifact with paths, streaming flags, input/output
+  types, per-message size limits and the descriptor's SHA-256. Supports a
+  global `--max-message-bytes` and per-method overrides from a TOML file, and
+  fails on malformed descriptors, missing fields, duplicate methods or
+  unresolved types. The self-contained loader `waf::grpc_allowlist::load_allowlist`
+  validates the artifact for the planned `waf.grpc.allowlist_file` hook; user
+  and CI workflow documented in `docs/grpc-inspection.md`.
 
 ### Changed
 

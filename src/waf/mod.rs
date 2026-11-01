@@ -3,6 +3,7 @@ pub mod auth;
 pub mod content_inspection;
 pub mod exporters;
 pub mod geoip;
+pub mod grpc_allowlist;
 pub mod io;
 pub mod middleware;
 #[path = "proxy_fixed.rs"]

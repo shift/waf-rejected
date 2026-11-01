@@ -77,10 +77,9 @@ are not `/package.Service/Method` paths.
 
 ### Generating the allowlist
 
-The allowlist can be generated from a protobuf `FileDescriptorSet`: walk the
-services in the descriptor and emit `/package.Service/Method` for every method
-in each service. That generator is being built on a separate branch; it is not
-part of this inspection change.
+Do not hand-maintain `method_allowlist`. Generate it from the protobuf
+`FileDescriptorSet` and commit the resulting artifact; see
+[Generating the allowlist from a descriptor set](#generating-the-allowlist-from-a-descriptor-set).
 
 ## Limitations
 
@@ -105,3 +104,167 @@ allowlist allow/block/monitor behaviour, base64 `-bin` metadata and text
 scanner exclusion, and `grpc-web-text` decoding. `src/waf/mod.rs` verifies
 that a gRPC protobuf body is not delivered to downstream rules while a
 non-gRPC body still is.
+
+## Generating the allowlist from a descriptor set
+
+**Tool:** `grpc-allowlist` (`src/bin/grpc-allowlist.rs`)
+**Library:** `src/waf/grpc_allowlist.rs`
+**Wrapper:** `scripts/grpc-allowlist.sh`
+
+Hand-writing `method_allowlist` drifts from the deployed services and fails
+open in practice: a method added to the `.proto` but forgotten in the config is
+blocked (or, in monitor mode, silently allowed). The generator derives the
+list directly from the compiled descriptor so reviewers can see exactly which
+methods a build exposes.
+
+### Ingestion workflow
+
+1. Compile the descriptor set from the exact protos used to build the service.
+   `--include_imports` is required so every request/response type, including
+   `google.protobuf.*`, is present in the set:
+
+   ```bash
+   protoc \
+     --descriptor_set_out=grpc/descriptor.binpb \
+     --include_imports \
+     -I proto \
+     proto/acme/billing/v1/billing.proto
+   ```
+
+   `protoc --descriptor_set_out=... --include_imports` writes the binary wire
+   format. To produce the JSON form, convert the descriptor set with any
+   protobuf implementation that supports the JSON mapping (`file`,
+   `package`, `messageType`, `service`, `method`, `inputType`, `outputType`,
+   `clientStreaming`, `serverStreaming`). Both camelCase and snake_case field
+   names are accepted.
+
+2. Generate the artifact:
+
+   ```bash
+   ./scripts/grpc-allowlist.sh \
+     --descriptor grpc/descriptor.binpb \
+     --max-message-bytes 4194304 \
+     --overrides grpc/allowlist-overrides.toml \
+     --output grpc/allowlist.json
+   ```
+
+   The format is detected from the extension (`.binpb`/`.pb` binary, `.json`
+   JSON); use `--format binpb|json|auto` to override. Without `--output` the
+   artifact is written to stdout.
+
+3. Review the diff and commit `grpc/allowlist.json` next to the descriptor.
+
+4. Reference the committed artifact from the WAF config:
+
+   ```toml
+   [waf.grpc]
+   allowlist_file = "/etc/waf/grpc/allowlist.json"
+   ```
+
+   `allowlist_file` is the planned loader hook; the inspector integration is
+   tracked separately. The loader interface is documented below.
+
+### Artifact shape
+
+```json
+{
+  "ir_version": 1,
+  "source": {"kind": "protobuf", "sha256": "438b9d3d..."},
+  "methods": [
+    {
+      "path": "/acme.billing.v1.Billing/Charge",
+      "client_streaming": false,
+      "server_streaming": false,
+      "input": "acme.billing.v1.Request",
+      "output": "acme.billing.v1.Response",
+      "max_message_bytes": 4194304
+    }
+  ],
+  "unknown_method_action": "block"
+}
+```
+
+* `ir_version` — artifact schema version; the loader accepts `1` only.
+* `source.kind` — always `protobuf`.
+* `source.sha256` — SHA-256 of the descriptor bytes exactly as ingested, so a
+  reviewer can prove the artifact came from a specific compiled descriptor.
+* `methods` — sorted by `path`. Streaming flags and fully-qualified types come
+  straight from the descriptor; nested message types are resolved
+  (`acme.billing.v1.Request.Item`).
+* `unknown_method_action` — `allow` (monitor) or `block`; the generator
+  defaults to `block`.
+
+Output is canonical: methods are sorted, the JSON is pretty-printed with a
+fixed field order, and a trailing newline is written. Running the generator
+twice over the same bytes produces byte-identical output.
+
+### Per-method overrides
+
+`--max-message-bytes` sets the default limit; `--overrides` supplies a small
+TOML file for per-method limits (for example upload methods) and defaults:
+
+```toml
+max_message_bytes = 4194304
+unknown_method_action = "block"
+
+[methods."/acme.billing.v1.Billing/Upload"]
+max_message_bytes = 16777216
+```
+
+Precedence: command-line `--max-message-bytes` / `--unknown-method-action`
+beat the override file's defaults; per-method entries beat both. An override
+for a path that is not in the descriptor is an error, so a renamed method
+cannot silently keep a stale limit. Unknown keys are rejected by the parser.
+
+### Provenance and CI diffing
+
+Commit the descriptor and the generated artifact together, then enforce in CI:
+
+```bash
+./scripts/grpc-allowlist.sh \
+  --descriptor grpc/descriptor.binpb \
+  --overrides grpc/allowlist-overrides.toml \
+  --output /tmp/grpc-allowlist.json
+
+git diff --no-index --exit-code grpc/allowlist.json /tmp/grpc-allowlist.json
+```
+
+This fails when a proto change adds, removes or re-types a method without the
+committed artifact being regenerated, making every exposure change a reviewable
+diff. Two further checks are cheap and worth running:
+
+* `source.sha256` in the committed artifact must match the committed
+  descriptor:
+  `sha256sum grpc/descriptor.binpb` equals the artifact value.
+* the artifact must load without errors; a unit test can call
+  `waf::grpc_allowlist::load_allowlist("grpc/allowlist.json")`.
+
+The generator exits non-zero with a specific message for: malformed wire data
+or JSON, a descriptor without services, missing service/method/type names,
+duplicate method paths (including collisions across files), input or output
+types not present in the descriptor set (usually a missing
+`--include_imports`), and overrides for unknown methods. It never emits a
+partial artifact.
+
+### Loader interface
+
+`src/waf/grpc_allowlist.rs` exposes the contract the inspector will use:
+
+```rust
+pub fn load_allowlist(path: impl AsRef<Path>) -> Result<GrpcAllowlist, GrpcAllowlistError>;
+
+impl GrpcAllowlist {
+    pub fn allows(&self, path: &str) -> bool;
+    pub fn max_message_bytes_for(&self, path: &str) -> Option<usize>;
+    pub fn validate(&self) -> Result<(), GrpcAllowlistError>;
+}
+```
+
+`load_allowlist` reads and validates the whole document (IR version, source
+kind/hash shape, method paths, types, non-zero limits, duplicate paths, known
+action). The returned struct is immutable data only; `GrpcAllowlist` is
+`Serialize`/`Deserialize` with `deny_unknown_fields`, so a typo in the artifact
+fails loading instead of being ignored. The inspector branch owns the decision
+to call it from `waf.grpc.allowlist_file` and to prefer per-method
+`max_message_bytes` over the global value; this module does not modify
+`src/waf/grpc.rs`.
