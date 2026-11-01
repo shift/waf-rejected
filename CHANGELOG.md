@@ -44,6 +44,16 @@ All notable changes to WAF-Rejected are documented here.
   events are emitted for blocks and inspection failures. See
   `docs/graphql-inspection.md`.
 
+- Reproducible end-to-end load-validation harness: `load-validate`
+  (`src/bin/load_validate.rs`) starts a mock upstream and a throwaway
+  `waf-ingress`, replays a seeded matrix of bodyless, form, gRPC, GraphQL and
+  attack traffic at concurrency 1/4/16/64, records p50/p95/p99/RPS/errors/503s/
+  RSS, checks decision correctness, and evaluates explicit acceptance gates.
+  `scripts/load-validate.sh` builds release, generates the throwaway config and
+  writes JSON plus a markdown summary under `/tmp/opencode/load-validation`.
+  Measured capacity and gate results are documented in
+  `docs/operations/performance-validation.md`.
+
 ## [0.1.0-beta.11] - 2026-11-01
 
 ### Added

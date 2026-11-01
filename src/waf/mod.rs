@@ -32,13 +32,13 @@ pub mod native_coraza;
 #[cfg(feature = "wasm-reactor")]
 pub mod grpc;
 
-/// Minimal protobuf wire decoder used by gRPC field-level inspection.
-#[cfg(feature = "wasm-reactor")]
-pub mod protobuf;
 /// Protocol-aware GraphQL-over-HTTP inspection (raw JSON bodies can be
 /// withheld from CRS body rules in `graphql-only` mode).
 #[cfg(feature = "wasm-reactor")]
 pub mod graphql;
+/// Minimal protobuf wire decoder used by gRPC field-level inspection.
+#[cfg(feature = "wasm-reactor")]
+pub mod protobuf;
 
 use bytes::Bytes;
 use hyper::{HeaderMap, Method, Uri};
