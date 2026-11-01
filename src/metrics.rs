@@ -8,6 +8,9 @@ const DURATION_BUCKETS: [f64; 11] = [
     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
 ];
 
+/// Upper bounds (seconds) for the Coraza evaluation-duration histogram.
+const CORAZA_DURATION_BUCKETS: [f64; 11] = DURATION_BUCKETS;
+
 /// Process-wide counters for the proxy.
 #[derive(Debug)]
 pub struct Metrics {
@@ -27,6 +30,13 @@ pub struct Metrics {
     duration_inf: AtomicU64,
     duration_sum_nanos: AtomicU64,
     duration_count: AtomicU64,
+    coraza_evaluations_total: AtomicU64,
+    coraza_blocks_total: AtomicU64,
+    coraza_errors_total: AtomicU64,
+    coraza_duration_buckets: [AtomicU64; 11],
+    coraza_duration_inf: AtomicU64,
+    coraza_duration_sum_nanos: AtomicU64,
+    coraza_duration_count: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -54,6 +64,13 @@ impl Metrics {
             duration_inf: AtomicU64::new(0),
             duration_sum_nanos: AtomicU64::new(0),
             duration_count: AtomicU64::new(0),
+            coraza_evaluations_total: AtomicU64::new(0),
+            coraza_blocks_total: AtomicU64::new(0),
+            coraza_errors_total: AtomicU64::new(0),
+            coraza_duration_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            coraza_duration_inf: AtomicU64::new(0),
+            coraza_duration_sum_nanos: AtomicU64::new(0),
+            coraza_duration_count: AtomicU64::new(0),
         }
     }
 
@@ -97,6 +114,34 @@ impl Metrics {
             }
         }
         self.duration_inf.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one Coraza reactor evaluation and its duration.
+    pub fn record_coraza_evaluation(&self, duration: Duration) {
+        self.coraza_evaluations_total
+            .fetch_add(1, Ordering::Relaxed);
+        let seconds = duration.as_secs_f64();
+        self.coraza_duration_count.fetch_add(1, Ordering::Relaxed);
+        self.coraza_duration_sum_nanos.fetch_add(
+            duration.as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+
+        for (index, bound) in CORAZA_DURATION_BUCKETS.iter().enumerate() {
+            if seconds <= *bound {
+                self.coraza_duration_buckets[index].fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        self.coraza_duration_inf.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_coraza_block(&self) {
+        self.coraza_blocks_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_coraza_error(&self) {
+        self.coraza_errors_total.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_webtransport_session(&self) {
@@ -178,6 +223,50 @@ impl Metrics {
             self.webtransport_datagrams_total.load(Ordering::Relaxed),
         ));
 
+        out.push_str(&format!(
+            "# HELP waf_coraza_evaluations_total Coraza reactor evaluations.\n\
+             # TYPE waf_coraza_evaluations_total counter\n\
+             waf_coraza_evaluations_total {}\n\
+             # HELP waf_coraza_blocks_total Requests blocked by the Coraza reactor.\n\
+             # TYPE waf_coraza_blocks_total counter\n\
+             waf_coraza_blocks_total {}\n\
+             # HELP waf_coraza_errors_total Coraza reactor evaluation failures.\n\
+             # TYPE waf_coraza_errors_total counter\n\
+             waf_coraza_errors_total {}\n",
+            self.coraza_evaluations_total.load(Ordering::Relaxed),
+            self.coraza_blocks_total.load(Ordering::Relaxed),
+            self.coraza_errors_total.load(Ordering::Relaxed),
+        ));
+
+        out.push_str(
+            "# HELP waf_coraza_evaluation_duration_seconds Coraza reactor evaluation duration in seconds.\n\
+             # TYPE waf_coraza_evaluation_duration_seconds histogram\n",
+        );
+        let mut coraza_cumulative = 0u64;
+        for (index, bound) in CORAZA_DURATION_BUCKETS.iter().enumerate() {
+            coraza_cumulative = coraza_cumulative
+                .saturating_add(self.coraza_duration_buckets[index].load(Ordering::Relaxed));
+            out.push_str(&format!(
+                "waf_coraza_evaluation_duration_seconds_bucket{{le=\"{}\"}} {}\n",
+                format_bucket(*bound),
+                coraza_cumulative
+            ));
+        }
+        let coraza_total =
+            coraza_cumulative.saturating_add(self.coraza_duration_inf.load(Ordering::Relaxed));
+        out.push_str(&format!(
+            "waf_coraza_evaluation_duration_seconds_bucket{{le=\"+Inf\"}} {}\n",
+            coraza_total
+        ));
+        out.push_str(&format!(
+            "waf_coraza_evaluation_duration_seconds_sum {}\n",
+            self.coraza_duration_sum_nanos.load(Ordering::Relaxed) as f64 / 1_000_000_000.0
+        ));
+        out.push_str(&format!(
+            "waf_coraza_evaluation_duration_seconds_count {}\n",
+            self.coraza_duration_count.load(Ordering::Relaxed)
+        ));
+
         out.push_str(
             "# HELP waf_request_duration_seconds Request processing duration in seconds.\n\
              # TYPE waf_request_duration_seconds histogram\n",
@@ -257,6 +346,89 @@ mod tests {
             find_line(&rendered, "waf_rate_limited_total "),
             "waf_rate_limited_total 1"
         );
+    }
+
+    #[test]
+    fn render_includes_coraza_counters() {
+        let metrics = Metrics::new();
+        metrics.record_coraza_evaluation(Duration::from_micros(500));
+        metrics.record_coraza_evaluation(Duration::from_millis(7));
+        metrics.record_coraza_block();
+        metrics.record_coraza_error();
+
+        let rendered = metrics.render_prometheus();
+        assert_eq!(
+            find_line(&rendered, "waf_coraza_evaluations_total "),
+            "waf_coraza_evaluations_total 2"
+        );
+        assert_eq!(
+            find_line(&rendered, "waf_coraza_blocks_total "),
+            "waf_coraza_blocks_total 1"
+        );
+        assert_eq!(
+            find_line(&rendered, "waf_coraza_errors_total "),
+            "waf_coraza_errors_total 1"
+        );
+    }
+
+    #[test]
+    fn render_coraza_histogram_is_cumulative_and_valid() {
+        let metrics = Metrics::new();
+        metrics.record_coraza_evaluation(Duration::from_micros(500));
+        metrics.record_coraza_evaluation(Duration::from_millis(7));
+        metrics.record_coraza_evaluation(Duration::from_millis(80));
+        metrics.record_coraza_evaluation(Duration::from_secs(10));
+
+        let rendered = metrics.render_prometheus();
+
+        assert_eq!(
+            find_line(
+                &rendered,
+                "waf_coraza_evaluation_duration_seconds_bucket{le=\"0.001\"}"
+            ),
+            "waf_coraza_evaluation_duration_seconds_bucket{le=\"0.001\"} 1"
+        );
+        assert_eq!(
+            find_line(
+                &rendered,
+                "waf_coraza_evaluation_duration_seconds_bucket{le=\"0.01\"}"
+            ),
+            "waf_coraza_evaluation_duration_seconds_bucket{le=\"0.01\"} 2"
+        );
+        assert_eq!(
+            find_line(
+                &rendered,
+                "waf_coraza_evaluation_duration_seconds_bucket{le=\"0.1\"}"
+            ),
+            "waf_coraza_evaluation_duration_seconds_bucket{le=\"0.1\"} 3"
+        );
+        assert_eq!(
+            find_line(
+                &rendered,
+                "waf_coraza_evaluation_duration_seconds_bucket{le=\"+Inf\"}"
+            ),
+            "waf_coraza_evaluation_duration_seconds_bucket{le=\"+Inf\"} 4"
+        );
+        assert_eq!(
+            find_line(&rendered, "waf_coraza_evaluation_duration_seconds_count "),
+            "waf_coraza_evaluation_duration_seconds_count 4"
+        );
+
+        let sum = find_line(&rendered, "waf_coraza_evaluation_duration_seconds_sum ");
+        let sum: f64 = sum.rsplit(' ').next().unwrap().parse().unwrap();
+        assert!((sum - 10.0875).abs() < 0.001, "unexpected sum {sum}");
+
+        for prefix in [
+            "# HELP waf_coraza_evaluations_total",
+            "# TYPE waf_coraza_evaluations_total counter",
+            "# HELP waf_coraza_blocks_total",
+            "# TYPE waf_coraza_blocks_total counter",
+            "# HELP waf_coraza_errors_total",
+            "# TYPE waf_coraza_errors_total counter",
+            "# TYPE waf_coraza_evaluation_duration_seconds histogram",
+        ] {
+            assert!(rendered.contains(prefix), "missing {prefix}");
+        }
     }
 
     #[test]

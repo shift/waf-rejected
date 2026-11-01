@@ -147,6 +147,32 @@ Module-side constants: `maxInputBytes = 64 * 1024`. The input buffer is a Go
 global; `input_base` exposes its address so the host never writes over Go
 runtime data at a fixed low offset.
 
+## Observability
+
+Attach the shared metrics registry when constructing the rule:
+
+```rust
+let metrics = Arc::new(Metrics::new());
+let rule = WasmReactorRule::new("coraza", Arc::new(reactor)).with_metrics(metrics);
+```
+
+The rule then records, under the `wasm-reactor` feature:
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `waf_coraza_evaluations_total` | counter | Reactor evaluations attempted (including failures) |
+| `waf_coraza_blocks_total` | counter | Decisions returned as block |
+| `waf_coraza_errors_total` | counter | Payload-encoding or evaluation failures |
+| `waf_coraza_evaluation_duration_seconds` | histogram | End-to-end rule path duration, including payload encoding |
+
+Recording is limited to relaxed atomic increments plus one `Instant` read per
+evaluation; there is no allocation on the metrics path. Without
+`with_metrics`, the rule performs no metric work.
+
+Prometheus alert rules for the error rate and block spikes are defined in
+`infrastructure/monitoring/alert_rules.yml` and documented in
+`docs/operations/monitoring.md`.
+
 ## Testing
 
 The host test builds on the module actually being executable, not just

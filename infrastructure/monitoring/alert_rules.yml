@@ -31,6 +31,30 @@ groups:
           summary: "Elevated rate limiting"
           description: "{{ $value | humanize }} requests per second are being rate limited"
 
+      - alert: CorazaEvaluationErrorRate
+        expr: |
+          rate(waf_coraza_errors_total[5m])
+          /
+          clamp_min(rate(waf_coraza_evaluations_total[5m]), 0.001)
+          > 0.05
+        for: 2m
+        labels:
+          severity: critical
+          category: security
+        annotations:
+          summary: "Coraza reactor evaluation errors"
+          description: "{{ $value | humanizePercentage }} of Coraza evaluations are failing"
+
+      - alert: CorazaBlockSpike
+        expr: rate(waf_coraza_blocks_total[5m]) > 10
+        for: 2m
+        labels:
+          severity: warning
+          category: security
+        annotations:
+          summary: "Coraza block spike"
+          description: "Coraza is blocking {{ $value | humanize }} requests per second"
+
       - alert: HighRequestLatency
         expr: histogram_quantile(0.95, sum by (le) (rate(waf_request_duration_seconds_bucket[5m]))) > 0.5
         for: 5m

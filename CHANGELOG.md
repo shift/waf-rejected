@@ -2,6 +2,24 @@
 
 All notable changes to WAF-Rejected are documented here.
 
+## [Unreleased]
+
+### Added
+
+- Coraza reactor observability behind the non-default `wasm-reactor` feature:
+  `waf_coraza_evaluations_total`, `waf_coraza_blocks_total`,
+  `waf_coraza_errors_total` and the
+  `waf_coraza_evaluation_duration_seconds` histogram. `WasmReactorRule`
+  records them through an optional shared metrics registry
+  (`with_metrics`).
+- Prometheus alerts for Coraza evaluation error rate and block spikes, using
+  only the emitted Coraza metrics.
+
+### Documentation
+
+- Documented Coraza metrics, alert rules and recording overhead in
+  `docs/operations/monitoring.md` and `docs/coraza-wasi-reactor.md`.
+
 ## [0.1.0-beta.10] - 2026-11-01
 
 ### Added

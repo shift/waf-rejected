@@ -23,6 +23,20 @@ WAF-Rejected provides comprehensive monitoring capabilities through OpenTelemetr
 - `waf_webtransport_streams_total` - WebTransport streams inspected
 - `waf_webtransport_datagrams_total` - WebTransport datagrams inspected
 
+### Coraza Reactor Metrics
+
+These metrics are emitted by the built-in `/metrics` endpoint when a
+`WasmReactorRule` is registered with the process metrics registry
+(`with_metrics`). They remain at zero when the experimental `wasm-reactor`
+feature is not in use.
+
+- `waf_coraza_evaluations_total` - Coraza reactor evaluations
+- `waf_coraza_blocks_total` - Requests blocked by the Coraza reactor
+- `waf_coraza_errors_total` - Coraza reactor evaluation or payload failures
+- `waf_coraza_evaluation_duration_seconds` - Coraza evaluation duration
+  histogram (buckets `le="0.001"` through `le="5"`, plus `+Inf`, with `_sum`
+  and `_count`)
+
 The metrics above are emitted by the built-in `/metrics` endpoint. The
 following extended metrics are planned or emitted by optional integrations:
 
@@ -111,6 +125,38 @@ spec:
     severity: warning
   annotations:
     summary: "High authentication failure rate"
+```
+
+### Coraza Reactor Alerts
+
+These rules use only the Coraza metrics emitted above. The error-rate rule
+guards against a failing reactor (fail-closed `503`s); the block-spike rule
+catches unexpected rule behaviour or an active attack.
+
+```yaml
+# Coraza evaluation error rate
+- alert: CorazaEvaluationErrorRate
+  expr: |
+    rate(waf_coraza_errors_total[5m])
+    /
+    clamp_min(rate(waf_coraza_evaluations_total[5m]), 0.001)
+    > 0.05
+  for: 2m
+  labels:
+    severity: critical
+  annotations:
+    summary: "Coraza reactor evaluation errors"
+    description: "{{ $value | humanizePercentage }} of Coraza evaluations are failing"
+
+# Coraza block spike
+- alert: CorazaBlockSpike
+  expr: rate(waf_coraza_blocks_total[5m]) > 10
+  for: 2m
+  labels:
+    severity: warning
+  annotations:
+    summary: "Coraza block spike"
+    description: "Coraza is blocking {{ $value | humanize }} requests per second"
 ```
 
 ### Performance Alerts

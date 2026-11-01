@@ -9,12 +9,14 @@
 //! See `docs/wasm-reactor-spike.md` for the ABI and migration notes.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use tracing::warn;
 use wasmi::{
     Caller, Config, Engine, Extern, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder,
 };
 
+use crate::metrics::Metrics;
 use crate::waf::{Decision, RequestContext, WafRule};
 
 /// Decision code returned by the reactor for "allow".
@@ -627,6 +629,7 @@ impl WasmReactor {
 pub struct WasmReactorRule {
     name: String,
     reactor: Arc<WasmReactor>,
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl WasmReactorRule {
@@ -635,7 +638,15 @@ impl WasmReactorRule {
         Self {
             name: name.into(),
             reactor,
+            metrics: None,
         }
+    }
+
+    /// Attaches the process metrics registry so reactor evaluations are
+    /// observable through `/metrics`.
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Creates a rule backed by the embedded spike module.
@@ -653,10 +664,15 @@ impl WafRule for WasmReactorRule {
     }
 
     fn evaluate(&self, ctx: &RequestContext) -> Decision {
+        let started = Instant::now();
         let payload = match build_payload(ctx) {
             Ok(payload) => payload,
             Err(err) => {
                 warn!(rule = %self.name, error = %err, "failed to encode wasm reactor payload");
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_coraza_evaluation(started.elapsed());
+                    metrics.record_coraza_error();
+                }
                 return Decision::Block {
                     status: 503,
                     reason: "wasm reactor payload encoding failed".to_string(),
@@ -664,11 +680,24 @@ impl WafRule for WasmReactorRule {
             }
         };
 
-        match self.reactor.evaluate(&payload) {
+        let result = self.reactor.evaluate(&payload);
+        if let Some(metrics) = &self.metrics {
+            metrics.record_coraza_evaluation(started.elapsed());
+        }
+
+        match result {
             Ok(ReactorDecision::Allow) => Decision::Allow,
-            Ok(ReactorDecision::Block { status, reason }) => Decision::Block { status, reason },
+            Ok(ReactorDecision::Block { status, reason }) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_coraza_block();
+                }
+                Decision::Block { status, reason }
+            }
             Err(err) => {
                 warn!(rule = %self.name, error = %err, "wasm reactor evaluation failed");
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_coraza_error();
+                }
                 Decision::Block {
                     status: 503,
                     reason: format!("wasm reactor failure: {err}"),
