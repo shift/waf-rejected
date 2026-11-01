@@ -6,6 +6,15 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Added
 
+- gRPC-correct proxy transport. gRPC requests (`application/grpc*`, including
+  gRPC-Web) are classified explicitly; unary requests keep trailing headers
+  (`grpc-status`, `grpc-message`) across request/response forwarding, including
+  empty bodies, and `TE: trailers` / `Trailer` are forwarded instead of being
+  stripped. Streaming RPCs (gRPC content type without `content-length`) are
+  relayed incrementally without buffering and without WAF body inspection,
+  bounded by the new `server.grpc_max_stream_bytes` (default 4 MiB) and
+  `server.grpc_max_stream_seconds` (default 300). See
+  `docs/architecture/grpc-transport.md`.
 - The Coraza WASI reactor is now enabled by default: `wasm-reactor` is part of
   the default Cargo features and `WafCorazaConfig::default().enabled` is
   `true`. Default start-up compiles the ~20 MiB module once (~4.5 s) and warms

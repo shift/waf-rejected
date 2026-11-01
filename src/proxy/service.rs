@@ -5,10 +5,10 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use http_body_util::{BodyExt, Full, Limited};
-use hyper::body::Incoming;
+use http_body_util::{BodyExt, Full};
+use hyper::body::{Body, Frame, Incoming};
 use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode, Uri};
+use hyper::{HeaderMap, Request, Response, StatusCode, Uri};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
@@ -48,7 +48,7 @@ use crate::waf::{Decision, RequestContext, WafEngine};
 /// Supports HTTP/1.0-3, WebSocket, and WebTransport protocols.
 pub struct WafProxyService {
     waf_engine: Arc<WafEngine>,
-    upstream_client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
+    upstream_client: Client<HttpsConnector<HttpConnector>, ProxyBody>,
     upstream_uri: Uri,
     config: Arc<Config>,
     buffer_pool: Arc<BufferPool>,
@@ -62,6 +62,245 @@ pub struct WafProxyService {
 /// Upstream byte stream, either plain TCP or TLS over TCP.
 trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
+
+/// Error type shared by every proxied request and response body.
+pub(crate) type ProxyBodyError = Box<dyn std::error::Error + Send + Sync>;
+
+/// gRPC request classification derived from the request headers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RequestClassification {
+    /// `content-type` is a gRPC or gRPC-Web media type.
+    pub(crate) is_grpc: bool,
+    /// The body uses the gRPC-Web HTTP/1.1 framing (trailers in the body).
+    pub(crate) is_grpc_web: bool,
+    /// gRPC request without `content-length`: treated as a streaming RPC.
+    pub(crate) is_grpc_streaming: bool,
+}
+
+/// Classify a request for gRPC transport handling.
+///
+/// `application/grpc`, `application/grpc+proto`, `application/grpc+json`,
+/// `application/grpc-web`, `application/grpc-web-text` and their `+proto` /
+/// `+json` variants all share the `application/grpc` prefix.
+pub(crate) fn classify_request(headers: &HeaderMap) -> RequestClassification {
+    let content_type = headers
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().to_ascii_lowercase());
+
+    let media_type = content_type
+        .as_deref()
+        .map(|value| value.split(';').next().unwrap_or("").trim())
+        .unwrap_or("");
+
+    let is_grpc = media_type.starts_with("application/grpc");
+    let is_grpc_web = media_type.starts_with("application/grpc-web");
+    // A unary call always carries one complete gRPC message and therefore a
+    // content-length. A body without one is a stream and must not be buffered.
+    let is_grpc_streaming = is_grpc && !headers.contains_key(hyper::header::CONTENT_LENGTH);
+
+    RequestClassification {
+        is_grpc,
+        is_grpc_web,
+        is_grpc_streaming,
+    }
+}
+
+/// Connection-scoped header fields that must not be forwarded by a proxy.
+///
+/// `Trailer` is deliberately absent: it is an end-to-end field announcing
+/// trailing headers and is required for gRPC over HTTP/1.1.
+pub(crate) fn is_hop_by_hop_header(name: &str) -> bool {
+    matches!(
+        name,
+        "connection" | "proxy-connection" | "keep-alive" | "transfer-encoding" | "upgrade"
+    )
+}
+
+/// Requests and responses may be buffered, passed through from hyper, or
+/// streamed under a size/duration guard.
+///
+/// Trailing headers are body frames in hyper 1.x, never request/response
+/// parts, so every variant that can carry trailers yields them as a final
+/// `Frame::trailers`. This is what keeps gRPC `grpc-status` / `grpc-message`
+/// intact for both unary and streaming RPCs.
+pub(crate) enum ProxyBody {
+    /// A fully buffered body with no trailing headers.
+    Full(Full<Bytes>),
+    /// A buffered body plus optional trailing headers.
+    Buffered {
+        data: Option<Bytes>,
+        trailers: Option<HeaderMap>,
+    },
+    /// An upstream body streamed incrementally (body frames and trailers).
+    Incoming(Incoming),
+    /// A streaming body bounded by a byte cap and an overall deadline.
+    Guarded(GuardedBody<Incoming>),
+}
+
+impl ProxyBody {
+    pub(crate) fn full(data: impl Into<Bytes>) -> Self {
+        Self::Full(Full::new(data.into()))
+    }
+
+    pub(crate) fn buffered(data: Bytes, trailers: Option<HeaderMap>) -> Self {
+        Self::Buffered {
+            data: Some(data),
+            trailers,
+        }
+    }
+
+    pub(crate) fn incoming(body: Incoming) -> Self {
+        Self::Incoming(body)
+    }
+
+    /// Stream `body` unchanged while enforcing a byte cap and a deadline.
+    pub(crate) fn guarded(body: Incoming, max_bytes: usize, max_duration: Duration) -> Self {
+        Self::Guarded(GuardedBody::new(body, max_bytes, max_duration))
+    }
+
+    /// Trailer field names carried by an already-buffered body, formatted for a
+    /// `Trailer` header. Hyper only encodes trailing fields that the message
+    /// head announced, so this must be emitted before the body is polled.
+    fn announced_trailer_fields(&self) -> Option<String> {
+        match self {
+            ProxyBody::Buffered {
+                trailers: Some(trailers),
+                ..
+            } if !trailers.is_empty() => Some(
+                trailers
+                    .keys()
+                    .map(|name| name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+            _ => None,
+        }
+    }
+}
+
+fn map_body_poll<E>(
+    poll: Poll<Option<Result<Frame<Bytes>, E>>>,
+) -> Poll<Option<Result<Frame<Bytes>, ProxyBodyError>>>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    match poll {
+        Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
+        Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(Box::new(error) as ProxyBodyError))),
+        Poll::Ready(None) => Poll::Ready(None),
+        Poll::Pending => Poll::Pending,
+    }
+}
+
+impl Body for ProxyBody {
+    type Data = Bytes;
+    type Error = ProxyBodyError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        match self.get_mut() {
+            ProxyBody::Full(body) => map_body_poll(Pin::new(body).poll_frame(cx)),
+            ProxyBody::Buffered { data, trailers } => {
+                if let Some(data) = data.take() {
+                    if !data.is_empty() {
+                        return Poll::Ready(Some(Ok(Frame::data(data))));
+                    }
+                }
+                if let Some(trailers) = trailers.take() {
+                    return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+                }
+                Poll::Ready(None)
+            }
+            ProxyBody::Incoming(body) => map_body_poll(Pin::new(body).poll_frame(cx)),
+            ProxyBody::Guarded(body) => Pin::new(body).poll_frame(cx),
+        }
+    }
+}
+
+/// Streaming-body limit violations surfaced to hyper as body errors.
+#[derive(Debug)]
+pub(crate) enum StreamLimitError {
+    BytesExceeded { limit: usize },
+    DurationExceeded { seconds: u64 },
+}
+
+impl std::fmt::Display for StreamLimitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StreamLimitError::BytesExceeded { limit } => {
+                write!(f, "streaming body exceeds limit of {} bytes", limit)
+            }
+            StreamLimitError::DurationExceeded { seconds } => {
+                write!(f, "streaming body exceeded its {} second deadline", seconds)
+            }
+        }
+    }
+}
+
+impl std::error::Error for StreamLimitError {}
+
+/// Body wrapper that relays frames unchanged while enforcing a total byte cap
+/// and an overall deadline. No buffering is performed.
+pub(crate) struct GuardedBody<B> {
+    inner: B,
+    remaining: usize,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+    max_seconds: u64,
+}
+
+impl<B> GuardedBody<B> {
+    fn new(inner: B, max_bytes: usize, max_duration: Duration) -> Self {
+        Self {
+            inner,
+            remaining: max_bytes,
+            deadline: Box::pin(tokio::time::sleep(max_duration)),
+            max_seconds: max_duration.as_secs(),
+        }
+    }
+}
+
+impl<B> Body for GuardedBody<B>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    type Data = Bytes;
+    type Error = ProxyBodyError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        let this = self.get_mut();
+        if std::future::Future::poll(this.deadline.as_mut(), cx).is_ready() {
+            return Poll::Ready(Some(Err(Box::new(StreamLimitError::DurationExceeded {
+                seconds: this.max_seconds,
+            }))));
+        }
+
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    if data.len() > this.remaining {
+                        return Poll::Ready(Some(Err(Box::new(StreamLimitError::BytesExceeded {
+                            limit: this.remaining,
+                        }))));
+                    }
+                    this.remaining -= data.len();
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                Poll::Ready(Some(Err(Box::new(error) as ProxyBodyError)))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
 
 /// Resolve a WebSocket upstream URI to `(use_tls, port)`.
 fn websocket_upstream_transport(upstream: &Uri) -> Result<(bool, u16), ()> {
@@ -141,7 +380,7 @@ fn is_webtransport_upgrade(headers: &hyper::HeaderMap) -> bool {
 #[derive(Clone)]
 pub(crate) struct ProxyState {
     pub(crate) waf_engine: Arc<WafEngine>,
-    pub(crate) upstream_client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
+    pub(crate) upstream_client: Client<HttpsConnector<HttpConnector>, ProxyBody>,
     pub(crate) upstream_uri: Uri,
     pub(crate) config: Arc<Config>,
     pub(crate) buffer_pool: Arc<BufferPool>,
@@ -590,7 +829,7 @@ impl WafProxyService {
         state: ProxyState,
         peer_ip: IpAddr,
         is_https: bool,
-    ) -> Result<Response<Full<Bytes>>, Infallible> {
+    ) -> Result<Response<ProxyBody>, Infallible> {
         let start_time = Instant::now();
         state.metrics.record_request();
 
@@ -695,6 +934,7 @@ impl WafProxyService {
         }
 
         let (mut parts, body) = req.into_parts();
+        let classification = classify_request(&parts.headers);
         let has_content_encoding = parts.headers.contains_key(hyper::header::CONTENT_ENCODING);
         let size_hint = parts
             .headers
@@ -703,7 +943,61 @@ impl WafProxyService {
             .and_then(|s| s.parse::<usize>().ok());
         let max_body_size = state.config.server.max_body_size;
 
-        let body_bytes = match tokio::time::timeout(
+        // Streaming gRPC is transport-only: the body is relayed frame by frame
+        // under a byte cap and deadline instead of being buffered, so it is
+        // never passed to the WAF body inspector. Header/URI rules still run.
+        if classification.is_grpc_streaming {
+            debug!(
+                "Streaming gRPC request from {} forwarded without body inspection (transport-only)",
+                client_ip
+            );
+            let request_context = RequestContext::with_http_version(
+                client_ip,
+                parts.method.clone(),
+                parts.uri.clone(),
+                parts.headers.clone(),
+                None,
+                http_version.clone(),
+            );
+            match state.waf_engine.evaluate(&request_context).await {
+                Decision::Allow => {}
+                Decision::Block { status, reason } => {
+                    warn!(
+                        "WAF blocked streaming gRPC request from {}: {} (status: {})",
+                        client_ip, reason, status
+                    );
+                    state.metrics.record_blocked();
+                    state.metrics.record_request_duration(start_time.elapsed());
+                    return Ok(Self::create_blocked_response(status, &reason));
+                }
+                Decision::RateLimit { reason } => {
+                    warn!(
+                        "WAF rate limited streaming gRPC request from {}: {}",
+                        client_ip, reason
+                    );
+                    state.metrics.record_rate_limited();
+                    state.metrics.record_blocked();
+                    state.metrics.record_request_duration(start_time.elapsed());
+                    return Ok(Self::create_rate_limit_response(&reason));
+                }
+            }
+
+            state.metrics.record_allowed();
+            let response = Self::forward_grpc_stream(
+                parts,
+                body,
+                &state,
+                start_time,
+                &http_version,
+                client_ip,
+                is_https,
+            )
+            .await;
+            state.metrics.record_request_duration(start_time.elapsed());
+            return Ok(response);
+        }
+
+        let (body_bytes, request_trailers) = match tokio::time::timeout(
             Duration::from_secs(state.config.server.request_timeout_secs.max(1)),
             state
                 .buffer_pool
@@ -711,7 +1005,7 @@ impl WafProxyService {
         )
         .await
         {
-            Ok(Ok(buffer)) => buffer.to_bytes(),
+            Ok(Ok((buffer, trailers))) => (buffer.to_bytes(), trailers),
             Ok(Err(BodyReadError::TooLarge { .. })) => {
                 warn!(
                     "Request body from {} exceeds limit {}",
@@ -804,7 +1098,7 @@ impl WafProxyService {
                 state.metrics.record_allowed();
                 let response = Self::forward_to_upstream_with_protocol(
                     parts,
-                    body_bytes,
+                    ProxyBody::buffered(body_bytes, request_trailers),
                     state.upstream_client,
                     state.upstream_uri,
                     start_time,
@@ -843,7 +1137,7 @@ impl WafProxyService {
         mut req: Request<Incoming>,
         state: &ProxyState,
         client_ip: IpAddr,
-    ) -> Response<Full<Bytes>> {
+    ) -> Response<ProxyBody> {
         let upstream = &state.upstream_uri;
         let (use_tls, port) = match websocket_upstream_transport(upstream) {
             Ok(transport) => transport,
@@ -1159,7 +1453,7 @@ impl WafProxyService {
             client_ip, host, port
         );
         builder
-            .body(Full::new(Bytes::new()))
+            .body(ProxyBody::full(Bytes::new()))
             .unwrap_or_else(|_| Self::create_error_response(StatusCode::BAD_GATEWAY, "Handshake"))
     }
 
@@ -1332,101 +1626,121 @@ impl WafProxyService {
             .contains(&version.to_string())
     }
 
-    /// Protocol-aware request forwarding with version preservation
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn forward_to_upstream_with_protocol(
+    /// Build the upstream request, preserving the client's method, headers and
+    /// protocol version while stripping hop-by-hop values and stamping the
+    /// authoritative client identity.
+    fn build_upstream_request(
         parts: hyper::http::request::Parts,
-        body_bytes: Bytes,
-        upstream_client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
-        upstream_uri: Uri,
-        start_time: Instant,
+        body: ProxyBody,
+        upstream_uri: &Uri,
         http_version: &str,
-        metrics: &Metrics,
         client_ip: IpAddr,
         is_https: bool,
-        max_response_bytes: usize,
-    ) -> Result<Response<Full<Bytes>>, Infallible> {
-        // Optimized URI rewriting with protocol version awareness
+    ) -> Result<Request<ProxyBody>, Box<Response<ProxyBody>>> {
+        let classification = classify_request(&parts.headers);
+
         let upstream_path_and_query = parts
             .uri
             .path_and_query()
             .map(|pq| pq.as_str())
             .unwrap_or("/");
 
-        // Efficient path concatenation
         let upstream_base = upstream_uri.to_string();
         let upstream_base = upstream_base.trim_end_matches('/');
         let path = if upstream_path_and_query.starts_with('/') {
-            upstream_path_and_query
+            upstream_path_and_query.to_string()
         } else {
-            &format!("/{}", upstream_path_and_query)
+            format!("/{}", upstream_path_and_query)
         };
 
-        let new_uri = format!("{}{}", upstream_base, path).parse::<Uri>();
-
-        let new_uri = match new_uri {
+        let new_uri = match format!("{}{}", upstream_base, path).parse::<Uri>() {
             Ok(uri) => uri,
             Err(e) => {
                 error!("Failed to construct upstream URI: {}", e);
-                return Ok(Self::create_error_response(
+                return Err(Box::new(Self::create_error_response(
                     StatusCode::BAD_GATEWAY,
                     "Invalid upstream URI",
-                ));
+                )));
             }
         };
 
         // Preserve the original virtual host for the upstream application.
         let original_host = parts.headers.get(hyper::header::HOST).cloned();
 
-        // Build protocol-aware proxy request
+        // Hyper only writes trailing fields listed in a `Trailer` header. For a
+        // buffered body the names are known now; for a streamed body the client
+        // must have announced them (the header is forwarded below).
+        let announced_trailers = body.announced_trailer_fields();
+        let has_trailer_header = parts.headers.contains_key(hyper::header::TRAILER);
+
         let mut proxy_req = Request::builder()
             .method(parts.method)
             .uri(new_uri)
             .version(parts.version); // Preserve HTTP version
 
-        // Add protocol-specific headers
         match http_version {
             "1.0" => {
-                // HTTP/1.0 specific handling
                 proxy_req = proxy_req.header("Connection", "close");
             }
             "1.1" => {
-                // HTTP/1.1 specific handling
                 proxy_req = proxy_req.header("Connection", "keep-alive");
             }
-            "2" => {
-                // HTTP/2 specific handling - no Connection header needed
-            }
+            "2" => {}
             "3" => {
-                // HTTP/3 specific handling - QUIC protocol
                 debug!("HTTP/3 request forwarded via HTTP/2 to upstream (protocol conversion)");
             }
             _ => {
-                // Default to HTTP/1.1 behavior
                 proxy_req = proxy_req.header("Connection", "keep-alive");
             }
         }
 
-        // Efficient header copying (skip hop-by-hop and untrusted forwarding headers)
+        // Copy headers, skipping hop-by-hop values that the upstream connection
+        // must negotiate for itself. `Te` and `Trailer` are end-to-end header
+        // fields for gRPC: dropping them silently breaks trailing status.
+        let mut has_te = false;
         for (key, value) in parts.headers {
             if let Some(key) = key {
                 let key_str = key.as_str().to_ascii_lowercase();
-                if !matches!(
+                if matches!(
                     key_str.as_str(),
                     "host"
                         | "connection"
                         | "proxy-connection"
                         | "upgrade"
-                        | "te"
-                        | "trailer"
                         | "transfer-encoding"
                         | "keep-alive"
                         | "x-forwarded-for"
                         | "x-real-ip"
                         | "x-forwarded-proto"
                 ) {
-                    proxy_req = proxy_req.header(key, value);
+                    continue;
                 }
+                if key_str == "te" {
+                    // `TE` is connection-scoped; only gRPC's `trailers` value is
+                    // meaningful end-to-end (and the only value HTTP/2 allows).
+                    let trailer_te = value.to_str().ok().is_some_and(|value| {
+                        value
+                            .split(',')
+                            .any(|token| token.trim().eq_ignore_ascii_case("trailers"))
+                    });
+                    if !classification.is_grpc || !trailer_te {
+                        continue;
+                    }
+                    has_te = true;
+                }
+                proxy_req = proxy_req.header(key, value);
+            }
+        }
+
+        // gRPC over HTTP/1.x uses chunked framing; `TE: trailers` tells the
+        // upstream that trailing headers may be sent.
+        if classification.is_grpc && !has_te && matches!(http_version, "1.0" | "1.1") {
+            proxy_req = proxy_req.header("te", "trailers");
+        }
+
+        if !has_trailer_header && matches!(http_version, "1.0" | "1.1") {
+            if let Some(names) = announced_trailers {
+                proxy_req = proxy_req.header(hyper::header::TRAILER, names);
             }
         }
 
@@ -1446,30 +1760,55 @@ impl WafProxyService {
                 .header(hyper::header::HOST, host);
         }
 
-        let proxy_req = match proxy_req.body(Full::new(body_bytes)) {
-            Ok(req) => req,
-            Err(e) => {
-                error!("Failed to build proxy request: {}", e);
-                return Ok(Self::create_error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to build proxy request",
-                ));
-            }
+        proxy_req.body(body).map_err(|e| {
+            error!("Failed to build proxy request: {}", e);
+            Box::new(Self::create_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to build proxy request",
+            ))
+        })
+    }
+
+    /// Protocol-aware request forwarding with version preservation.
+    ///
+    /// The request body is already buffered (and inspected) by the caller. The
+    /// upstream response is collected for inspection and its trailing headers
+    /// are re-emitted unchanged so `grpc-status` survives even with an empty
+    /// body.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn forward_to_upstream_with_protocol(
+        parts: hyper::http::request::Parts,
+        body: ProxyBody,
+        upstream_client: Client<HttpsConnector<HttpConnector>, ProxyBody>,
+        upstream_uri: Uri,
+        start_time: Instant,
+        http_version: &str,
+        metrics: &Metrics,
+        client_ip: IpAddr,
+        is_https: bool,
+        max_response_bytes: usize,
+    ) -> Result<Response<ProxyBody>, Infallible> {
+        let proxy_req = match Self::build_upstream_request(
+            parts,
+            body,
+            &upstream_uri,
+            http_version,
+            client_ip,
+            is_https,
+        ) {
+            Ok(request) => request,
+            Err(response) => return Ok(*response),
         };
 
-        // Forward request with timeout
-        match tokio::time::timeout(
-            Duration::from_secs(30), // Reasonable timeout
-            upstream_client.request(proxy_req),
-        )
-        .await
+        match tokio::time::timeout(Duration::from_secs(30), upstream_client.request(proxy_req))
+            .await
         {
             Ok(Ok(response)) => {
                 let processing_time = start_time.elapsed();
                 debug!("Request processed in {:?}", processing_time);
 
-                // Optimized response handling
                 let (parts, body) = response.into_parts();
+                let has_trailer_header = parts.headers.contains_key(hyper::header::TRAILER);
                 if let Some(length) = parts
                     .headers
                     .get(hyper::header::CONTENT_LENGTH)
@@ -1484,11 +1823,19 @@ impl WafProxyService {
                         ));
                     }
                 }
-                let limited = Limited::new(body, max_response_bytes);
-                let body_bytes =
-                    match tokio::time::timeout(Duration::from_secs(30), limited.collect()).await {
-                        Ok(Ok(collected)) => collected.to_bytes(),
-                        Ok(Err(e)) => {
+
+                let mut collected = Vec::new();
+                let mut trailers = None;
+                let mut body = std::pin::pin!(body);
+                loop {
+                    let frame = match tokio::time::timeout(
+                        Duration::from_secs(30),
+                        BodyExt::frame(&mut body),
+                    )
+                    .await
+                    {
+                        Ok(Some(Ok(frame))) => frame,
+                        Ok(Some(Err(e))) => {
                             metrics.record_upstream_error();
                             error!("Failed to collect upstream response body: {}", e);
                             return Ok(Self::create_error_response(
@@ -1496,7 +1843,9 @@ impl WafProxyService {
                                 "Failed to read upstream response",
                             ));
                         }
+                        Ok(None) => break,
                         Err(_) => {
+                            metrics.record_upstream_error();
                             error!("Upstream response collection timed out");
                             return Ok(Self::create_error_response(
                                 StatusCode::GATEWAY_TIMEOUT,
@@ -1505,30 +1854,60 @@ impl WafProxyService {
                         }
                     };
 
+                    match frame.into_data() {
+                        Ok(data) => {
+                            if collected.len().saturating_add(data.len()) > max_response_bytes {
+                                metrics.record_upstream_error();
+                                return Ok(Self::create_error_response(
+                                    StatusCode::BAD_GATEWAY,
+                                    "Upstream response too large",
+                                ));
+                            }
+                            collected.extend_from_slice(&data);
+                        }
+                        Err(frame) => {
+                            if let Ok(block) = frame.into_trailers() {
+                                trailers = Some(block);
+                            }
+                        }
+                    }
+                }
+
                 let mut response_builder = Response::builder()
                     .status(parts.status)
                     .version(parts.version);
 
-                // Copy response headers, dropping hop-by-hop values that the
-                // downstream connection must negotiate for itself.
+                let announced_trailers =
+                    if !has_trailer_header && matches!(http_version, "1.0" | "1.1") {
+                        trailers
+                            .as_ref()
+                            .filter(|fields| !fields.is_empty())
+                            .map(|fields| {
+                                fields
+                                    .keys()
+                                    .map(|name| name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            })
+                    } else {
+                        None
+                    };
+
+                // Copy response headers, dropping only connection-specific
+                // values. `trailer` announces trailing fields and is preserved.
                 for (key, value) in parts.headers {
                     if let Some(key) = key {
                         let name = key.as_str().to_ascii_lowercase();
-                        if !matches!(
-                            name.as_str(),
-                            "connection"
-                                | "proxy-connection"
-                                | "keep-alive"
-                                | "transfer-encoding"
-                                | "upgrade"
-                                | "trailer"
-                        ) {
+                        if !is_hop_by_hop_header(&name) {
                             response_builder = response_builder.header(key, value);
                         }
                     }
                 }
 
-                // Add performance-optimized WAF response headers
+                if let Some(names) = announced_trailers {
+                    response_builder = response_builder.header(hyper::header::TRAILER, names);
+                }
+
                 response_builder = response_builder
                     .header(
                         "x-waf-processing-time-ms",
@@ -1540,7 +1919,7 @@ impl WafProxyService {
                     )
                     .header("x-content-type-options", "nosniff");
 
-                match response_builder.body(Full::new(body_bytes)) {
+                match response_builder.body(ProxyBody::buffered(Bytes::from(collected), trailers)) {
                     Ok(response) => Ok(response),
                     Err(e) => {
                         error!("Failed to build response: {}", e);
@@ -1570,8 +1949,102 @@ impl WafProxyService {
         }
     }
 
+    /// Relay a streaming gRPC exchange without buffering either direction.
+    ///
+    /// Streaming RPCs are transport-only: the request and response bodies are
+    /// forwarded frame by frame (including trailing headers) under
+    /// `server.grpc_max_stream_bytes` and `server.grpc_max_stream_seconds`.
+    /// No WAF body inspection is performed; only header/URI rules run.
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_grpc_stream(
+        parts: hyper::http::request::Parts,
+        body: Incoming,
+        state: &ProxyState,
+        start_time: Instant,
+        http_version: &str,
+        client_ip: IpAddr,
+        is_https: bool,
+    ) -> Response<ProxyBody> {
+        let max_bytes = state.config.server.grpc_max_stream_bytes;
+        let max_seconds = state.config.server.grpc_max_stream_seconds;
+        let max_duration = Duration::from_secs(max_seconds);
+
+        let announce_grpc_trailers =
+            classify_request(&parts.headers).is_grpc && matches!(http_version, "1.0" | "1.1");
+
+        let guarded = ProxyBody::guarded(body, max_bytes, max_duration);
+        let proxy_req = match Self::build_upstream_request(
+            parts,
+            guarded,
+            &state.upstream_uri,
+            http_version,
+            client_ip,
+            is_https,
+        ) {
+            Ok(request) => request,
+            Err(response) => return *response,
+        };
+
+        match tokio::time::timeout(max_duration, state.upstream_client.request(proxy_req)).await {
+            Ok(Ok(response)) => {
+                let processing_time = start_time.elapsed();
+                let (parts, body) = response.into_parts();
+                let has_trailer_header = parts.headers.contains_key(hyper::header::TRAILER);
+
+                let mut response_builder = Response::builder()
+                    .status(parts.status)
+                    .version(parts.version);
+                for (key, value) in parts.headers {
+                    if let Some(key) = key {
+                        let name = key.as_str().to_ascii_lowercase();
+                        if !is_hop_by_hop_header(&name) {
+                            response_builder = response_builder.header(key, value);
+                        }
+                    }
+                }
+                if announce_grpc_trailers && !has_trailer_header {
+                    // Streaming trailers are unknown up front; announce the
+                    // gRPC status fields so HTTP/1.x can encode them.
+                    response_builder = response_builder
+                        .header(hyper::header::TRAILER, "grpc-status, grpc-message");
+                }
+                response_builder = response_builder
+                    .header(
+                        "x-waf-processing-time-ms",
+                        processing_time.as_millis().to_string(),
+                    )
+                    .header(
+                        "x-waf-version",
+                        concat!("waf-rejected/", env!("CARGO_PKG_VERSION")),
+                    )
+                    .header("x-content-type-options", "nosniff");
+
+                match response_builder.body(ProxyBody::guarded(body, max_bytes, max_duration)) {
+                    Ok(response) => response,
+                    Err(e) => {
+                        error!("Failed to build streaming gRPC response: {}", e);
+                        Self::create_error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Failed to build response",
+                        )
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                state.metrics.record_upstream_error();
+                error!("Streaming gRPC upstream request failed: {}", e);
+                Self::create_error_response(StatusCode::BAD_GATEWAY, "Upstream server unavailable")
+            }
+            Err(_) => {
+                state.metrics.record_upstream_error();
+                error!("Streaming gRPC upstream request timed out");
+                Self::create_error_response(StatusCode::GATEWAY_TIMEOUT, "Upstream server timeout")
+            }
+        }
+    }
+
     /// Create blocked response with protocol information
-    pub(crate) fn create_blocked_response(status_code: u16, reason: &str) -> Response<Full<Bytes>> {
+    pub(crate) fn create_blocked_response(status_code: u16, reason: &str) -> Response<ProxyBody> {
         let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::FORBIDDEN);
         let body = format!("Request blocked by WAF: {}", reason);
 
@@ -1588,12 +2061,12 @@ impl WafProxyService {
                 "x-waf-supported-protocols",
                 "HTTP/1.0,HTTP/1.1,HTTP/2,HTTP/3",
             )
-            .body(Full::new(Bytes::from(body)))
+            .body(ProxyBody::full(body))
             .unwrap()
     }
 
     /// Create rate limit response with protocol information
-    pub(crate) fn create_rate_limit_response(reason: &str) -> Response<Full<Bytes>> {
+    pub(crate) fn create_rate_limit_response(reason: &str) -> Response<ProxyBody> {
         let body = format!("Rate limited: {}", reason);
 
         Response::builder()
@@ -1610,15 +2083,12 @@ impl WafProxyService {
                 "HTTP/1.0,HTTP/1.1,HTTP/2,HTTP/3",
             )
             .header("retry-after", "60") // Suggest retry after 60 seconds
-            .body(Full::new(Bytes::from(body)))
+            .body(ProxyBody::full(body))
             .unwrap()
     }
 
     /// Create generic error response with protocol information
-    pub(crate) fn create_error_response(
-        status: StatusCode,
-        message: &str,
-    ) -> Response<Full<Bytes>> {
+    pub(crate) fn create_error_response(status: StatusCode, message: &str) -> Response<ProxyBody> {
         Response::builder()
             .status(status)
             .header("content-type", "text/plain")
@@ -1630,7 +2100,7 @@ impl WafProxyService {
                 "x-waf-supported-protocols",
                 "HTTP/1.0,HTTP/1.1,HTTP/2,HTTP/3",
             )
-            .body(Full::new(Bytes::from(message.to_string())))
+            .body(ProxyBody::full(message.to_string()))
             .unwrap()
     }
 }
@@ -1640,6 +2110,64 @@ mod tests {
     use super::*;
     use crate::config::ProxyConfig;
     use proptest::prelude::*;
+
+    #[test]
+    fn classifies_grpc_media_types() {
+        for content_type in [
+            "application/grpc",
+            "application/grpc+proto",
+            "application/grpc+json",
+            "application/grpc-web",
+            "application/grpc-web+proto",
+            "application/grpc-web-text",
+            "Application/GRPC+Proto; charset=utf-8",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("content-type", content_type.parse().unwrap());
+            let classification = classify_request(&headers);
+            assert!(classification.is_grpc, "{content_type} must be gRPC");
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/grpc+proto".parse().unwrap());
+        assert!(classify_request(&headers).is_grpc_streaming);
+
+        headers.insert("content-length", "10".parse().unwrap());
+        let unary = classify_request(&headers);
+        assert!(unary.is_grpc);
+        assert!(!unary.is_grpc_streaming, "content-length means unary");
+        assert!(!unary.is_grpc_web);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/grpc-web".parse().unwrap());
+        assert!(classify_request(&headers).is_grpc_web);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        let plain = classify_request(&headers);
+        assert!(!plain.is_grpc && !plain.is_grpc_streaming && !plain.is_grpc_web);
+    }
+
+    #[tokio::test]
+    async fn guarded_body_enforces_byte_cap() {
+        let body = GuardedBody::new(
+            Full::new(Bytes::from_static(b"0123456789")),
+            4,
+            Duration::from_secs(30),
+        );
+        let mut body = std::pin::pin!(body);
+        let error = loop {
+            match body.frame().await {
+                Some(Ok(_)) => continue,
+                Some(Err(error)) => break error,
+                None => panic!("byte cap was not enforced"),
+            }
+        };
+        assert!(
+            error.to_string().contains("exceeds limit"),
+            "unexpected error: {error}"
+        );
+    }
 
     #[test]
     fn test_websocket_upstream_transport_schemes() {

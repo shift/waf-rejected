@@ -13,7 +13,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use http::header::HOST;
 use http::uri::Scheme;
 use http::{HeaderMap, HeaderValue, Request, Response, StatusCode, Uri};
-use http_body_util::{BodyExt, Full};
+use http_body_util::BodyExt;
 use quinn::crypto::rustls::QuicServerConfig;
 use tracing::{debug, info, warn};
 
@@ -315,7 +315,7 @@ async fn handle_request(
             state.metrics.record_allowed();
             let response = WafProxyService::forward_to_upstream_with_protocol(
                 parts,
-                body_bytes,
+                crate::proxy::service::ProxyBody::buffered(body_bytes, None),
                 state.upstream_client.clone(),
                 state.upstream_uri.clone(),
                 start_time,
@@ -386,28 +386,33 @@ async fn read_body(stream: &mut H3Stream, max_body_size: usize) -> Result<Bytes,
 
 async fn send_response(
     stream: &mut H3Stream,
-    response: Response<Full<Bytes>>,
+    response: Response<crate::proxy::service::ProxyBody>,
 ) -> Result<(), WafError> {
     let (parts, body) = response.into_parts();
-    let body = body
-        .collect()
-        .await
-        .map_err(|e| WafError::internal(format!("Failed to collect response body: {}", e)))?
-        .to_bytes();
+
+    // Collect frames so the header block is sent before any body data. Trailing
+    // headers (gRPC `grpc-status`) are forwarded as HTTP/3 trailers.
+    let mut body_bytes = BytesMut::new();
+    let mut trailers = None;
+    let mut body = std::pin::pin!(body);
+    while let Some(frame) = body.frame().await {
+        let frame = frame
+            .map_err(|e| WafError::internal(format!("Failed to read response body: {}", e)))?;
+        match frame.into_data() {
+            Ok(data) => body_bytes.extend_from_slice(&data),
+            Err(frame) => {
+                if let Ok(block) = frame.into_trailers() {
+                    trailers = Some(block);
+                }
+            }
+        }
+    }
 
     let mut builder = Response::builder().status(parts.status);
     for (name, value) in parts.headers.iter() {
         // Connection-specific headers are forbidden in HTTP/3.
         let name_str = name.as_str().to_ascii_lowercase();
-        if matches!(
-            name_str.as_str(),
-            "connection"
-                | "proxy-connection"
-                | "keep-alive"
-                | "transfer-encoding"
-                | "upgrade"
-                | "trailer"
-        ) {
+        if crate::proxy::service::is_hop_by_hop_header(&name_str) {
             continue;
         }
         builder = builder.header(name, value);
@@ -420,16 +425,20 @@ async fn send_response(
         .send_response(response)
         .await
         .map_err(|e| WafError::NetworkError(format!("Failed to send HTTP/3 response: {}", e)))?;
-    if !body.is_empty() {
+    if !body_bytes.is_empty() {
         stream
-            .send_data(body)
+            .send_data(body_bytes.freeze())
             .await
             .map_err(|e| WafError::NetworkError(format!("Failed to send HTTP/3 body: {}", e)))?;
     }
-    stream
-        .finish()
-        .await
-        .map_err(|e| WafError::NetworkError(format!("Failed to finish HTTP/3 stream: {}", e)))?;
+    match trailers {
+        Some(trailers) => stream.send_trailers(trailers).await.map_err(|e| {
+            WafError::NetworkError(format!("Failed to send HTTP/3 trailers: {}", e))
+        })?,
+        None => stream.finish().await.map_err(|e| {
+            WafError::NetworkError(format!("Failed to finish HTTP/3 stream: {}", e))
+        })?,
+    }
 
     Ok(())
 }

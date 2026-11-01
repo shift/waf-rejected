@@ -151,6 +151,16 @@ pub struct ServerConfig {
     /// Maximum request body size in bytes
     pub max_body_size: usize,
 
+    /// Maximum number of bytes forwarded for one streaming gRPC exchange.
+    ///
+    /// Streaming gRPC bodies (no `content-length`) are not buffered and never
+    /// reach the WAF body inspector, so this cap bounds the bytes the proxy
+    /// will relay in either direction.
+    pub grpc_max_stream_bytes: usize,
+
+    /// Maximum duration in seconds of one streaming gRPC exchange.
+    pub grpc_max_stream_seconds: u64,
+
     /// TLS configuration
     pub tls: TlsConfig,
 
@@ -871,7 +881,9 @@ impl Default for ServerConfig {
                 "2".to_string(),
                 "3".to_string(),
             ],
-            max_body_size: 10 * 1024 * 1024, // 10MB
+            max_body_size: 10 * 1024 * 1024,        // 10MB
+            grpc_max_stream_bytes: 4 * 1024 * 1024, // 4MiB
+            grpc_max_stream_seconds: 300,
             tls: TlsConfig::default(),
             webtransport: WebTransportConfig::default(),
         }
@@ -1048,6 +1060,12 @@ impl Config {
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.server.max_body_size == 0 {
             anyhow::bail!("server.max_body_size must be greater than zero");
+        }
+        if self.server.grpc_max_stream_bytes == 0 {
+            anyhow::bail!("server.grpc_max_stream_bytes must be greater than zero");
+        }
+        if self.server.grpc_max_stream_seconds == 0 {
+            anyhow::bail!("server.grpc_max_stream_seconds must be greater than zero");
         }
         if self.proxy.timeout_seconds == 0 || self.server.request_timeout_secs == 0 {
             anyhow::bail!("request timeouts must be greater than zero");

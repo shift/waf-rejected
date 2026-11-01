@@ -9,6 +9,9 @@ mod ai_tests;
 #[path = "integration/auth_tests.rs"]
 mod auth_tests;
 
+#[path = "integration/grpc_tests.rs"]
+mod grpc_tests;
+
 #[cfg(feature = "compliance")]
 #[path = "integration/compliance_tests.rs"]
 mod compliance_tests;

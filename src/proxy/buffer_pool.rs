@@ -290,15 +290,18 @@ impl BufferPool {
     /// Efficiently read an incoming HTTP body into a pooled buffer.
     ///
     /// `max_size` is enforced while streaming, including for chunked bodies
-    /// that do not advertise a `Content-Length`.
+    /// that do not advertise a `Content-Length`. Any trailing header block
+    /// (gRPC `grpc-status` / `grpc-message`) is returned alongside the data so
+    /// the caller can re-emit it unchanged.
     pub async fn read_incoming_body(
         self: &Arc<Self>,
         body: Incoming,
         size_hint: Option<usize>,
         max_size: Option<usize>,
-    ) -> Result<PooledBuffer, BodyReadError> {
+    ) -> Result<(PooledBuffer, Option<hyper::HeaderMap>), BodyReadError> {
         let expected_size = size_hint.unwrap_or(MEDIUM_BUFFER_SIZE);
         let mut buffer = self.get_buffer(expected_size);
+        let mut trailers = None;
 
         // Stream body data into pooled buffer
         let mut body = std::pin::pin!(body);
@@ -306,17 +309,24 @@ impl BufferPool {
             let frame = http_body_util::BodyExt::frame(&mut body).await;
             let Some(frame) = frame else { break };
             let chunk = frame.map_err(|e| BodyReadError::Read(e.to_string()))?;
-            if let Some(data) = chunk.data_ref() {
-                if let Some(limit) = max_size {
-                    if buffer.len().saturating_add(data.len()) > limit {
-                        return Err(BodyReadError::TooLarge { limit });
+            match chunk.into_data() {
+                Ok(data) => {
+                    if let Some(limit) = max_size {
+                        if buffer.len().saturating_add(data.len()) > limit {
+                            return Err(BodyReadError::TooLarge { limit });
+                        }
+                    }
+                    buffer.as_mut().extend_from_slice(&data);
+                }
+                Err(frame) => {
+                    if let Ok(block) = frame.into_trailers() {
+                        trailers = Some(block);
                     }
                 }
-                buffer.as_mut().extend_from_slice(data);
             }
         }
 
-        Ok(buffer)
+        Ok((buffer, trailers))
     }
 }
 
