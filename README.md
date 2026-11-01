@@ -1,6 +1,6 @@
 # WAF-Rejected
 
-**Current Beta:** `0.1.0-beta.8` · prebuilt image tarball attached to the GitHub release
+**Current Beta:** `0.1.0-beta.9` · prebuilt image tarball attached to the GitHub release
 
 A Rust reverse-proxy web application firewall. Requests are inspected by a
 configurable rule chain (SQL injection, XSS, command injection, path traversal,

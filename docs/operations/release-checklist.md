@@ -1,6 +1,6 @@
 # Release Checklist
 
-## Beta 0.1.0-beta.3
+## Beta 0.1.0-beta.9
 
 ### Verification
 
@@ -45,7 +45,7 @@ curl -o /dev/null -w '%{http_code}\n' -X POST --data '<script>alert(1)</script>'
 ### Publishing
 
 - [ ] Commit release version and changelog.
-- [ ] Tag `v0.1.0-beta.3`.
+- [ ] Tag `v0.1.0-beta.9`.
 - [ ] Push branch and tag.
 - [ ] Confirm the Release workflow built and attached every asset:
       - `waf-rejected-v<version>-x86_64-linux.tar.gz` (binary tarball)

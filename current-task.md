@@ -1,4 +1,4 @@
-# P0-09: Beta Release (current: 0.1.0-beta.8) (NORTH STAR)
+# P0-09: Beta Release (current: 0.1.0-beta.9) (NORTH STAR)
 
 **Target**: ship a usable Beta that can be deployed behind a TLS-terminating
 load balancer and will enforce the documented WAF controls.
@@ -13,6 +13,7 @@ load balancer and will enforce the documented WAF controls.
 - `0.1.0-beta.6` — WSS upstreams, frame size limits, image tarball asset.
 - `0.1.0-beta.7` — feature-gated HTTP/3 ingress.
 - `0.1.0-beta.8` — custom TLS WebSocket upstream CA, build provenance.
+- `0.1.0-beta.9` — HTTP/3 + WebTransport, supply-chain policy, fuzz/property tests, security model.
 
 ## Active delegated work
 
