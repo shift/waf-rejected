@@ -20,6 +20,13 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     // mistakes such as disabled authentication or an upstream typo.
     let config = Config::load()?;
 
+    #[cfg(feature = "wasm-reactor")]
+    {
+        crate::waf::wasm_reactor::validate_startup().map_err(|err| {
+            format!("Coraza reactor startup validation failed (fail-closed): {err}")
+        })?;
+    }
+
     info!("Configuration loaded successfully");
     info!("  Bind address: {}", config.bind_addr);
     info!("  Health/metrics: {}", config.health_bind_addr);

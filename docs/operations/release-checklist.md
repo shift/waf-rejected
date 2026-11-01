@@ -11,6 +11,14 @@
 - [ ] `cargo test --lib`
 - [ ] `cargo test --test integration`
 - [ ] `nix build .#waf-ingress`
+- [ ] `./scripts/check-coraza-reactor-size.sh` passes (digest matches and the
+      module is at most 32 MiB; current build is about 18 MiB)
+- [ ] `result/share/waf/wasm/coraza_reactor.wasm` exists in the Nix
+      package, alongside `LICENSE-CRS`, `PROVENANCE.md` and `SHA256SUMS`
+- [ ] Container image contains `/usr/share/waf/wasm/coraza_reactor.wasm` and
+      the module digest matches `SHA256SUMS`
+- [ ] A `wasm-reactor` build fails closed when the module is missing or has
+      broken exports (see `docs/coraza-wasi-reactor.md`)
 - [ ] Container image starts and answers `/health` on port 8081
 
 ### Verify provenance
@@ -48,10 +56,16 @@ curl -o /dev/null -w '%{http_code}\n' -X POST --data '<script>alert(1)</script>'
 - [ ] Tag `v0.1.0-beta.9`.
 - [ ] Push branch and tag.
 - [ ] Confirm the Release workflow built and attached every asset:
-      - `waf-rejected-v<version>-x86_64-linux.tar.gz` (binary tarball)
+      - `waf-rejected-v<version>-x86_64-linux.tar.gz` (binary tarball,
+        includes `wasm/coraza_reactor.wasm`, `wasm/LICENSE-CRS`,
+        `wasm/PROVENANCE.md` and `wasm/SHA256SUMS`)
       - `waf-rejected-<version>-image.tar.gz` (prebuilt container image)
-      - `waf-rejected-<version>.cdx.json` (CycloneDX SBOM)
-      - `<asset>.sha256` for each of the three assets above
+      - `waf-rejected-<version>.cdx.json` (CycloneDX SBOM, with the reactor
+        file component, SHA-256 and Apache-2.0 licence note)
+      - `waf-rejected-<version>-coraza_reactor.wasm` (standalone module)
+      - `waf-rejected-<version>-coraza-LICENSE`
+      - `waf-rejected-<version>-coraza-PROVENANCE.md`
+      - `<asset>.sha256` for each of the assets above
 - [ ] Confirm the image is still pushed to GHCR under `v<version>`.
 - [ ] Download the assets and verify them: `sha256sum --check *.sha256`.
 - [ ] Verify build provenance for each asset:

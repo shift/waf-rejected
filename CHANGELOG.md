@@ -61,6 +61,32 @@ All notable changes to WAF-Rejected are documented here.
   wasmi recursion depth are raised to 200 billion and 1024 respectively so the
   larger rule bundle can initialise and evaluate.
 
+### Release packaging
+
+- Coraza WASI reactor is now a first-class release artifact. The Nix package
+  and release container install `coraza_reactor.wasm`, `LICENSE-CRS`,
+  `PROVENANCE.md` and `SHA256SUMS` at `/usr/share/waf/wasm/`; the binary
+  tarball includes the same files under `wasm/`, and tagged releases attach
+  the module, licence and provenance as standalone assets with checksums.
+- The CycloneDX SBOM now records the reactor as a `file` component with its
+  SHA-256 digest and Apache-2.0 licence note, because `cargo-cyclonedx` only
+  inventories Rust crates.
+- Startup validation for `wasm-reactor` builds: a missing, malformed,
+  oversized or export-incomplete module, failed `_initialize`/`init`, or
+  failed benign evaluation aborts startup with a fail-closed error.
+  `WAF_CORAZA_REACTOR_PATH` selects the module and
+  `WAF_CORAZA_REACTOR_ENABLED=false` is available for local experiments.
+- A 32 MiB module size budget is enforced by the host loader, Nix package,
+  container build, release workflow and
+  `scripts/check-coraza-reactor-size.sh`. The current module is about 18 MiB;
+  the tradeoff is documented in `docs/coraza-wasi-reactor.md`.
+
+### Documentation
+
+- Updated `docs/coraza-wasi-reactor.md`, the release checklist, container guide
+  and SBOM notes with the stable reactor path, startup validation and size
+  budget.
+
 ## [0.1.0-beta.10] - 2026-11-01
 
 ### Added

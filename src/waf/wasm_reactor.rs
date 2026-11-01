@@ -8,10 +8,11 @@
 //!
 //! See `docs/wasm-reactor-spike.md` for the ABI and migration notes.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use tracing::warn;
+use tracing::{info, warn};
 use wasmi::{
     Caller, Config, Engine, Extern, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder,
 };
@@ -47,6 +48,14 @@ pub const CORAZA_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 /// Go runtime start-up and compilation of the CRS directive bundle dominate
 /// this budget; see the performance notes in `docs/coraza-wasi-reactor.md`.
 pub const CORAZA_FUEL: u64 = 200_000_000_000;
+
+/// Size budget for the shipped Coraza reactor. The current module is about
+/// 18 MiB; the budget leaves room for a pinned rule bundle while still
+/// catching accidental debug builds or unstripped payloads.
+pub const CORAZA_MAX_MODULE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Stable path where release packages install the reactor module.
+pub const CORAZA_RELEASE_MODULE_PATH: &str = "/usr/share/waf/wasm/coraza_reactor.wasm";
 
 const SPIKE_WAT: &str = include_str!("../../wasm/reactor_spike.wat");
 
@@ -106,6 +115,9 @@ pub enum ReactorError {
     /// The configured module file could not be read.
     #[error("failed to read reactor module `{path}`: {detail}")]
     Io { path: String, detail: String },
+    /// The module exceeds the release size budget.
+    #[error("reactor module is {size} bytes, exceeding the {limit} byte budget")]
+    ModuleTooLarge { size: usize, limit: usize },
     /// A required ABI export is missing or has the wrong signature.
     #[error("reactor module is missing required export `{0}`")]
     MissingExport(&'static str),
@@ -516,6 +528,43 @@ impl WasmReactor {
         Self::from_wat(SPIKE_WAT, ReactorLimits::default())
     }
 
+    /// Loads the shipped Coraza reactor from a file, enforcing the size budget
+    /// and the full Coraza export set.
+    pub fn from_coraza_file(path: impl AsRef<Path>) -> Result<Self, ReactorError> {
+        let path = path.as_ref();
+        let metadata = std::fs::metadata(path).map_err(|err| {
+            ReactorError::Compile(format!("cannot read module {}: {err}", path.display()))
+        })?;
+        let size = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+        if size > CORAZA_MAX_MODULE_BYTES {
+            return Err(ReactorError::ModuleTooLarge {
+                size,
+                limit: CORAZA_MAX_MODULE_BYTES,
+            });
+        }
+        let bytes = std::fs::read(path).map_err(|err| {
+            ReactorError::Compile(format!("cannot read module {}: {err}", path.display()))
+        })?;
+        Self::from_coraza_bytes(&bytes)
+    }
+
+    /// Compiles the Coraza reactor from bytes and requires its full ABI.
+    pub fn from_coraza_bytes(bytes: &[u8]) -> Result<Self, ReactorError> {
+        if bytes.len() > CORAZA_MAX_MODULE_BYTES {
+            return Err(ReactorError::ModuleTooLarge {
+                size: bytes.len(),
+                limit: CORAZA_MAX_MODULE_BYTES,
+            });
+        }
+        let reactor = Self::from_bytes(bytes, ReactorLimits::coraza())?;
+        for name in ["_initialize", "input_base"] {
+            if reactor.module.get_export(name).is_none() {
+                return Err(ReactorError::MissingExport(name));
+            }
+        }
+        Ok(reactor)
+    }
+
     /// Returns the configured limits.
     pub fn limits(&self) -> &ReactorLimits {
         &self.limits
@@ -627,6 +676,37 @@ impl WasmReactor {
             other => Err(ReactorError::UnknownDecision(other)),
         }
     }
+}
+
+/// Validates the packaged Coraza reactor at startup when the `wasm-reactor`
+/// feature is enabled. Any load, export, initialisation, size or execution
+/// failure is fatal so the process fails closed instead of serving traffic
+/// without the configured WAF engine.
+pub fn validate_startup() -> Result<(), ReactorError> {
+    let enabled = std::env::var("WAF_CORAZA_REACTOR_ENABLED")
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(true);
+    if !enabled {
+        warn!("Coraza reactor startup validation disabled by WAF_CORAZA_REACTOR_ENABLED");
+        return Ok(());
+    }
+
+    let path = std::env::var("WAF_CORAZA_REACTOR_PATH")
+        .unwrap_or_else(|_| CORAZA_RELEASE_MODULE_PATH.to_string());
+    let reactor = WasmReactor::from_coraza_file(&path)?;
+
+    // `_initialize` and `init` run as part of the first evaluation, so this
+    // also proves the Go runtime and Coraza engine construct successfully.
+    let probe = br#"{"method":"GET","uri":"/","http_version":"1.1","headers":[],"body":null,"body_size":0}"#;
+    reactor.evaluate(probe)?;
+
+    info!(module = %path, "Coraza reactor startup validation passed");
+    Ok(())
 }
 
 /// A [`WafRule`] backed by a reactor.
@@ -910,6 +990,20 @@ mod tests {
             ReactorLimits::default(),
         )
         .expect_err("module without ABI exports must not load");
+        assert!(matches!(err, ReactorError::MissingExport(_)));
+    }
+
+    #[test]
+    fn coraza_requires_reactor_exports() {
+        let wat = r#"
+            (module
+              (memory (export "memory") 1)
+              (func (export "init") (result i32) i32.const 0)
+              (func (export "eval") (param i32 i32) (result i32) i32.const 0)
+              (func (export "free") (param i32 i32)))
+        "#;
+        let err = WasmReactor::from_coraza_bytes(wat.as_bytes())
+            .expect_err("module without _initialize/input_base must not load");
         assert!(matches!(err, ReactorError::MissingExport(_)));
     }
 

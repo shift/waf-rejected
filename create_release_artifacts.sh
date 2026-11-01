@@ -72,6 +72,16 @@ if [[ -d "rules" ]]; then
     echo "✅ Added security rules"
 fi
 
+# Coraza WASI reactor: shipped at the same stable relative path as the Nix
+# package and container image, with digest, licence and provenance.
+./scripts/check-coraza-reactor-size.sh
+install -Dm644 wasm/coraza_reactor/coraza_reactor.wasm \
+    "$RELEASE_DIR/wasm/coraza_reactor.wasm"
+install -Dm644 wasm/coraza_reactor/LICENSE-CRS "$RELEASE_DIR/wasm/LICENSE-CRS"
+install -Dm644 wasm/coraza_reactor/PROVENANCE.md "$RELEASE_DIR/wasm/PROVENANCE.md"
+install -Dm644 wasm/coraza_reactor/SHA256SUMS "$RELEASE_DIR/wasm/SHA256SUMS"
+echo "✅ Added Coraza reactor ($(stat -c%s wasm/coraza_reactor/coraza_reactor.wasm) bytes)"
+
 # Create startup script
 cat > "$RELEASE_DIR/start_waf.sh" << 'EOF'
 #!/bin/bash

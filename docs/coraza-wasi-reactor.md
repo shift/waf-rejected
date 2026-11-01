@@ -15,6 +15,58 @@ heuristic rules. It ships the full **request-side** CRS 4.14.0 rule set
 (anomaly scoring, paranoia level 1); response inspection is disabled because
 the host does not forward response bodies.
 
+## Packaging and stable path
+
+The module is a first-class release artifact. The Nix package and the release
+container image install it, its Apache-2.0 licence (`LICENSE-CRS`), its
+provenance (`PROVENANCE.md`) and its digest (`SHA256SUMS`) at:
+
+```text
+/usr/share/waf/wasm/coraza_reactor.wasm
+/usr/share/waf/wasm/LICENSE-CRS
+/usr/share/waf/wasm/PROVENANCE.md
+/usr/share/waf/wasm/SHA256SUMS
+```
+
+The binary tarball ships `wasm/coraza_reactor.wasm` plus `wasm/LICENSE-CRS`,
+`wasm/PROVENANCE.md` and `wasm/SHA256SUMS`. Tagged releases
+also attach the module, licence and provenance as standalone assets with
+`.sha256` checksums, and the CycloneDX SBOM records the module as a `file`
+component with its SHA-256 and `Apache-2.0` licence. The current digest is
+recorded in `wasm/coraza_reactor/SHA256SUMS`; do not update the module without
+updating that file, `PROVENANCE.md` and the SBOM output in the release run.
+
+### Size budget and the 18 MiB tradeoff
+
+`wasm/coraza_reactor/coraza_reactor.wasm` is about 20 MiB because it embeds
+the Go runtime and the Coraza engine. That is large for an embedded security
+control, but it buys a self-contained, auditable module with no JavaScript
+host, no filesystem access and no runtime dependency on `rules/coraza.conf`.
+The release pipeline enforces a **32 MiB** ceiling
+(`CORAZA_MAX_MODULE_BYTES`, 33,554,432 bytes) in the Nix package, the
+container build, `scripts/check-coraza-reactor-size.sh` and the host loader.
+Exceeding it fails the build or startup instead of silently shipping a debug
+or unstripped binary. Shrinking the module with `wasm-opt -Oz` remains
+desirable, but the budget leaves headroom for a pinned CRS bundle.
+
+## Startup validation (fail closed)
+
+With the `wasm-reactor` feature compiled in, `waf-ingress` validates the
+reactor during startup, before it starts listening:
+
+1. read the module from `WAF_CORAZA_REACTOR_PATH` (default
+   `/usr/share/waf/wasm/coraza_reactor.wasm`);
+2. reject a missing file, unreadable file, malformed module or module over the
+   32 MiB budget;
+3. require `memory`, `_initialize`, `input_base`, `init`, `eval` and `free`;
+4. run `_initialize`/`init` and one benign evaluation.
+
+Any failure is fatal and prints a `Coraza reactor startup validation failed
+(fail-closed): ...` error. Set `WAF_CORAZA_REACTOR_ENABLED=false` only for
+local experiments; disabling the check means the module is not validated at
+startup. Feature builds without the module therefore fail closed rather than
+serving traffic with an unvalidated Coraza control.
+
 ## Toolchain
 
 Verified in the project Nix development shell:
@@ -303,7 +355,7 @@ nix develop
 cargo bench --features wasm-reactor --bench coraza
 ```
 
-The benchmark loads the committed 18 MiB module once, then measures:
+The benchmark loads the committed 20 MiB module once, then measures:
 
 - `reactor_construction/compile_module`: wasmi validation/compilation of the
   module bytes;
@@ -374,7 +426,7 @@ as an order of magnitude, not a service-level guarantee.
   in release, and remove the test-only `#[ignore]` once a debug-friendly
   runtime path exists.
 - **Module size:** run `wasm-opt -Oz` and/or split unused Coraza features;
-  18 MiB is large for an embedded security control.
+  20 MiB is large for an embedded security control.
 - **Default enablement:** keep `wasm-reactor` non-default until CRS,
   performance and an explicit fail-open/fail-closed policy are agreed.
 - **Body fidelity:** the ABI is UTF-8/lossy; binary-safe inspection needs a

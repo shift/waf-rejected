@@ -64,6 +64,24 @@ jobs:
             --spec-version 1.5 \
             --all \
             --override-filename "waf-rejected-${VERSION}"
+          # cargo-cyclonedx only inventories Rust crates. Record the shipped
+          # WASI reactor explicitly so the SBOM names the module digest and
+          # the Apache-2.0 Coraza/CRS licensing obligation.
+          REACTOR_SHA="$(sha256sum wasm/coraza_reactor/coraza_reactor.wasm | awk '{print $1}')"
+          jq --arg sha "$REACTOR_SHA" \
+            '.components += [{
+              "type": "file",
+              "name": "coraza_reactor.wasm",
+              "version": "coraza-3.3.3",
+              "hashes": [{"alg": "SHA-256", "content": $sha}],
+              "licenses": [{"license": {"id": "Apache-2.0"}}],
+              "properties": [
+                {"name": "waf:component", "value": "Coraza WASI reactor built with Go 1.24 and Coraza v3.3.3"},
+                {"name": "waf:license-note", "value": "Coraza and referenced OWASP CRS material are Apache-2.0; see wasm/coraza_reactor/LICENSE-CRS"},
+                {"name": "waf:source", "value": "wasm/coraza_reactor/main.go"}
+              ]
+            }]' "waf-rejected-${VERSION}.cdx.json" > "waf-rejected-${VERSION}.cdx.json.tmp"
+          mv "waf-rejected-${VERSION}.cdx.json.tmp" "waf-rejected-${VERSION}.cdx.json"
           test -s "waf-rejected-${VERSION}.cdx.json"
           ls -l "waf-rejected-${VERSION}.cdx.json"
       - name: Upload SBOM artifact
@@ -159,6 +177,8 @@ jobs:
         uses: cachix/install-nix-action@v25
       - name: Build release binary
         run: nix build .#waf-ingress
+      - name: Verify Coraza reactor digest and size budget
+        run: ./scripts/check-coraza-reactor-size.sh
       - name: Package artifacts
         run: |
           set -euo pipefail
@@ -168,14 +188,31 @@ jobs:
           cp README.md CHANGELOG.md SECURITY.md LICENSE-* "waf-rejected-v${VERSION}/"
           cp "sbom/waf-rejected-${VERSION}.cdx.json" "waf-rejected-v${VERSION}/"
           cp -r rules "waf-rejected-v${VERSION}/"
+          install -Dm644 wasm/coraza_reactor/coraza_reactor.wasm \
+            "waf-rejected-v${VERSION}/wasm/coraza_reactor.wasm"
+          install -Dm644 wasm/coraza_reactor/LICENSE-CRS \
+            "waf-rejected-v${VERSION}/wasm/LICENSE-CRS"
+          install -Dm644 wasm/coraza_reactor/PROVENANCE.md \
+            "waf-rejected-v${VERSION}/wasm/PROVENANCE.md"
+          install -Dm644 wasm/coraza_reactor/SHA256SUMS \
+            "waf-rejected-v${VERSION}/wasm/SHA256SUMS"
           tar -czf "dist/waf-rejected-v${VERSION}-x86_64-linux.tar.gz" "waf-rejected-v${VERSION}"
           cp "image/waf-rejected-${VERSION}-image.tar.gz" dist/
           cp "sbom/waf-rejected-${VERSION}.cdx.json" dist/
+          cp wasm/coraza_reactor/coraza_reactor.wasm \
+            "dist/waf-rejected-${VERSION}-coraza_reactor.wasm"
+          cp wasm/coraza_reactor/LICENSE-CRS \
+            "dist/waf-rejected-${VERSION}-coraza-LICENSE"
+          cp wasm/coraza_reactor/PROVENANCE.md \
+            "dist/waf-rejected-${VERSION}-coraza-PROVENANCE.md"
           cd dist
           for asset in \
             "waf-rejected-v${VERSION}-x86_64-linux.tar.gz" \
             "waf-rejected-${VERSION}-image.tar.gz" \
-            "waf-rejected-${VERSION}.cdx.json"; do
+            "waf-rejected-${VERSION}.cdx.json" \
+            "waf-rejected-${VERSION}-coraza_reactor.wasm" \
+            "waf-rejected-${VERSION}-coraza-LICENSE" \
+            "waf-rejected-${VERSION}-coraza-PROVENANCE.md"; do
             test -s "${asset}"
             sha256sum "${asset}" > "${asset}.sha256"
           done
@@ -187,6 +224,9 @@ jobs:
             dist/waf-rejected-v*-x86_64-linux.tar.gz
             dist/waf-rejected-*-image.tar.gz
             dist/waf-rejected-*.cdx.json
+            dist/waf-rejected-*-coraza_reactor.wasm
+            dist/waf-rejected-*-coraza-LICENSE
+            dist/waf-rejected-*-coraza-PROVENANCE.md
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
@@ -196,4 +236,7 @@ jobs:
             dist/waf-rejected-v*-x86_64-linux.tar.gz
             dist/waf-rejected-*-image.tar.gz
             dist/waf-rejected-*.cdx.json
+            dist/waf-rejected-*-coraza_reactor.wasm
+            dist/waf-rejected-*-coraza-LICENSE
+            dist/waf-rejected-*-coraza-PROVENANCE.md
             dist/*.sha256

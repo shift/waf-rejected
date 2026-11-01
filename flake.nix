@@ -79,7 +79,23 @@
           # Tests run in the dedicated CI/test jobs; keeping them out of the
           # package build avoids compiling every test utility binary twice.
           doCheck = false;
-          
+
+          # Ship the Coraza reactor at a stable, read-only path next to the
+          # binary. Fail the package build if the digest or size budget drifts.
+          postInstall = ''
+            mkdir -p "$out/share/waf/wasm"
+            install -m644 ${./wasm/coraza_reactor/coraza_reactor.wasm} \
+              "$out/share/waf/wasm/coraza_reactor.wasm"
+            install -m644 ${./wasm/coraza_reactor/LICENSE-CRS} \
+              "$out/share/waf/wasm/LICENSE-CRS"
+            install -m644 ${./wasm/coraza_reactor/PROVENANCE.md} \
+              "$out/share/waf/wasm/PROVENANCE.md"
+            install -m644 ${./wasm/coraza_reactor/SHA256SUMS} \
+              "$out/share/waf/wasm/SHA256SUMS"
+            (cd "$out/share/waf/wasm" && sha256sum --check SHA256SUMS)
+            test "$(stat -c%s "$out/share/waf/wasm/coraza_reactor.wasm")" -le 33554432
+          '';
+
           meta = with pkgs.lib; {
             description = "High-Performance Rust-Based WAF Ingress";
             homepage = "https://github.com/shift/waf-rejected";

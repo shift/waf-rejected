@@ -18,6 +18,8 @@ The image is a Debian slim runtime with the `waf-ingress` binary, the bundled
 | Proxy port | `8080` (`bind_addr`) |
 | Health/metrics port | `8081` (`health_bind_addr`) |
 | Config path | `/etc/waf/config.toml` |
+| Coraza reactor | `/usr/share/waf/wasm/coraza_reactor.wasm` |
+| Reactor licence/provenance | `/usr/share/waf/wasm/LICENSE-CRS`, `/usr/share/waf/wasm/PROVENANCE.md`, `/usr/share/waf/wasm/SHA256SUMS` |
 | Data and logs | `/var/lib/waf/data`, `/var/lib/waf/logs` |
 | User | `1000` |
 
@@ -94,6 +96,30 @@ Notes:
   metrics, not just liveness.
 - `SIGTERM` triggers graceful shutdown, so use `docker stop` rather than
   `docker kill`.
+
+### Coraza reactor artifact
+
+The image bundles the experimental Coraza WASI reactor at
+`/usr/share/waf/wasm/coraza_reactor.wasm`, with `LICENSE-CRS`,
+`PROVENANCE.md` and `SHA256SUMS` in the same directory. The image build
+verifies the digest and that the module is at most 32 MiB (the current build
+is about 18 MiB).
+
+The reactor is only active in builds compiled with the non-default
+`wasm-reactor` feature. Such a build validates the module at startup and
+fails closed if it is missing, malformed, over budget or missing required
+exports. `WAF_CORAZA_REACTOR_PATH` overrides the module path;
+`WAF_CORAZA_REACTOR_ENABLED=false` disables validation for local experiments
+only.
+
+```bash
+docker run --rm --entrypoint sha256sum \
+  ghcr.io/shift/waf-rejected@sha256:<digest> \
+  /usr/share/waf/wasm/coraza_reactor.wasm
+```
+
+Compare the digest with the release asset, `wasm/coraza_reactor/SHA256SUMS`
+and the CycloneDX SBOM component named `coraza_reactor.wasm`.
 
 Verify:
 

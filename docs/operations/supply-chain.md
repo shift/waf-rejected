@@ -93,6 +93,30 @@ still reviewed whenever it changes.
   current `Cargo.lock` contains no git dependencies. Adding a git dependency
   requires an explicit, reviewed addition here with a pinned `rev`.
 
+## CycloneDX SBOM and the Coraza reactor
+
+`cargo cyclonedx` inventories Rust crates only. The release workflow therefore
+adds the shipped Coraza WASI reactor as an explicit CycloneDX `file`
+component, including:
+
+- `name: coraza_reactor.wasm` and version `coraza-3.3.3`;
+- the SHA-256 digest of `wasm/coraza_reactor/coraza_reactor.wasm`;
+- an `Apache-2.0` licence entry covering Coraza and the referenced OWASP CRS
+  material;
+- `waf:component`, `waf:license-note` and `waf:source` properties pointing at
+  `wasm/coraza_reactor/LICENSE-CRS` and `main.go`.
+
+Verify the SBOM component after download:
+
+```bash
+jq '.components[] | select(.name == "coraza_reactor.wasm")' \
+  waf-rejected-<version>.cdx.json
+```
+
+The release also enforces a 32 MiB budget for the module and publishes its
+standalone digest asset; see
+[`docs/coraza-wasi-reactor.md`](../coraza-wasi-reactor.md).
+
 ## Container and filesystem vulnerability scanning
 
 Tagged releases additionally run [Trivy](https://github.com/aquasecurity/trivy)

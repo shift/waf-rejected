@@ -15,7 +15,19 @@ RUN apt-get update \
 
 COPY --from=builder /build/target/release/waf-ingress /usr/local/bin/waf-ingress
 COPY --from=builder /build/rules /opt/waf/rules
+COPY wasm/coraza_reactor/coraza_reactor.wasm \
+     wasm/coraza_reactor/LICENSE-CRS \
+     wasm/coraza_reactor/PROVENANCE.md \
+     wasm/coraza_reactor/SHA256SUMS \
+     /usr/share/waf/wasm/
 COPY config.docker.toml /etc/waf/config.toml
+
+# Release guard: the module must be present, have a matching digest, and stay
+# within the 32 MiB budget (the current build is about 18 MiB).
+RUN test -s /usr/share/waf/wasm/coraza_reactor.wasm \
+    && test "$(stat -c%s /usr/share/waf/wasm/coraza_reactor.wasm)" -le 33554432 \
+    && cd /usr/share/waf/wasm \
+    && sha256sum --check SHA256SUMS
 
 WORKDIR /var/lib/waf
 USER 1000
