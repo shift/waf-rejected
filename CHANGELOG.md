@@ -19,6 +19,12 @@ All notable changes to WAF-Rejected are documented here.
   WebSocket upstreams).
 - Integration tests for forwarding to a self-signed TLS upstream using
   `proxy.upstream_ca_path`, plus a plain HTTP regression test.
+- HTTPS upstream mutual TLS: setting both `proxy.upstream_client_cert_path`
+  and `proxy.upstream_client_key_path` presents a PEM client certificate chain
+  and key to upstreams. Startup fails with a clear error when only one of the
+  pair is configured or when the files are invalid. An integration test covers
+  a client-auth-requiring upstream (success with the client certificate, `502`
+  without it).
 - Bounded `gzip`, `deflate` (zlib-wrapped) and `br` request-body
   decompression before WAF inspection on HTTP/1.1, HTTP/2 and HTTP/3.
   Decompressed output is capped at `server.max_body_size` (`413` when

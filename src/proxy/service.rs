@@ -15,7 +15,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use ipnetwork::IpNetwork;
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
@@ -155,7 +155,14 @@ pub(crate) struct ProxyState {
 /// The WebPKI public roots are always trusted. When `proxy.upstream_ca_path`
 /// is set, the certificates in that PEM bundle are trusted in addition to the
 /// public roots, which allows private/self-signed upstream CAs.
-fn build_upstream_tls_config(ca_path: Option<&str>) -> Result<ClientConfig, WafError> {
+///
+/// When both `client_cert_path` and `client_key_path` are set, the PEM client
+/// certificate chain and key are presented to the upstream for mutual TLS.
+fn build_upstream_tls_config(
+    ca_path: Option<&str>,
+    client_cert_path: Option<&str>,
+    client_key_path: Option<&str>,
+) -> Result<ClientConfig, WafError> {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
@@ -192,13 +199,65 @@ fn build_upstream_tls_config(ca_path: Option<&str>) -> Result<ClientConfig, WafE
         }
     }
 
-    Ok(
+    let builder =
         ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()
             .map_err(|e| WafError::internal(format!("Failed to build upstream TLS config: {}", e)))?
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    )
+            .with_root_certificates(roots);
+
+    match (client_cert_path, client_key_path) {
+        (None, None) => Ok(builder.with_no_client_auth()),
+        (Some(cert_path), Some(key_path)) => {
+            let cert_pem = std::fs::read(cert_path).map_err(|e| {
+                WafError::internal(format!(
+                    "Failed to read upstream client certificate '{}': {}",
+                    cert_path, e
+                ))
+            })?;
+            let certs = CertificateDer::pem_slice_iter(&cert_pem)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| {
+                    WafError::internal(format!(
+                        "Failed to parse upstream client certificate '{}': {}",
+                        cert_path, e
+                    ))
+                })?;
+            if certs.is_empty() {
+                return Err(WafError::internal(format!(
+                    "Upstream client certificate '{}' contains no certificates",
+                    cert_path
+                )));
+            }
+
+            let key_pem = std::fs::read(key_path).map_err(|e| {
+                WafError::internal(format!(
+                    "Failed to read upstream client key '{}': {}",
+                    key_path, e
+                ))
+            })?;
+            let key = PrivateKeyDer::from_pem_slice(&key_pem).map_err(|e| {
+                WafError::internal(format!(
+                    "Failed to parse upstream client key '{}': {}",
+                    key_path, e
+                ))
+            })?;
+
+            builder
+                .with_client_auth_cert(certs, key)
+                .map_err(|e| {
+                    WafError::internal(format!(
+                        "Failed to configure upstream mutual TLS from '{}' and '{}': {}",
+                        cert_path, key_path, e
+                    ))
+                })
+        }
+        (Some(_), None) => Err(WafError::internal(
+            "proxy.upstream_client_cert_path is set but proxy.upstream_client_key_path is missing; both are required for upstream mutual TLS",
+        )),
+        (None, Some(_)) => Err(WafError::internal(
+            "proxy.upstream_client_key_path is set but proxy.upstream_client_cert_path is missing; both are required for upstream mutual TLS",
+        )),
+    }
 }
 
 impl WafProxyService {
@@ -224,7 +283,11 @@ impl WafProxyService {
         connector.set_nodelay(true);
         connector.set_reuse_address(true);
 
-        let tls_config = build_upstream_tls_config(config.proxy.upstream_ca_path.as_deref())?;
+        let tls_config = build_upstream_tls_config(
+            config.proxy.upstream_ca_path.as_deref(),
+            config.proxy.upstream_client_cert_path.as_deref(),
+            config.proxy.upstream_client_key_path.as_deref(),
+        )?;
         let connector = HttpsConnectorBuilder::new()
             .with_tls_config(tls_config)
             .https_or_http()
@@ -1593,6 +1656,8 @@ mod tests {
                 timeout_seconds: 30,
                 max_request_size: 10_485_760,
                 upstream_ca_path: None,
+                upstream_client_cert_path: None,
+                upstream_client_key_path: None,
             },
             ..Default::default()
         };

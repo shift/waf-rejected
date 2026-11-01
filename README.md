@@ -11,7 +11,8 @@ request-size and rate limits) before being forwarded to an upstream service.
 - Reverse proxy with HTTP/1.1, HTTP/2 over TLS, and feature-gated HTTP/3 (QUIC).
 - HTTP and HTTPS upstreams over HTTP/1.1 and HTTP/2. HTTPS upstreams are
   verified against `webpki-roots`, with an optional private CA bundle via
-  `proxy.upstream_ca_path`.
+  `proxy.upstream_ca_path`. Upstream mutual TLS is enabled by setting both
+  `proxy.upstream_client_cert_path` and `proxy.upstream_client_key_path`.
 - WebSocket upgrade proxying with per-frame WAF inspection.
 - TLS WebSocket upstreams (`https://`) verified against `webpki-roots`, with an
   optional private CA bundle via `proxy.upstream_ca_path`.

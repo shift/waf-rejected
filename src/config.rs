@@ -110,6 +110,17 @@ pub struct ProxyConfig {
     /// certificates in the bundle are trusted in addition to the built-in
     /// roots. This is intended for private/self-signed upstream CAs.
     pub upstream_ca_path: Option<String>,
+
+    /// Optional PEM client certificate chain presented to HTTPS upstreams.
+    ///
+    /// Must be set together with `upstream_client_key_path` to enable upstream
+    /// mutual TLS. Setting only one of the pair is a startup error.
+    pub upstream_client_cert_path: Option<String>,
+
+    /// Optional PEM private key for the upstream client certificate.
+    ///
+    /// Must be set together with `upstream_client_cert_path`.
+    pub upstream_client_key_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -789,6 +800,8 @@ impl Default for ProxyConfig {
             timeout_seconds: 30,
             max_request_size: 10 * 1024 * 1024, // 10MB
             upstream_ca_path: None,
+            upstream_client_cert_path: None,
+            upstream_client_key_path: None,
         }
     }
 }

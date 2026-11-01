@@ -65,9 +65,11 @@ async fn spawn_http_upstream() -> std::net::SocketAddr {
     addr
 }
 
-/// Generate a self-signed test CA and a server certificate for 127.0.0.1
-/// signed by that CA. Returns `(ca_path, cert_path, key_path)`.
-fn generate_test_ca_and_server_cert(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+/// Generate a self-signed test CA, a server certificate for 127.0.0.1, and a
+/// client certificate signed by the same CA.
+/// Returns `(ca_path, server_cert_path, server_key_path, client_cert_path,
+/// client_key_path)`.
+fn generate_test_certificates(dir: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
     let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca_params
@@ -95,18 +97,44 @@ fn generate_test_ca_and_server_cert(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
     let issuer = Issuer::from_params(&ca_params, &ca_key);
     let server_cert = server_params.signed_by(&server_key, &issuer).unwrap();
 
-    let ca_path = dir.join("ca.pem");
-    let cert_path = dir.join("server.pem");
-    let key_path = dir.join("server.key");
-    std::fs::write(&ca_path, ca_cert.pem()).unwrap();
-    std::fs::write(&cert_path, server_cert.pem()).unwrap();
-    std::fs::write(&key_path, server_key.serialize_pem()).unwrap();
+    let mut client_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    client_params.is_ca = IsCa::NoCa;
+    client_params
+        .distinguished_name
+        .push(DnType::CommonName, "waf-upstream-mtls-client");
+    client_params.use_authority_key_identifier_extension = true;
+    client_params
+        .key_usages
+        .push(KeyUsagePurpose::DigitalSignature);
+    client_params
+        .extended_key_usages
+        .push(ExtendedKeyUsagePurpose::ClientAuth);
 
-    (ca_path, cert_path, key_path)
+    let client_key = KeyPair::generate().unwrap();
+    let client_cert = client_params.signed_by(&client_key, &issuer).unwrap();
+
+    let ca_path = dir.join("ca.pem");
+    let server_cert_path = dir.join("server.pem");
+    let server_key_path = dir.join("server.key");
+    let client_cert_path = dir.join("client.pem");
+    let client_key_path = dir.join("client.key");
+    std::fs::write(&ca_path, ca_cert.pem()).unwrap();
+    std::fs::write(&server_cert_path, server_cert.pem()).unwrap();
+    std::fs::write(&server_key_path, server_key.serialize_pem()).unwrap();
+    std::fs::write(&client_cert_path, client_cert.pem()).unwrap();
+    std::fs::write(&client_key_path, client_key.serialize_pem()).unwrap();
+
+    (
+        ca_path,
+        server_cert_path,
+        server_key_path,
+        client_cert_path,
+        client_key_path,
+    )
 }
 
 async fn spawn_tls_upstream(dir: &Path) -> (std::net::SocketAddr, PathBuf) {
-    let (ca_path, cert_path, key_path) = generate_test_ca_and_server_cert(dir);
+    let (ca_path, cert_path, key_path, _client_cert, _client_key) = generate_test_certificates(dir);
 
     let cert_pem = std::fs::read(&cert_path).unwrap();
     let certs = rustls::pki_types::CertificateDer::pem_slice_iter(&cert_pem)
@@ -126,6 +154,50 @@ async fn spawn_tls_upstream(dir: &Path) -> (std::net::SocketAddr, PathBuf) {
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     let acceptor = TlsAcceptor::from(Arc::new(config));
 
+    let addr = spawn_tls_listener(acceptor).await;
+    (addr, ca_path)
+}
+
+/// Spawn a TLS upstream that requires a client certificate signed by the test CA.
+/// Returns `(addr, ca_path, client_cert_path, client_key_path)`.
+async fn spawn_mtls_tls_upstream(dir: &Path) -> (std::net::SocketAddr, PathBuf, PathBuf, PathBuf) {
+    let (ca_path, cert_path, key_path, client_cert_path, client_key_path) =
+        generate_test_certificates(dir);
+
+    let cert_pem = std::fs::read(&cert_path).unwrap();
+    let certs = rustls::pki_types::CertificateDer::pem_slice_iter(&cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let key_pem = std::fs::read(&key_path).unwrap();
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(&key_pem).expect("server key");
+
+    let ca_pem = std::fs::read(&ca_path).unwrap();
+    let mut client_roots = rustls::RootCertStore::empty();
+    for cert in rustls::pki_types::CertificateDer::pem_slice_iter(&ca_pem) {
+        client_roots.add(cert.unwrap()).unwrap();
+    }
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(client_roots),
+        provider.clone(),
+    )
+    .build()
+    .unwrap();
+
+    let mut config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certs, key)
+        .unwrap();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let acceptor = TlsAcceptor::from(Arc::new(config));
+
+    let addr = spawn_tls_listener(acceptor).await;
+    (addr, ca_path, client_cert_path, client_key_path)
+}
+
+async fn spawn_tls_listener(acceptor: TlsAcceptor) -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -153,13 +225,21 @@ async fn spawn_tls_upstream(dir: &Path) -> (std::net::SocketAddr, PathBuf) {
         }
     });
 
-    (addr, ca_path)
+    addr
 }
 
-async fn spawn_proxy(upstream_uri: String, ca_path: Option<&Path>) -> String {
+async fn spawn_proxy(
+    upstream_uri: String,
+    ca_path: Option<&Path>,
+    client_identity: Option<(&Path, &Path)>,
+) -> String {
     let mut config = Config::default();
     config.upstream_uri = upstream_uri;
     config.proxy.upstream_ca_path = ca_path.map(|path| path.to_string_lossy().into_owned());
+    if let Some((cert_path, key_path)) = client_identity {
+        config.proxy.upstream_client_cert_path = Some(cert_path.to_string_lossy().into_owned());
+        config.proxy.upstream_client_key_path = Some(key_path.to_string_lossy().into_owned());
+    }
     config.server.max_body_size = 4096;
     config.waf.rate_limit.per_ip_enabled = false;
     config.waf.rate_limit.global_enabled = false;
@@ -181,6 +261,7 @@ async fn https_upstream_with_custom_ca_is_forwarded() {
     let proxy = spawn_proxy(
         format!("https://127.0.0.1:{}", upstream.port()),
         Some(&ca_path),
+        None,
     )
     .await;
 
@@ -194,9 +275,68 @@ async fn https_upstream_with_custom_ca_is_forwarded() {
 }
 
 #[tokio::test]
+async fn https_upstream_mutual_tls_with_client_certificate_is_forwarded() {
+    let cert_dir = tempfile::tempdir().unwrap();
+    let (upstream, ca_path, client_cert, client_key) =
+        spawn_mtls_tls_upstream(cert_dir.path()).await;
+    let proxy = spawn_proxy(
+        format!("https://127.0.0.1:{}", upstream.port()),
+        Some(&ca_path),
+        Some((&client_cert, &client_key)),
+    )
+    .await;
+
+    let response = reqwest::get(format!("{}/hello", proxy)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.unwrap();
+    assert!(body.starts_with("upstream-ok "), "unexpected body: {body}");
+}
+
+#[tokio::test]
+async fn https_upstream_mutual_tls_without_client_certificate_fails() {
+    let cert_dir = tempfile::tempdir().unwrap();
+    let (upstream, ca_path, _client_cert, _client_key) =
+        spawn_mtls_tls_upstream(cert_dir.path()).await;
+    let proxy = spawn_proxy(
+        format!("https://127.0.0.1:{}", upstream.port()),
+        Some(&ca_path),
+        None,
+    )
+    .await;
+
+    let response = reqwest::get(format!("{}/hello", proxy)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+}
+
+#[test]
+fn upstream_mutual_tls_requires_cert_and_key_together() {
+    let mut config = Config::default();
+    config.proxy.upstream_client_cert_path = Some("/nonexistent/client.pem".to_string());
+    let error = WafProxyService::new(config)
+        .err()
+        .expect("expected startup error")
+        .to_string();
+    assert!(
+        error.contains("upstream_client_key_path is missing"),
+        "unexpected error: {error}"
+    );
+
+    let mut config = Config::default();
+    config.proxy.upstream_client_key_path = Some("/nonexistent/client.key".to_string());
+    let error = WafProxyService::new(config)
+        .err()
+        .expect("expected startup error")
+        .to_string();
+    assert!(
+        error.contains("upstream_client_cert_path is missing"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
 async fn http_upstream_still_works() {
     let upstream = spawn_http_upstream().await;
-    let proxy = spawn_proxy(format!("http://{}", upstream), None).await;
+    let proxy = spawn_proxy(format!("http://{}", upstream), None, None).await;
 
     let response = reqwest::get(format!("{}/hello", proxy)).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
