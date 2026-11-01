@@ -603,8 +603,10 @@ pub struct WafCorazaConfig {
     /// Maximum linear memory the reactor may grow to.
     pub memory_limit_bytes: usize,
 
-    /// Instruction (fuel) budget for one `_initialize` + `init` + `eval` round trip.
-    pub fuel: u64,
+    /// Wall-clock budget for one reactor `eval`, in milliseconds. Enforced by
+    /// wasmtime epoch interruption; this is a denial-of-service bound, not a
+    /// latency target.
+    pub eval_timeout_ms: u64,
 
     /// Number of pre-warmed reactor instances, one dedicated OS thread each.
     /// `0` selects the number of available cores clamped to `1..=8`.
@@ -618,9 +620,9 @@ impl Default for WafCorazaConfig {
             module_path: None,
             max_payload_bytes: 64 * 1024,
             memory_limit_bytes: 256 * 1024 * 1024,
-            // OWASP CRS initialisation needs the larger budget used by the
-            // Coraza reactor defaults.
-            fuel: 200_000_000_000,
+            // Generous DoS bound: CRS body inspection is byte-linear and a
+            // 60 KiB body can legitimately take seconds on modest hardware.
+            eval_timeout_ms: 5000,
             // Auto: one pre-warmed reactor per available core (clamped).
             pool_size: 0,
         }
@@ -1067,8 +1069,8 @@ impl Config {
                 "waf.coraza.max_payload_bytes must not exceed waf.coraza.memory_limit_bytes"
             );
         }
-        if self.waf.coraza.fuel == 0 {
-            anyhow::bail!("waf.coraza.fuel must be greater than zero");
+        if self.waf.coraza.eval_timeout_ms == 0 {
+            anyhow::bail!("waf.coraza.eval_timeout_ms must be greater than zero");
         }
         // Each pre-warmed reactor owns a Go runtime and its own OS thread.
         if self.waf.coraza.pool_size > 8 {
@@ -1363,7 +1365,7 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
         assert!(config.validate().is_err());
 
         let mut config = Config::default();
-        config.waf.coraza.fuel = 0;
+        config.waf.coraza.eval_timeout_ms = 0;
         assert!(config.validate().is_err());
 
         let mut config = Config::default();

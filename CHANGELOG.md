@@ -44,6 +44,21 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Changed
 
+- Replaced wasmtime fuel metering in the Coraza WASI reactor with epoch
+  interruption and a wall-clock timeout. `waf.coraza.fuel` is removed and
+  replaced by `waf.coraza.eval_timeout_ms` (default 5000 ms, validated as
+  non-zero). A per-reactor ticker advances the engine epoch every 10 ms; each
+  `eval` gets a deadline of `eval_timeout_ms` and `_initialize`/`init` get a
+  fixed 60 s budget. A deadline trap surfaces as `ReactorError::Timeout`,
+  discards the worker instance, and follows the existing `fail_mode` path. The
+  host reply wait is now `eval_timeout_ms + 5 s` instead of a fixed 60 s.
+  Removing fuel instrumentation also removes its ~14 % per-block cost.
+- Tuned the Go guest's garbage collector at startup with
+  `debug.SetGCPercent(600)` and `debug.SetMemoryLimit(192 MiB)`. CRS workload
+  allocates about 0.5–1 MiB per 8 KiB body, and the default GC target made
+  collections land mid-evaluation (observed 8 KiB p50 ~830 ms versus ~347 ms
+  steady state); the larger growth target and a soft limit below the 256 MiB
+  store cap remove the tail without raising 60 KiB steady-state cost.
 - Coraza WASI reactor instances are reused instead of being created per
   request, and start-up is now deterministic. `WasmReactor::warm()` creates a
   fixed pool of dedicated OS threads (available parallelism clamped to `1..=8`,

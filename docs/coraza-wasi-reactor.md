@@ -212,13 +212,13 @@ blocks until every one of them has finished start-up:
 Every request then only:
 
 1. hands the payload to an idle pool worker;
-2. resets the fuel budget;
+2. sets the wasmtime epoch deadline from `waf.coraza.eval_timeout_ms`;
 3. copies the JSON payload to `input_base`;
 4. calls `eval(base, len)`;
 5. calls `free(base, len)`.
 
 `eval` creates and closes a Coraza transaction per request, so decisions do not
-leak between requests. A failed evaluation (trap, fuel exhaustion, failed init)
+leak between requests. A failed evaluation (trap, epoch timeout, failed init)
 discards that worker's instance, returns the error to the caller and the
 worker's next job rebuilds it. Each worker owns one wasmtime
 `Store`/`Instance`/`Memory`, which are not `Send`, so instances never migrate
@@ -241,10 +241,13 @@ deliberately does not compile or warm a second reactor.
   channel, waits for the decision and returns the worker. Contention beyond the
   pool size queues on the condition variable rather than blocking a Tokio
   worker inside Go.
-- **Fail closed:** a worker that panics or exits drops its reply channel;
-  `evaluate` observes the disconnect (or a 60 s reply timeout), discards the
-  worker and returns `ReactorError::Trap` instead of hanging. A replacement
-  thread is started for the next job.
+- **Fail closed:** the guest runs under a wasmtime epoch deadline equal to
+  `waf.coraza.eval_timeout_ms`; exceeding it traps and surfaces as
+  `ReactorError::Timeout`. As a host-side backstop, `evaluate` also stops
+  waiting `eval_timeout_ms + 5 s` after dispatch, discards the worker and
+  returns an error instead of hanging. A worker that panics or exits drops its
+  reply channel and is handled the same way. A replacement thread is started
+  for the next job.
 - **Idempotence:** `warm()` is serialised by a mutex and becomes a no-op after
   the pool exists. A failed warm-up leaves no pool installed, so start-up fails
   closed and a later call retries.
@@ -334,20 +337,28 @@ enabled = true            # default; set false to skip compilation/warm-up entir
 # module_path = "/etc/waf/coraza_reactor.wasm"  # omit to use the embedded reactor
 max_payload_bytes = 65536
 memory_limit_bytes = 268435456
-fuel = 2000000000
+eval_timeout_ms = 5000    # DoS bound per eval; init gets a fixed 60 s budget
 pool_size = 0             # 0 = one worker per core, clamped to 1..=8
 ```
 
 `module_path` is optional: when omitted the Coraza module is embedded in the
-WAF binary. `Config::validate` rejects zero payload/fuel values, a memory limit
-below 64 KiB, a payload limit larger than the memory limit, an empty module
-path, and a `pool_size` above 8.
+WAF binary. `Config::validate` rejects zero payload/timeout values, a memory
+limit below 64 KiB, a payload limit larger than the memory limit, an empty
+module path, and a `pool_size` above 8.
+
+`eval_timeout_ms` is a wall-clock denial-of-service bound, not a latency
+target. It is generous because CRS body inspection is byte-linear and a 60 KiB
+body can legitimately take seconds on modest hardware. Exceeding it traps the
+guest through wasmtime epoch interruption (checked every 10 ms), discards the
+instance, and follows the failure policy below. Go `_initialize` and Coraza
+`init` use a separate fixed 60 s budget so slow start-up is never mistaken for
+an attack.
 
 If the reactor cannot be constructed at start-up, the engine adds a
 fail-closed placeholder rule when `waf.fail_mode != "open"`; the placeholder
 returns `503`. In `open` mode the failure is logged and the request continues
-through the remaining rules. At request time any reactor error (trap, fuel
-exhaustion, payload overflow) follows the same policy: `503` when closed,
+through the remaining rules. At request time any reactor error (trap, epoch
+timeout, payload overflow) follows the same policy: `503` when closed,
 log-and-allow when open.
 
 ## Memory and limits
@@ -358,7 +369,8 @@ Host-side limits for the Coraza reactor (`ReactorLimits::coraza`):
 | --- | --- | --- |
 | `max_payload_bytes` | 64 KiB | Host rejects larger payloads; matches the module's static buffer. |
 | `memory_limit_bytes` | 256 MiB | wasmtime `StoreLimits` with `trap_on_grow_failure`; Go starts near 10 MiB and grows. |
-| `fuel` | 200,000,000,000 | Bounds `_initialize` + `init` on first use; reset before every `eval`. |
+| `eval_timeout_ms` | 5,000 ms | wasmtime epoch deadline per `eval`; a ticker advances the epoch every 10 ms. Exceeding it traps as `ReactorError::Timeout`. |
+| init timeout | 60 s (fixed) | Larger epoch deadline for `_initialize` + `init`, so slow Go/CRS start-up is not treated as an attack. |
 | `max_wasm_stack` | 8 MiB | Bounds native stack used by compiled wasm frames; traps instead of overflowing the host thread. |
 | `async_stack_size` | 8 MiB | Must be at least `max_wasm_stack`; required by wasmtime even for sync calls. |
 | `pool_size` | cores clamped to `1..=8` (`0` = auto) | Number of pre-warmed reactor instances, one dedicated OS thread each. Each reserves a 32 MiB native stack. |
@@ -371,6 +383,23 @@ Because a Go reactor can grow to the 256 MiB memory limit, budget up to that
 amount per pool worker. The default pool of one worker per core (at most eight)
 therefore caps the reactor's worst-case linear-memory footprint at
 `pool_size * memory_limit_bytes`, but typical resident usage is far lower.
+
+### Guest GC tuning
+
+At startup the reactor calls `debug.SetGCPercent(600)` and
+`debug.SetMemoryLimit(192 MiB)` in `wasm/coraza_reactor/main.go`. With the Go
+default (`GOGC=100`) a collection lands every ~10 MiB of allocation; CRS
+evaluation allocates ~0.5–1 MiB per 8 KiB body, so early requests can pay a
+collection mid-evaluation and roughly double that request's latency. Raising
+the growth target amortises collections across requests, and the soft memory
+limit keeps the heap target below the host's 256 MiB store limit, so the
+runtime still collects before linear memory traps.
+
+The tradeoff is higher resident memory and, when a collection does happen, a
+larger live heap to scan. Measured on the reference machine, the 8–16 KiB p50
+tail (up to ~2.6× the steady-state floor on unprimed heaps) disappears while
+60 KiB steady-state cost is unchanged. The 192 MiB soft limit leaves 64 MiB of
+headroom under the 256 MiB store cap for Go runtime and wasm overhead.
 
 ## Observability
 
@@ -423,7 +452,10 @@ asserts a failed worker aborts warm-up, `concurrent_evaluations_return_correct_d
 runs eight threads against a two-worker pool, and
 `worker_trap_discards_instance_without_hanging_or_corrupting` interleaves
 trapping and clean payloads to prove a failed instance is rebuilt and later
-evaluations stay correct.
+evaluations stay correct, and
+`evaluation_timeout_discards_instance_and_next_evaluation_recovers` does the
+same for an evaluation that exceeds `eval_timeout_ms` and must surface as
+`ReactorError::Timeout`.
 
 The tests are ignored in debug builds because Go runtime start-up and CRS
 compilation are slow without optimisation. Release builds pass:
@@ -473,9 +505,7 @@ evaluation to these figures:
 | allow decision (warm) | 8.42 ms | 7.02 ms | ~119 ops/s |
 | SQLi block (warm) | 10.59 ms | 10.62 ms | ~94 ops/s |
 | XSS block (warm) | not re-measured | — | — |
-| 1 KiB body (warm) | not re-measured | — | — |
-| 16 KiB body (warm) | not re-measured | — | — |
-| 64 KiB body ceiling (warm) | not re-measured | — | — |
+| body sizes (warm) | see request-body table below | — | — |
 
 wasmtime is **5–8× faster than wasmi with the CRS module** (wasmi/CRS measured
 40.4 ms allow and 75.3 ms SQLi). It is still not sub-millisecond: the Go/Coraza
@@ -507,6 +537,40 @@ well under the 1 ms budget. Warm-up itself is a start-up cost: with the default
 pool size it runs one Go/CRS init per core (at most eight), in parallel. Treat
 these numbers as an order of magnitude, not a service-level guarantee.
 
+### Request-body latency after wasm tuning
+
+Epoch interruption and guest GC tuning were measured on 2026-11-01 with a
+release build (`cargo build --release`), a one-worker pre-warmed pool pinned
+with `taskset -c 2`, and form-urlencoded `data=AAA…` bodies. Each row is seven
+evaluations after one warm-up; p50 and mean are milliseconds. The module was
+the rebuilt 20 MiB reactor with `SetGCPercent(600)` and a 192 MiB soft memory
+limit.
+
+| Body | Payload bytes | Before p50 | Before mean | After p50 | After mean |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| none (GET) | 173 | 2.2 | 2.2 | 2.3 | 2.3 |
+| 1 KiB | 1,283 | 38.6 | 38.7 | 39.1 | 39.3 |
+| 4 KiB | 4,355 | 163.8 | 163.7 | 167.5 | 169.3 |
+| 8 KiB | 8,451 | 832.6 | 804.2 | 351.4 | 353.6 |
+| 16 KiB | 16,645 | 1,754.4 | 1,677.9 | 707.1 | 708.2 |
+| 60 KiB | 61,701 | 2,624.5 | 2,689.4 | 2,650.2 | 2,652.1 |
+
+The 8–16 KiB improvement is the GC tail disappearing: before tuning the same
+8 KiB workload alternated between a ~347 ms steady state and ~830 ms p50 when a
+collection landed mid-request. Body cost remains linear in inspected bytes and
+is dominated by Go→wasm CRS operator scanning, so 60 KiB is still ~2.6 s on
+this hardware; a 60 KiB request can approach the default 5 s
+`eval_timeout_ms` when the laptop is throttled to 1.7 GHz.
+
+The development laptop throttles between 1.7 and 3.3 GHz, so the same workload
+varies by up to ~2.6× between runs. For example a 4 KiB body measured 164 ms in
+one run and 375 ms in another. A/B runs were therefore interleaved and pinned;
+treat these numbers as relative guidance, not an SLO. On the same machine a
+forced `eval_timeout_ms = 20` made an 8 KiB evaluation return
+`ReactorError::Timeout` in 19 ms; the next (fast) evaluation succeeded on a
+freshly created instance, and the rule maps the timeout to `503` when
+`fail_mode = "closed"`.
+
 ## Remaining work
 
 - **Response coverage:** enable `SecResponseBodyAccess` and the
@@ -515,10 +579,11 @@ these numbers as an order of magnitude, not a service-level guarantee.
   `REQUEST-999`) and raise the paranoia level only with application-specific
   false-positive testing.
 - **Performance:** wasmtime's compiled execution did not remove the dominant
-  cost: the Go/Coraza transaction work and full-payload JSON decoding still
-  dominate. Large bodies (16–64 KiB) remain in the low-millisecond range, so
-  sub-millisecond proxying needs a byte-oriented, allocation-free ABI rather
-  than a faster runtime.
+  cost: CRS operators scan the whole body byte-for-byte and Go→wasm adds a
+  ~5× constant factor. Epoch interruption and GC tuning help the tail, but an
+  8 KiB body still costs ~350 ms and 60 KiB ~2.6 s on the reference laptop.
+  Sub-second large-body inspection needs a body-size policy or native Coraza,
+  not a faster runtime.
 - **Tokio interaction:** wasmtime-wasi's sync preview1 adapters cannot run
   inside the proxy's Tokio workers, hence the shadowed stdio/path imports. If
   a future wasmtime-wasi release offers a runtime-free sync surface, the shims
@@ -530,8 +595,9 @@ these numbers as an order of magnitude, not a service-level guarantee.
 - **Module size:** run `wasm-opt -Oz` and/or split unused Coraza features;
   20 MiB is large for an embedded security control.
 - **Default enablement:** `wasm-reactor` is now default-on. Watch the
-  ~4.5 s compile + ~1.1 s pool warm at start-up and the ~8–10 ms p50
-  per-request cost; provide a lighter CRS profile if that is too expensive for
-  edge deployments.
+  ~4.5 s compile + ~1.1 s pool warm at start-up and the body-size-dependent
+  per-request cost (~2 ms bodyless, ~350 ms per 8 KiB body); provide a
+  lighter CRS profile or a body-size policy if that is too expensive for edge
+  deployments.
 - **Body fidelity:** the ABI is UTF-8/lossy; binary-safe inspection needs a
   byte-oriented payload format.

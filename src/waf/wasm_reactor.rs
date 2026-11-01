@@ -10,7 +10,7 @@
 
 use std::borrow::Cow;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -42,8 +42,14 @@ pub const DEFAULT_MAX_PAYLOAD_BYTES: usize = 32 * 1024;
 /// Maximum linear memory the reactor is allowed to grow to.
 pub const DEFAULT_MEMORY_LIMIT_BYTES: usize = 64 * 1024;
 
-/// Fuel budget for one `init` + `eval` round trip.
-pub const DEFAULT_FUEL: u64 = 1_000_000;
+/// Default wall-clock budget for one `eval`. This is a denial-of-service
+/// bound, not a normal-latency target: CRS body inspection is byte-linear and
+/// a 60 KiB body can legitimately take seconds on modest hardware.
+pub const DEFAULT_EVAL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Wall-clock budget for Go `_initialize` + Coraza `init` on a fresh instance.
+/// Rule compilation is a start-up cost and gets a much larger bound.
+pub const INIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Maximum payload accepted by the Coraza reactor (its static input buffer).
 pub const CORAZA_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
@@ -52,10 +58,13 @@ pub const CORAZA_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 /// roughly 10 MiB and grows during WAF compilation and request parsing.
 pub const CORAZA_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 
-/// Fuel budget for one Coraza `_initialize` + `init` + `eval` round trip.
-/// Go runtime start-up and compilation of the CRS directive bundle dominate
-/// this budget; see the performance notes in `docs/coraza-wasi-reactor.md`.
-pub const CORAZA_FUEL: u64 = 200_000_000_000;
+/// Shared engine epoch tick period. A store deadline set to N ticks therefore
+/// expires after roughly `N * 10 ms` of guest execution.
+const EPOCH_TICK_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Margin added to the guest `eval` timeout for the host-side channel wait, so
+/// a wedged worker is discarded shortly after the epoch deadline fires.
+const HOST_REPLY_MARGIN: Duration = Duration::from_secs(5);
 
 /// Size budget for the shipped Coraza reactor. The current module is about
 /// 18 MiB; the budget leaves room for a pinned rule bundle while still
@@ -74,11 +83,6 @@ pub const MAX_REACTOR_POOL_SIZE: usize = 8;
 /// frames need substantially more than a default 2 MiB thread stack; this
 /// leaves four times the 8 MiB wasm stack limit for host frames.
 const REACTOR_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
-
-/// How long one evaluation may wait for its worker before the host treats the
-/// worker as wedged and fails closed. Fuel bounds guest execution, so this only
-/// guards against a host-side stall.
-const EVALUATE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Default pool size: one worker per available core, clamped to a sane range.
 fn default_pool_size() -> usize {
@@ -103,8 +107,10 @@ pub struct ReactorLimits {
     pub max_payload_bytes: usize,
     /// Maximum linear-memory size in bytes.
     pub memory_limit_bytes: usize,
-    /// Instruction budget for one evaluation.
-    pub fuel: u64,
+    /// Wall-clock budget for one `eval`. Enforced by wasmtime epoch
+    /// interruption; exceeding it traps and surfaces as
+    /// [`ReactorError::Timeout`].
+    pub eval_timeout: Duration,
     /// Number of pre-warmed reactor instances (one OS thread each). Clamped to
     /// `1..=MAX_REACTOR_POOL_SIZE` when the reactor is built.
     pub pool_size: usize,
@@ -115,7 +121,7 @@ impl Default for ReactorLimits {
         Self {
             max_payload_bytes: DEFAULT_MAX_PAYLOAD_BYTES,
             memory_limit_bytes: DEFAULT_MEMORY_LIMIT_BYTES,
-            fuel: DEFAULT_FUEL,
+            eval_timeout: DEFAULT_EVAL_TIMEOUT,
             pool_size: default_pool_size(),
         }
     }
@@ -127,7 +133,7 @@ impl ReactorLimits {
         Self {
             max_payload_bytes: CORAZA_MAX_PAYLOAD_BYTES,
             memory_limit_bytes: CORAZA_MEMORY_LIMIT_BYTES,
-            fuel: CORAZA_FUEL,
+            eval_timeout: DEFAULT_EVAL_TIMEOUT,
             pool_size: default_pool_size(),
         }
     }
@@ -166,9 +172,12 @@ pub enum ReactorError {
     /// The payload does not fit in the reactor's linear memory.
     #[error("request payload does not fit in reactor linear memory")]
     PayloadOutOfBounds,
-    /// The reactor trapped, ran out of fuel, or otherwise failed while running.
+    /// The reactor trapped or otherwise failed while running.
     #[error("reactor execution failed: {0}")]
     Trap(String),
+    /// The reactor exceeded its wall-clock execution budget.
+    #[error("reactor execution exceeded the configured timeout")]
+    Timeout,
     /// The reactor returned a decision code the host does not understand.
     #[error("reactor returned unknown decision code {0}")]
     UnknownDecision(i32),
@@ -430,6 +439,9 @@ pub struct WasmReactor {
     pool_size: usize,
     pool: OnceLock<Arc<ReactorPool>>,
     warm_lock: Mutex<()>,
+    /// Keeps the engine epoch advancing while the reactor is alive. Dropping
+    /// the reactor stops and joins the ticker.
+    _epoch: EpochTicker,
 }
 
 impl std::fmt::Debug for WasmReactor {
@@ -444,6 +456,64 @@ impl std::fmt::Debug for WasmReactor {
 }
 
 static NEXT_REACTOR_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Advances a reactor engine's epoch on a fixed interval.
+///
+/// wasmtime checks the deadline only at epoch boundaries, so this replaces the
+/// per-basic-block fuel instrumentation with one wakeup per tick per reactor.
+/// The thread stops and joins when the reactor (and therefore this handle) is
+/// dropped, so reactors created and discarded by tests do not leak threads.
+struct EpochTicker {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl EpochTicker {
+    fn start(engine: Engine) -> Result<Self, ReactorError> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        let handle = thread::Builder::new()
+            .name("coraza-epoch-ticker".to_string())
+            .spawn(move || {
+                while !stop_flag.load(Ordering::Relaxed) {
+                    thread::sleep(EPOCH_TICK_INTERVAL);
+                    engine.increment_epoch();
+                }
+            })
+            .map_err(|err| ReactorError::Compile(format!("failed to spawn epoch ticker: {err}")))?;
+        Ok(Self {
+            stop,
+            handle: Some(handle),
+        })
+    }
+}
+
+impl Drop for EpochTicker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Converts a wall-clock budget to wasmtime epoch ticks, rounding up so a
+/// non-zero timeout always allows at least one tick.
+fn epoch_deadline_ticks(timeout: Duration) -> u64 {
+    let tick = EPOCH_TICK_INTERVAL.as_millis().max(1);
+    let millis = timeout.as_millis();
+    let ticks = millis.div_ceil(tick).max(1);
+    u64::try_from(ticks).unwrap_or(u64::MAX)
+}
+
+/// Maps a guest trap caused by the epoch deadline to [`ReactorError::Timeout`].
+fn map_guest_error(err: wasmtime::Error) -> ReactorError {
+    if err.downcast_ref::<wasmtime::Trap>() == Some(&wasmtime::Trap::Interrupt) {
+        ReactorError::Timeout
+    } else {
+        ReactorError::Trap(err.to_string())
+    }
+}
 
 /// One initialised reactor instance, owned by a single worker thread.
 struct CachedInstance {
@@ -568,7 +638,15 @@ impl ReactorPool {
             ));
         }
 
-        match reply_rx.recv_timeout(EVALUATE_TIMEOUT) {
+        // The guest epoch deadline is the primary bound; this host-side wait is
+        // a backstop for a worker wedged outside guest code. It is only a small
+        // margin longer so a stuck worker cannot pin a request for a minute.
+        let host_timeout = self
+            .config
+            .limits
+            .eval_timeout
+            .saturating_add(HOST_REPLY_MARGIN);
+        match reply_rx.recv_timeout(host_timeout) {
             Ok(result) => {
                 self.release(worker);
                 result
@@ -577,9 +655,7 @@ impl ReactorPool {
                 // The worker may still be running; dropping it detaches the
                 // thread and closes its job channel so it exits afterwards.
                 self.discard(worker);
-                Err(ReactorError::Trap(
-                    "reactor evaluation timed out".to_string(),
-                ))
+                Err(ReactorError::Timeout)
             }
             Err(RecvTimeoutError::Disconnected) => {
                 // The worker panicked or exited without replying.
@@ -716,9 +792,9 @@ impl WorkerConfig {
             },
         );
         store.limiter(|state: &mut ReactorState| &mut state.limits);
-        store
-            .set_fuel(self.limits.fuel)
-            .map_err(|err| ReactorError::Trap(err.to_string()))?;
+        // Go runtime start-up and CRS compilation get the larger
+        // initialisation budget; `evaluate_on` sets a fresh deadline per eval.
+        store.set_epoch_deadline(epoch_deadline_ticks(INIT_TIMEOUT));
 
         let instance = self
             .linker
@@ -742,14 +818,10 @@ impl WorkerConfig {
         // run before any `//go:wasmexport` function. Modules without it (the
         // WAT spike) simply skip this step.
         if let Ok(initialize) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
-            initialize
-                .call(&mut store, ())
-                .map_err(|err| ReactorError::Trap(err.to_string()))?;
+            initialize.call(&mut store, ()).map_err(map_guest_error)?;
         }
 
-        let init_code = init
-            .call(&mut store, ())
-            .map_err(|err| ReactorError::Trap(err.to_string()))?;
+        let init_code = init.call(&mut store, ()).map_err(map_guest_error)?;
         if init_code != 0 {
             return Err(ReactorError::Init(init_code));
         }
@@ -759,9 +831,7 @@ impl WorkerConfig {
         // fixed offset.
         let input_base = match instance.get_typed_func::<(), i32>(&mut store, "input_base") {
             Ok(func) => {
-                let base = func
-                    .call(&mut store, ())
-                    .map_err(|err| ReactorError::Trap(err.to_string()))?;
+                let base = func.call(&mut store, ()).map_err(map_guest_error)?;
                 if base < 0 {
                     return Err(ReactorError::PayloadOutOfBounds);
                 }
@@ -780,8 +850,8 @@ impl WorkerConfig {
     }
 
     /// Runs one `eval` against an initialised instance and returns it for
-    /// reuse on success. Fuel is reset per request so one evaluation cannot
-    /// starve the next.
+    /// reuse on success. The epoch deadline is reset per request so one
+    /// evaluation cannot consume the next one's budget.
     fn evaluate_on(
         &self,
         mut cached: CachedInstance,
@@ -789,8 +859,7 @@ impl WorkerConfig {
     ) -> Result<(ReactorDecision, CachedInstance), ReactorError> {
         cached
             .store
-            .set_fuel(self.limits.fuel)
-            .map_err(|err| ReactorError::Trap(err.to_string()))?;
+            .set_epoch_deadline(epoch_deadline_ticks(self.limits.eval_timeout));
 
         let input_base = cached.input_base;
         let end = input_base
@@ -809,7 +878,7 @@ impl WorkerConfig {
         let code = cached
             .eval
             .call(&mut cached.store, (base_i32, len_i32))
-            .map_err(|err| ReactorError::Trap(err.to_string()))?;
+            .map_err(map_guest_error)?;
 
         // `free` is part of the ABI even though the reactors do not allocate
         // per request. A failure here does not invalidate the instance.
@@ -836,7 +905,10 @@ impl WasmReactor {
     /// Compiles a reactor from Wasm bytes. WAT text is accepted as well.
     pub fn from_bytes(bytes: &[u8], limits: ReactorLimits) -> Result<Self, ReactorError> {
         let mut config = Config::new();
-        config.consume_fuel(true);
+        // Epoch interruption bounds wall-clock execution without the per-block
+        // instrumentation cost of fuel metering. The ticker below advances the
+        // epoch; stores set a deadline before each guest call.
+        config.epoch_interruption(true);
         config.cranelift_opt_level(OptLevel::Speed);
         // The Go runtime uses more wasm stack than a typical Rust/C guest.
         // Exceeding this limit traps in wasm instead of overflowing the host
@@ -848,6 +920,7 @@ impl WasmReactor {
         let module =
             Module::new(&engine, bytes).map_err(|err| ReactorError::Compile(err.to_string()))?;
         let linker = wasi_linker(&engine)?;
+        let epoch = EpochTicker::start(engine.clone())?;
         let pool_size = limits.pool_size.clamp(1, MAX_REACTOR_POOL_SIZE);
         let reactor = Self {
             id: NEXT_REACTOR_ID.fetch_add(1, Ordering::Relaxed),
@@ -858,6 +931,7 @@ impl WasmReactor {
             pool_size,
             pool: OnceLock::new(),
             warm_lock: Mutex::new(()),
+            _epoch: epoch,
         };
         reactor.validate_exports()?;
         Ok(reactor)
@@ -1117,7 +1191,7 @@ impl From<&crate::config::WafCorazaConfig> for ReactorLimits {
         Self {
             max_payload_bytes: config.max_payload_bytes,
             memory_limit_bytes: config.memory_limit_bytes,
-            fuel: config.fuel,
+            eval_timeout: Duration::from_millis(config.eval_timeout_ms),
             pool_size: if config.pool_size == 0 {
                 default_pool_size()
             } else {
@@ -1510,6 +1584,43 @@ mod tests {
             // correct and the call returns instead of hanging.
             assert_eq!(reactor.evaluate(b"0").unwrap(), ReactorDecision::Allow);
         }
+    }
+
+    #[test]
+    fn evaluation_timeout_discards_instance_and_next_evaluation_recovers() {
+        // `eval` spins forever when the payload starts with '1' and allows
+        // otherwise, so the timeout path can be exercised without a real hang.
+        let wat = r#"
+            (module
+              (memory (export "memory") 1)
+              (func (export "init") (result i32) i32.const 0)
+              (func (export "eval") (param $ptr i32) (param $len i32) (result i32)
+                (if (i32.and (i32.gt_s (local.get $len) (i32.const 0))
+                             (i32.eq (i32.load8_u (local.get $ptr)) (i32.const 49)))
+                  (then (loop $spin (br $spin))))
+                i32.const 0)
+              (func (export "free") (param i32 i32)))
+        "#;
+        let limits = ReactorLimits {
+            pool_size: 1,
+            eval_timeout: Duration::from_millis(30),
+            ..ReactorLimits::default()
+        };
+        let reactor = WasmReactor::from_wat(wat, limits).expect("module must load");
+        reactor.warm().expect("warm-up must succeed");
+
+        let started = Instant::now();
+        assert!(matches!(reactor.evaluate(b"1"), Err(ReactorError::Timeout)));
+        // The epoch deadline, not the host-side backstop, ended the call.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "timeout should fire near the 30 ms budget, took {:?}",
+            started.elapsed()
+        );
+
+        // The timed-out instance was discarded; the next evaluation builds a
+        // fresh one and succeeds.
+        assert_eq!(reactor.evaluate(b"0").unwrap(), ReactorDecision::Allow);
     }
 
     #[test]

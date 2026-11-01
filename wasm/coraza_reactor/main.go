@@ -10,11 +10,33 @@ import (
 	"embed"
 	"encoding/json"
 	"io/fs"
+	"runtime/debug"
 	"strings"
 	"unsafe"
 
 	"github.com/corazawaf/coraza/v3"
 )
+
+// GC tuning. A default GOGC=100 collects roughly every 10 MiB of allocation;
+// CRS evaluation allocates about 0.5-1 MiB per 8 KiB body, so an early
+// collection lands mid-evaluation and can double that request's latency
+// (measured p50 863 ms versus a 333 ms steady-state floor). Raising the heap
+// growth target amortises collections across many requests, while
+// GOMEMLIMIT keeps the heap target comfortably below the host's 256 MiB
+// store limit so the runtime still collects before linear memory traps.
+//
+// Tradeoff: resident memory is higher and a collection, when it does happen,
+// scans a larger live heap. The 192 MiB soft limit leaves 64 MiB of headroom
+// for non-heap/wasm overhead under the 256 MiB store cap.
+const (
+	gcPercent   = 600
+	memoryLimit = 192 << 20
+)
+
+func init() {
+	debug.SetGCPercent(gcPercent)
+	debug.SetMemoryLimit(memoryLimit)
+}
 
 // maxInputBytes is the size of the static request buffer exposed to the host.
 // Keep this in sync with the host's DEFAULT_MAX_PAYLOAD_BYTES and the input

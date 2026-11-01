@@ -97,7 +97,7 @@ These are placeholders for demonstration and tests only.
 | --- | --- | --- |
 | `max_payload_bytes` | 32 KiB | Host rejects larger payloads before touching Wasm memory. |
 | `memory_limit_bytes` | 64 KiB | `wasmi::StoreLimits` rejects `memory.grow` beyond the limit. |
-| `fuel` | 1,000,000 | `wasmi` fuel metering bounds instruction count per `init` + `eval`. |
+| `eval_timeout` | 5 s | wasmtime epoch interruption bounds wall-clock time per `eval`; `init` gets a fixed 60 s budget. |
 
 The module itself declares `(memory 1 1)`; a real reactor that needs more
 scratch space must raise both its minimum pages and `memory_limit_bytes`.
@@ -109,7 +109,7 @@ Additional hardening already in place:
 - module export presence is checked at load time (`memory`, `init`, `eval`,
   `free`);
 - negative and overflowing `(ptr, len)` values are rejected inside the module;
-- traps, fuel exhaustion and unknown decision codes surface as
+- traps, epoch timeouts and unknown decision codes surface as
   `ReactorError` rather than panics;
 - the rule maps any reactor failure to `503` (fail closed), matching the
   project's fail-closed posture.
@@ -171,12 +171,12 @@ changing the host.
    let reactor = WasmReactor::from_bytes(&wasm, ReactorLimits::default())?;
    ```
 
-4. Raise `memory_limit_bytes` and `fuel` deliberately. Coraza rule loading and
-   regex evaluation are heavier than the spike; measure before enabling it in
-   the proxy pipeline.
+4. Raise `memory_limit_bytes` and `eval_timeout` deliberately. Coraza rule
+   loading and regex evaluation are heavier than the spike; measure before
+   enabling it in the proxy pipeline.
 
 5. Add parity tests: benign allow, SQLi/XSS block, oversized body, malformed
-   module, trap, fuel exhaustion, and a request that exercises CRS rule IDs.
+   module, trap, epoch timeout, and a request that exercises CRS rule IDs.
 
 ## Known limitations
 
