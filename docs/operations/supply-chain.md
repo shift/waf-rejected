@@ -93,6 +93,60 @@ still reviewed whenever it changes.
   current `Cargo.lock` contains no git dependencies. Adding a git dependency
   requires an explicit, reviewed addition here with a pinned `rev`.
 
+## Container and filesystem vulnerability scanning
+
+Tagged releases additionally run [Trivy](https://github.com/aquasecurity/trivy)
+through `aquasecurity/trivy-action` in `.github/workflows/release.yml`:
+
+- **`trivy-filesystem`** scans the checked-out repository (`scan-type: fs`):
+  dependency manifests/lockfiles, vendored assets and configuration in the
+  source tree.
+- **`trivy-image`** scans the release container image tarball produced by the
+  `build-image` job (`scan-type: image`), covering OS packages as well as
+  application dependencies layered into the image.
+
+Both scans:
+
+- report `HIGH` and `CRITICAL` findings only;
+- fail the job when any finding is present (`exit-code: 1`), including findings
+  without an upstream fix (`ignore-unfixed: false`);
+- emit SARIF to the repository's code-scanning dashboard with separate
+  `trivy-filesystem` and `trivy-image` categories, even when the scan fails.
+
+`build-release` depends on both scan jobs, so a failing scan blocks the release.
+The jobs request `contents: read` and `security-events: write`; the latter is
+required to upload SARIF. If the repository has code scanning disabled, the
+scan still blocks the release even though the SARIF upload step reports an
+error.
+
+### Running Trivy locally
+
+The local CI runner runs the filesystem scan only when explicitly requested:
+
+```bash
+TRIVY=1 ./scripts/ci-local.sh
+```
+
+The stage is skipped with a warning if `trivy` is not installed. If it is
+missing, use the Nix shell:
+
+```bash
+# Filesystem/dependency scan (same thresholds as CI)
+nix shell nixpkgs#trivy -c trivy fs \
+  --scanners vuln --severity HIGH,CRITICAL --exit-code 1 .
+
+# Release image scan from the published tag, a locally built image, or a
+# release tarball (`trivy image --input waf-rejected-<version>-image.tar.gz`)
+nix shell nixpkgs#trivy -c trivy image \
+  --severity HIGH,CRITICAL --exit-code 1 ghcr.io/shift/waf-rejected:<tag>
+nix shell nixpkgs#trivy -c trivy image \
+  --severity HIGH,CRITICAL --exit-code 1 waf-rejected:local-ci
+```
+
+Trivy downloads its vulnerability database on first use; on an air-gapped host,
+pre-populate the cache or mirror the database before running the scan. CI never
+skips the scans.
+
 ## Changing the policy
 
 1. Open a pull request that edits `deny.toml` and this document together.

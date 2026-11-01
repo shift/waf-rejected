@@ -26,12 +26,22 @@ All notable changes to WAF-Rejected are documented here.
   (`waf_request_duration_seconds` histogram) across HTTP/1.1, HTTP/2 and
   HTTP/3 request paths, with matching Prometheus alert rules and monitoring
   documentation.
+- Trivy filesystem and release-image vulnerability scans in the release
+  workflow, emitting SARIF and blocking releases on `HIGH`/`CRITICAL` findings.
+- Optional `TRIVY=1` filesystem scan stage in `scripts/ci-local.sh`, skipped
+  with a warning when Trivy is not installed.
 
 ### Changed
 
 - Allowed compressed request bodies are forwarded upstream in their
   decompressed `identity` form. `Content-Encoding` is dropped and
   `Content-Length` is recomputed for the decompressed body.
+
+### Documentation
+
+- Documented the Trivy scan policy, failure thresholds and local reproduction
+  commands in `docs/operations/supply-chain.md`, with links from `README.md`
+  and `SECURITY.md`.
 
 ## [0.1.0-beta.9] - 2026-10-31
 

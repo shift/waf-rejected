@@ -108,6 +108,10 @@ in-scope service:
   `compliance` feature is a certification.
 - Report supply-chain issues you find in WAF-Rejected to us through the private
   channel above so that other operators can be warned.
+- Release filesystems and container images are scanned with Trivy; any
+  `HIGH` or `CRITICAL` finding blocks the release. The scan policy and local
+  reproduction steps are documented in
+  [`docs/operations/supply-chain.md`](docs/operations/supply-chain.md).
 
 ## Verifying release provenance
 

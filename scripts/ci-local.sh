@@ -13,6 +13,7 @@
 # Environment:
 #   SKIP_AUDIT=1         Skip `cargo audit` even when cargo-audit is installed.
 #   SKIP_DENY=1          Skip `cargo deny check` even when cargo-deny is installed.
+#   TRIVY=1              Also run a Trivy filesystem scan (HIGH/CRITICAL fail).
 #   BUILD_IMAGE=1        Also build the container image (docker by default).
 #   CONTAINER_ENGINE=... Container engine for BUILD_IMAGE (default: docker).
 
@@ -23,6 +24,7 @@ cd "$ROOT_DIR"
 
 SKIP_AUDIT="${SKIP_AUDIT:-0}"
 SKIP_DENY="${SKIP_DENY:-0}"
+TRIVY="${TRIVY:-0}"
 BUILD_IMAGE="${BUILD_IMAGE:-0}"
 CONTAINER_ENGINE="${CONTAINER_ENGINE:-docker}"
 
@@ -126,6 +128,9 @@ fi
 if [[ "$BUILD_IMAGE" == "1" ]]; then
   STAGE_TOTAL=$((STAGE_TOTAL + 1))
 fi
+if [[ "$TRIVY" == "1" ]]; then
+  STAGE_TOTAL=$((STAGE_TOTAL + 1))
+fi
 
 printf 'WAF-Rejected local CI\n'
 printf 'Repository: %s\n' "$ROOT_DIR"
@@ -168,6 +173,17 @@ else
   skip_stage "cargo deny check" "cargo-deny is not available in the dev shell"
   printf '%sWARNING%s cargo-deny not found; install it (nix shell nixpkgs#cargo-deny nixpkgs#cargo) to enforce the supply-chain policy.\n' \
     "$COLOR_SKIP" "$COLOR_RESET"
+fi
+
+if [[ "$TRIVY" == "1" ]]; then
+  if command -v trivy >/dev/null 2>&1; then
+    run_stage "trivy fs (HIGH/CRITICAL)" \
+      trivy fs --scanners vuln --severity HIGH,CRITICAL --exit-code 1 .
+  else
+    skip_stage "trivy fs" "trivy is not installed"
+    printf '%sWARNING%s trivy not found; install it (nix shell nixpkgs#trivy) to scan dependencies and the repository filesystem.\n' \
+      "$COLOR_SKIP" "$COLOR_RESET"
+  fi
 fi
 
 if [[ $helm_available -eq 1 ]]; then
