@@ -213,6 +213,13 @@ compliance = ["sled"]
 name = "security_performance"
 harness = false
 
+# wasmi's debug-build interpreter frames are large enough to overflow a
+# normal test-thread stack when running the Go/Coraza reactor. Optimising only
+# the interpreter keeps `cargo test --features wasm-reactor` usable without
+# affecting the rest of the development profile.
+[profile.dev.package.wasmi]
+opt-level = 3
+
 [profile.release]
 opt-level = 3
 lto = true
