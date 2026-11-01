@@ -2,6 +2,18 @@
 
 All notable changes to WAF-Rejected are documented here.
 
+## [Unreleased]
+
+### Added
+
+- HTTPS upstream support: the proxy now uses a rustls-backed connector for both
+  `http://` and `https://` upstreams over HTTP/1.1 and HTTP/2. HTTPS upstreams
+  are verified against the public WebPKI roots, and `proxy.upstream_ca_path`
+  adds a private CA bundle as an additional trust root (shared with TLS
+  WebSocket upstreams).
+- Integration tests for forwarding to a self-signed TLS upstream using
+  `proxy.upstream_ca_path`, plus a plain HTTP regression test.
+
 ## [0.1.0-beta.9] - 2026-10-31
 
 ### Added

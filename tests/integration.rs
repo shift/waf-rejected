@@ -16,6 +16,9 @@ mod compliance_tests;
 #[path = "integration/maxmind_tests.rs"]
 mod maxmind_tests;
 
+#[path = "integration/https_upstream_tests.rs"]
+mod https_upstream_tests;
+
 #[path = "integration/pipeline_tests.rs"]
 mod pipeline_tests;
 

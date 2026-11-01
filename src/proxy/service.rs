@@ -9,6 +9,7 @@ use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode, Uri};
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
@@ -43,7 +44,7 @@ use crate::waf::{Decision, RequestContext, WafEngine};
 /// Supports HTTP/1.0-3, WebSocket, and WebTransport protocols.
 pub struct WafProxyService {
     waf_engine: Arc<WafEngine>,
-    upstream_client: Client<HttpConnector, Full<Bytes>>,
+    upstream_client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
     upstream_uri: Uri,
     config: Arc<Config>,
     buffer_pool: Arc<BufferPool>,
@@ -136,13 +137,64 @@ fn is_webtransport_upgrade(headers: &hyper::HeaderMap) -> bool {
 #[derive(Clone)]
 pub(crate) struct ProxyState {
     pub(crate) waf_engine: Arc<WafEngine>,
-    pub(crate) upstream_client: Client<HttpConnector, Full<Bytes>>,
+    pub(crate) upstream_client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
     pub(crate) upstream_uri: Uri,
     pub(crate) config: Arc<Config>,
     pub(crate) buffer_pool: Arc<BufferPool>,
     pub(crate) auth_validator: Option<Arc<ApiKeyValidator>>,
     pub(crate) trusted_proxies: Arc<Vec<IpNetwork>>,
     pub(crate) metrics: Arc<Metrics>,
+}
+
+/// Build the rustls client configuration used for HTTPS upstreams.
+///
+/// The WebPKI public roots are always trusted. When `proxy.upstream_ca_path`
+/// is set, the certificates in that PEM bundle are trusted in addition to the
+/// public roots, which allows private/self-signed upstream CAs.
+fn build_upstream_tls_config(ca_path: Option<&str>) -> Result<ClientConfig, WafError> {
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    if let Some(ca_path) = ca_path {
+        let ca_pem = std::fs::read(ca_path).map_err(|e| {
+            WafError::internal(format!(
+                "Failed to read upstream CA bundle '{}': {}",
+                ca_path, e
+            ))
+        })?;
+
+        let mut loaded = 0usize;
+        for cert in CertificateDer::pem_slice_iter(&ca_pem) {
+            let cert = cert.map_err(|e| {
+                WafError::internal(format!(
+                    "Failed to parse upstream CA bundle '{}': {}",
+                    ca_path, e
+                ))
+            })?;
+            roots.add(cert).map_err(|e| {
+                WafError::internal(format!(
+                    "Invalid certificate in upstream CA bundle '{}': {}",
+                    ca_path, e
+                ))
+            })?;
+            loaded += 1;
+        }
+
+        if loaded == 0 {
+            return Err(WafError::internal(format!(
+                "Upstream CA bundle '{}' contains no certificates",
+                ca_path
+            )));
+        }
+    }
+
+    Ok(
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(|e| WafError::internal(format!("Failed to build upstream TLS config: {}", e)))?
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )
 }
 
 impl WafProxyService {
@@ -163,9 +215,18 @@ impl WafProxyService {
 
         // Create optimized HTTP client with multi-protocol support
         let mut connector = HttpConnector::new();
+        connector.enforce_http(false);
         connector.set_keepalive(Some(Duration::from_secs(30)));
         connector.set_nodelay(true);
         connector.set_reuse_address(true);
+
+        let tls_config = build_upstream_tls_config(config.proxy.upstream_ca_path.as_deref())?;
+        let connector = HttpsConnectorBuilder::new()
+            .with_tls_config(tls_config)
+            .https_or_http()
+            .enable_http1()
+            .enable_http2()
+            .wrap_connector(connector);
 
         // Create HTTP client with optimized configuration for all protocols
         let upstream_client = Client::builder(TokioExecutor::new())
@@ -228,7 +289,10 @@ impl WafProxyService {
             "WAF Proxy Service initialized with {} rules",
             waf_engine.rule_count()
         );
-        info!("Upstream target: {} (optimized HTTP client)", upstream_uri);
+        info!(
+            "Upstream target: {} (HTTP/1.1 + HTTP/2, http/https)",
+            upstream_uri
+        );
         info!(
             "Protocol support: HTTP/1.0-3, WebSocket{}, TLS: {}",
             if cfg!(feature = "webtransport") {
@@ -1144,7 +1208,7 @@ impl WafProxyService {
     pub(crate) async fn forward_to_upstream_with_protocol(
         parts: hyper::http::request::Parts,
         body_bytes: Bytes,
-        upstream_client: Client<HttpConnector, Full<Bytes>>,
+        upstream_client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
         upstream_uri: Uri,
         start_time: Instant,
         http_version: &str,

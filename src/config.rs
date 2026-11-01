@@ -103,11 +103,12 @@ pub struct ProxyConfig {
     /// Maximum request size in bytes
     pub max_request_size: usize,
 
-    /// Optional PEM CA bundle used to verify TLS WebSocket upstreams.
+    /// Optional PEM CA bundle used to verify TLS upstreams.
     ///
-    /// When unset, upstream certificates are verified against `webpki-roots`.
-    /// When set, the certificates in the bundle are trusted in addition to the
-    /// built-in roots. This is intended for private/self-signed upstream CAs.
+    /// Applies to HTTPS upstreams and to TLS WebSocket upstreams. When unset,
+    /// upstream certificates are verified against `webpki-roots`. When set, the
+    /// certificates in the bundle are trusted in addition to the built-in
+    /// roots. This is intended for private/self-signed upstream CAs.
     pub upstream_ca_path: Option<String>,
 }
 
