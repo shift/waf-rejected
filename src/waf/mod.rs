@@ -23,6 +23,8 @@ pub mod wasm_reactor;
 /// Shared JSON payload envelope for the wasm reactor and native sidecar.
 #[cfg(any(feature = "wasm-reactor", feature = "coraza-native"))]
 pub mod coraza_payload;
+#[cfg(all(feature = "coraza-native", unix))]
+pub mod coraza_wire;
 
 /// Experimental native Go Coraza sidecar client (non-default feature).
 #[cfg(all(feature = "coraza-native", unix))]

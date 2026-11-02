@@ -18,6 +18,7 @@ ExecStart=/usr/local/bin/coraza-sidecar \
   --max-body 65536 \
   --max-headers 100 \
   --max-header-bytes 65536 \
+  --max-conns 128 \
   --timeout 5s \
   --grace 10s
 Restart=on-failure

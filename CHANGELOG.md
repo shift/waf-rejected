@@ -146,6 +146,42 @@ All notable changes to WAF-Rejected are documented here.
   `403` block or `13` (INTERNAL) for other block statuses, plus
   `grpc-message`. The default keeps the historical plain HTTP response.
 
+- Binary wire protocol v1 for the experimental native Coraza sidecar
+  (`coraza-native`, still not the default backend). Frames keep the 4-byte
+  length prefix and add a fixed 28-byte request header (flags, request-line and
+  header lengths, body length, declared and original body size) followed by the
+  request line, the header block and the **raw body bytes**, so there is no
+  JSON escaping and no base64 for protobuf/binary bodies. Responses are an
+  8-byte header plus reason. A `0xC1` handshake negotiates binary v1 and falls
+  back to the unchanged JSON envelope for older sidecars, so both directions
+  stay compatible. Client and sidecar now allocate less per request (server
+  decode 27 → 9 allocations, response encode 2 → 0) and write head + body with
+  one `writev`.
+- Native sidecar concurrency rework. The Rust client replaces its dedicated
+  Tokio runtime, job channel and per-request task with a bounded pool of
+  blocking connections (mutex + condvar, socket timeouts plus a post-read
+  deadline check). Callers above `pool_size` now wait for a connection until
+  `eval_timeout_ms` instead of failing immediately with `QueueFull`; a timed-out
+  or failed connection is dropped and replaced. The Go sidecar gains
+  `--max-conns` (default 128) admission control, a per-connection reusable
+  read buffer, zero-copy body slices and a single-syscall response write.
+- `examples/coraza_ipc_profile.rs` (client build / IPC / CRS split) and
+  `examples/coraza_native_load.rs` (concurrency 1/4/16/64 × 1/4/8/16 KiB with
+  p50/p95/p99 and RPS), plus Go decode/evaluate/encode benchmarks in
+  `native/coraza-sidecar/bench_test.go`. `docs/coraza-native-sidecar.md` has a
+  new Performance section with the split, the load matrix, capacity guidance
+  and the reasoning for not using `SOCK_SEQPACKET`, `io_uring`, batching or
+  client-side pipelining.
+
+### Changed
+
+- The native Coraza sidecar's per-request cost is now protocol-independent: CRS
+  scanning is 99.8 %+ of latency at every body size (measured split: 13–18 µs
+  client+IPC vs 7.1–114 ms total), so p50 is unchanged and throughput is
+  bounded by cores at ~130 KiB of inspected body per second per core. The
+  earlier prototype claim of ~46 req/s at 4 KiB was a single-core measurement;
+  the same harness reports ~134 req/s at four callers on six cores.
+
 ### Fixed
 
 - gRPC field-content scans no longer bypass heavy-inspection admission control.

@@ -630,3 +630,35 @@ impl LoadTestRunner {
   - Authentication middleware fully integrated in src/proxy/service.rs
   - Module exported in src/waf/mod.rs
 - Beginning Phase 4: Testing
+
+## perf: native Coraza sidecar throughput (worktree `.worktrees/native-perf`)
+
+Branch: `perf/native-sidecar-throughput`. Task: remove IPC/protocol overhead
+and improve concurrency for the native Go Coraza sidecar without changing
+detection, the default backend or fail-closed behaviour.
+
+Outcome: CRS scanning is 99.8 %+ of latency at every body size, so p50 is
+unchanged. The work removed the protocol/IPC overhead (client build
+3–15 µs → 0.2 µs, client+IPC 18–36 µs → 13–18 µs, server decode
+27 µs–112 µs → 0.3 µs, response encode 2 allocations → 0) and replaced the
+client's dedicated runtime + job channel with a bounded blocking pool, which
+removes the fail-fast `QueueFull` path and stabilises tails under contention.
+
+- Binary wire protocol v1 with a `0xC1` handshake and JSON fallback
+  (`src/waf/coraza_wire.rs`, `native/coraza-sidecar/protocol.go`).
+- Go sidecar: `--max-conns` admission, per-connection reusable read buffer,
+  zero-copy body slices, single-syscall response write.
+- Rust client: bounded blocking connection pool, socket timeouts plus a
+  post-read deadline check, connection dropped on timeout/error.
+- New harnesses: `examples/coraza_ipc_profile.rs`,
+  `examples/coraza_native_load.rs`, `native/coraza-sidecar/bench_test.go`.
+- Docs: `docs/coraza-native-sidecar.md` Performance section; CHANGELOG
+  Unreleased.
+- Not used, with measured reasons in the docs: `SOCK_SEQPACKET`, `io_uring`,
+  batching, client-side pipelining.
+- Verified: `cargo fmt -- --check`, `cargo test --lib --features
+  wasm-reactor,coraza-native`, ignored native e2e suite, `cargo clippy --lib
+  --features wasm-reactor,coraza-native -- --deny warnings`, Go tests,
+  `nix build .#coraza-native-sidecar`.
+- Note: the measurement machine is shared with other agents, so the docs
+  compare interleaved ratios rather than single absolute runs.

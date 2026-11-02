@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-func testServer(t *testing.T) *server {
+func testServer(t testing.TB) *server {
 	t.Helper()
 	engine, err := newEngine("../../wasm/coraza_reactor/rules/crs/crs.conf", 64*1024)
 	if err != nil {

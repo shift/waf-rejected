@@ -2,42 +2,60 @@
 //!
 //! This module talks to `native/coraza-sidecar` over a Unix domain socket. It
 //! is enabled with the `coraza-native` feature and selected with
-//! `waf.coraza.backend = "native"`. The wire envelope is the same JSON payload
-//! used by [`crate::waf::wasm_reactor`], framed with a 4-byte big-endian length
-//! prefix in each direction.
+//! `waf.coraza.backend = "native"`.
 //!
-//! The sync [`WafRule`] trait cannot `.await`, so requests are handed to a
-//! dedicated Tokio runtime thread. That keeps all I/O off the proxy's async
-//! workers and gives connection pooling, reconnect and timeouts without
-//! blocking a shared runtime.
+//! Two wire encodings are supported on the same framing:
+//!
+//! * **binary v1** ([`crate::waf::coraza_wire`]) — length-prefixed fixed
+//!   header, request line and headers, then the raw body bytes. No JSON
+//!   escaping, no base64, one `writev` per request and a reused response
+//!   buffer.
+//! * **legacy JSON** — the envelope shared with the WASI reactor, kept for
+//!   compatibility with sidecars that predate binary v1.
+//!
+//! A new client sends a handshake frame when it opens a connection. A sidecar
+//! that understands binary v1 answers with an ack; a legacy sidecar answers
+//! with a JSON `400` block, which the client reads as "use JSON on this
+//! connection". The decision is remembered for the process lifetime, so the
+//! handshake costs one round trip per connection at start-up and nothing after
+//! that.
+//!
+//! The sync [`WafRule`] trait cannot `.await`, so evaluations use a bounded
+//! pool of blocking connections: a caller checks a connection out, writes the
+//! request, reads the decision and returns it. Socket send/receive timeouts
+//! plus a post-read deadline check enforce `eval_timeout_ms`; a connection that
+//! times out or errors is dropped instead of reused. This is the same
+//! fail-closed contract as before, without a dedicated runtime thread, a job
+//! channel or a task spawn per request.
 
+use std::io::{self, IoSlice, Read, Write};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc as std_mpsc;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
-use tokio::sync::{mpsc, Mutex, Semaphore};
 use tracing::{info, warn};
 
 use crate::metrics::Metrics;
-use crate::waf::coraza_payload::{build_payload_with_policy, BodyInspectionPolicy, PayloadBuild};
+use crate::waf::coraza_payload::BodyInspectionPolicy;
+use crate::waf::coraza_wire::{
+    decode_handshake, decode_response, encode_request, handshake_frame, BinaryRequest, WireBuild,
+    DECISION_ALLOW, FRAME_MAGIC_BINARY, WIRE_VERSION,
+};
 use crate::waf::{Decision, RequestContext, WafRule};
 
 /// Maximum response frame the client will accept from the sidecar.
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
-/// Default number of concurrent sidecar connections when config says `0`.
+/// Default number of pooled sidecar connections when config says `0`.
 const DEFAULT_POOL_SIZE: usize = 8;
 
-/// How long to wait for a Unix socket connect outside the evaluation budget.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Extra time the sync caller waits for the runtime thread, on top of the
-/// async evaluation timeout, so the async path reports the real error first.
-const REPLY_MARGIN: Duration = Duration::from_secs(1);
+/// Negotiation state shared by the pool.
+const NEGOTIATION_UNKNOWN: u8 = 0;
+const NEGOTIATION_BINARY: u8 = 1;
+const NEGOTIATION_JSON: u8 = 2;
 
 /// Errors returned by the native backend.
 #[derive(Debug, thiserror::Error)]
@@ -48,9 +66,6 @@ pub enum NativeCorazaError {
     /// The sidecar did not answer within the configured budget.
     #[error("native Coraza sidecar request exceeded the configured timeout")]
     Timeout,
-    /// The bounded request queue is full.
-    #[error("native Coraza sidecar request queue is full")]
-    QueueFull,
     /// The payload exceeds the configured limit.
     #[error("request payload of {size} bytes exceeds the {limit} byte limit")]
     PayloadTooLarge { size: usize, limit: usize },
@@ -63,9 +78,6 @@ pub enum NativeCorazaError {
     /// The sidecar returned a decision the client does not understand.
     #[error("native Coraza sidecar returned unknown decision `{0}`")]
     UnknownDecision(String),
-    /// The background runtime could not be started or has stopped.
-    #[error("native Coraza sidecar client is not running: {0}")]
-    Client(String),
 }
 
 #[derive(Debug, Clone)]
@@ -105,120 +117,318 @@ struct SidecarResponse {
     reason: Option<String>,
 }
 
-struct Job {
-    payload: Vec<u8>,
-    reply: std_mpsc::Sender<Result<SidecarResponse, NativeCorazaError>>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WireProtocol {
+    Binary,
+    Json,
 }
 
-struct ConnectionPool {
-    pub socket_path: PathBuf,
-    pub timeout: Duration,
-    semaphore: Semaphore,
-    idle: Mutex<Vec<UnixStream>>,
+struct Conn {
+    stream: UnixStream,
+    /// Socket send/receive timeout set at connect time.
+    timeout: Duration,
+    read_buf: Vec<u8>,
 }
 
-impl ConnectionPool {
+struct PoolState {
+    idle: Vec<Conn>,
+    /// Connections that are open or being opened (idle + checked out).
+    open: usize,
+}
+
+/// Bounded pool of blocking sidecar connections.
+///
+/// `pool_size` is the maximum number of simultaneous evaluations; a caller that
+/// finds the pool exhausted waits on the condvar until a connection is
+/// returned or its deadline expires.
+struct Pool {
+    socket_path: PathBuf,
+    timeout: Duration,
+    max: usize,
+    negotiated: AtomicU8,
+    state: Mutex<PoolState>,
+    available: Condvar,
+}
+
+impl Pool {
     fn new(config: &ClientConfig) -> Self {
         Self {
             socket_path: config.socket_path.clone(),
             timeout: config.timeout,
-            semaphore: Semaphore::new(config.pool_size.max(1)),
-            idle: Mutex::new(Vec::new()),
+            max: config.pool_size.max(1),
+            negotiated: AtomicU8::new(NEGOTIATION_UNKNOWN),
+            state: Mutex::new(PoolState {
+                idle: Vec::new(),
+                open: 0,
+            }),
+            available: Condvar::new(),
         }
     }
 
-    async fn take_idle(&self) -> Option<UnixStream> {
-        self.idle.lock().await.pop()
+    fn lock(&self) -> std::sync::MutexGuard<'_, PoolState> {
+        // A panic in a request must not poison the pool: the state is a plain
+        // counter plus a list of connections.
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    async fn release(&self, conn: UnixStream) {
-        self.idle.lock().await.push(conn);
+    fn acquire(&self, deadline: Instant) -> Result<Conn, NativeCorazaError> {
+        let mut state = self.lock();
+        loop {
+            if let Some(conn) = state.idle.pop() {
+                return Ok(conn);
+            }
+            if state.open < self.max {
+                state.open += 1;
+                drop(state);
+                return match self.connect() {
+                    Ok(conn) => Ok(conn),
+                    Err(err) => {
+                        let mut state = self.lock();
+                        state.open -= 1;
+                        self.available.notify_one();
+                        Err(err)
+                    }
+                };
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(NativeCorazaError::Timeout);
+            }
+            let (guard, _) = self
+                .available
+                .wait_timeout(state, deadline - now)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = guard;
+        }
     }
 
-    async fn connect(&self) -> Result<UnixStream, NativeCorazaError> {
-        match tokio::time::timeout(CONNECT_TIMEOUT, UnixStream::connect(&self.socket_path)).await {
-            Ok(Ok(stream)) => Ok(stream),
-            Ok(Err(err)) => Err(NativeCorazaError::Unavailable {
+    fn release(&self, conn: Conn) {
+        let mut state = self.lock();
+        state.idle.push(conn);
+        drop(state);
+        self.available.notify_one();
+    }
+
+    /// Drops a connection whose stream state is unknown (error or timeout).
+    fn discard(&self) {
+        let mut state = self.lock();
+        state.open = state.open.saturating_sub(1);
+        drop(state);
+        self.available.notify_one();
+    }
+
+    fn connect(&self) -> Result<Conn, NativeCorazaError> {
+        let stream = UnixStream::connect(&self.socket_path).map_err(|err| {
+            NativeCorazaError::Unavailable {
                 path: self.socket_path.display().to_string(),
                 detail: err.to_string(),
-            }),
-            Err(_) => Err(NativeCorazaError::Timeout),
-        }
-    }
-
-    async fn evaluate(&self, payload: &[u8]) -> Result<SidecarResponse, NativeCorazaError> {
-        let _permit = self
-            .semaphore
-            .acquire()
-            .await
-            .map_err(|_| NativeCorazaError::Client("connection pool closed".to_string()))?;
-
-        let mut last_error = None;
-        // One retry with a fresh connection covers a sidecar restart and a
-        // pooled connection that was closed while idle.
-        for attempt in 0..2 {
-            let mut conn = if attempt == 0 {
-                match self.take_idle().await {
-                    Some(conn) => conn,
-                    None => self.connect_bounded().await?,
-                }
-            } else {
-                self.connect_bounded().await?
-            };
-
-            // The deadline is enforced here, at the client, because Coraza has
-            // no cancellation API. On expiry the connection is dropped rather
-            // than returned to the pool, which closes the socket and lets the
-            // sidecar's per-connection goroutine exit as soon as its current
-            // evaluation finishes. The sidecar must still bound its own work.
-            match tokio::time::timeout(self.timeout, round_trip(&mut conn, payload)).await {
-                Ok(Ok(response)) => {
-                    self.release(conn).await;
-                    return Ok(response);
-                }
-                Ok(Err(err)) => {
-                    last_error = Some(err);
-                }
-                Err(_) => return Err(NativeCorazaError::Timeout),
             }
+        })?;
+        stream
+            .set_write_timeout(Some(self.timeout))
+            .map_err(io_error)?;
+        stream
+            .set_read_timeout(Some(self.timeout))
+            .map_err(io_error)?;
+        let mut conn = Conn {
+            stream,
+            timeout: self.timeout,
+            read_buf: Vec::new(),
+        };
+        match self.negotiated.load(Ordering::Relaxed) {
+            NEGOTIATION_BINARY | NEGOTIATION_JSON => {}
+            _ => match conn.negotiate() {
+                Ok(protocol) => {
+                    self.negotiated.store(
+                        if protocol == WireProtocol::Binary {
+                            NEGOTIATION_BINARY
+                        } else {
+                            NEGOTIATION_JSON
+                        },
+                        Ordering::Relaxed,
+                    );
+                }
+                Err(err) => {
+                    // A legacy sidecar answers the handshake with a JSON block
+                    // or closes the connection. Either way, fall back to JSON
+                    // for every future connection; the connection itself is
+                    // kept because the failure may have been the handshake
+                    // only.
+                    info!(
+                        error = %err,
+                        "native Coraza sidecar did not negotiate the binary protocol; using JSON"
+                    );
+                    self.negotiated.store(NEGOTIATION_JSON, Ordering::Relaxed);
+                }
+            },
         }
-        Err(last_error.unwrap_or_else(|| NativeCorazaError::Io("no attempt made".to_string())))
+        Ok(conn)
     }
 
-    async fn connect_bounded(&self) -> Result<UnixStream, NativeCorazaError> {
-        match tokio::time::timeout(self.timeout, self.connect()).await {
-            Ok(result) => result,
-            Err(_) => Err(NativeCorazaError::Timeout),
+    /// Opens one connection so the negotiated protocol is known before the
+    /// first evaluation.
+    fn warm(&self, deadline: Instant) -> Result<(), NativeCorazaError> {
+        let conn = self.acquire(deadline)?;
+        self.release(conn);
+        Ok(())
+    }
+
+    fn uses_binary(&self) -> bool {
+        self.negotiated.load(Ordering::Relaxed) == NEGOTIATION_BINARY
+    }
+}
+
+impl Conn {
+    /// Sends the handshake frame and reads the ack.
+    fn negotiate(&mut self) -> Result<WireProtocol, NativeCorazaError> {
+        self.stream
+            .write_all(&handshake_frame())
+            .map_err(io_error)?;
+        let n = self.read_len()?;
+        self.fill(n)?;
+        Ok(match decode_handshake(&self.read_buf[..n]) {
+            Some(version) if version >= WIRE_VERSION => WireProtocol::Binary,
+            _ => WireProtocol::Json,
+        })
+    }
+
+    fn read_len(&mut self) -> Result<usize, NativeCorazaError> {
+        let mut header = [0u8; 4];
+        self.stream.read_exact(&mut header).map_err(read_error)?;
+        let n = u32::from_be_bytes(header) as usize;
+        if n == 0 || n > MAX_RESPONSE_BYTES {
+            return Err(NativeCorazaError::Protocol(format!(
+                "response frame of {n} bytes is invalid"
+            )));
+        }
+        Ok(n)
+    }
+
+    fn fill(&mut self, n: usize) -> Result<(), NativeCorazaError> {
+        if self.read_buf.len() < n {
+            self.read_buf.resize(n, 0);
+        }
+        self.stream
+            .read_exact(&mut self.read_buf[..n])
+            .map_err(read_error)
+    }
+
+    /// Writes a binary request and reads its decision.
+    fn round_trip_binary(
+        &mut self,
+        request: &BinaryRequest,
+        deadline: Instant,
+    ) -> Result<Decision, NativeCorazaError> {
+        self.apply_deadline(deadline)?;
+        write_frame(&mut self.stream, request.head(), request.body()).map_err(io_error)?;
+        let decision = self.read_decision()?;
+        check_deadline(deadline)?;
+        Ok(decision)
+    }
+
+    /// Writes a legacy JSON payload and reads its decision.
+    fn round_trip_json(
+        &mut self,
+        payload: &[u8],
+        deadline: Instant,
+    ) -> Result<Decision, NativeCorazaError> {
+        self.apply_deadline(deadline)?;
+        let len = u32::try_from(payload.len())
+            .map_err(|_| NativeCorazaError::Protocol("payload too large to frame".to_string()))?;
+        write_frame(&mut self.stream, &len.to_be_bytes(), Some(payload)).map_err(io_error)?;
+        let decision = self.read_decision()?;
+        check_deadline(deadline)?;
+        Ok(decision)
+    }
+
+    /// Tightens the socket timeouts when a retry has less budget left. The
+    /// common path keeps the timeouts set at connect time and pays no syscall.
+    fn apply_deadline(&mut self, deadline: Instant) -> Result<(), NativeCorazaError> {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(NativeCorazaError::Timeout);
+        }
+        let remaining = deadline - now;
+        if remaining + Duration::from_millis(1) < self.timeout {
+            self.stream
+                .set_write_timeout(Some(remaining))
+                .map_err(io_error)?;
+            self.stream
+                .set_read_timeout(Some(remaining))
+                .map_err(io_error)?;
+        }
+        Ok(())
+    }
+
+    fn read_decision(&mut self) -> Result<Decision, NativeCorazaError> {
+        let n = self.read_len()?;
+        self.fill(n)?;
+        let frame = &self.read_buf[..n];
+        // The response encoding is self-describing: the sidecar answers in the
+        // encoding of the request frame it received, so dispatch on the magic
+        // rather than on connection state.
+        if frame.first() == Some(&FRAME_MAGIC_BINARY) {
+            let view = decode_response(frame)
+                .map_err(|err| NativeCorazaError::Protocol(err.to_string()))?;
+            if view.decision == DECISION_ALLOW {
+                return Ok(Decision::Allow);
+            }
+            let status = if view.status == 0 { 403 } else { view.status };
+            let reason = if view.reason.is_empty() {
+                "request blocked by native Coraza".to_string()
+            } else {
+                String::from_utf8_lossy(view.reason).into_owned()
+            };
+            Ok(Decision::Block { status, reason })
+        } else {
+            let response: SidecarResponse = serde_json::from_slice(frame).map_err(|err| {
+                NativeCorazaError::Protocol(format!("invalid response JSON: {err}"))
+            })?;
+            response_to_decision(response)
         }
     }
 }
 
-async fn round_trip(
-    conn: &mut UnixStream,
-    payload: &[u8],
-) -> Result<SidecarResponse, NativeCorazaError> {
-    let len = u32::try_from(payload.len())
-        .map_err(|_| NativeCorazaError::Protocol("payload too large to frame".to_string()))?;
-    conn.write_all(&len.to_be_bytes()).await.map_err(io_error)?;
-    conn.write_all(payload).await.map_err(io_error)?;
-    conn.flush().await.map_err(io_error)?;
-
-    let mut header = [0u8; 4];
-    conn.read_exact(&mut header).await.map_err(io_error)?;
-    let response_len = u32::from_be_bytes(header) as usize;
-    if response_len == 0 || response_len > MAX_RESPONSE_BYTES {
-        return Err(NativeCorazaError::Protocol(format!(
-            "response frame of {response_len} bytes is invalid"
-        )));
+/// Writes the frame head and the body with a single `writev` when possible.
+fn write_frame(stream: &mut UnixStream, head: &[u8], body: Option<&[u8]>) -> io::Result<()> {
+    let mut slices = [IoSlice::new(head), IoSlice::new(body.unwrap_or(&[]))];
+    let count = if body.is_some() { 2 } else { 1 };
+    let mut bufs = &mut slices[..count];
+    while !bufs.is_empty() {
+        match stream.write_vectored(bufs) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "native Coraza sidecar closed the connection",
+                ))
+            }
+            Ok(n) => IoSlice::advance_slices(&mut bufs, n),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
     }
-    let mut body = vec![0u8; response_len];
-    conn.read_exact(&mut body).await.map_err(io_error)?;
-    serde_json::from_slice(&body)
-        .map_err(|err| NativeCorazaError::Protocol(format!("invalid response JSON: {err}")))
+    Ok(())
 }
 
-fn io_error(err: std::io::Error) -> NativeCorazaError {
+fn check_deadline(deadline: Instant) -> Result<(), NativeCorazaError> {
+    if Instant::now() > deadline {
+        Err(NativeCorazaError::Timeout)
+    } else {
+        Ok(())
+    }
+}
+
+fn io_error(err: io::Error) -> NativeCorazaError {
     NativeCorazaError::Io(err.to_string())
+}
+
+fn read_error(err: io::Error) -> NativeCorazaError {
+    match err.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => NativeCorazaError::Timeout,
+        _ => NativeCorazaError::Io(err.to_string()),
+    }
 }
 
 fn response_to_decision(resp: SidecarResponse) -> Result<Decision, NativeCorazaError> {
@@ -235,72 +445,135 @@ fn response_to_decision(resp: SidecarResponse) -> Result<Decision, NativeCorazaE
     }
 }
 
-/// A pooled, async Unix-socket client driven by a dedicated runtime thread.
+/// A pooled, blocking Unix-socket client.
 pub struct NativeCorazaClient {
-    tx: mpsc::Sender<Job>,
+    pool: Pool,
     pub timeout: Duration,
     pub max_payload_bytes: usize,
-    _thread: std::thread::JoinHandle<()>,
+}
+
+/// Outcome of a request-context evaluation.
+#[derive(Debug)]
+pub enum Evaluation {
+    /// The sidecar returned a decision.
+    Decided {
+        decision: Decision,
+        /// Number of body bytes actually handed to Coraza.
+        inspected_bytes: usize,
+        /// Whether the body was truncated to the inspection prefix.
+        truncated: bool,
+    },
+    /// The body-size policy rejected the request before evaluation.
+    BodyRejected { size: usize, limit: usize },
+}
+
+/// A request encoded in whichever wire format the sidecar negotiated.
+enum Encoded<'a> {
+    Binary(BinaryRequest),
+    Json(std::borrow::Cow<'a, [u8]>),
+}
+
+impl Encoded<'_> {
+    fn body_len(&self) -> usize {
+        match self {
+            Self::Binary(request) => request.body_len(),
+            Self::Json(payload) => payload.len(),
+        }
+    }
 }
 
 impl NativeCorazaClient {
     /// Creates a client and verifies that the sidecar socket accepts
     /// connections. This is the start-up check: a missing sidecar is reported
     /// immediately rather than surfacing as per-request 503s.
+    ///
+    /// The first connection also negotiates the wire protocol, so every
+    /// evaluation knows whether to use binary v1 or the legacy JSON envelope.
     pub fn new(config: &ClientConfig) -> Result<Self, NativeCorazaError> {
         preflight(&config.socket_path)?;
-
-        let queue_capacity = config.pool_size.saturating_mul(2).max(8);
-        let (tx, mut rx) = mpsc::channel::<Job>(queue_capacity);
-        let thread_config = config.clone();
-        let thread = std::thread::Builder::new()
-            .name("coraza-native-client".to_string())
-            .spawn(move || {
-                let runtime = match tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(2)
-                    .enable_all()
-                    .build()
-                {
-                    Ok(runtime) => runtime,
-                    Err(err) => {
-                        warn!(error = %err, "failed to start native Coraza client runtime");
-                        return;
-                    }
-                };
-                runtime.block_on(async move {
-                    let pool = Arc::new(ConnectionPool::new(&thread_config));
-                    while let Some(job) = rx.recv().await {
-                        let pool = Arc::clone(&pool);
-                        tokio::spawn(async move {
-                            let result = tokio::time::timeout(
-                                thread_config.timeout,
-                                pool.evaluate(&job.payload),
-                            )
-                            .await
-                            .unwrap_or(Err(NativeCorazaError::Timeout));
-                            let _ = job.reply.send(result);
-                        });
-                    }
-                });
-            })
-            .map_err(|err| NativeCorazaError::Client(err.to_string()))?;
-
+        let client = Self {
+            pool: Pool::new(config),
+            timeout: config.timeout,
+            max_payload_bytes: config.max_payload_bytes,
+        };
+        client.pool.warm(Instant::now() + config.timeout)?;
         info!(
             socket = %config.socket_path.display(),
             pool_size = config.pool_size,
             timeout_ms = config.timeout.as_millis(),
+            binary_protocol = client.uses_binary(),
             "Coraza native sidecar client ready"
         );
-        Ok(Self {
-            tx,
-            timeout: config.timeout,
-            max_payload_bytes: config.max_payload_bytes,
-            _thread: thread,
+        Ok(client)
+    }
+
+    /// True when the sidecar negotiated binary v1 for this process.
+    pub fn uses_binary(&self) -> bool {
+        self.pool.uses_binary()
+    }
+
+    /// Encodes the request in the negotiated format, applies the body-size
+    /// policy and evaluates it.
+    pub fn evaluate_context(
+        &self,
+        ctx: &RequestContext,
+        policy: &BodyInspectionPolicy,
+    ) -> Result<Evaluation, NativeCorazaError> {
+        let (encoded, inspected_bytes, truncated) = if self.uses_binary() {
+            match encode_request(ctx, policy) {
+                Ok(WireBuild::Built {
+                    request,
+                    inspected_bytes,
+                    truncated,
+                }) => (Encoded::Binary(request), inspected_bytes, truncated),
+                Ok(WireBuild::Reject { size, limit }) => {
+                    return Ok(Evaluation::BodyRejected { size, limit });
+                }
+                Err(err) => {
+                    return Err(NativeCorazaError::Protocol(format!(
+                        "failed to encode binary request: {err}"
+                    )));
+                }
+            }
+        } else {
+            match crate::waf::coraza_payload::build_payload_with_policy(ctx, policy) {
+                Ok(crate::waf::coraza_payload::PayloadBuild::Built {
+                    payload,
+                    inspected_bytes,
+                    truncated,
+                }) => (
+                    Encoded::Json(std::borrow::Cow::Owned(payload)),
+                    inspected_bytes,
+                    truncated,
+                ),
+                Ok(crate::waf::coraza_payload::PayloadBuild::Reject { size, limit }) => {
+                    return Ok(Evaluation::BodyRejected { size, limit });
+                }
+                Err(err) => {
+                    return Err(NativeCorazaError::Protocol(format!(
+                        "failed to encode JSON request: {err}"
+                    )));
+                }
+            }
+        };
+
+        if encoded.body_len() > self.max_payload_bytes {
+            return Err(NativeCorazaError::PayloadTooLarge {
+                size: encoded.body_len(),
+                limit: self.max_payload_bytes,
+            });
+        }
+
+        let decision = self.execute(&encoded)?;
+        Ok(Evaluation::Decided {
+            decision,
+            inspected_bytes,
+            truncated,
         })
     }
 
-    /// Sends one payload and waits for the decision. Called only from the sync
-    /// rule; the actual I/O runs on the dedicated runtime thread.
+    /// Evaluates a pre-encoded legacy JSON payload. Kept for callers that build
+    /// the shared envelope (the gRPC content scanner and tests).
     pub fn evaluate(&self, payload: &[u8]) -> Result<Decision, NativeCorazaError> {
         if payload.len() > self.max_payload_bytes {
             return Err(NativeCorazaError::PayloadTooLarge {
@@ -308,26 +581,58 @@ impl NativeCorazaClient {
                 limit: self.max_payload_bytes,
             });
         }
-        let (reply_tx, reply_rx) = std_mpsc::channel();
-        self.tx
-            .try_send(Job {
-                payload: payload.to_vec(),
-                reply: reply_tx,
-            })
-            .map_err(|err| match err {
-                mpsc::error::TrySendError::Full(_) => NativeCorazaError::QueueFull,
-                mpsc::error::TrySendError::Closed(_) => {
-                    NativeCorazaError::Client("runtime thread stopped".to_string())
-                }
-            })?;
+        self.execute(&Encoded::Json(std::borrow::Cow::Borrowed(payload)))
+    }
 
-        match reply_rx.recv_timeout(self.timeout + REPLY_MARGIN) {
-            Ok(result) => result.and_then(response_to_decision),
-            Err(std_mpsc::RecvTimeoutError::Timeout) => Err(NativeCorazaError::Timeout),
-            Err(std_mpsc::RecvTimeoutError::Disconnected) => Err(NativeCorazaError::Client(
-                "runtime thread stopped".to_string(),
-            )),
+    /// Evaluates a pre-encoded binary v1 request frame.
+    pub fn evaluate_binary(&self, request: BinaryRequest) -> Result<Decision, NativeCorazaError> {
+        if !self.uses_binary() {
+            return Err(NativeCorazaError::Protocol(
+                "sidecar negotiated the JSON protocol".to_string(),
+            ));
         }
+        if request.body_len() > self.max_payload_bytes {
+            return Err(NativeCorazaError::PayloadTooLarge {
+                size: request.body_len(),
+                limit: self.max_payload_bytes,
+            });
+        }
+        self.execute(&Encoded::Binary(request))
+    }
+
+    /// Runs one evaluation, retrying once on a fresh connection so a sidecar
+    /// restart or a pooled connection closed while idle is transparent.
+    ///
+    /// The deadline is enforced at the client because Coraza has no
+    /// cancellation API. On expiry the connection is dropped rather than
+    /// returned to the pool, which closes the socket and lets the sidecar's
+    /// per-connection goroutine exit as soon as its current evaluation
+    /// finishes. The sidecar must still bound its own work.
+    fn execute(&self, encoded: &Encoded<'_>) -> Result<Decision, NativeCorazaError> {
+        let deadline = Instant::now() + self.timeout;
+        let mut last_error = None;
+        for _ in 0..2 {
+            let mut conn = self.pool.acquire(deadline)?;
+            let result = match encoded {
+                Encoded::Binary(request) => conn.round_trip_binary(request, deadline),
+                Encoded::Json(payload) => conn.round_trip_json(payload, deadline),
+            };
+            match result {
+                Ok(decision) => {
+                    self.pool.release(conn);
+                    return Ok(decision);
+                }
+                Err(NativeCorazaError::Timeout) => {
+                    self.pool.discard();
+                    return Err(NativeCorazaError::Timeout);
+                }
+                Err(err) => {
+                    self.pool.discard();
+                    last_error = Some(err);
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| NativeCorazaError::Io("no attempt made".to_string())))
     }
 }
 
@@ -430,62 +735,50 @@ impl WafRule for NativeCorazaRule {
 
     fn evaluate(&self, ctx: &RequestContext) -> Decision {
         let started = Instant::now();
-        let (payload, inspected_bytes, truncated) = match build_payload_with_policy(
-            ctx,
-            &self.body_policy,
-        ) {
-            Ok(PayloadBuild::Built {
-                payload,
-                inspected_bytes,
-                truncated,
-            }) => (payload, inspected_bytes, truncated),
-            Ok(PayloadBuild::Reject { size, limit }) => {
-                if let Some(metrics) = &self.metrics {
-                    metrics.record_coraza_body_rejected();
-                }
-                return Decision::Block {
-                        status: 413,
-                        reason: format!(
-                            "request body of {size} bytes exceeds the {limit} byte Coraza inspection limit"
-                        ),
-                    };
-            }
-            Err(err) => {
-                warn!(rule = %self.name, error = %err, "failed to encode native Coraza payload");
-                if let Some(metrics) = &self.metrics {
-                    metrics.record_coraza_evaluation(started.elapsed());
-                    metrics.record_coraza_error();
-                }
-                return self.failure_decision(err.to_string());
-            }
-        };
-
-        if let Some(metrics) = &self.metrics {
-            metrics.record_coraza_body_inspected_bytes(inspected_bytes);
-            if truncated {
-                metrics.record_coraza_body_truncated();
-            }
-        }
-
-        let result = self.client.evaluate(&payload);
+        let result = self.client.evaluate_context(ctx, &self.body_policy);
         if let Some(metrics) = &self.metrics {
             metrics.record_coraza_evaluation(started.elapsed());
         }
 
         match result {
-            Ok(Decision::Allow) => Decision::Allow,
-            Ok(decision @ Decision::Block { .. }) => {
+            Ok(Evaluation::Decided {
+                decision,
+                inspected_bytes,
+                truncated,
+            }) => {
                 if let Some(metrics) = &self.metrics {
-                    metrics.record_coraza_block();
+                    metrics.record_coraza_body_inspected_bytes(inspected_bytes);
+                    if truncated {
+                        metrics.record_coraza_body_truncated();
+                    }
                 }
-                decision
+                match decision {
+                    Decision::Allow => Decision::Allow,
+                    decision @ Decision::Block { .. } => {
+                        if let Some(metrics) = &self.metrics {
+                            metrics.record_coraza_block();
+                        }
+                        decision
+                    }
+                    other => {
+                        warn!(rule = %self.name, ?other, "native sidecar returned unexpected decision");
+                        if let Some(metrics) = &self.metrics {
+                            metrics.record_coraza_error();
+                        }
+                        self.failure_decision("unexpected decision variant".to_string())
+                    }
+                }
             }
-            Ok(other) => {
-                warn!(rule = %self.name, ?other, "native sidecar returned unexpected decision");
+            Ok(Evaluation::BodyRejected { size, limit }) => {
                 if let Some(metrics) = &self.metrics {
-                    metrics.record_coraza_error();
+                    metrics.record_coraza_body_rejected();
                 }
-                self.failure_decision("unexpected decision variant".to_string())
+                Decision::Block {
+                    status: 413,
+                    reason: format!(
+                        "request body of {size} bytes exceeds the {limit} byte Coraza inspection limit"
+                    ),
+                }
             }
             Err(err) => {
                 warn!(rule = %self.name, error = %err, "native Coraza sidecar evaluation failed");
@@ -507,22 +800,45 @@ pub fn socket_available(path: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::waf::coraza_payload::build_payload;
+    use crate::waf::coraza_wire::{FRAME_MAGIC_BINARY, FRAME_MAGIC_HANDSHAKE};
     use bytes::Bytes;
     use hyper::{HeaderMap, Method, Uri};
-    use std::io::{Read as _, Write as _};
     use std::net::IpAddr;
-    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize};
 
     static SOCKET_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum TestProtocol {
+        /// Pre-binary sidecar: answers the handshake with a JSON block.
+        JsonOnly,
+        /// Binary v1 sidecar: acks the handshake and answers in binary.
+        Binary,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Behaviour {
+        Ok,
+        /// Close the connection after the first frame.
+        Close,
+        /// Delay past the client deadline.
+        Timeout,
+        /// Answer with an undecodable payload.
+        Malformed,
+        /// Write the response in two chunks with a pause between them.
+        SlowChunks,
+    }
 
     struct TestSidecar {
         path: PathBuf,
         stop: Arc<AtomicU32>,
+        handshakes: Arc<AtomicUsize>,
+        requests: Arc<AtomicUsize>,
         handle: Option<std::thread::JoinHandle<()>>,
     }
 
     impl TestSidecar {
-        fn start(mode: &'static str) -> Self {
+        fn start(protocol: TestProtocol, behaviour: Behaviour) -> Self {
             let seq = SOCKET_SEQ.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
                 "coraza-native-test-{}-{seq}.sock",
@@ -531,19 +847,35 @@ mod tests {
             let _ = std::fs::remove_file(&path);
             let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind test socket");
             let stop = Arc::new(AtomicU32::new(0));
+            let handshakes = Arc::new(AtomicUsize::new(0));
+            let requests = Arc::new(AtomicUsize::new(0));
             let stop_thread = Arc::clone(&stop);
+            let handshakes_thread = Arc::clone(&handshakes);
+            let requests_thread = Arc::clone(&requests);
             let handle = std::thread::spawn(move || {
                 for stream in listener.incoming() {
                     if stop_thread.load(Ordering::Relaxed) != 0 {
                         break;
                     }
                     let Ok(mut stream) = stream else { break };
-                    std::thread::spawn(move || serve_test_connection(&mut stream, mode));
+                    let handshakes = Arc::clone(&handshakes_thread);
+                    let requests = Arc::clone(&requests_thread);
+                    std::thread::spawn(move || {
+                        serve_test_connection(
+                            &mut stream,
+                            protocol,
+                            behaviour,
+                            &handshakes,
+                            &requests,
+                        )
+                    });
                 }
             });
             Self {
                 path,
                 stop,
+                handshakes,
+                requests,
                 handle: Some(handle),
             }
         }
@@ -561,7 +893,31 @@ mod tests {
         }
     }
 
-    fn serve_test_connection(stream: &mut std::os::unix::net::UnixStream, mode: &str) {
+    fn write_framed(stream: &mut std::os::unix::net::UnixStream, body: &[u8]) {
+        let mut out = Vec::with_capacity(4 + body.len());
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        out.extend_from_slice(body);
+        let _ = stream.write_all(&out);
+    }
+
+    fn binary_response(decision: u8, status: u16, reason: &[u8]) -> Vec<u8> {
+        let mut body = vec![0u8; 8];
+        body[0] = FRAME_MAGIC_BINARY;
+        body[1] = WIRE_VERSION;
+        body[2] = decision;
+        body[4..6].copy_from_slice(&status.to_be_bytes());
+        body[6..8].copy_from_slice(&(reason.len() as u16).to_be_bytes());
+        body.extend_from_slice(reason);
+        body
+    }
+
+    fn serve_test_connection(
+        stream: &mut std::os::unix::net::UnixStream,
+        protocol: TestProtocol,
+        behaviour: Behaviour,
+        handshakes: &AtomicUsize,
+        requests: &AtomicUsize,
+    ) {
         loop {
             let mut header = [0u8; 4];
             if stream.read_exact(&mut header).is_err() {
@@ -572,29 +928,67 @@ mod tests {
             if stream.read_exact(&mut payload).is_err() {
                 return;
             }
-            if mode == "close" {
+            if payload.first() == Some(&FRAME_MAGIC_HANDSHAKE) {
+                handshakes.fetch_add(1, Ordering::Relaxed);
+                if protocol == TestProtocol::Binary {
+                    write_framed(stream, &[FRAME_MAGIC_HANDSHAKE, WIRE_VERSION, 1]);
+                } else {
+                    write_framed(
+                        stream,
+                        br#"{"decision":"block","status":400,"reason":"malformed request payload"}"#,
+                    );
+                }
+                continue;
+            }
+            requests.fetch_add(1, Ordering::Relaxed);
+            if behaviour == Behaviour::Close {
                 return;
             }
-            if mode == "timeout" {
+            if behaviour == Behaviour::Timeout {
                 std::thread::sleep(Duration::from_millis(500));
             }
-            let body = if mode == "malformed" {
-                b"not json".to_vec()
-            } else if let Ok(req) = serde_json::from_slice::<serde_json::Value>(&payload) {
-                let uri = req["uri"].as_str().unwrap_or("/");
-                if uri.contains("attack") {
-                    br#"{"decision":"block","status":403,"reason":"test block"}"#.to_vec()
-                } else {
-                    br#"{"decision":"allow"}"#.to_vec()
+            let attack = payload.windows(6).any(|w| w == b"attack");
+            let body = match behaviour {
+                Behaviour::Malformed => {
+                    if protocol == TestProtocol::Binary {
+                        // Magic and version are valid, the reason length is not.
+                        let mut body = binary_response(0, 0, b"");
+                        body[6..8].copy_from_slice(&9u16.to_be_bytes());
+                        body
+                    } else {
+                        b"not json".to_vec()
+                    }
+                }
+                _ => match protocol {
+                    TestProtocol::Binary => {
+                        if attack {
+                            binary_response(1, 403, b"test block")
+                        } else {
+                            binary_response(0, 0, b"")
+                        }
+                    }
+                    TestProtocol::JsonOnly => {
+                        if attack {
+                            br#"{"decision":"block","status":403,"reason":"test block"}"#.to_vec()
+                        } else {
+                            br#"{"decision":"allow"}"#.to_vec()
+                        }
+                    }
+                },
+            };
+            if behaviour == Behaviour::SlowChunks {
+                let (first, rest) = body.split_at(body.len() / 2);
+                let mut framed = Vec::with_capacity(4 + body.len());
+                framed.extend_from_slice(&(body.len() as u32).to_be_bytes());
+                if stream.write_all(&framed).is_err() || stream.write_all(first).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+                if stream.write_all(rest).is_err() {
+                    return;
                 }
             } else {
-                br#"{"decision":"block","status":400,"reason":"malformed"}"#.to_vec()
-            };
-            let mut out = Vec::with_capacity(4 + body.len());
-            out.extend_from_slice(&(body.len() as u32).to_be_bytes());
-            out.extend_from_slice(&body);
-            if stream.write_all(&out).is_err() {
-                return;
+                write_framed(stream, &body);
             }
         }
     }
@@ -613,18 +1007,52 @@ mod tests {
     }
 
     fn client(path: &Path, timeout: Duration) -> NativeCorazaClient {
+        client_with_pool(path, timeout, 2)
+    }
+
+    fn client_with_pool(path: &Path, timeout: Duration, pool_size: usize) -> NativeCorazaClient {
         NativeCorazaClient::new(&ClientConfig {
             socket_path: path.to_path_buf(),
-            pool_size: 2,
+            pool_size,
             timeout,
             max_payload_bytes: 64 * 1024,
         })
         .expect("client must start against test sidecar")
     }
 
+    fn rule(path: &Path) -> NativeCorazaRule {
+        NativeCorazaRule::new(
+            "coraza-native-sidecar",
+            client(path, Duration::from_secs(2)),
+        )
+    }
+
     #[test]
-    fn allows_benign_and_blocks_attack() {
-        let sidecar = TestSidecar::start("ok");
+    fn binary_protocol_allows_benign_and_blocks_attack() {
+        let sidecar = TestSidecar::start(TestProtocol::Binary, Behaviour::Ok);
+        let rule = rule(&sidecar.path);
+        assert_eq!(
+            rule.evaluate(&context("/hello", Some(b"a=b"))),
+            Decision::Allow
+        );
+        match rule.evaluate(&context("/attack", Some(b"x=1"))) {
+            Decision::Block { status, reason } => {
+                assert_eq!(status, 403);
+                assert_eq!(reason, "test block");
+            }
+            other => panic!("expected block, got {other:?}"),
+        }
+        assert_eq!(
+            sidecar.handshakes.load(Ordering::Relaxed),
+            1,
+            "the handshake must run once per connection"
+        );
+        assert_eq!(sidecar.requests.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn legacy_json_sidecar_still_works() {
+        let sidecar = TestSidecar::start(TestProtocol::JsonOnly, Behaviour::Ok);
         let client = client(&sidecar.path, Duration::from_secs(2));
         assert_eq!(
             client
@@ -642,21 +1070,78 @@ mod tests {
             }
             other => panic!("expected block, got {other:?}"),
         }
+        assert_eq!(
+            sidecar.handshakes.load(Ordering::Relaxed),
+            1,
+            "negotiation must be remembered for the process"
+        );
     }
 
     #[test]
-    fn malformed_response_fails_closed() {
-        let sidecar = TestSidecar::start("malformed");
+    fn legacy_json_sidecar_decisions_match_binary() {
+        let binary = TestSidecar::start(TestProtocol::Binary, Behaviour::Ok);
+        let json = TestSidecar::start(TestProtocol::JsonOnly, Behaviour::Ok);
+        let binary_rule = rule(&binary.path);
+        let json_rule = rule(&json.path);
+        for (uri, body) in [
+            ("/hello", Some(&b"a=b"[..])),
+            ("/attack", Some(&b"x=1"[..])),
+            ("/hello", None),
+        ] {
+            let ctx = context(uri, body);
+            assert_eq!(
+                binary_rule.evaluate(&ctx),
+                json_rule.evaluate(&ctx),
+                "decision parity for {uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn partial_response_reads_are_reassembled() {
+        let sidecar = TestSidecar::start(TestProtocol::Binary, Behaviour::SlowChunks);
         let client = client(&sidecar.path, Duration::from_secs(2));
-        let err = client
-            .evaluate(&build_payload(&context("/hello", None)).unwrap())
-            .unwrap_err();
-        assert!(matches!(err, NativeCorazaError::Protocol(_)), "{err}");
+        for _ in 0..3 {
+            let request = match encode_request(
+                &context("/hello", Some(b"a=b")),
+                &BodyInspectionPolicy::default(),
+            )
+            .unwrap()
+            {
+                WireBuild::Built { request, .. } => request,
+                WireBuild::Reject { .. } => panic!("default policy must not reject"),
+            };
+            assert_eq!(client.evaluate_binary(request).unwrap(), Decision::Allow);
+        }
+    }
+
+    #[test]
+    fn malformed_binary_response_fails_closed() {
+        let sidecar = TestSidecar::start(TestProtocol::Binary, Behaviour::Malformed);
+        let client = client(&sidecar.path, Duration::from_secs(2));
+        let request =
+            match encode_request(&context("/hello", None), &BodyInspectionPolicy::default())
+                .unwrap()
+            {
+                WireBuild::Built { request, .. } => request,
+                WireBuild::Reject { .. } => panic!("default policy must not reject"),
+            };
+        let err = client.evaluate_binary(request).unwrap_err();
+        assert!(
+            matches!(err, NativeCorazaError::Protocol(_)),
+            "unexpected error: {err}"
+        );
+
+        // The rule must turn that into a fail-closed 503, not an allow.
+        assert!(matches!(
+            rule(&sidecar.path).evaluate(&context("/hello", None)),
+            Decision::Block { status: 503, .. }
+        ));
     }
 
     #[test]
     fn timeout_is_reported() {
-        let sidecar = TestSidecar::start("timeout");
+        let sidecar = TestSidecar::start(TestProtocol::Binary, Behaviour::Timeout);
         let client = client(&sidecar.path, Duration::from_millis(80));
         let err = client
             .evaluate(&build_payload(&context("/hello", None)).unwrap())
@@ -666,10 +1151,8 @@ mod tests {
 
     #[test]
     fn reconnects_after_sidecar_closes_connection() {
-        let sidecar = TestSidecar::start("close");
+        let sidecar = TestSidecar::start(TestProtocol::Binary, Behaviour::Close);
         let client = client(&sidecar.path, Duration::from_secs(2));
-        // First call uses the preflight/initial connection, which the test
-        // server closes. The retry must establish a fresh connection.
         let err = client
             .evaluate(&build_payload(&context("/hello", None)).unwrap())
             .unwrap_err();
@@ -696,7 +1179,7 @@ mod tests {
 
     #[test]
     fn payload_limit_is_enforced() {
-        let sidecar = TestSidecar::start("ok");
+        let sidecar = TestSidecar::start(TestProtocol::Binary, Behaviour::Ok);
         let client = NativeCorazaClient::new(&ClientConfig {
             socket_path: sidecar.path.clone(),
             pool_size: 1,
@@ -706,6 +1189,71 @@ mod tests {
         .unwrap();
         let err = client.evaluate(b"0123456789").unwrap_err();
         assert!(matches!(err, NativeCorazaError::PayloadTooLarge { .. }));
+
+        let request = match encode_request(
+            &context("/hello", Some(b"0123456789")),
+            &BodyInspectionPolicy::default(),
+        )
+        .unwrap()
+        {
+            WireBuild::Built { request, .. } => request,
+            WireBuild::Reject { .. } => panic!("default policy must not reject"),
+        };
+        let err = client.evaluate_binary(request).unwrap_err();
+        assert!(matches!(err, NativeCorazaError::PayloadTooLarge { .. }));
+    }
+
+    #[test]
+    fn pool_serves_more_callers_than_connections() {
+        let sidecar = TestSidecar::start(TestProtocol::Binary, Behaviour::Ok);
+        let client = Arc::new(client_with_pool(&sidecar.path, Duration::from_secs(5), 2));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let client = Arc::clone(&client);
+                scope.spawn(move || {
+                    for _ in 0..5 {
+                        let request = match encode_request(
+                            &context("/hello", Some(b"a=b")),
+                            &BodyInspectionPolicy::default(),
+                        )
+                        .unwrap()
+                        {
+                            WireBuild::Built { request, .. } => request,
+                            WireBuild::Reject { .. } => panic!("default policy must not reject"),
+                        };
+                        assert_eq!(client.evaluate_binary(request).unwrap(), Decision::Allow);
+                    }
+                });
+            }
+        });
+        assert_eq!(sidecar.requests.load(Ordering::Relaxed), 40);
+    }
+
+    #[test]
+    fn pool_recovers_after_timeouts() {
+        let sidecar = TestSidecar::start(TestProtocol::Binary, Behaviour::Timeout);
+        let client = client_with_pool(&sidecar.path, Duration::from_millis(50), 1);
+        let request = || match encode_request(
+            &context("/hello", Some(b"a=b")),
+            &BodyInspectionPolicy::default(),
+        )
+        .unwrap()
+        {
+            WireBuild::Built { request, .. } => request,
+            WireBuild::Reject { .. } => panic!("default policy must not reject"),
+        };
+        for _ in 0..3 {
+            assert!(matches!(
+                client.evaluate_binary(request()).unwrap_err(),
+                NativeCorazaError::Timeout
+            ));
+        }
+
+        // A healthy sidecar must be usable again after the timeouts dropped
+        // every pooled connection.
+        let healthy = TestSidecar::start(TestProtocol::Binary, Behaviour::Ok);
+        let client = client_with_pool(&healthy.path, Duration::from_secs(2), 1);
+        assert_eq!(client.evaluate_binary(request()).unwrap(), Decision::Allow);
     }
 
     #[test]
@@ -717,7 +1265,7 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        let (tx, rx) = std_mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
@@ -729,6 +1277,10 @@ mod tests {
                 let len = u32::from_be_bytes(header) as usize;
                 let mut payload = vec![0u8; len];
                 if stream.read_exact(&mut payload).is_err() {
+                    continue;
+                }
+                if payload.first() == Some(&FRAME_MAGIC_HANDSHAKE) {
+                    write_framed(&mut stream, &[FRAME_MAGIC_HANDSHAKE, WIRE_VERSION, 1]);
                     continue;
                 }
                 tx.send(true).unwrap();
@@ -757,7 +1309,7 @@ mod tests {
 
     #[test]
     fn native_rule_records_coraza_metrics() {
-        let sidecar = TestSidecar::start("ok");
+        let sidecar = TestSidecar::start(TestProtocol::Binary, Behaviour::Ok);
         let metrics = Arc::new(Metrics::new());
         let rule = NativeCorazaRule::new(
             "coraza-native-sidecar",
@@ -780,7 +1332,7 @@ mod tests {
         assert!(rendered.contains("waf_coraza_errors_total 0"));
         assert!(rendered.contains("waf_coraza_evaluation_duration_seconds_count 2"));
 
-        let malformed = TestSidecar::start("malformed");
+        let malformed = TestSidecar::start(TestProtocol::Binary, Behaviour::Malformed);
         let error_metrics = Arc::new(Metrics::new());
         let error_rule = NativeCorazaRule::new(
             "coraza-native-sidecar",

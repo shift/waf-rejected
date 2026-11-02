@@ -79,6 +79,7 @@ func main() {
 		maxBody        = flag.Int("max-body", 64*1024, "maximum inspected request body in bytes")
 		maxHeaders     = flag.Int("max-headers", 100, "maximum number of request headers")
 		maxHeaderBytes = flag.Int("max-header-bytes", 64*1024, "maximum total request header bytes")
+		maxConns       = flag.Int("max-conns", 128, "maximum concurrently served connections")
 		timeout        = flag.Duration("timeout", 5*time.Second, "per-request wall-clock budget")
 		grace          = flag.Duration("grace", 10*time.Second, "graceful shutdown drain budget")
 	)
@@ -114,7 +115,8 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	log.Printf("ready socket=%s rules=%s max_body=%d timeout=%s", *socketPath, *rulesPath, *maxBody, *timeout)
+	log.Printf("ready socket=%s rules=%s max_body=%d max_conns=%d timeout=%s",
+		*socketPath, *rulesPath, *maxBody, *maxConns, *timeout)
 
 	var wg sync.WaitGroup
 	go func() {
@@ -130,6 +132,13 @@ func main() {
 		})
 	}()
 
+	// Admission control: a connection slot is held for the lifetime of the
+	// connection, so the number of concurrently evaluating goroutines is
+	// bounded by --max-conns. Blocking here applies backpressure through the
+	// listen backlog instead of spawning unbounded goroutines.
+	slots := make(chan struct{}, *maxConns)
+
+accept:
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -142,9 +151,16 @@ func main() {
 			log.Printf("accept: %v", err)
 			break
 		}
+		select {
+		case slots <- struct{}{}:
+		case <-ctx.Done():
+			_ = conn.Close()
+			break accept
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer func() { <-slots }()
 			srv.handle(conn)
 		}()
 	}
@@ -192,55 +208,70 @@ func (s *server) handle(conn net.Conn) {
 	s.conns.Store(conn, struct{}{})
 	defer s.conns.Delete(conn)
 	defer conn.Close()
+
+	reader := &frameReader{r: conn}
+	// Reused response buffer: the steady-state allow path allocates nothing.
+	var respBuf []byte
 	for {
-		deadline := time.Now().Add(s.requestTimeout + 5*time.Second)
-		_ = conn.SetReadDeadline(deadline)
-		payload, err := readFrame(conn)
+		_ = conn.SetReadDeadline(time.Now().Add(s.requestTimeout + 5*time.Second))
+		frame, err := reader.next()
 		if err != nil {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
 				log.Printf("read frame: %v", err)
 			}
 			return
 		}
-		resp := s.evaluate(payload)
+		if isHandshake(frame) {
+			var ack [7]byte
+			binary.BigEndian.PutUint32(ack[:4], 3)
+			ack[4] = frameMagicHandshake
+			ack[5] = wireVersion
+			ack[6] = 1 // binary v1 supported
+			_ = conn.SetWriteDeadline(time.Now().Add(s.requestTimeout))
+			if _, err := conn.Write(ack[:]); err != nil {
+				log.Printf("write handshake: %v", err)
+				return
+			}
+			continue
+		}
+
+		binaryProto := len(frame) > 0 && frame[0] == frameMagicBinary
+		resp := s.evaluate(frame)
 		_ = conn.SetWriteDeadline(time.Now().Add(s.requestTimeout))
-		if err := writeFrame(conn, resp); err != nil {
+		respBuf, err = writeResponse(conn, respBuf, binaryProto, resp)
+		if err != nil {
 			log.Printf("write response: %v", err)
 			return
 		}
 	}
 }
 
+// writeResponse encodes resp as either a binary v1 or legacy JSON frame into
+// buf (reused across requests) and writes it with a single syscall.
+func writeResponse(conn net.Conn, buf []byte, binaryProto bool, resp Response) ([]byte, error) {
+	buf = buf[:0]
+	buf = append(buf, 0, 0, 0, 0)
+	if binaryProto {
+		buf = appendBinaryResponse(buf, resp)
+	} else {
+		body, err := json.Marshal(resp)
+		if err != nil {
+			return buf, err
+		}
+		buf = append(buf, body...)
+	}
+	binary.BigEndian.PutUint32(buf[:4], uint32(len(buf)-4))
+	_, err := conn.Write(buf)
+	return buf, err
+}
+
 func readFrame(r io.Reader) ([]byte, error) {
-	var hdr [4]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return nil, err
-	}
-	n := binary.BigEndian.Uint32(hdr[:])
-	if n > maxFrame {
-		return nil, fmt.Errorf("frame of %d bytes exceeds %d byte limit", n, maxFrame)
-	}
-	buf := make([]byte, n)
-	if _, err := io.ReadFull(r, buf); err != nil {
-		return nil, err
-	}
-	return buf, nil
+	reader := &frameReader{r: r}
+	return reader.next()
 }
 
-func writeFrame(w io.Writer, resp Response) error {
-	body, err := json.Marshal(resp)
-	if err != nil {
-		return err
-	}
-	var hdr [4]byte
-	binary.BigEndian.PutUint32(hdr[:], uint32(len(body)))
-	if _, err := w.Write(hdr[:]); err != nil {
-		return err
-	}
-	_, err = w.Write(body)
-	return err
-}
-
+// evaluate dispatches on the frame magic. The JSON path is retained verbatim
+// for compatibility with clients that predate the binary encoding.
 func (s *server) evaluate(payload []byte) Response {
 	// The sidecar owns the timeout: a slow evaluation is reported to the
 	// client as a block rather than leaving the connection hanging. Coraza
@@ -252,20 +283,50 @@ func (s *server) evaluate(payload []byte) Response {
 		}
 	}()
 
-	var req Request
-	if err := json.Unmarshal(payload, &req); err != nil {
-		return Response{Decision: "block", Status: 400, Reason: "malformed request payload"}
+	var req *wireRequest
+	if len(payload) > 0 && payload[0] == frameMagicBinary {
+		decoded, err := decodeBinaryRequest(payload)
+		if err != nil {
+			return Response{Decision: "block", Status: 400,
+				Reason: "malformed request payload: " + err.Error()}
+		}
+		req = decoded
+	} else {
+		decoded, err := decodeJSONRequest(payload)
+		if err != nil {
+			return Response{Decision: "block", Status: 400, Reason: err.Error()}
+		}
+		req = decoded
 	}
-	if req.BodySize != nil && (*req.BodySize < 0 || *req.BodySize > s.maxBody) {
+	return s.evaluateParsed(req)
+}
+
+// evaluateParsed applies the limits and runs the CRS transaction. It is shared
+// by the JSON and binary decoders so both paths make identical decisions.
+func (s *server) evaluateParsed(req *wireRequest) Response {
+	if req.BodySize < 0 || req.BodySize > s.maxBody {
 		return Response{Decision: "block", Status: 413, Reason: "request body exceeds sidecar limit"}
 	}
-	headers, err := s.decodeHeaders(req.Headers)
-	if err != nil {
-		return Response{Decision: "block", Status: 400, Reason: err.Error()}
+	if len(req.Headers) > s.maxHeaderCount {
+		return Response{Decision: "block", Status: 400,
+			Reason: fmt.Sprintf("header count %d exceeds limit %d", len(req.Headers), s.maxHeaderCount)}
 	}
-	body, err := decodeBody(&req, s.maxBody)
-	if err != nil {
-		return Response{Decision: "block", Status: 400, Reason: err.Error()}
+	total := 0
+	for _, h := range req.Headers {
+		total += len(h[0]) + len(h[1])
+	}
+	if total > s.maxHeaderBytes {
+		return Response{Decision: "block", Status: 400,
+			Reason: fmt.Sprintf("header bytes %d exceed limit %d", total, s.maxHeaderBytes)}
+	}
+	if req.HasBody {
+		if req.BodySize != len(req.Body) {
+			return Response{Decision: "block", Status: 400, Reason: "body_size does not match decoded body"}
+		}
+		if len(req.Body) > s.maxBody {
+			return Response{Decision: "block", Status: 413,
+				Reason: fmt.Sprintf("body of %d bytes exceeds limit %d", len(req.Body), s.maxBody)}
+		}
 	}
 
 	tx := s.engine.NewTransaction()
@@ -276,14 +337,14 @@ func (s *server) evaluate(payload []byte) Response {
 	} else {
 		tx.ProcessURI(req.URI, req.Method, "HTTP/1.1")
 	}
-	for _, h := range headers {
+	for _, h := range req.Headers {
 		tx.AddRequestHeader(h[0], h[1])
 	}
 	if it := tx.ProcessRequestHeaders(); it != nil {
 		return blockResponse(it, "request headers")
 	}
-	if len(body) > 0 {
-		if _, _, err := tx.WriteRequestBody(body); err != nil {
+	if len(req.Body) > 0 {
+		if _, _, err := tx.WriteRequestBody(req.Body); err != nil {
 			return Response{Decision: "block", Status: 400, Reason: "invalid request body"}
 		}
 	}
@@ -310,7 +371,37 @@ func blockResponse(it *types.Interruption, phase string) Response {
 	return Response{Decision: "block", Status: status, Reason: reason}
 }
 
-func (s *server) decodeHeaders(raw json.RawMessage) ([][2]string, error) {
+// decodeJSONRequest converts the legacy JSON envelope into the shared
+// wireRequest representation.
+func decodeJSONRequest(payload []byte) (*wireRequest, error) {
+	var req Request
+	if err := json.Unmarshal(payload, &req); err != nil {
+		return nil, errors.New("malformed request payload")
+	}
+	headers, err := decodeHeaders(req.Headers)
+	if err != nil {
+		return nil, err
+	}
+	body, hasBody, err := decodeBody(&req)
+	if err != nil {
+		return nil, err
+	}
+	bodySize := len(body)
+	if req.BodySize != nil {
+		bodySize = *req.BodySize
+	}
+	return &wireRequest{
+		Method:      req.Method,
+		URI:         req.URI,
+		HTTPVersion: req.HTTPVersion,
+		Headers:     headers,
+		Body:        body,
+		HasBody:     hasBody,
+		BodySize:    bodySize,
+	}, nil
+}
+
+func decodeHeaders(raw json.RawMessage) ([][2]string, error) {
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil, nil
 	}
@@ -325,60 +416,41 @@ func (s *server) decodeHeaders(raw json.RawMessage) ([][2]string, error) {
 			pairs = append(pairs, [2]string{k, v})
 		}
 	}
-	if len(pairs) > s.maxHeaderCount {
-		return nil, fmt.Errorf("header count %d exceeds limit %d", len(pairs), s.maxHeaderCount)
-	}
-	total := 0
-	for _, h := range pairs {
-		total += len(h[0]) + len(h[1])
-	}
-	if total > s.maxHeaderBytes {
-		return nil, fmt.Errorf("header bytes %d exceed limit %d", total, s.maxHeaderBytes)
-	}
 	return pairs, nil
 }
 
-func decodeBody(req *Request, maxBody int) ([]byte, error) {
+// decodeBody returns the raw body bytes. Limits and the body_size consistency
+// check are applied by evaluateParsed, so both wire encodings share them.
+func decodeBody(req *Request) ([]byte, bool, error) {
 	if req.BodyB64 != nil {
 		if req.Body != nil {
-			return nil, errors.New("body and body_b64 are mutually exclusive")
+			return nil, false, errors.New("body and body_b64 are mutually exclusive")
 		}
 		decoded, err := base64.StdEncoding.DecodeString(*req.BodyB64)
 		if err != nil {
-			return nil, errors.New("invalid body_b64")
+			return nil, false, errors.New("invalid body_b64")
 		}
-		if len(decoded) > maxBody {
-			return nil, fmt.Errorf("body of %d bytes exceeds limit %d", len(decoded), maxBody)
-		}
-		return decoded, nil
+		return decoded, true, nil
 	}
 	if req.Body == nil {
-		return nil, nil
+		return nil, false, nil
 	}
 	encoding := req.BodyEncoding
 	if encoding == "" {
 		encoding = bodyEncodingUTF8
 	}
-	var body []byte
 	switch encoding {
 	case bodyEncodingUTF8:
-		body = []byte(*req.Body)
+		return []byte(*req.Body), true, nil
 	case bodyEncodingBase64:
 		decoded, err := base64.StdEncoding.DecodeString(*req.Body)
 		if err != nil {
-			return nil, errors.New("invalid base64 body")
+			return nil, false, errors.New("invalid base64 body")
 		}
-		body = decoded
+		return decoded, true, nil
 	default:
-		return nil, fmt.Errorf("unknown body_encoding %q", encoding)
+		return nil, false, fmt.Errorf("unknown body_encoding %q", encoding)
 	}
-	if req.BodySize != nil && *req.BodySize != len(body) {
-		return nil, errors.New("body_size does not match decoded body")
-	}
-	if len(body) > maxBody {
-		return nil, fmt.Errorf("body of %d bytes exceeds limit %d", len(body), maxBody)
-	}
-	return body, nil
 }
 
 func init() {

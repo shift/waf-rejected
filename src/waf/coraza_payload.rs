@@ -56,6 +56,64 @@ pub enum PayloadBuild {
     Reject { size: usize, limit: usize },
 }
 
+/// Body selected for inspection after applying [`BodyInspectionPolicy`].
+///
+/// Shared by the JSON and binary encoders so both hand Coraza exactly the same
+/// bytes and report the same inspected size.
+#[derive(Debug)]
+pub enum BodySelection<'a> {
+    /// Body bytes to inspect (empty when the request has no body).
+    Inspect {
+        body: Option<&'a [u8]>,
+        /// Number of body bytes actually handed to Coraza.
+        inspected_bytes: usize,
+        /// Full request body length before truncation, when known.
+        original_size: Option<usize>,
+        /// Whether the body was truncated to the inspection prefix.
+        truncated: bool,
+    },
+    /// The policy rejected the request before evaluation.
+    Reject { size: usize, limit: usize },
+}
+
+/// Applies the body-size policy to a request context.
+pub fn select_body<'a>(
+    ctx: &'a RequestContext,
+    policy: &BodyInspectionPolicy,
+) -> BodySelection<'a> {
+    let full_body = ctx.body.as_deref();
+    let original_size = full_body.map(<[u8]>::len).or(ctx.body_size);
+
+    let mut inspected = full_body;
+    let mut truncated = false;
+    if policy.max_inspect_bytes > 0 {
+        if let Some(bytes) = full_body {
+            if bytes.len() > policy.max_inspect_bytes {
+                match policy.oversize_action {
+                    CorazaOversizeAction::InspectAll => {}
+                    CorazaOversizeAction::ForwardUninspected => {
+                        inspected = Some(&bytes[..policy.max_inspect_bytes]);
+                        truncated = true;
+                    }
+                    CorazaOversizeAction::Reject => {
+                        return BodySelection::Reject {
+                            size: bytes.len(),
+                            limit: policy.max_inspect_bytes,
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    BodySelection::Inspect {
+        body: inspected,
+        inspected_bytes: inspected.map(<[u8]>::len).unwrap_or(0),
+        original_size,
+        truncated,
+    }
+}
+
 /// Serialises the request context into the reactor/sidecar JSON payload using
 /// the default (inspect-all) policy.
 pub fn build_payload(ctx: &RequestContext) -> Result<Vec<u8>, serde_json::Error> {
@@ -93,30 +151,17 @@ pub fn build_payload_with_policy(
         })
         .collect();
 
-    let full_body = ctx.body.as_deref();
-    let original_size = full_body.map(<[u8]>::len).or(ctx.body_size);
-
-    let mut inspected = full_body;
-    let mut truncated = false;
-    if policy.max_inspect_bytes > 0 {
-        if let Some(bytes) = full_body {
-            if bytes.len() > policy.max_inspect_bytes {
-                match policy.oversize_action {
-                    CorazaOversizeAction::InspectAll => {}
-                    CorazaOversizeAction::ForwardUninspected => {
-                        inspected = Some(&bytes[..policy.max_inspect_bytes]);
-                        truncated = true;
-                    }
-                    CorazaOversizeAction::Reject => {
-                        return Ok(PayloadBuild::Reject {
-                            size: bytes.len(),
-                            limit: policy.max_inspect_bytes,
-                        });
-                    }
-                }
-            }
+    let (inspected, original_size, truncated) = match select_body(ctx, policy) {
+        BodySelection::Inspect {
+            body,
+            original_size,
+            truncated,
+            ..
+        } => (body, original_size, truncated),
+        BodySelection::Reject { size, limit } => {
+            return Ok(PayloadBuild::Reject { size, limit });
         }
-    }
+    };
 
     let (body, body_encoding) = match inspected {
         None => (None, BODY_ENCODING_UTF8),

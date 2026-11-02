@@ -30,5 +30,6 @@ ENTRYPOINT ["/usr/local/bin/coraza-sidecar"]
 CMD ["--socket", "/run/waf/coraza.sock", \
      "--rules", "/usr/share/waf/coraza/crs/crs.conf", \
      "--max-body", "65536", \
+     "--max-conns", "128", \
      "--timeout", "5s", \
      "--grace", "10s"]
