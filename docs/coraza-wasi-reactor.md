@@ -559,27 +559,72 @@ Module-side constants: `maxInputBytes = 64 * 1024`. The input buffer is a Go
 global; `input_base` exposes its address so the host never writes over Go
 runtime data at a fixed low offset.
 
-Because a Go reactor can grow to the 256 MiB memory limit, budget up to that
-amount per pool worker. The default pool of one worker per core (at most eight)
-therefore caps the reactor's worst-case linear-memory footprint at
-`pool_size * memory_limit_bytes`, but typical resident usage is far lower.
+Because Go's wasm linear memory only grows, `waf.coraza.memory_limit_bytes`
+(256 MiB) is a trap ceiling, not a residency target. Size the pool from the
+measured plateau instead of from that ceiling:
 
-### Guest GC tuning
+```text
+budget MiB ≈ 370 (host: wasmtime engine, module, thread stacks, channels)
+           + pool_size × 80 (guest linear memory per worker at the 64 MiB GC bound)
+```
+
+A conservative planning rule is one worker per 96 MiB of available memory
+after reserving ~384 MiB for the host: `pool_size ≈ (available_MiB - 384) / 96`,
+clamped to `1..=8`. For example 1 GiB available supports 6 workers, 512 MiB
+supports 1, and 2 GiB or more supports the 8-worker cap. Keep each worker's
+`memory_limit_bytes` at or above ~96 MiB so the Go runtime has room for
+non-heap linear memory (`waf.coraza.memory_limit_bytes` below ~96 MiB is not a
+supported sizing).
+
+### Guest GC tuning and measured memory plateau
 
 At startup the reactor calls `debug.SetGCPercent(600)` and
-`debug.SetMemoryLimit(192 MiB)` in `wasm/coraza_reactor/main.go`. With the Go
+`debug.SetMemoryLimit(64 MiB)` in `wasm/coraza_reactor/main.go`. With the Go
 default (`GOGC=100`) a collection lands every ~10 MiB of allocation; CRS
 evaluation allocates ~0.5–1 MiB per 8 KiB body, so early requests can pay a
-collection mid-evaluation and roughly double that request's latency. Raising
-the growth target amortises collections across requests, and the soft memory
-limit keeps the heap target below the host's 256 MiB store limit, so the
-runtime still collects before linear memory traps.
+collection mid-evaluation and roughly double that request's latency. The 600 %
+growth target amortises collections across requests, while the 64 MiB soft
+limit bounds the retained heap before linear memory grows without bound.
 
-The tradeoff is higher resident memory and, when a collection does happen, a
-larger live heap to scan. Measured on the reference machine, the 8–16 KiB p50
-tail (up to ~2.6× the steady-state floor on unprimed heaps) disappears while
-60 KiB steady-state cost is unchanged. The 192 MiB soft limit leaves 64 MiB of
-headroom under the 256 MiB store cap for Go runtime and wasm overhead.
+The limit matters because wasm memory cannot be returned to the OS. Measured
+with `memory-soak` (6 workers, 6 client threads, 90 s, mixed bodyless/1 KiB/
+8 KiB plus a 60 KiB body every 20 s) on the reference 6-core laptop:
+
+| `SetMemoryLimit` | peak RSS | linear memory | p50 bodyless / 1 KiB / 8 KiB / 60 KiB |
+| ---: | ---: | ---: | --- |
+| 64 MiB | 797–842 MiB | 456–528 MiB | 3.0 / 49.5 / 440 / 3 390 ms (GC 600) |
+| 128 MiB | 1 029–1 191 MiB | 720–888 MiB | 3.8–4.8 / 90–95 / 610–1 190 / 3 510–10 100 ms |
+| 192 MiB | 1 084–1 404 MiB | 784–1 116 MiB | 2.8–3.6 / 47–89 / 420–610 / 3 510–4 130 ms |
+
+A 10-minute soak at the chosen GC 600 / 64 MiB setting held **837.6 MiB peak
+RSS** and **480 MiB linear memory** across 24 112 evaluations; after the
+midpoint growth was 0.0 %, so this is a plateau rather than a slow leak. The
+same 6-worker pool with the previous 192 MiB limit was still climbing at
+1.4 GiB. At the 64 MiB bound, GC 200/400/600 all plateaued; 600 kept the
+lowest 8 KiB/60 KiB p50 and is retained.
+
+Pool-size scaling at GC 600 / 64 MiB (same 90 s workload) is linear, with a
+fixed ~370 MiB host cost:
+
+| `pool_size` | baseline RSS | 90 s RSS | linear memory |
+| ---: | ---: | ---: | ---: |
+| 1 | 435 MiB | 445 MiB | 80 MiB |
+| 2 | 492 MiB | 512 MiB | 160 MiB |
+| 4 | 619 MiB | 661 MiB | 320 MiB |
+| 6 | 759 MiB | 819 MiB | 480 MiB |
+
+Calling `debug.FreeOSMemory()` every 256 evaluations was also measured: it
+produced the same 815 MiB plateau and indistinguishable p50 (per-evaluation
+counter plus forced collection), because wasm linear memory cannot shrink.
+It is not enabled. A worker could be recycled to bound a pathological workload,
+but dropping and re-running Go/CRS init costs about a second per worker, and
+the 64 MiB GC bound already plateaus on the mixed workload tested here.
+
+The tradeoff of the tighter limit is slightly higher GC frequency; measured
+p50 for bodyless, 1 KiB and 8 KiB traffic stayed at or below the 192 MiB
+setting, so no latency regression was observed. The size-dependent cost is
+still dominated by CRS scanning, not collection. The 8–16 KiB GC tail
+described in earlier measurements was the reason for 600 %; that remains.
 
 ## Observability
 
@@ -644,6 +689,33 @@ The tests are ignored in debug builds because Go runtime start-up and CRS
 compilation are slow without optimisation. Release builds pass:
 `cargo test --release --lib --features wasm-reactor -- --ignored` runs all five
 Coraza tests.
+
+## Memory soak
+
+`memory-soak` (`src/bin/memory_soak.rs`) drives a warm pool directly with the
+mixed workload described above and samples `/proc/self/status` RSS plus the
+reactor's published linear-memory total once per second. It fails when RSS
+exceeds `--max-rss-mib`, when RSS after the midpoint grows more than
+`--max-growth-pct`, or when any evaluation errors. Defaults are 5 minutes,
+6 workers and the automatic pool ceiling; use `--duration-secs 1800` for a
+30-minute run and `--module <path>` to test a candidate build. A zero
+`--max-rss-mib` (the default) selects the documented `370 + 96 × pool_size`
+MiB ceiling.
+
+```sh
+nix develop -c cargo build --release --features wasm-reactor --bin memory-soak
+./target/release/memory-soak --duration-secs 600 --pool-size 6 \
+  --concurrency 6 --large-body-interval-secs 30 \
+  --max-rss-mib 1024 --max-growth-pct 5 \
+  --output /tmp/opencode/coraza-soak.csv
+```
+
+For the 6-worker pool on the reference host the operational gate is **peak
+RSS < 1024 MiB and < 5 % growth after the midpoint**. The chosen GC 600 /
+64 MiB module measured 838 MiB peak after 10 minutes. Scale the ceiling with
+the pool: `370 + 96 × pool_size` MiB is a conservative cap (1/2/4/6/8 workers
+→ 466/562/754/946/1138 MiB). Also run the end-to-end `load-validate` matrix,
+whose `rss-peak` and `rss-growth` gates cover host and proxy buffers.
 
 ## Benchmarks
 
@@ -726,8 +798,9 @@ Epoch interruption and guest GC tuning were measured on 2026-11-01 with a
 release build (`cargo build --release`), a one-worker pre-warmed pool pinned
 with `taskset -c 2`, and form-urlencoded `data=AAA…` bodies. Each row is seven
 evaluations after one warm-up; p50 and mean are milliseconds. The module was
-the rebuilt 20 MiB reactor with `SetGCPercent(600)` and a 192 MiB soft memory
-limit.
+the rebuilt 20 MiB reactor with `SetGCPercent(600)` and the then-current
+192 MiB soft memory limit (later reduced to 64 MiB to bound RSS, see the
+memory section above).
 
 | Body | Payload bytes | Before p50 | Before mean | After p50 | After mean |
 | --- | ---: | ---: | ---: | ---: | ---: |

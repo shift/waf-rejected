@@ -27,12 +27,16 @@ import (
 // GOMEMLIMIT keeps the heap target comfortably below the host's 256 MiB
 // store limit so the runtime still collects before linear memory traps.
 //
-// Tradeoff: resident memory is higher and a collection, when it does happen,
-// scans a larger live heap. The 192 MiB soft limit leaves 64 MiB of headroom
-// for non-heap/wasm overhead under the 256 MiB store cap.
+// Tradeoff: a larger growth target is faster but retains more heap, and wasm
+// linear memory cannot shrink. The 64 MiB soft limit is the measured plateau
+// bound: on the reference 6-core host a six-worker pool levels off at about
+// 814 MiB RSS (80 MiB linear memory per worker) after warm-up, versus >1.4 GiB
+// and still rising with a 192 MiB limit. Keep enough headroom under
+// `waf.coraza.memory_limit_bytes` (256 MiB default) for the Go runtime's
+// non-heap linear memory.
 const (
 	gcPercent   = 600
-	memoryLimit = 192 << 20
+	memoryLimit = 64 << 20
 )
 
 func init() {

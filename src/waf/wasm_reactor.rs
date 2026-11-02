@@ -459,6 +459,10 @@ pub struct WasmReactor {
     pool_size: usize,
     pool: OnceLock<Arc<ReactorPool>>,
     warm_lock: Mutex<()>,
+    /// Sum of the linear-memory sizes currently published by live workers.
+    /// Guest Go heaps live inside this memory, so it separates wasm growth
+    /// from host-side RSS. Updated by workers at most once per evaluation.
+    linear_memory_bytes: Arc<AtomicU64>,
     /// Keeps the engine epoch advancing while the reactor is alive. Dropping
     /// the reactor stops and joins the ticker.
     _epoch: EpochTicker,
@@ -544,6 +548,12 @@ struct CachedInstance {
     input_base: usize,
 }
 
+impl CachedInstance {
+    fn linear_memory_bytes(&self) -> u64 {
+        self.memory.data_size(&self.store) as u64
+    }
+}
+
 /// Immutable data each pool worker needs to build and drive its own instance.
 ///
 /// `Engine`, `Module` and `Linker` are cheap to clone (`Arc` inside) and
@@ -555,6 +565,8 @@ struct WorkerConfig {
     module: Module,
     linker: Linker<ReactorState>,
     limits: ReactorLimits,
+    /// Aggregate linear-memory counter shared with the owning reactor.
+    linear_memory_bytes: Arc<AtomicU64>,
 }
 
 /// One request dispatched to a pool worker. The payload is copied because the
@@ -751,8 +763,10 @@ fn worker_loop(
     jobs: mpsc::Receiver<Job>,
     ready: Option<mpsc::Sender<Result<(), ReactorError>>>,
 ) {
+    let mut reported_memory = 0u64;
     let mut cached = match config.instantiate() {
         Ok(instance) => {
+            publish_memory(&config, &mut reported_memory, &instance);
             if let Some(ready) = ready {
                 let _ = ready.send(Ok(()));
             }
@@ -770,7 +784,10 @@ fn worker_loop(
         let instance = match cached.take() {
             Some(instance) => instance,
             None => match config.instantiate() {
-                Ok(instance) => instance,
+                Ok(instance) => {
+                    publish_memory(&config, &mut reported_memory, &instance);
+                    instance
+                }
                 Err(err) => {
                     let _ = job.reply.send(Err(err));
                     continue;
@@ -780,15 +797,40 @@ fn worker_loop(
 
         match config.evaluate_on(instance, &job.payload) {
             Ok((decision, instance)) => {
+                publish_memory(&config, &mut reported_memory, &instance);
                 cached = Some(instance);
                 let _ = job.reply.send(Ok(decision));
             }
             // The failed instance was already dropped; the next job builds a
             // fresh one.
             Err(err) => {
+                clear_memory(&config, &mut reported_memory);
                 let _ = job.reply.send(Err(err));
             }
         }
+    }
+}
+
+fn publish_memory(config: &WorkerConfig, reported: &mut u64, instance: &CachedInstance) {
+    let current = instance.linear_memory_bytes();
+    if current >= *reported {
+        config
+            .linear_memory_bytes
+            .fetch_add(current - *reported, Ordering::Relaxed);
+    } else {
+        config
+            .linear_memory_bytes
+            .fetch_sub(*reported - current, Ordering::Relaxed);
+    }
+    *reported = current;
+}
+
+fn clear_memory(config: &WorkerConfig, reported: &mut u64) {
+    if *reported != 0 {
+        config
+            .linear_memory_bytes
+            .fetch_sub(*reported, Ordering::Relaxed);
+        *reported = 0;
     }
 }
 
@@ -974,6 +1016,7 @@ impl WasmReactor {
             pool_size,
             pool: OnceLock::new(),
             warm_lock: Mutex::new(()),
+            linear_memory_bytes: Arc::new(AtomicU64::new(0)),
             _epoch: epoch,
         };
         reactor.validate_exports()?;
@@ -998,7 +1041,11 @@ impl WasmReactor {
         Self::from_coraza_bytes_with_limits(bytes, ReactorLimits::coraza())
     }
 
-    fn from_coraza_bytes_with_limits(
+    /// Compiles the Coraza reactor from bytes with explicit limits.
+    ///
+    /// Callers that need a non-default pool size or memory ceiling use this;
+    /// [`WasmReactor::from_coraza_bytes`] applies [`ReactorLimits::coraza`].
+    pub fn from_coraza_bytes_with_limits(
         bytes: &[u8],
         limits: ReactorLimits,
     ) -> Result<Self, ReactorError> {
@@ -1020,6 +1067,16 @@ impl WasmReactor {
     /// Returns the configured limits.
     pub fn limits(&self) -> &ReactorLimits {
         &self.limits
+    }
+
+    /// Sum of linear-memory sizes currently published by live pool workers.
+    ///
+    /// The Go heap and Coraza allocations live inside this memory, so the
+    /// value separates guest/wasm growth from host-side RSS (stacks, wasmtime
+    /// stores and channels). Workers refresh it once per evaluation; it is a
+    /// diagnostic, not a security limit.
+    pub fn linear_memory_bytes(&self) -> u64 {
+        self.linear_memory_bytes.load(Ordering::Relaxed)
     }
 
     /// Checks the module's export section before the first evaluation so that
@@ -1059,6 +1116,7 @@ impl WasmReactor {
                 module: self.module.clone(),
                 linker: self.linker.clone(),
                 limits: self.limits.clone(),
+                linear_memory_bytes: Arc::clone(&self.linear_memory_bytes),
             },
             self.pool_size,
         )?;
@@ -1789,6 +1847,10 @@ mod tests {
         reactor.warm().expect("warm-up must succeed");
         // Idempotent and cheap: the pool is only built once.
         reactor.warm().expect("second warm-up must succeed");
+        assert!(
+            reactor.linear_memory_bytes() > 0,
+            "warm workers must publish their linear-memory size"
+        );
 
         assert_eq!(
             reactor.evaluate(&benign_payload()).unwrap(),

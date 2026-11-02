@@ -109,6 +109,34 @@ send a handful of maximum-size bodies should not be able to add seconds to
 every bodyless request. A failure here is a beta-readiness blocker for
 untrusted-traffic deployments even when throughput gates pass.
 
+## Reactor memory soak gate
+
+The end-to-end matrix is short and mixes in proxy buffers, so it cannot prove
+that a warm reactor pool has stopped growing. `memory-soak`
+(`src/bin/memory_soak.rs`) is the dedicated gate. It drives a warm
+`WasmReactor` directly with bodyless, 1 KiB, 8 KiB and periodic 60 KiB
+requests for a configurable duration, samples process RSS and wasm linear
+memory once per second, and fails on errors, an RSS ceiling, or growth after
+the midpoint.
+
+```bash
+nix develop -c cargo build --release --features wasm-reactor --bin memory-soak
+./target/release/memory-soak \
+  --duration-secs 600 --pool-size 6 --concurrency 6 \
+  --large-body-interval-secs 30 \
+  --max-rss-mib 1024 --max-growth-pct 5 \
+  --output /tmp/opencode/coraza-soak.csv
+```
+
+The documented ceiling scales with the pool as `370 + 96 × pool_size` MiB
+(6 workers → 946 MiB; the 1024 MiB gate leaves margin). A 10-minute run on
+the reference laptop with the chosen guest GC (600 %, 64 MiB soft limit)
+peaked at **837.6 MiB RSS / 480 MiB linear memory**, with **0.0 % growth after
+the midpoint**, and passed the ceiling and zero-error gates. The previous
+192 MiB limit reached 1.4 GiB in 90 s and was still rising, so it failed. Use
+`--duration-secs 1800` for the 30-minute acceptance run and `--module PATH`
+to soak a candidate module before replacing the embedded one.
+
 ## Commands
 
 ```bash
@@ -147,7 +175,8 @@ Override ports with `WAF_PORT`, `HEALTH_PORT`, `UPSTREAM_PORT` when 39080/39081/
   separate load generator.
 - Reactor pool is auto (`pool_size = 0`), i.e. `min(cores, 8)`. This host runs
   6 pre-warmed reactor workers. Memory therefore scales with pool size plus
-  per-request buffers.
+  per-request buffers. With the 64 MiB guest GC bound the 6-worker pool
+  plateaus near 838 MiB RSS; see the reactor memory soak gate above.
 - Plaintext ingress is HTTP/1.1 only; HTTP/2 requires TLS ALPN. gRPC numbers
   are the HTTP/1.1 path, which uses the same Coraza withholding path as HTTP/2
   gRPC. `grpc-content-*` buffers the body (Content-Length) so the

@@ -148,6 +148,15 @@ All notable changes to WAF-Rejected are documented here.
   queue depth, admissions, rejections, wait duration and per-class in-flight.
   Inspection is never skipped or reduced. See `docs/coraza-wasi-reactor.md`.
 
+- `memory-soak` (`src/bin/memory_soak.rs`), a direct Coraza reactor memory
+  gate with a configurable mixed body workload, RSS/linear-memory sampling,
+  and ceilings on peak RSS and post-midpoint growth. The reactor now publishes
+  its aggregate wasm linear-memory size (`WasmReactor::linear_memory_bytes`)
+  so guest growth is separable from host RSS. Measured 6-worker plateau is
+  838 MiB RSS / 480 MiB linear memory over 10 minutes; see
+  `docs/coraza-wasi-reactor.md` and
+  `docs/operations/performance-validation.md`.
+
 - Descriptor-driven gRPC field-level inspection. The generated allowlist
   artifact now carries an `ir_version` 2 `messages` section with request
   message field metadata (reachable nested messages and enum values, bounded
@@ -450,11 +459,14 @@ All notable changes to WAF-Rejected are documented here.
   host reply wait is now `eval_timeout_ms + 5 s` instead of a fixed 60 s.
   Removing fuel instrumentation also removes its ~14 % per-block cost.
 - Tuned the Go guest's garbage collector at startup with
-  `debug.SetGCPercent(600)` and `debug.SetMemoryLimit(192 MiB)`. CRS workload
+  `debug.SetGCPercent(600)` and `debug.SetMemoryLimit(64 MiB)`. CRS workload
   allocates about 0.5–1 MiB per 8 KiB body, and the default GC target made
   collections land mid-evaluation (observed 8 KiB p50 ~830 ms versus ~347 ms
-  steady state); the larger growth target and a soft limit below the 256 MiB
-  store cap remove the tail without raising 60 KiB steady-state cost.
+  steady state); the larger growth target removes that tail. The soft limit
+  was reduced from 192 MiB to 64 MiB after soak testing showed wasm linear
+  memory cannot shrink: a 6-worker pool went from >1.4 GiB and still rising to
+  a stable ~838 MiB RSS / 480 MiB linear memory plateau, with no measurable
+  p50 regression.
 - Replaced the `wasmi` interpreter with wasmtime 49 (`wasmtime` +
   `wasmtime-wasi`) for the Coraza WASI reactor. `Engine`/`Module` compile once,
   the preview1 imports come from wasmtime-wasi, and each worker thread keeps a
