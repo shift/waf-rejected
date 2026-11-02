@@ -224,6 +224,13 @@ rand = "0.8"
 # System information
 num_cpus = "1.0"
 
+# Optional global allocators for performance benchmarking. Non-default.
+mimalloc = { version = "0.1", optional = true }
+tikv-jemallocator = { version = "0.6", optional = true }
+
+# Optional CPU affinity/pinning for proxy worker threads. Non-default.
+core_affinity = { version = "0.8", optional = true }
+
 # Memory mapping for optimized WASM loading
 
 # Security modules dependencies
@@ -303,6 +310,15 @@ native-detect = []
 # Non-default until differential parity against Coraza is proven. See
 # docs/suggestions_from_agents/rust-engine.md.
 rust-engine = ["dep:aho-corasick"]
+# Optional global allocator selection for benchmarking. Non-default; the
+# system allocator remains the default. See docs/suggestions_from_agents/alloc-tuning.md.
+alloc-mimalloc = ["dep:mimalloc"]
+alloc-jemalloc = ["dep:tikv-jemallocator"]
+
+# Optional CPU affinity/pinning for proxy worker threads. Non-default and
+# config-gated; see docs/suggestions_from_agents/alloc-tuning.md.
+cpu-pinning = ["dep:core_affinity"]
+
 # Protocol support features
 websocket = []
 # HTTP/3 over QUIC. Not part of default features: it pulls in quinn/h3 and

@@ -34,6 +34,19 @@
     clippy::empty_line_after_doc_comments
 )]
 
+// Optional global allocator selection for benchmarking. The system allocator
+// remains the default; these features are non-default and opt-in.
+#[cfg(feature = "alloc-mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(feature = "alloc-jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// Optional CPU affinity/pinning helpers (non-default `cpu-pinning` feature).
+pub mod affinity;
+
 // Core modules for Strategic Roadmap v0.1
 pub mod config;
 pub mod engine;

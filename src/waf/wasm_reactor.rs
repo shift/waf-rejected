@@ -614,7 +614,16 @@ impl ReactorPool {
             let join = thread::Builder::new()
                 .name(format!("coraza-reactor-{}-{index}", config.id))
                 .stack_size(REACTOR_THREAD_STACK_BYTES)
-                .spawn(move || worker_loop(worker_config, rx, Some(ready_tx)))
+                .spawn(move || {
+                    #[cfg(feature = "cpu-pinning")]
+                    if crate::affinity::reactor_pinning_enabled() {
+                        let cores = crate::affinity::available_cores();
+                        if let Some(core) = crate::affinity::core_for_index(&cores, index) {
+                            let _ = crate::affinity::pin_current_thread(core);
+                        }
+                    }
+                    worker_loop(worker_config, rx, Some(ready_tx))
+                })
                 .map_err(|err| {
                     ReactorError::Compile(format!("failed to spawn reactor worker: {err}"))
                 })?;
@@ -734,7 +743,17 @@ impl ReactorPool {
         let join = thread::Builder::new()
             .name(format!("coraza-reactor-{}", config.id))
             .stack_size(REACTOR_THREAD_STACK_BYTES)
-            .spawn(move || worker_loop(config, rx, None))
+            .spawn(move || {
+                #[cfg(feature = "cpu-pinning")]
+                if crate::affinity::reactor_pinning_enabled() {
+                    let cores = crate::affinity::available_cores();
+                    let index = crate::affinity::next_pin_index();
+                    if let Some(core) = crate::affinity::core_for_index(&cores, index) {
+                        let _ = crate::affinity::pin_current_thread(core);
+                    }
+                }
+                worker_loop(config, rx, None)
+            })
             .map_err(|err| {
                 ReactorError::Compile(format!("failed to spawn reactor worker: {err}"))
             })?;

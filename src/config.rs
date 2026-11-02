@@ -33,6 +33,89 @@ pub struct Config {
     pub storage: StorageConfig,
     // Security module configurations
     pub security: SecurityConfig,
+    /// Runtime / scheduling configuration (Tokio tuning and CPU pinning).
+    pub runtime: RuntimeConfig,
+}
+
+/// Tokio runtime and CPU-affinity tuning. All fields are optional and default
+/// to the previous behaviour (Tokio defaults, no pinning) so existing
+/// deployments are unaffected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RuntimeConfig {
+    /// Number of Tokio worker threads. `None` uses Tokio's default
+    /// (number of logical CPUs).
+    pub worker_threads: Option<usize>,
+    /// Maximum number of Tokio blocking-pool threads. `None` uses Tokio's
+    /// default (512).
+    pub max_blocking_threads: Option<usize>,
+    /// Keep-alive for idle worker threads in seconds. `None` uses Tokio's
+    /// default (10s).
+    pub thread_keep_alive_secs: Option<u64>,
+    /// Enable CPU affinity/pinning for proxy worker threads. Requires the
+    /// non-default `cpu-pinning` build feature; silently falls back when the
+    /// platform does not support it.
+    pub enable_cpu_pinning: bool,
+    /// Explicit core IDs to pin worker threads to. When empty/`None`, all
+    /// available cores are used in round-robin order.
+    pub cpu_pin_cores: Option<Vec<usize>>,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            worker_threads: None,
+            max_blocking_threads: None,
+            thread_keep_alive_secs: None,
+            enable_cpu_pinning: false,
+            cpu_pin_cores: None,
+        }
+    }
+}
+
+impl RuntimeConfig {
+    /// Validate scheduling settings. Pinning is optional and never fatal:
+    /// requesting it without the build feature or host support logs a warning
+    /// and the caller falls back to unpinned scheduling.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(threads) = self.worker_threads {
+            if threads == 0 {
+                anyhow::bail!("runtime.worker_threads must be greater than zero when set");
+            }
+            if threads > 1024 {
+                anyhow::bail!("runtime.worker_threads must be at most 1024");
+            }
+        }
+        if let Some(threads) = self.max_blocking_threads {
+            if threads == 0 {
+                anyhow::bail!("runtime.max_blocking_threads must be greater than zero when set");
+            }
+        }
+        if self.enable_cpu_pinning && !cfg!(feature = "cpu-pinning") {
+            tracing::warn!(
+                "runtime.enable_cpu_pinning = true but binary was built without the \
+                 `cpu-pinning` feature; worker threads will not be pinned"
+            );
+        }
+        if let Some(cores) = &self.cpu_pin_cores {
+            if cores.is_empty() {
+                anyhow::bail!("runtime.cpu_pin_cores must not be empty when set");
+            }
+            let mut sorted = cores.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            if sorted.len() != cores.len() {
+                anyhow::bail!("runtime.cpu_pin_cores must not contain duplicates");
+            }
+            let logical = num_cpus::get();
+            if sorted.last().copied().unwrap_or(0) >= logical {
+                anyhow::bail!(
+                    "runtime.cpu_pin_cores entries must be below the logical CPU count ({logical})"
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1521,6 +1604,7 @@ impl Default for Config {
             waf: WafConfig::default(),
             storage: StorageConfig::default(),
             security: SecurityConfig::default(),
+            runtime: RuntimeConfig::default(),
         }
     }
 }
@@ -1879,6 +1963,8 @@ impl Config {
             }
         }
 
+        self.runtime.validate()?;
+
         Ok(())
     }
 
@@ -1911,6 +1997,74 @@ mod tests {
         assert_eq!(config.bind_addr.to_string(), "0.0.0.0:8080");
         assert!(config.upstream_uri.starts_with("http://"));
         assert!(config.server.max_connections > 0);
+    }
+
+    #[test]
+    fn test_runtime_config_defaults_are_off() {
+        let runtime = RuntimeConfig::default();
+        assert_eq!(runtime.worker_threads, None);
+        assert_eq!(runtime.max_blocking_threads, None);
+        assert_eq!(runtime.thread_keep_alive_secs, None);
+        assert!(!runtime.enable_cpu_pinning);
+        assert_eq!(runtime.cpu_pin_cores, None);
+        runtime.validate().expect("defaults must validate");
+    }
+
+    #[test]
+    fn test_runtime_config_rejects_zero_worker_threads() {
+        let runtime = RuntimeConfig {
+            worker_threads: Some(0),
+            ..RuntimeConfig::default()
+        };
+        assert!(runtime.validate().is_err());
+    }
+
+    #[test]
+    fn test_runtime_config_rejects_excessive_worker_threads() {
+        let runtime = RuntimeConfig {
+            worker_threads: Some(2048),
+            ..RuntimeConfig::default()
+        };
+        assert!(runtime.validate().is_err());
+    }
+
+    #[test]
+    fn test_runtime_config_rejects_duplicate_pin_cores() {
+        let runtime = RuntimeConfig {
+            cpu_pin_cores: Some(vec![0, 1, 1]),
+            ..RuntimeConfig::default()
+        };
+        assert!(runtime.validate().is_err());
+    }
+
+    #[test]
+    fn test_runtime_config_rejects_out_of_range_pin_cores() {
+        let runtime = RuntimeConfig {
+            cpu_pin_cores: Some(vec![num_cpus::get() + 1]),
+            ..RuntimeConfig::default()
+        };
+        assert!(runtime.validate().is_err());
+    }
+
+    #[test]
+    fn test_runtime_config_pinning_fallback_is_not_fatal() {
+        // Requesting pinning without the build feature must warn, not fail.
+        let runtime = RuntimeConfig {
+            enable_cpu_pinning: true,
+            ..RuntimeConfig::default()
+        };
+        runtime
+            .validate()
+            .expect("pinning fallback must not be fatal");
+    }
+
+    #[test]
+    fn test_runtime_config_accepts_valid_pin_cores() {
+        let runtime = RuntimeConfig {
+            cpu_pin_cores: Some(vec![0]),
+            ..RuntimeConfig::default()
+        };
+        runtime.validate().expect("valid pin cores must pass");
     }
 
     #[test]
