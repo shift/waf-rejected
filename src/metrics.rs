@@ -79,6 +79,9 @@ pub struct Metrics {
     allow_cache_skipped_total: AtomicU64,
     allow_cache_invalidations_total: AtomicU64,
     allow_cache_entries: AtomicU64,
+    fast_allow_hits_total: AtomicU64,
+    fast_allow_blocks_total: AtomicU64,
+    fast_allow_fallthrough_total: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -150,6 +153,9 @@ impl Metrics {
             allow_cache_skipped_total: AtomicU64::new(0),
             allow_cache_invalidations_total: AtomicU64::new(0),
             allow_cache_entries: AtomicU64::new(0),
+            fast_allow_hits_total: AtomicU64::new(0),
+            fast_allow_blocks_total: AtomicU64::new(0),
+            fast_allow_fallthrough_total: AtomicU64::new(0),
         }
     }
 
@@ -436,6 +442,19 @@ impl Metrics {
             .store(entries.min(u64::MAX as usize) as u64, Ordering::Relaxed);
     }
 
+    pub fn record_fast_allow_hit(&self) {
+        self.fast_allow_hits_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_fast_allow_block(&self) {
+        self.fast_allow_blocks_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_fast_allow_fallthrough(&self) {
+        self.fast_allow_fallthrough_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn uptime_seconds(&self) -> u64 {
         self.start_time.elapsed().as_secs()
     }
@@ -618,6 +637,21 @@ impl Metrics {
             self.graphql_error_total.load(Ordering::Relaxed),
         ));
 
+        out.push_str(&format!(
+            "# HELP waf_fast_allow_hits_total Bodyless requests decided by the compiled allowlist.\n\
+             # TYPE waf_fast_allow_hits_total counter\n\
+             waf_fast_allow_hits_total {}\n\
+             # HELP waf_fast_allow_blocks_total Fast-allow requests rejected by an always-on gate.\n\
+             # TYPE waf_fast_allow_blocks_total counter\n\
+             waf_fast_allow_blocks_total {}\n\
+             # HELP waf_fast_allow_fallthrough_total Matched fast-allow routes that fell through to full evaluation.\n\
+             # TYPE waf_fast_allow_fallthrough_total counter\n\
+             waf_fast_allow_fallthrough_total {}\n",
+            self.fast_allow_hits_total.load(Ordering::Relaxed),
+            self.fast_allow_blocks_total.load(Ordering::Relaxed),
+            self.fast_allow_fallthrough_total.load(Ordering::Relaxed),
+        ));
+
         out.push_str(
             "# HELP waf_admission_wait_duration_seconds Time heavy inspections waited for a permit.\n\
              # TYPE waf_admission_wait_duration_seconds histogram\n",
@@ -785,6 +819,29 @@ mod tests {
         assert_eq!(
             find_line(&rendered, "waf_rate_limited_total "),
             "waf_rate_limited_total 1"
+        );
+    }
+
+    #[test]
+    fn render_includes_fast_allow_counters() {
+        let metrics = Metrics::new();
+        metrics.record_fast_allow_hit();
+        metrics.record_fast_allow_hit();
+        metrics.record_fast_allow_block();
+        metrics.record_fast_allow_fallthrough();
+
+        let rendered = metrics.render_prometheus();
+        assert_eq!(
+            find_line(&rendered, "waf_fast_allow_hits_total "),
+            "waf_fast_allow_hits_total 2"
+        );
+        assert_eq!(
+            find_line(&rendered, "waf_fast_allow_blocks_total "),
+            "waf_fast_allow_blocks_total 1"
+        );
+        assert_eq!(
+            find_line(&rendered, "waf_fast_allow_fallthrough_total "),
+            "waf_fast_allow_fallthrough_total 1"
         );
     }
 

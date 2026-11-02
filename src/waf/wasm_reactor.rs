@@ -1374,6 +1374,12 @@ impl WafRule for WasmReactorRule {
         true
     }
 
+    fn fast_allow_policy(&self) -> crate::waf::fast_allow::FastAllowPolicy {
+        // Coraza is per-request inspection; an explicitly allowlisted route
+        // opts out of it.
+        crate::waf::fast_allow::FastAllowPolicy::Skip
+    }
+
     fn evaluate(&self, ctx: &RequestContext) -> Decision {
         let started = Instant::now();
         #[cfg(feature = "crs-prefilter")]

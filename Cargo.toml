@@ -395,6 +395,10 @@ name = "enterprise_modsecurity_test"
 path = "src/bin/enterprise_modsecurity_test.rs"
 
 [[bin]]
+name = "bodyless-bench"
+path = "src/bin/bodyless_bench.rs"
+
+[[bin]]
 name = "progressive_load_test"
 path = "src/bin/progressive_load_test.rs"
 

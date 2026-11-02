@@ -26,6 +26,21 @@ All notable changes to WAF-Rejected are documented here.
   native engine and prefilter; Coraza remains the default request path. See
   `docs/suggestions_from_agents/native-detect.md`.
 
+- Compiled bodyless fast-allow path (`[waf.fast_allow]`, default **off**).
+  An exact `(method, path)` byte trie returns a precomputed `Allow` for
+  explicitly listed routes, before the proxy builds a `RequestContext`, clones
+  a `HeaderMap`, acquires admission, runs the gRPC/GraphQL pre-checks,
+  dispatches inspection rules or constructs an audit event. Only bodyless,
+  query-free requests match; always-on gates (request size, method, per-IP/
+  global/adaptive/burst rate limits and geographic blocking) still run, and any
+  custom rule forces a fall-through. `Config::validate` rejects empty,
+  malformed, duplicate or unsupported routes. New metrics
+  `waf_fast_allow_{hits,blocks,fallthrough}_total`, and an in-process harness
+  (`bodyless-bench`). Audit event construction now checks the threat level
+  before allocating, so default `min_threat_level = "medium"` allow events are
+  no longer built and discarded. See
+  `docs/suggestions_from_agents/fastpath-engine.md`.
+
 - Per-rule CRS gating (`waf.coraza.prefilter = "gated"`, default `off`). The
   host scans the URI, query, headers, cookies and body with the required-literal
   prefilter and removes only the gated CRS rules whose proven mandatory literals

@@ -376,6 +376,12 @@ impl WafRule for ContentInspectionRule {
         true
     }
 
+    fn fast_allow_policy(&self) -> crate::waf::fast_allow::FastAllowPolicy {
+        // Stateless content inspection: an explicitly allowlisted route opts
+        // out of this rule. The route list is the operator's exemption.
+        crate::waf::fast_allow::FastAllowPolicy::Skip
+    }
+
     fn evaluate(&self, ctx: &RequestContext) -> Decision {
         if !self.enabled {
             return Decision::Allow;

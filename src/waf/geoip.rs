@@ -299,25 +299,15 @@ impl GeoBlockingRule {
         self.blocked_regions.push(region.to_string());
         self
     }
-}
 
-impl WafRule for GeoBlockingRule {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-
-    fn evaluate(&self, ctx: &RequestContext) -> Decision {
+    fn check_ip(&self, client_ip: IpAddr) -> Decision {
         if !self.enabled {
             return Decision::Allow;
         }
 
         let geo_service = geoip_service().lock().unwrap();
         let geo_info = geo_service
-            .lookup(&ctx.client_ip)
+            .lookup(&client_ip)
             .unwrap_or_else(|| geo_service.default_geo_info());
 
         // Check if country is in allowed list (if specified)
@@ -380,6 +370,28 @@ impl WafRule for GeoBlockingRule {
         }
 
         Decision::Allow
+    }
+}
+
+impl WafRule for GeoBlockingRule {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn fast_allow_policy(&self) -> crate::waf::fast_allow::FastAllowPolicy {
+        crate::waf::fast_allow::FastAllowPolicy::Gate
+    }
+
+    fn fast_allow_gate(&self, ctx: &crate::waf::fast_allow::FastAllowContext<'_>) -> Decision {
+        self.check_ip(ctx.client_ip)
+    }
+
+    fn evaluate(&self, ctx: &RequestContext) -> Decision {
+        self.check_ip(ctx.client_ip)
     }
 }
 

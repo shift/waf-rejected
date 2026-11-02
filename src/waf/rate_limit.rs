@@ -1,6 +1,7 @@
 use crate::waf::{Decision, RequestContext, WafRule};
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
@@ -60,6 +61,8 @@ pub struct RateLimiter {
     refill_rate: u32,
     window_size: Duration,
     enabled: bool,
+    /// Deterministic cleanup trigger; replaces a per-request RNG draw.
+    evaluations: AtomicU64,
 }
 
 impl RateLimiter {
@@ -71,6 +74,7 @@ impl RateLimiter {
             refill_rate,
             window_size,
             enabled: true,
+            evaluations: AtomicU64::new(0),
         }
     }
 
@@ -85,34 +89,33 @@ impl RateLimiter {
 
         buckets.retain(|_, bucket| now.duration_since(bucket.last_refill) < self.window_size * 2);
     }
-}
 
-impl WafRule for RateLimiter {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn evaluate(&self, ctx: &RequestContext) -> Decision {
-        // Periodically clean up expired buckets
-        if rand::random::<f32>() < 0.01 {
-            // 1% chance
+    /// Consume one token for `client_ip`. Shared by the full rule path and the
+    /// bodyless fast path so both enforce the same bucket.
+    fn check_ip(&self, client_ip: IpAddr) -> Decision {
+        // Periodically clean up expired buckets (about once per 100 calls).
+        if self
+            .evaluations
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(100)
+        {
             self.cleanup_expired_buckets();
         }
 
         let mut buckets = self.buckets.write().unwrap();
         let bucket = buckets
-            .entry(ctx.client_ip)
+            .entry(client_ip)
             .or_insert_with(|| TokenBucket::new(self.capacity, self.refill_rate));
 
         if bucket.try_consume(1) {
             debug!(
                 "Rate limit check passed for {}, {} tokens remaining",
-                ctx.client_ip,
+                client_ip,
                 bucket.available_tokens()
             );
             Decision::Allow
         } else {
-            warn!("Rate limit exceeded for {}", ctx.client_ip);
+            warn!("Rate limit exceeded for {}", client_ip);
             Decision::RateLimit {
                 reason: format!(
                     "Rate limit exceeded: {} requests per {} seconds",
@@ -121,6 +124,24 @@ impl WafRule for RateLimiter {
                 ),
             }
         }
+    }
+}
+
+impl WafRule for RateLimiter {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn fast_allow_policy(&self) -> crate::waf::fast_allow::FastAllowPolicy {
+        crate::waf::fast_allow::FastAllowPolicy::Gate
+    }
+
+    fn fast_allow_gate(&self, ctx: &crate::waf::fast_allow::FastAllowContext<'_>) -> Decision {
+        self.check_ip(ctx.client_ip)
+    }
+
+    fn evaluate(&self, ctx: &RequestContext) -> Decision {
+        self.check_ip(ctx.client_ip)
     }
 
     fn is_enabled(&self) -> bool {
@@ -148,14 +169,8 @@ impl GlobalRateLimiter {
         self.enabled = false;
         self
     }
-}
 
-impl WafRule for GlobalRateLimiter {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn evaluate(&self, _ctx: &RequestContext) -> Decision {
+    fn check_global(&self) -> Decision {
         let mut bucket = self.bucket.write().unwrap();
 
         if bucket.try_consume(1) {
@@ -170,6 +185,24 @@ impl WafRule for GlobalRateLimiter {
                 reason: "Global rate limit exceeded".to_string(),
             }
         }
+    }
+}
+
+impl WafRule for GlobalRateLimiter {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn fast_allow_policy(&self) -> crate::waf::fast_allow::FastAllowPolicy {
+        crate::waf::fast_allow::FastAllowPolicy::Gate
+    }
+
+    fn fast_allow_gate(&self, _ctx: &crate::waf::fast_allow::FastAllowContext<'_>) -> Decision {
+        self.check_global()
+    }
+
+    fn evaluate(&self, _ctx: &RequestContext) -> Decision {
+        self.check_global()
     }
 
     fn is_enabled(&self) -> bool {
@@ -213,18 +246,12 @@ impl AdaptiveRateLimiter {
         let refill_rate = ((self.base_refill_rate as f32) / self.threat_multiplier) as u32;
         (capacity.max(1), refill_rate.max(1))
     }
-}
 
-impl WafRule for AdaptiveRateLimiter {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn evaluate(&self, ctx: &RequestContext) -> Decision {
+    fn check_ip(&self, client_ip: IpAddr) -> Decision {
         let (capacity, refill_rate) = self.get_adjusted_limits();
         let mut buckets = self.buckets.write().unwrap();
         let bucket = buckets
-            .entry(ctx.client_ip)
+            .entry(client_ip)
             .or_insert_with(|| TokenBucket::new(capacity, refill_rate));
 
         // Update existing bucket parameters if they've changed
@@ -238,14 +265,14 @@ impl WafRule for AdaptiveRateLimiter {
         if bucket.try_consume(1) {
             debug!(
                 "Adaptive rate limit check passed for {}, {} tokens remaining",
-                ctx.client_ip,
+                client_ip,
                 bucket.available_tokens()
             );
             Decision::Allow
         } else {
             warn!(
                 "Adaptive rate limit exceeded for {} (multiplier: {})",
-                ctx.client_ip, self.threat_multiplier
+                client_ip, self.threat_multiplier
             );
             Decision::RateLimit {
                 reason: format!(
@@ -254,6 +281,24 @@ impl WafRule for AdaptiveRateLimiter {
                 ),
             }
         }
+    }
+}
+
+impl WafRule for AdaptiveRateLimiter {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn fast_allow_policy(&self) -> crate::waf::fast_allow::FastAllowPolicy {
+        crate::waf::fast_allow::FastAllowPolicy::Gate
+    }
+
+    fn fast_allow_gate(&self, ctx: &crate::waf::fast_allow::FastAllowContext<'_>) -> Decision {
+        self.check_ip(ctx.client_ip)
+    }
+
+    fn evaluate(&self, ctx: &RequestContext) -> Decision {
+        self.check_ip(ctx.client_ip)
     }
 
     fn is_enabled(&self) -> bool {
@@ -295,16 +340,10 @@ impl BurstRateLimiter {
         self.enabled = false;
         self
     }
-}
 
-impl WafRule for BurstRateLimiter {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn evaluate(&self, ctx: &RequestContext) -> Decision {
+    fn check_ip(&self, client_ip: IpAddr) -> Decision {
         let mut buckets = self.buckets.write().unwrap();
-        let (normal_bucket, burst_bucket) = buckets.entry(ctx.client_ip).or_insert_with(|| {
+        let (normal_bucket, burst_bucket) = buckets.entry(client_ip).or_insert_with(|| {
             (
                 TokenBucket::new(self.normal_capacity, self.normal_refill),
                 TokenBucket::new(self.burst_capacity, self.burst_refill),
@@ -313,21 +352,39 @@ impl WafRule for BurstRateLimiter {
 
         // Try normal bucket first
         if normal_bucket.try_consume(1) {
-            debug!("Normal rate limit check passed for {}", ctx.client_ip);
+            debug!("Normal rate limit check passed for {}", client_ip);
             Decision::Allow
         }
         // Fall back to burst bucket
         else if burst_bucket.try_consume(1) {
-            debug!("Burst rate limit check passed for {}", ctx.client_ip);
+            debug!("Burst rate limit check passed for {}", client_ip);
             Decision::Allow
         }
         // Both buckets exhausted
         else {
-            warn!("Burst rate limit exceeded for {}", ctx.client_ip);
+            warn!("Burst rate limit exceeded for {}", client_ip);
             Decision::RateLimit {
                 reason: "Burst rate limit exceeded".to_string(),
             }
         }
+    }
+}
+
+impl WafRule for BurstRateLimiter {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn fast_allow_policy(&self) -> crate::waf::fast_allow::FastAllowPolicy {
+        crate::waf::fast_allow::FastAllowPolicy::Gate
+    }
+
+    fn fast_allow_gate(&self, ctx: &crate::waf::fast_allow::FastAllowContext<'_>) -> Decision {
+        self.check_ip(ctx.client_ip)
+    }
+
+    fn evaluate(&self, ctx: &RequestContext) -> Decision {
+        self.check_ip(ctx.client_ip)
     }
 
     fn is_enabled(&self) -> bool {

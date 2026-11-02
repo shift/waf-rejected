@@ -33,6 +33,23 @@ impl WafRule for RequestSizeRule {
         &self.name
     }
 
+    fn fast_allow_policy(&self) -> crate::waf::fast_allow::FastAllowPolicy {
+        crate::waf::fast_allow::FastAllowPolicy::Gate
+    }
+
+    fn fast_allow_gate(&self, ctx: &crate::waf::fast_allow::FastAllowContext<'_>) -> Decision {
+        match ctx.body_size {
+            Some(body_size) if body_size > self.max_size => Decision::Block {
+                status: 413,
+                reason: format!(
+                    "Request body size {} exceeds limit {}",
+                    body_size, self.max_size
+                ),
+            },
+            _ => Decision::Allow,
+        }
+    }
+
     fn evaluate(&self, ctx: &RequestContext) -> Decision {
         if let Some(body_size) = ctx.body_size {
             if body_size > self.max_size {
@@ -87,6 +104,20 @@ impl MethodRule {
 impl WafRule for MethodRule {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn fast_allow_policy(&self) -> crate::waf::fast_allow::FastAllowPolicy {
+        crate::waf::fast_allow::FastAllowPolicy::Gate
+    }
+
+    fn fast_allow_gate(&self, ctx: &crate::waf::fast_allow::FastAllowContext<'_>) -> Decision {
+        if self.blocked_methods.contains(ctx.method) {
+            return Decision::Block {
+                status: 405,
+                reason: format!("HTTP method {} is not allowed", ctx.method),
+            };
+        }
+        Decision::Allow
     }
 
     fn evaluate(&self, ctx: &RequestContext) -> Decision {
@@ -212,6 +243,10 @@ impl WafRule for SqlInjectionRule {
         &self.name
     }
 
+    fn fast_allow_policy(&self) -> crate::waf::fast_allow::FastAllowPolicy {
+        crate::waf::fast_allow::FastAllowPolicy::Skip
+    }
+
     fn evaluate(&self, ctx: &RequestContext) -> Decision {
         let uri_str = ctx.uri.to_string();
 
@@ -309,6 +344,10 @@ impl XssRule {
 impl WafRule for XssRule {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn fast_allow_policy(&self) -> crate::waf::fast_allow::FastAllowPolicy {
+        crate::waf::fast_allow::FastAllowPolicy::Skip
     }
 
     fn evaluate(&self, ctx: &RequestContext) -> Decision {

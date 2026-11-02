@@ -477,6 +477,11 @@ pub struct WafConfig {
     /// feature). Disabled by default; see
     /// `docs/suggestions_from_agents/allow-cache.md`.
     pub allow_cache: AllowCacheConfig,
+
+    /// Compiled bodyless allowlist fast path. Disabled by default; when
+    /// enabled, only the explicitly listed `"METHOD /path"` routes skip
+    /// per-request inspection.
+    pub fast_allow: WafFastAllowConfig,
 }
 
 /// Opt-in allow-verdict cache.
@@ -518,6 +523,71 @@ impl Default for AllowCacheConfig {
             max_body_bytes: 64 * 1024,
             routes: Vec::new(),
         }
+    }
+}
+
+/// Compiled bodyless allowlist fast path.
+///
+/// A route listed here is an explicit, operator-approved WAF exclusion for
+/// bodyless requests with no query string: the route's inspection rules are
+/// skipped and the precomputed `Allow` verdict is returned. Always-on policy
+/// gates (request size, method, rate limits and geographic blocking) still
+/// run, so a fast-allowed route cannot bypass those controls.
+///
+/// This is **off by default** and never weakens inspection for any route that
+/// is not listed. A request with a query string, a body, a body framing
+/// header, a content encoding or an upgrade is never fast-allowed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WafFastAllowConfig {
+    /// Enable the compiled allowlist. Requires at least one route.
+    pub enabled: bool,
+
+    /// Exact routes as `"METHOD /path"` (for example `"GET /health"`).
+    /// Matching is exact: no prefix, query, wildcard or trailing-slash
+    /// folding. Methods are the standard uppercase HTTP methods.
+    pub routes: Vec<String>,
+
+    /// Fraction of fast-allowed requests that still emit an allow audit
+    /// event. `0.0` (the default) skips allow-event construction entirely;
+    /// blocks are always audited.
+    pub allow_audit_sample_rate: f64,
+}
+
+impl Default for WafFastAllowConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            routes: Vec::new(),
+            allow_audit_sample_rate: 0.0,
+        }
+    }
+}
+
+impl WafFastAllowConfig {
+    /// Validate the compiled allowlist before it reaches the request path.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.routes.is_empty() {
+            anyhow::bail!("waf.fast_allow.enabled is true but waf.fast_allow.routes is empty");
+        }
+        if !(0.0..=1.0).contains(&self.allow_audit_sample_rate) {
+            anyhow::bail!("waf.fast_allow.allow_audit_sample_rate must be between 0.0 and 1.0");
+        }
+        if self.routes.len() > 4096 {
+            anyhow::bail!("waf.fast_allow.routes must contain at most 4096 entries");
+        }
+        let mut seen = std::collections::HashSet::with_capacity(self.routes.len());
+        for route in &self.routes {
+            let parsed = crate::waf::fast_allow::parse_route_spec(route)
+                .map_err(|err| anyhow::anyhow!("waf.fast_allow.routes entry '{route}': {err}"))?;
+            if !seen.insert((parsed.method.as_str().to_string(), parsed.path.to_string())) {
+                anyhow::bail!("waf.fast_allow.routes contains duplicate route '{route}'");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1535,6 +1605,7 @@ impl Default for WafConfig {
             graphql: WafGraphqlConfig::default(),
             admission: WafAdmissionConfig::default(),
             allow_cache: AllowCacheConfig::default(),
+            fast_allow: WafFastAllowConfig::default(),
         }
     }
 }
@@ -1764,6 +1835,7 @@ impl Config {
                 }
             }
         }
+        self.waf.fast_allow.validate()?;
         self.waf.grpc.validate()?;
         self.waf.graphql.validate()?;
         if self.security.auth.enabled && self.security.auth.api_keys.is_empty() {
@@ -2372,5 +2444,67 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
 
         std::env::remove_var("WAF_UPSTREAM_URI");
         std::env::remove_var("WAF_CONFIG_FILE");
+    }
+
+    #[test]
+    fn fast_allow_is_disabled_by_default() {
+        let config = Config::default();
+        assert!(!config.waf.fast_allow.enabled);
+        assert!(config.waf.fast_allow.routes.is_empty());
+        assert_eq!(config.waf.fast_allow.allow_audit_sample_rate, 0.0);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn fast_allow_requires_routes_when_enabled() {
+        let mut config = Config::default();
+        config.waf.fast_allow.enabled = true;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("waf.fast_allow.routes is empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn fast_allow_rejects_invalid_and_duplicate_routes() {
+        for (route, expected) in [
+            ("GET", "expected \"METHOD /path\""),
+            ("GET health", "path must start with '/'"),
+            ("get /health", "not supported"),
+            ("GET /health?x=1", "query or fragment"),
+            ("GET /health/../admin", "'..'"),
+        ] {
+            let mut config = Config::default();
+            config.waf.fast_allow.enabled = true;
+            config.waf.fast_allow.routes = vec![route.to_string()];
+            let error = config.validate().unwrap_err().to_string();
+            assert!(
+                error.contains(expected),
+                "route {route:?}: expected {expected:?}, got {error}"
+            );
+        }
+
+        let mut config = Config::default();
+        config.waf.fast_allow.enabled = true;
+        config.waf.fast_allow.routes = vec!["GET /health".to_string(), "GET /health".to_string()];
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("duplicate route"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn fast_allow_rejects_out_of_range_sample_rate() {
+        let mut config = Config::default();
+        config.waf.fast_allow.enabled = true;
+        config.waf.fast_allow.routes = vec!["GET /health".to_string()];
+        config.waf.fast_allow.allow_audit_sample_rate = 1.5;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("allow_audit_sample_rate"),
+            "unexpected error: {error}"
+        );
     }
 }

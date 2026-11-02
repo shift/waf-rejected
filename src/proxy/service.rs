@@ -843,7 +843,7 @@ impl WafProxyService {
         debug!("Detected HTTP version: {}", http_version);
 
         // Check if HTTP version is supported
-        if !Self::is_http_version_supported(&http_version, &state.config) {
+        if !Self::is_http_version_supported(http_version, &state.config) {
             warn!("Unsupported HTTP version: {}", http_version);
             return Ok(Self::create_error_response(
                 StatusCode::HTTP_VERSION_NOT_SUPPORTED,
@@ -900,7 +900,7 @@ impl WafProxyService {
                 req.uri().clone(),
                 req.headers().clone(),
                 None,
-                http_version.clone(),
+                http_version.to_string(),
             );
             match state.waf_engine.evaluate_shared(&upgrade_context).await {
                 Decision::Allow => {}
@@ -938,8 +938,91 @@ impl WafProxyService {
             ));
         }
 
+        let classification = classify_request(req.headers());
+
+        // Compiled bodyless allowlist. This runs before `into_parts` and before
+        // any `RequestContext` is built, so an allowlisted route pays no
+        // HeaderMap clone, version string, admission, pre-check, inspection,
+        // rule dispatch or audit-event construction. A query, body, framing
+        // header, content encoding, upgrade, gRPC/GraphQL content type or
+        // streaming gRPC request never matches and falls through unchanged.
+        if !classification.is_grpc_streaming {
+            if let Some(outcome) = state.waf_engine.fast_allow(
+                req.method(),
+                req.uri(),
+                req.headers(),
+                client_ip,
+                None,
+                req.body().is_end_stream(),
+            ) {
+                match &outcome.decision {
+                    Decision::Allow => {
+                        let (parts, _body) = req.into_parts();
+                        state.metrics.record_allowed();
+                        let response = Self::forward_to_upstream_with_protocol(
+                            parts,
+                            ProxyBody::buffered(Bytes::new(), None),
+                            state.upstream_client,
+                            state.upstream_uri,
+                            start_time,
+                            http_version,
+                            &state.metrics,
+                            client_ip,
+                            is_https,
+                            state.config.server.max_body_size,
+                        )
+                        .await;
+                        state.metrics.record_request_duration(start_time.elapsed());
+                        return response;
+                    }
+                    Decision::Block { status, reason } => {
+                        state
+                            .waf_engine
+                            .audit_fast_decision(
+                                client_ip,
+                                req.method(),
+                                req.uri(),
+                                req.headers(),
+                                http_version,
+                                &outcome.decision,
+                                outcome.triggered_rules,
+                            )
+                            .await;
+                        warn!(
+                            "WAF fast-allow gate blocked request from {}: {} (status: {})",
+                            client_ip, reason, status
+                        );
+                        state.metrics.record_blocked();
+                        state.metrics.record_request_duration(start_time.elapsed());
+                        return Ok(Self::create_blocked_response(*status, reason));
+                    }
+                    Decision::RateLimit { reason } => {
+                        state
+                            .waf_engine
+                            .audit_fast_decision(
+                                client_ip,
+                                req.method(),
+                                req.uri(),
+                                req.headers(),
+                                http_version,
+                                &outcome.decision,
+                                outcome.triggered_rules,
+                            )
+                            .await;
+                        warn!(
+                            "WAF fast-allow gate rate limited request from {}: {}",
+                            client_ip, reason
+                        );
+                        state.metrics.record_rate_limited();
+                        state.metrics.record_blocked();
+                        state.metrics.record_request_duration(start_time.elapsed());
+                        return Ok(Self::create_rate_limit_response(reason));
+                    }
+                }
+            }
+        }
+
         let (mut parts, body) = req.into_parts();
-        let classification = classify_request(&parts.headers);
         let has_content_encoding = parts.headers.contains_key(hyper::header::CONTENT_ENCODING);
         let size_hint = parts
             .headers
@@ -962,7 +1045,7 @@ impl WafProxyService {
                 parts.uri.clone(),
                 parts.headers.clone(),
                 None,
-                http_version.clone(),
+                http_version.to_string(),
             );
             match state.waf_engine.evaluate_shared(&request_context).await {
                 Decision::Allow => {}
@@ -996,7 +1079,7 @@ impl WafProxyService {
                 body,
                 &state,
                 start_time,
-                &http_version,
+                http_version,
                 client_ip,
                 is_https,
             )
@@ -1091,7 +1174,7 @@ impl WafProxyService {
             parts.uri.clone(),
             parts.headers.clone(),
             Some(body_bytes.len()),
-            http_version.clone(),
+            http_version.to_string(),
         )
         .with_body(Some(body_bytes.clone()));
 
@@ -1110,7 +1193,7 @@ impl WafProxyService {
                     state.upstream_client,
                     state.upstream_uri,
                     start_time,
-                    &http_version,
+                    http_version,
                     &state.metrics,
                     client_ip,
                     is_https,
@@ -1619,14 +1702,14 @@ impl WafProxyService {
     }
 
     /// Detect HTTP protocol version from request
-    fn detect_http_version<T>(req: &Request<T>) -> String {
+    fn detect_http_version<T>(req: &Request<T>) -> &'static str {
         match req.version() {
-            hyper::Version::HTTP_09 => "0.9".to_string(),
-            hyper::Version::HTTP_10 => "1.0".to_string(),
-            hyper::Version::HTTP_11 => "1.1".to_string(),
-            hyper::Version::HTTP_2 => "2".to_string(),
-            hyper::Version::HTTP_3 => "3".to_string(),
-            _ => "1.1".to_string(), // Default fallback
+            hyper::Version::HTTP_09 => "0.9",
+            hyper::Version::HTTP_10 => "1.0",
+            hyper::Version::HTTP_11 => "1.1",
+            hyper::Version::HTTP_2 => "2",
+            hyper::Version::HTTP_3 => "3",
+            _ => "1.1", // Default fallback
         }
     }
 
@@ -1635,7 +1718,8 @@ impl WafProxyService {
         config
             .server
             .supported_http_versions
-            .contains(&version.to_string())
+            .iter()
+            .any(|supported| supported.as_str() == version)
     }
 
     /// Build the upstream request, preserving the client's method, headers and

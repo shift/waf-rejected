@@ -827,6 +827,10 @@ impl WafRule for NativeCorazaRule {
         true
     }
 
+    fn fast_allow_policy(&self) -> crate::waf::fast_allow::FastAllowPolicy {
+        crate::waf::fast_allow::FastAllowPolicy::Skip
+    }
+
     fn evaluate(&self, ctx: &RequestContext) -> Decision {
         #[allow(unused_mut)]
         let mut evaluation_ctx = ctx;

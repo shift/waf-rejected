@@ -4,6 +4,7 @@ pub mod auth;
 pub mod content_inspection;
 pub mod coraza_corpus;
 pub mod exporters;
+pub mod fast_allow;
 pub mod geoip;
 pub mod grpc_allowlist;
 pub mod io;
@@ -198,6 +199,27 @@ pub trait WafRule: Send + Sync {
     fn cacheable(&self) -> bool {
         false
     }
+
+    /// How the compiled bodyless fast path treats this rule.
+    ///
+    /// The default is [`fast_allow::FastAllowPolicy::FallThrough`], so a
+    /// custom rule can never be silently skipped by an allowlisted route. A
+    /// rule that is stateless inspection may opt into `Skip`; a stateful
+    /// policy gate may opt into `Gate` and implement
+    /// [`Self::fast_allow_gate`].
+    fn fast_allow_policy(&self) -> fast_allow::FastAllowPolicy {
+        fast_allow::FastAllowPolicy::FallThrough
+    }
+
+    /// Evaluate the always-on policy/state portion of a gate rule for a
+    /// bodyless request. Only called when [`Self::fast_allow_policy`] returns
+    /// [`fast_allow::FastAllowPolicy::Gate`].
+    fn fast_allow_gate(&self, _ctx: &fast_allow::FastAllowContext<'_>) -> Decision {
+        Decision::Block {
+            status: 503,
+            reason: "fast-allow gate is not implemented for this rule".to_string(),
+        }
+    }
 }
 
 /// Fail-closed placeholder used when a configured reactor cannot be loaded.
@@ -254,6 +276,8 @@ pub struct WafEngine {
     /// Experimental content-addressed allow-verdict cache (`allow-cache`).
     #[cfg(feature = "allow-cache")]
     allow_cache: Option<Arc<allow_cache::AllowCache>>,
+    /// Compiled bodyless allowlist fast path.
+    fast_allow: Arc<fast_allow::FastAllow>,
 }
 
 /// Result of the synchronous inspection stages.
@@ -331,6 +355,7 @@ impl Clone for WafEngine {
             metrics: self.metrics.clone(),
             #[cfg(feature = "allow-cache")]
             allow_cache: self.allow_cache.clone(),
+            fast_allow: Arc::clone(&self.fast_allow),
         }
     }
 }
@@ -358,6 +383,7 @@ impl WafEngine {
             metrics: None,
             #[cfg(feature = "allow-cache")]
             allow_cache: None,
+            fast_allow: Arc::new(fast_allow::FastAllow::disabled()),
         }
     }
 
@@ -378,6 +404,17 @@ impl WafEngine {
         let wasm_init_failed = config.waf.wasm.enabled && wasm_engine.is_none();
         #[cfg(not(feature = "wasm-waf"))]
         let wasm_init_failed = false;
+
+        let fast_allow = match fast_allow::FastAllow::from_config(&config.waf.fast_allow) {
+            Ok(fast) => Arc::new(fast),
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "waf.fast_allow configuration is invalid; the compiled allowlist is disabled"
+                );
+                Arc::new(fast_allow::FastAllow::disabled())
+            }
+        };
 
         let mut engine = Self {
             rules: Arc::new(RwLock::new(Vec::new())),
@@ -404,6 +441,7 @@ impl WafEngine {
             metrics,
             #[cfg(feature = "allow-cache")]
             allow_cache: None,
+            fast_allow,
         };
 
         // gRPC is protocol-aware: validate the envelope before Coraza runs so
@@ -783,6 +821,147 @@ impl WafEngine {
         &self.admission
     }
 
+    /// Whether the compiled bodyless allowlist is enabled.
+    pub fn fast_allow_enabled(&self) -> bool {
+        self.fast_allow.enabled()
+    }
+
+    /// Number of compiled fast-allow routes.
+    pub fn fast_allow_route_count(&self) -> usize {
+        self.fast_allow.route_count()
+    }
+
+    /// Look up a bodyless request in the compiled allowlist.
+    ///
+    /// `None` means "fall through to full evaluation": the route is not
+    /// configured, the request is not bodyless (query, body framing, content
+    /// encoding, upgrade or a gRPC/GraphQL content type), or a rule in the
+    /// chain is not fast-allow safe. `Some(Allow)` is the precomputed route
+    /// verdict after every always-on policy gate (size, method, rate limits,
+    /// geographic blocking) allowed the request. A gate rejection is returned
+    /// with the triggering rule so the caller can audit it.
+    ///
+    /// This method borrows the method/URI/headers: it never clones a
+    /// `HeaderMap`, allocates a `RequestContext` or formats a string on the
+    /// allow path.
+    pub fn fast_allow(
+        &self,
+        method: &Method,
+        uri: &Uri,
+        headers: &HeaderMap,
+        client_ip: IpAddr,
+        body_size: Option<usize>,
+        body_is_empty: bool,
+    ) -> Option<fast_allow::FastAllowOutcome> {
+        if !self.enabled || !self.fast_allow.enabled() {
+            return None;
+        }
+        // Never fast-allow through a fail-closed initialisation failure.
+        if self.wasm_init_failed && self.fail_closed {
+            return None;
+        }
+        if !body_is_empty
+            || !fast_allow::is_bodyless_headers(headers)
+            || fast_allow::has_protocol_content_type(headers)
+        {
+            return None;
+        }
+        if !self.fast_allow.matches(method, uri) {
+            return None;
+        }
+
+        let ctx = fast_allow::FastAllowContext {
+            client_ip,
+            method,
+            uri,
+            headers,
+            body_size,
+        };
+        let rules = self.rules.read().unwrap();
+
+        // Pass 1: only allow when every enabled rule is either inspection the
+        // route opted out of, or a gate we can evaluate. Any custom/unknown
+        // rule falls through before a gate consumes state.
+        for rule in rules.iter() {
+            if !rule.is_enabled() {
+                continue;
+            }
+            if rule.fast_allow_policy() == fast_allow::FastAllowPolicy::FallThrough {
+                drop(rules);
+                self.record_fast_allow_fallthrough();
+                return None;
+            }
+        }
+
+        // Pass 2: evaluate always-on gates. No inspection rule runs here.
+        for rule in rules.iter() {
+            if !rule.is_enabled() || rule.fast_allow_policy() != fast_allow::FastAllowPolicy::Gate {
+                continue;
+            }
+            let decision = rule.fast_allow_gate(&ctx);
+            if decision != Decision::Allow {
+                let triggered_rules = vec![rule.name().to_string()];
+                drop(rules);
+                self.record_fast_allow_block();
+                return Some(fast_allow::FastAllowOutcome {
+                    decision,
+                    triggered_rules,
+                });
+            }
+        }
+
+        drop(rules);
+        self.record_fast_allow_hit();
+        Some(fast_allow::FastAllowOutcome {
+            decision: Decision::Allow,
+            triggered_rules: Vec::new(),
+        })
+    }
+
+    fn record_fast_allow_hit(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_fast_allow_hit();
+        }
+    }
+
+    fn record_fast_allow_block(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_fast_allow_block();
+        }
+    }
+
+    fn record_fast_allow_fallthrough(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_fast_allow_fallthrough();
+        }
+    }
+
+    /// Emit the audit event for a fast-allow decision. Only called for blocks
+    /// and for sampled allows, so the allow path normally pays nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn audit_fast_decision(
+        &self,
+        client_ip: IpAddr,
+        method: &Method,
+        uri: &Uri,
+        headers: &HeaderMap,
+        http_version: &str,
+        decision: &Decision,
+        triggered_rules: Vec<String>,
+    ) {
+        let ctx = RequestContext::with_http_version(
+            client_ip,
+            method.clone(),
+            uri.clone(),
+            headers.clone(),
+            None,
+            http_version.to_string(),
+        );
+        self.event_logger
+            .log_event(&ctx, decision, triggered_rules)
+            .await;
+    }
+
     pub fn add_rule<R: WafRule + 'static>(&mut self, rule: R) {
         self.add_rule_boxed(Box::new(rule));
     }
@@ -1030,6 +1209,29 @@ impl WafEngine {
         outcome.decision
     }
 
+    /// Complete a fast-allow lookup. Allows skip audit construction unless the
+    /// configured sample rate selects them; blocks and rate limits are always
+    /// audited.
+    async fn complete_fast_allow(
+        &self,
+        request: &RequestContext,
+        outcome: fast_allow::FastAllowOutcome,
+    ) -> Decision {
+        match outcome.decision {
+            Decision::Allow => {
+                if self.fast_allow.should_sample_allow() {
+                    self.finish(request, CoreOutcome::new(Decision::Allow, Vec::new()))
+                        .await;
+                }
+                Decision::Allow
+            }
+            decision => {
+                self.finish(request, CoreOutcome::new(decision, outcome.triggered_rules))
+                    .await
+            }
+        }
+    }
+
     /// Synchronous protocol pre-checks: GraphQL, then gRPC.
     ///
     /// Both run a Coraza evaluation of decoded content (the gRPC field-content
@@ -1215,6 +1417,17 @@ impl WafEngine {
             return Decision::Allow;
         }
 
+        if let Some(outcome) = self.fast_allow(
+            &request.method,
+            &request.uri,
+            &request.headers,
+            request.client_ip,
+            request.body_size,
+            request.body.as_ref().is_none_or(|body| body.is_empty()),
+        ) {
+            return self.complete_fast_allow(request, outcome).await;
+        }
+
         let guard = match self.admit(request).await {
             Ok(guard) => guard,
             Err(decision) => return decision,
@@ -1253,6 +1466,17 @@ impl WafEngine {
     pub async fn evaluate(&self, request: &RequestContext) -> Decision {
         if !self.enabled {
             return Decision::Allow;
+        }
+
+        if let Some(outcome) = self.fast_allow(
+            &request.method,
+            &request.uri,
+            &request.headers,
+            request.client_ip,
+            request.body_size,
+            request.body.as_ref().is_none_or(|body| body.is_empty()),
+        ) {
+            return self.complete_fast_allow(request, outcome).await;
         }
 
         // Admission control covers the protocol pre-checks as well as the rule
@@ -1307,6 +1531,17 @@ impl WafEngine {
         {
             if !self.enabled {
                 return Decision::Allow;
+            }
+
+            if let Some(outcome) = self.fast_allow(
+                &request.method,
+                &request.uri,
+                &request.headers,
+                request.client_ip,
+                request.body_size,
+                request.body.as_ref().is_none_or(|body| body.is_empty()),
+            ) {
+                return self.complete_fast_allow(request, outcome).await;
             }
 
             let cost = self.inspection_cost(request);
@@ -3194,5 +3429,261 @@ mod tests {
             assert!(rendered.contains("waf_allow_cache_misses_total 1"));
             assert!(rendered.contains("waf_allow_cache_entries 1"));
         }
+    }
+
+    fn fast_allow_engine(routes: &[&str]) -> WafEngine {
+        let mut config = crate::config::Config::default();
+        // The unit test build must not spin up the reactor or protocol
+        // inspectors; the fast path is decided before either would run.
+        config.waf.coraza.enabled = false;
+        config.waf.grpc.enabled = false;
+        config.waf.graphql.enabled = false;
+        config.waf.fast_allow.enabled = true;
+        config.waf.fast_allow.routes = routes.iter().map(|route| route.to_string()).collect();
+        WafEngine::with_config(&config)
+    }
+
+    fn health_context(uri: &'static str) -> RequestContext {
+        RequestContext::new(
+            IpAddr::from_str("192.168.1.100").unwrap(),
+            Method::GET,
+            Uri::from_static(uri),
+            HeaderMap::new(),
+            None,
+        )
+    }
+
+    #[test]
+    fn fast_allow_is_disabled_by_default_and_never_matches() {
+        let mut config = crate::config::Config::default();
+        assert!(!config.waf.fast_allow.enabled);
+        // Keep the unit test from initialising the reactor.
+        config.waf.coraza.enabled = false;
+        config.waf.grpc.enabled = false;
+        config.waf.graphql.enabled = false;
+        let engine = WafEngine::with_config(&config);
+        assert!(!engine.fast_allow_enabled());
+        assert_eq!(engine.fast_allow_route_count(), 0);
+        let ctx = health_context("/health");
+        assert!(engine
+            .fast_allow(
+                &ctx.method,
+                &ctx.uri,
+                &ctx.headers,
+                ctx.client_ip,
+                ctx.body_size,
+                true,
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn fast_allow_matches_exact_method_and_path() {
+        let engine = fast_allow_engine(&["GET /health"]);
+        assert!(engine.fast_allow_enabled());
+        assert_eq!(engine.fast_allow_route_count(), 1);
+
+        let hit = health_context("/health");
+        let outcome = engine
+            .fast_allow(
+                &hit.method,
+                &hit.uri,
+                &hit.headers,
+                hit.client_ip,
+                hit.body_size,
+                true,
+            )
+            .expect("configured route must match");
+        assert_eq!(outcome.decision, Decision::Allow);
+
+        for uri in ["/healthz", "/health/", "/other"] {
+            let miss = health_context(uri);
+            assert!(
+                engine
+                    .fast_allow(
+                        &miss.method,
+                        &miss.uri,
+                        &miss.headers,
+                        miss.client_ip,
+                        miss.body_size,
+                        true,
+                    )
+                    .is_none(),
+                "{uri} must fall through"
+            );
+        }
+
+        let mut post = health_context("/health");
+        post.method = Method::POST;
+        assert!(engine
+            .fast_allow(
+                &post.method,
+                &post.uri,
+                &post.headers,
+                post.client_ip,
+                post.body_size,
+                true,
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn fast_allow_requires_a_bodyless_request() {
+        let engine = fast_allow_engine(&["GET /health"]);
+
+        let mut query = health_context("/health?probe=1");
+        assert!(engine
+            .fast_allow(
+                &query.method,
+                &query.uri,
+                &query.headers,
+                query.client_ip,
+                query.body_size,
+                true,
+            )
+            .is_none());
+        query.uri = Uri::from_static("/health");
+
+        // A non-empty body, a framing header or a content encoding must all
+        // fall through so the body is inspected.
+        assert!(engine
+            .fast_allow(
+                &query.method,
+                &query.uri,
+                &query.headers,
+                query.client_ip,
+                None,
+                false,
+            )
+            .is_none());
+
+        let mut framed = query.clone();
+        framed
+            .headers
+            .insert("transfer-encoding", "chunked".parse().unwrap());
+        assert!(engine
+            .fast_allow(
+                &framed.method,
+                &framed.uri,
+                &framed.headers,
+                framed.client_ip,
+                None,
+                true,
+            )
+            .is_none());
+
+        let mut encoded = query.clone();
+        encoded
+            .headers
+            .insert("content-encoding", "gzip".parse().unwrap());
+        assert!(engine
+            .fast_allow(
+                &encoded.method,
+                &encoded.uri,
+                &encoded.headers,
+                encoded.client_ip,
+                None,
+                true,
+            )
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn fast_allow_never_allows_an_engine_block_for_the_route() {
+        let engine = fast_allow_engine(&["GET /health"]);
+        let malicious = health_context("/health?q=1%20union%20select%20password%20from%20users");
+
+        // The query is outside the fast-path domain, so the request falls
+        // through and the engine's content inspection blocks it.
+        assert!(engine
+            .fast_allow(
+                &malicious.method,
+                &malicious.uri,
+                &malicious.headers,
+                malicious.client_ip,
+                malicious.body_size,
+                true,
+            )
+            .is_none());
+        assert!(
+            matches!(engine.evaluate(&malicious).await, Decision::Block { .. }),
+            "the engine must still block the malicious query"
+        );
+    }
+
+    #[tokio::test]
+    async fn fast_allow_still_enforces_stateful_rate_limit_gates() {
+        let mut config = crate::config::Config::default();
+        config.waf.coraza.enabled = false;
+        config.waf.grpc.enabled = false;
+        config.waf.graphql.enabled = false;
+        config.waf.rate_limit.per_ip_enabled = true;
+        config.waf.rate_limit.per_ip_max_requests = 1;
+        config.waf.rate_limit.per_ip_window_secs = 60;
+        config.waf.rate_limit.global_enabled = false;
+        config.waf.fast_allow.enabled = true;
+        config.waf.fast_allow.routes = vec!["GET /health".to_string()];
+        let engine = WafEngine::with_config(&config);
+
+        let ctx = health_context("/health");
+        let first = engine
+            .fast_allow(
+                &ctx.method,
+                &ctx.uri,
+                &ctx.headers,
+                ctx.client_ip,
+                ctx.body_size,
+                true,
+            )
+            .expect("route matches");
+        assert_eq!(first.decision, Decision::Allow);
+
+        let second = engine
+            .fast_allow(
+                &ctx.method,
+                &ctx.uri,
+                &ctx.headers,
+                ctx.client_ip,
+                ctx.body_size,
+                true,
+            )
+            .expect("route still matches");
+        assert!(
+            matches!(second.decision, Decision::RateLimit { .. }),
+            "the fast path must not bypass the rate-limit gate: {:?}",
+            second.decision
+        );
+    }
+
+    #[test]
+    fn fast_allow_falls_through_for_a_custom_rule() {
+        struct CustomRule;
+
+        impl WafRule for CustomRule {
+            fn name(&self) -> &str {
+                "custom"
+            }
+
+            fn evaluate(&self, _ctx: &RequestContext) -> Decision {
+                Decision::Allow
+            }
+        }
+
+        let mut engine = fast_allow_engine(&["GET /health"]);
+        engine.add_rule(CustomRule);
+        let ctx = health_context("/health");
+        assert!(
+            engine
+                .fast_allow(
+                    &ctx.method,
+                    &ctx.uri,
+                    &ctx.headers,
+                    ctx.client_ip,
+                    ctx.body_size,
+                    true,
+                )
+                .is_none(),
+            "an unknown custom rule must force full evaluation"
+        );
     }
 }

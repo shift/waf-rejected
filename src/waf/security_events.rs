@@ -222,12 +222,17 @@ impl SecurityEventLogger {
         if !self.config.enabled {
             return;
         }
-        let event = self.create_security_event(ctx, decision, triggered_rules);
 
-        // Skip events below minimum threat level
-        if !self.should_log_event(&event) {
+        // Determine the level before constructing the event. The default
+        // minimum is `medium`, so allowed requests (level `low`) return here
+        // without a UUID, timestamp, header strings or a `HashMap`.
+        let threat_level = self.determine_threat_level(decision, &triggered_rules);
+        if !self.threat_level_logged(threat_level) {
             return;
         }
+
+        let event =
+            self.create_security_event_with_level(ctx, decision, triggered_rules, threat_level);
 
         // Export through dispatcher (handles CEF, OTel, etc.)
         if let Err(e) = self.dispatcher.export_event(&event).await {
@@ -239,14 +244,13 @@ impl SecurityEventLogger {
     }
 
     /// Create a comprehensive security event from request context
-    fn create_security_event(
+    fn create_security_event_with_level(
         &self,
         ctx: &RequestContext,
         decision: &Decision,
         triggered_rules: Vec<String>,
+        threat_level: ThreatLevel,
     ) -> SecurityEvent {
-        let threat_level = self.determine_threat_level(decision, &triggered_rules);
-
         SecurityEvent {
             id: uuid::Uuid::new_v4(),
             timestamp: Utc::now(),
@@ -295,15 +299,29 @@ impl SecurityEventLogger {
 
     /// Determine if event should be logged based on threat level
     fn should_log_event(&self, event: &SecurityEvent) -> bool {
-        let min_level = self.config.min_threat_level.to_ascii_lowercase();
+        self.threat_level_logged(event.threat_level)
+    }
 
-        match (min_level.as_str(), &event.threat_level) {
-            ("low", _) => true,
-            ("medium", ThreatLevel::Medium | ThreatLevel::High | ThreatLevel::Critical) => true,
-            ("high", ThreatLevel::High | ThreatLevel::Critical) => true,
-            ("critical", ThreatLevel::Critical) => true,
-            _ => false,
+    /// Minimum-level check without allocating a lowercase copy of the
+    /// configured level. Used on the hot audit path before event construction.
+    fn threat_level_logged(&self, level: ThreatLevel) -> bool {
+        let min_level = self.config.min_threat_level.as_str();
+        if min_level.eq_ignore_ascii_case("low") {
+            return true;
         }
+        if min_level.eq_ignore_ascii_case("medium") {
+            return matches!(
+                level,
+                ThreatLevel::Medium | ThreatLevel::High | ThreatLevel::Critical
+            );
+        }
+        if min_level.eq_ignore_ascii_case("high") {
+            return matches!(level, ThreatLevel::High | ThreatLevel::Critical);
+        }
+        if min_level.eq_ignore_ascii_case("critical") {
+            return matches!(level, ThreatLevel::Critical);
+        }
+        false
     }
 
     /// Determine threat level based on decision and triggered rules
