@@ -12,6 +12,10 @@ mod auth_tests;
 #[path = "integration/grpc_tests.rs"]
 mod grpc_tests;
 
+#[cfg(feature = "wasm-reactor")]
+#[path = "integration/grpc_h2_e2e.rs"]
+mod grpc_h2_e2e;
+
 #[cfg(feature = "compliance")]
 #[path = "integration/compliance_tests.rs"]
 mod compliance_tests;

@@ -114,6 +114,27 @@ All notable changes to WAF-Rejected are documented here.
   Measured capacity and gate results are documented in
   `docs/operations/performance-validation.md`.
 
+- Real HTTP/2 gRPC end-to-end coverage. `tests/integration/grpc_h2_e2e.rs`
+  starts a TLS HTTP/2 gRPC upstream and a TLS/HTTP2 proxy, then drives unary,
+  streaming, malformed-frame, descriptor-policy and gRPC-Web cases with real
+  ALPN `h2` / `http/1.1` clients. `scripts/test-grpc-e2e.sh` runs the ignored
+  suite. See `docs/architecture/grpc-transport.md`.
+
+- Opt-in gRPC-native WAF rejections via
+  `server.grpc_aware_rejections` (default `false`). When enabled, blocked gRPC
+  requests receive HTTP 200 with `grpc-status: 7` (PERMISSION_DENIED) for a
+  `403` block or `13` (INTERNAL) for other block statuses, plus
+  `grpc-message`. The default keeps the historical plain HTTP response.
+
+### Fixed
+
+- HTTP/2 ingress with keep-alive enabled now installs a `TokioTimer`; without
+  it hyper panicked with "You must supply a timer" on the first HTTP/2
+  connection.
+- Malformed and oversized gRPC frames now return the frame's own `400`/`413`
+  status instead of falling through the fail-closed inspection-error path and
+  returning `503`.
+
 ## [0.1.0-beta.11] - 2026-11-01
 
 ### Added

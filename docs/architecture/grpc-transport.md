@@ -41,6 +41,52 @@ response body:
 
 Both must be greater than zero; `Config::validate()` rejects zero values.
 
+## HTTP/2 and ALPN
+
+HTTP/2 is used only when TLS ALPN negotiates `h2`; cleartext listeners speak
+HTTP/1.1 (no h2c prior knowledge). The HTTP/2 server builder installs a
+`TokioTimer` because keep-alive intervals require one. Upstream HTTPS
+connections negotiate `h2` through the same ALPN list, so a gRPC request can
+arrive over HTTP/2 and be forwarded to an HTTP/2 upstream without protocol
+downgrade.
+
+## Verified transport matrix
+
+`tests/integration/grpc_h2_e2e.rs` starts a real TLS HTTP/2 gRPC upstream, a
+TLS/HTTP2 `WafProxyService`, and real ALPN `h2` / `http/1.1` clients. Run it
+with `./scripts/test-grpc-e2e.sh` (the tests are `#[ignore]`d by default
+because they bind local ports and generate certificates).
+
+| Case | Client | Result |
+| --- | --- | --- |
+| Unary echo, `te: trailers` | HTTP/2 + ALPN h2 | Body echoed; `grpc-status: 0` / `grpc-message` trailers preserved |
+| Unary with empty response body | HTTP/2 + ALPN h2 | `grpc-status` / `grpc-message` trailers preserved |
+| Streaming request (no `content-length`) | HTTP/2 + ALPN h2 | Relayed frame by frame; request and response trailers preserved |
+| Malformed frame (truncated prefix) | HTTP/2 + ALPN h2 | `400` before the upstream is called |
+| Oversized frame | HTTP/2 + ALPN h2 | `413` before the upstream is called |
+| SQLi/XSS text in a declared protobuf string field | HTTP/2 + ALPN h2 | Allowed: descriptor field policy is structural (length/UTF-8/unknown-field/enum), not content matching |
+| SQLi text in an undeclared field with `reject_unknown_fields` | HTTP/2 + ALPN h2 | `400` by descriptor policy |
+| gRPC-Web binary framing | HTTP/1.1 + ALPN http/1.1 | Body-encoded trailer frame forwarded unchanged |
+
+Malformed and oversized frames are client errors: the gRPC inspector maps
+`FrameError::status()` (`400`/`413`) directly instead of taking the fail-closed
+`503` inspection-error path.
+
+## gRPC-aware rejections
+
+By default a WAF block is a plain HTTP response (`403 text/plain` for a policy
+block). Set `server.grpc_aware_rejections = true` to return a gRPC-native
+rejection for blocked gRPC requests instead:
+
+* HTTP `200` with `content-type: application/grpc`,
+* `grpc-status: 7` (PERMISSION_DENIED) for a `403` block,
+* `grpc-status: 13` (INTERNAL) for any other block status,
+* `grpc-message` carrying the WAF reason,
+* an empty body with the status fields as trailers.
+
+The flag defaults to `false`, so existing deployments keep the historical
+plain-HTTP behaviour. Non-gRPC traffic is unaffected.
+
 ## HTTP/1.1 framing
 
 HTTP/2 carries trailers natively. HTTP/1.x requires chunked framing plus two

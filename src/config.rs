@@ -161,6 +161,15 @@ pub struct ServerConfig {
     /// Maximum duration in seconds of one streaming gRPC exchange.
     pub grpc_max_stream_seconds: u64,
 
+    /// Return gRPC-native rejection responses for blocked gRPC requests.
+    ///
+    /// When `false` (the default), a WAF block is a plain HTTP response with
+    /// the configured status (for example `403 text/plain`). When `true`, a
+    /// blocked gRPC request receives HTTP 200 with `grpc-status` and
+    /// `grpc-message` trailers: `7` (PERMISSION_DENIED) for `403` and `13`
+    /// (INTERNAL) for other block statuses. Non-gRPC traffic is unaffected.
+    pub grpc_aware_rejections: bool,
+
     /// TLS configuration
     pub tls: TlsConfig,
 
@@ -1372,6 +1381,7 @@ impl Default for ServerConfig {
             max_body_size: 10 * 1024 * 1024,        // 10MB
             grpc_max_stream_bytes: 4 * 1024 * 1024, // 4MiB
             grpc_max_stream_seconds: 300,
+            grpc_aware_rejections: false,
             tls: TlsConfig::default(),
             webtransport: WebTransportConfig::default(),
         }

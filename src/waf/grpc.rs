@@ -599,16 +599,24 @@ impl GrpcInspector {
 
         if let Some(body) = body.as_deref() {
             if !body.is_empty() {
-                let report = validate_frames(
+                let report = match validate_frames(
                     body,
                     FrameLimits {
                         max_message_bytes: self.max_message_bytes_for(&method.path),
                         max_frames: self.max_frames,
                     },
-                )
-                .map_err(|err| GrpcInspectionError {
-                    reason: err.to_string(),
-                })?;
+                ) {
+                    Ok(report) => report,
+                    // A malformed or oversized frame is a client error, not an
+                    // inspection failure: map it to the frame's own status
+                    // (400/413) instead of the fail-closed 503 path.
+                    Err(err) => {
+                        return Ok(GrpcVerdict::Block {
+                            status: err.status(),
+                            reason: err.to_string(),
+                        })
+                    }
+                };
 
                 // `identity` means frames must not be compressed; the
                 // compressed flag is only meaningful with a negotiated
@@ -1404,17 +1412,22 @@ mod tests {
         let inspector = GrpcInspector::try_from_config(&config).unwrap();
 
         // The artifact limit is smaller than the global one and is enforced.
-        let error = inspector
+        let verdict = inspector
             .inspect(&grpc_context(
                 "/acme.Service/Upload",
                 Some(frame(0, b"0123456789")),
             ))
-            .unwrap_err();
-        assert!(
-            error.reason.contains("8-byte limit"),
-            "unexpected error: {}",
-            error.reason
-        );
+            .unwrap();
+        match verdict {
+            GrpcVerdict::Block { status, reason } => {
+                assert_eq!(status, 413);
+                assert!(
+                    reason.contains("8-byte limit"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected a 413 block, got {other:?}"),
+        }
 
         // Another artifact method keeps its (larger) per-method limit.
         let verdict = inspector
@@ -1559,13 +1572,19 @@ mod tests {
     fn oversized_frames_follow_the_configured_limit_in_inspector() {
         let mut config = WafGrpcConfig::default();
         config.max_message_bytes = 4;
-        let err = inspector(config)
+        let verdict = inspector(config)
             .inspect(&grpc_context(
                 "/acme.Service/Method",
                 Some(frame(0, b"12345")),
             ))
-            .unwrap_err();
-        assert!(err.reason.contains("exceeding the 4-byte limit"));
+            .unwrap();
+        match verdict {
+            GrpcVerdict::Block { status, reason } => {
+                assert_eq!(status, 413);
+                assert!(reason.contains("exceeding the 4-byte limit"));
+            }
+            other => panic!("expected a 413 block, got {other:?}"),
+        }
     }
 
     #[test]

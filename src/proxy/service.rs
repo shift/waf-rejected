@@ -7,12 +7,13 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Frame, Incoming};
+use hyper::header::HeaderValue;
 use hyper::service::service_fn;
 use hyper::{HeaderMap, Request, Response, StatusCode, Uri};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::{TokioExecutor, TokioTimer};
 use ipnetwork::IpNetwork;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -810,6 +811,7 @@ impl WafProxyService {
 
         if enable_http2 {
             hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .timer(TokioTimer::new())
                 .keep_alive_interval(Some(Duration::from_secs(30)))
                 .keep_alive_timeout(Duration::from_secs(10))
                 .serve_connection(io, service)
@@ -971,6 +973,9 @@ impl WafProxyService {
                     );
                     state.metrics.record_blocked();
                     state.metrics.record_request_duration(start_time.elapsed());
+                    if classification.is_grpc && state.config.server.grpc_aware_rejections {
+                        return Ok(Self::create_grpc_blocked_response(status, &reason));
+                    }
                     return Ok(Self::create_blocked_response(status, &reason));
                 }
                 Decision::RateLimit { reason } => {
@@ -1122,7 +1127,11 @@ impl WafProxyService {
                 );
                 state.metrics.record_blocked();
                 state.metrics.record_request_duration(start_time.elapsed());
-                Ok(Self::create_blocked_response(status, &reason))
+                if classification.is_grpc && state.config.server.grpc_aware_rejections {
+                    Ok(Self::create_grpc_blocked_response(status, &reason))
+                } else {
+                    Ok(Self::create_blocked_response(status, &reason))
+                }
             }
             Decision::RateLimit { reason } => {
                 warn!("WAF rate limited request from {}: {}", client_ip, reason);
@@ -2069,6 +2078,43 @@ impl WafProxyService {
             builder = builder.header("retry-after", "1");
         }
         builder.body(ProxyBody::full(body)).unwrap()
+    }
+
+    /// Create a gRPC-native rejection response.
+    ///
+    /// gRPC clients expect HTTP 200 with the outcome in `grpc-status` /
+    /// `grpc-message` trailers. `403` maps to `7` (PERMISSION_DENIED); every
+    /// other WAF block status maps to `13` (INTERNAL). The body is empty, so
+    /// the trailers are the only payload.
+    pub(crate) fn create_grpc_blocked_response(
+        status_code: u16,
+        reason: &str,
+    ) -> Response<ProxyBody> {
+        let grpc_status = if status_code == 403 { "7" } else { "13" };
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", HeaderValue::from_static(grpc_status));
+        trailers.insert(
+            "grpc-message",
+            HeaderValue::from_str(reason)
+                .unwrap_or_else(|_| HeaderValue::from_static("blocked by WAF")),
+        );
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/grpc")
+            .header("trailer", "grpc-status, grpc-message")
+            .header("x-waf-decision", "block")
+            .header("x-waf-reason", reason)
+            .header(
+                "x-waf-version",
+                concat!("waf-rejected/", env!("CARGO_PKG_VERSION")),
+            )
+            .header(
+                "x-waf-supported-protocols",
+                "HTTP/1.0,HTTP/1.1,HTTP/2,HTTP/3",
+            )
+            .body(ProxyBody::buffered(Bytes::new(), Some(trailers)))
+            .unwrap()
     }
 
     /// Create rate limit response with protocol information
