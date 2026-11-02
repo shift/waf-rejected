@@ -902,7 +902,7 @@ impl WafProxyService {
                 None,
                 http_version.clone(),
             );
-            match state.waf_engine.evaluate(&upgrade_context).await {
+            match state.waf_engine.evaluate_shared(&upgrade_context).await {
                 Decision::Allow => {}
                 Decision::Block { status, reason } => {
                     warn!(
@@ -964,7 +964,7 @@ impl WafProxyService {
                 None,
                 http_version.clone(),
             );
-            match state.waf_engine.evaluate(&request_context).await {
+            match state.waf_engine.evaluate_shared(&request_context).await {
                 Decision::Allow => {}
                 Decision::Block { status, reason } => {
                     warn!(
@@ -1095,7 +1095,7 @@ impl WafProxyService {
         )
         .with_body(Some(body_bytes.clone()));
 
-        let decision = state.waf_engine.evaluate(&request_context).await;
+        let decision = state.waf_engine.evaluate_shared(&request_context).await;
 
         match decision {
             Decision::Allow => {
@@ -1528,7 +1528,7 @@ impl WafProxyService {
     }
 
     async fn websocket_message_blocked(
-        waf_engine: &WafEngine,
+        waf_engine: &Arc<WafEngine>,
         base_context: &RequestContext,
         message: &Message,
         max_frame_bytes: usize,
@@ -1556,7 +1556,7 @@ impl WafProxyService {
         context.body_size = Some(payload.len());
         context.timestamp = Instant::now();
 
-        match waf_engine.evaluate(&context).await {
+        match waf_engine.evaluate_shared(&context).await {
             Decision::Allow => false,
             Decision::Block { status, reason } => {
                 warn!(

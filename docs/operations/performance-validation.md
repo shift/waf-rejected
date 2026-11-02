@@ -332,6 +332,119 @@ and ~8x at c=8. The `grpc-content-4k-admission-bounded` gate enforces p95 <
 1 s with no non-503 errors. Absolute values are host- and load-dependent; the
 before/after ratio is the signal.
 
+### Tokio worker offload: heavy inspection leaves the async workers
+
+`WafEngine::evaluate` is `async`, but until this change every stage after
+admission ran inline: the GraphQL/gRPC pre-checks and the traditional rule
+chain, which contains the Coraza reactor rule. That rule hands the payload to a
+reactor worker and then blocks the caller until the verdict comes back —
+around a millisecond for a bodyless request, 39–706 ms for a 1–16 KiB body,
+~3 s for 60 KiB. The reactor pool is a separate set of threads, but the Tokio
+worker that called it stayed parked for the whole inspection and could not
+read, write, or time out anything else in the meantime.
+
+`WafProxyService` now calls `WafEngine::evaluate_shared`, which:
+
+1. classifies the request and acquires the heavy permit **asynchronously**
+   (classification and the `503 + Retry-After` saturation path are unchanged);
+2. for a **heavy** inspection (CRS body scan or gRPC field-content scan),
+   clones the `Arc<WafEngine>` and the `RequestContext` — the body is a `Bytes`
+   handle, not a copy — and runs the synchronous stages (GraphQL/gRPC
+   pre-check, the `wasm_init_failed` gate and the rule chain) inside
+   `tokio::task::spawn_blocking`;
+3. for a **cheap** inspection, runs the same stages inline, exactly as before;
+4. emits the audit event and returns the decision on the async side.
+
+The permit moves *into* the blocking task, so it is released when the
+inspection actually finishes. When a client disconnects and the future is
+dropped, the scan still completes and the permit is returned afterwards instead
+of being released early and over-admitting.
+
+Cheap evaluations deliberately stay inline. They are a header/URI rule pass plus
+a short reactor round-trip, and offloading them too measured **worse** for
+cheap traffic (see the mixed cells below): the extra thread hop and the deeper
+reactor queue cost more than the sub-millisecond parked worker they save. A
+blanket offload of every evaluation is therefore not what shipped.
+
+Ordering is unchanged: one evaluation still runs the pre-checks before the rule
+chain, in the same task, with the same stripped-body context. Parity is covered
+by unit tests — decision parity for allow/block/rate-limit,
+`offloaded_evaluation_preserves_protocol_precheck_semantics` (gRPC content scan
+runs once and the rule chain still sees a withheld body),
+`offloaded_evaluation_keeps_admission_before_the_offload`,
+`cancelled_offloaded_evaluation_holds_its_permit_until_it_finishes`, and a
+48-task no-deadlock run.
+
+`tokio::task::block_in_place` was the alternative. It was rejected because it
+converts the calling worker into a blocking thread (the runtime then starts a
+replacement), the future stays unobservable until the scan returns so a
+disconnect cannot release the request early, and it panics on a current-thread
+runtime, which the tests and embedded callers use.
+
+#### Runtime responsiveness (the property that changed)
+
+`measure_runtime_responsiveness_during_slow_inspection` runs six concurrent
+200 ms inspections on a six-worker runtime and records the worst delay of an
+unrelated 1 ms ticker task. Release build:
+
+| concurrent inspections | worst 1 ms ticker delay |
+|---|---:|
+| six inline `evaluate` calls (before) | **200.4 ms** |
+| six `evaluate_shared` calls (after) | **4.0 ms** |
+
+That 50x difference is the point of the change: before, one slow inspection
+removed a worker from the runtime for its entire duration; after, the runtime
+keeps running timers, connection I/O, cancellation and health/metrics while the
+scan is in progress.
+
+#### End-to-end effect
+
+Host: Intel i5-8400T, 6 logical CPUs, 15 862 MiB RAM, kernel 6.18.36. Release
+build, warm-up 1 s + measure 5 s, seed 42, pool auto = 6 (heavy permits = 3).
+Baseline is `main` at `d28e1a3`; after is this branch (`waf-ingress` sha256
+`f94654bfd16620ac9f8c2ff1b3e26047ce39d2d9bf427137bf9dbd072c7e8f4f`). Both
+binaries were started from the same throwaway config and the matrix was run
+**back to back, interleaved**, repeatedly; the table reports the pooled median
+across every run (6 runs per cell for bodyless, 3–7 for the rest). The host was
+**not idle** (other builds and benchmarks were running; the 1-minute load
+sampled during the runs was 7–28), so the deltas below are within run-to-run
+variance rather than capacity claims.
+
+| case | before p50 | after p50 | before p95 | after p95 | before RPS | after RPS |
+|---|---:|---:|---:|---:|---:|---:|
+| bodyless, c=16 | 9.7 ms | 9.1 ms | 19.3 ms | 19.0 ms | 1 466 | 1 558 |
+| bodyless, c=64 | 42.5 ms | 44.8 ms | 94.3 ms | 85.3 ms | 1 376 | 1 330 |
+| gRPC 1 KiB, c=64 | 56.5 ms | 83.8 ms | 130.7 ms | 170.0 ms | 962 | 645 |
+| form 8 KiB, c=16 | 251.6 ms | 251.5 ms | 895.5 ms | 918.8 ms | 46.7 | 48.6 |
+| mixed 60/20/10/10, c=64 | 72.0 ms | 74.3 ms | 406.1 ms | 369.2 ms | 388 | 431 |
+| mixed-dos, c=64: bodyless class | 41.8 ms | 47.0 ms | 104.1 ms | 105.4 ms | 429 | 416 |
+| mixed-grpc-dos, c=64: bodyless class | 37.7 ms | 44.2 ms | 82.1 ms | 85.7 ms | 761 | 683 |
+
+Two conclusions:
+
+- **Cheap traffic is unchanged.** Bodyless and gRPC-streaming requests take the
+  same code path as before by construction, and the measurements agree within
+  noise. The mixed DoS cells, which isolate the bodyless class under 10%
+  60 KiB or 10% gRPC-content-scan load, are also flat: admission control had
+  already reserved reactor capacity, and freeing workers does not add
+  throughput because the Coraza pool is the binding constraint. The gRPC 1 KiB
+  row is the clearest noise indicator — it is a cheap streaming request that
+  runs identical code in both binaries, yet the *same* baseline binary produced
+  224 RPS and 1 115 RPS in two runs of this matrix on this host. Do not read a
+  regression (or an improvement) into a single cell; the runtime
+  responsiveness measurement above is the signal for this change.
+- **The blanket variant was worse.** Offloading *every* evaluation, including
+  bodyless ones, measured 137 ms p95 (vs 103 ms) for the bodyless class under
+  `mixed-dos` at c=64 and 117 ms (vs 94 ms) under `mixed-grpc-dos`, because the
+  deeper reactor queue and the extra thread hop outweigh the parked worker at
+  sub-millisecond inspection times. That is why only heavy inspections are
+  offloaded.
+
+The offload is therefore an availability/latency-isolation change, not a
+throughput change: the 39–706 ms scans no longer sit on the async workers that
+serve timers, flow control, WebSocket frames and cancellation. Throughput for
+CRS work still scales only with `waf.coraza.pool_size`.
+
 ### Memory
 
 | metric | value |

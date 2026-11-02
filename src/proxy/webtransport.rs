@@ -190,7 +190,7 @@ async fn handle_session(
         origin.as_deref(),
         headers.clone(),
     );
-    match state.waf_engine.evaluate(&context).await {
+    match state.waf_engine.evaluate_shared(&context).await {
         Decision::Allow => {}
         Decision::Block { status, reason } => {
             warn!(
@@ -524,7 +524,7 @@ async fn evaluate_payload(
     )
     .with_body(Some(body));
 
-    state.waf_engine.evaluate(&context).await
+    state.waf_engine.evaluate_shared(&context).await
 }
 
 fn connect_context(

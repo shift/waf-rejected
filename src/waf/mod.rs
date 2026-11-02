@@ -61,7 +61,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
-use self::admission::AdmissionController;
+use self::admission::{AdmissionController, AdmissionGuard};
 use self::content_inspection::ContentInspectionRuleFactory;
 use self::geoip::{GeoBlockingRuleFactory, GeoIpService};
 use self::rate_limit::{GlobalRateLimiter, RateLimiter};
@@ -211,13 +211,41 @@ pub struct WafEngine {
     metrics: Option<Arc<crate::metrics::Metrics>>,
 }
 
+/// Result of the synchronous inspection stages.
+///
+/// The stages never touch the async runtime: the audit event for `decision` is
+/// emitted by the caller once the blocking work is done. That keeps the whole
+/// stage sequence runnable inside `spawn_blocking` without nesting runtimes.
+struct CoreOutcome {
+    decision: Decision,
+    triggered_rules: Vec<String>,
+}
+
+impl CoreOutcome {
+    fn new(decision: Decision, triggered_rules: Vec<String>) -> Self {
+        Self {
+            decision,
+            triggered_rules,
+        }
+    }
+}
+
+/// Outcome of the synchronous protocol pre-checks.
+enum PrecheckOutcome {
+    /// Continue evaluation. `Some` carries the context a pre-check produced
+    /// (for example a body-stripped one); `None` means "use the original".
+    Continue(Option<Box<RequestContext>>),
+    /// Stop evaluation with this outcome.
+    Reject(CoreOutcome),
+}
+
 /// Outcome of the gRPC protocol pre-check.
 #[cfg(feature = "wasm-reactor")]
 enum GrpcPrecheck {
     /// Continue evaluation with the supplied (possibly body-stripped) context.
     Continue(Box<RequestContext>),
     /// Return this decision immediately.
-    Reject(Decision),
+    Reject(CoreOutcome),
 }
 
 /// Outcome of the GraphQL protocol pre-check.
@@ -226,7 +254,7 @@ enum GraphqlPrecheck {
     /// Continue evaluation with the supplied (possibly body-stripped) context.
     Continue(Box<RequestContext>),
     /// Return this decision immediately.
-    Reject(Decision),
+    Reject(CoreOutcome),
 }
 
 impl Default for WafEngine {
@@ -680,8 +708,11 @@ impl WafEngine {
     }
 
     /// Outcome of the gRPC protocol pre-check.
+    ///
+    /// Synchronous by design: its Coraza field-content scan is one of the
+    /// reasons the whole stage sequence is offloaded to a blocking thread.
     #[cfg(feature = "wasm-reactor")]
-    async fn grpc_precheck(&self, request: &RequestContext) -> Option<GrpcPrecheck> {
+    fn grpc_precheck(&self, request: &RequestContext) -> Option<GrpcPrecheck> {
         let inspector = self.grpc_inspector.as_ref()?;
         if !inspector.matches(request) {
             return None;
@@ -711,33 +742,23 @@ impl WafEngine {
                 if let Some(metrics) = &self.metrics {
                     metrics.record_grpc_block();
                 }
-                let decision = Decision::Block { status, reason };
-                self.event_logger
-                    .log_event(
-                        request,
-                        &decision,
-                        vec!["grpc-protocol-inspection".to_string()],
-                    )
-                    .await;
-                Some(GrpcPrecheck::Reject(decision))
+                Some(GrpcPrecheck::Reject(CoreOutcome::new(
+                    Decision::Block { status, reason },
+                    vec!["grpc-protocol-inspection".to_string()],
+                )))
             }
             Err(err) => {
                 if let Some(metrics) = &self.metrics {
                     metrics.record_grpc_error();
                 }
                 if self.fail_closed {
-                    let decision = Decision::Block {
-                        status: 503,
-                        reason: format!("gRPC inspection unavailable: {err}"),
-                    };
-                    self.event_logger
-                        .log_event(
-                            request,
-                            &decision,
-                            vec!["grpc-protocol-inspection".to_string()],
-                        )
-                        .await;
-                    Some(GrpcPrecheck::Reject(decision))
+                    Some(GrpcPrecheck::Reject(CoreOutcome::new(
+                        Decision::Block {
+                            status: 503,
+                            reason: format!("gRPC inspection unavailable: {err}"),
+                        },
+                        vec!["grpc-protocol-inspection".to_string()],
+                    )))
                 } else {
                     warn!(
                         error = %err,
@@ -752,8 +773,10 @@ impl WafEngine {
     }
 
     /// Outcome of the GraphQL protocol pre-check.
+    ///
+    /// Synchronous by design: the stage sequence runs inside a blocking task.
     #[cfg(feature = "wasm-reactor")]
-    async fn graphql_precheck(&self, request: &RequestContext) -> Option<GraphqlPrecheck> {
+    fn graphql_precheck(&self, request: &RequestContext) -> Option<GraphqlPrecheck> {
         let inspector = self.graphql_inspector.as_ref()?;
         if !inspector.matches(request) {
             return None;
@@ -790,25 +813,23 @@ impl WafEngine {
                 if let Some(metrics) = &self.metrics {
                     metrics.record_graphql_block();
                 }
-                let decision = Decision::Block { status, reason };
-                self.event_logger
-                    .log_event(request, &decision, vec![graphql::RULE_NAME.to_string()])
-                    .await;
-                Some(GraphqlPrecheck::Reject(decision))
+                Some(GraphqlPrecheck::Reject(CoreOutcome::new(
+                    Decision::Block { status, reason },
+                    vec![graphql::RULE_NAME.to_string()],
+                )))
             }
             Err(err) => {
                 if let Some(metrics) = &self.metrics {
                     metrics.record_graphql_error();
                 }
                 if self.fail_closed {
-                    let decision = Decision::Block {
-                        status: 503,
-                        reason: format!("GraphQL inspection unavailable: {err}"),
-                    };
-                    self.event_logger
-                        .log_event(request, &decision, vec![graphql::RULE_NAME.to_string()])
-                        .await;
-                    Some(GraphqlPrecheck::Reject(decision))
+                    Some(GraphqlPrecheck::Reject(CoreOutcome::new(
+                        Decision::Block {
+                            status: 503,
+                            reason: format!("GraphQL inspection unavailable: {err}"),
+                        },
+                        vec![graphql::RULE_NAME.to_string()],
+                    )))
                 } else {
                     warn!(
                         error = %err,
@@ -894,280 +915,83 @@ impl WafEngine {
         decision
     }
 
-    /// Fast evaluation for performance-critical paths (headers/URI only)
-    /// Skips expensive operations like body inspection
-    pub async fn fast_evaluate(&self, request: &RequestContext) -> Decision {
-        if !self.enabled {
-            return Decision::Allow;
+    /// Acquire admission for one evaluation.
+    ///
+    /// The wait happens on the async runtime, before any blocking stage, so a
+    /// queued request never occupies an evaluation thread. Rejections are
+    /// mapped to the fail-closed `503` decision here.
+    async fn admit(&self, request: &RequestContext) -> Result<AdmissionGuard, Decision> {
+        match self.admission.admit(self.inspection_cost(request)).await {
+            Ok(guard) => Ok(guard),
+            Err(rejection) => Err(self.admission_rejected(request, rejection).await),
         }
-
-        // Admission control covers the protocol pre-checks too: a gRPC
-        // field-content scan is a full Coraza evaluation even though the raw
-        // body is withheld from the rule chain.
-        let _admission_guard = match self.admission.admit(self.inspection_cost(request)).await {
-            Ok(guard) => guard,
-            Err(rejection) => return self.admission_rejected(request, rejection).await,
-        };
-
-        #[cfg(feature = "wasm-reactor")]
-        let graphql_context;
-        #[cfg(feature = "wasm-reactor")]
-        let request: &RequestContext = match self.graphql_precheck(request).await {
-            Some(GraphqlPrecheck::Reject(decision)) => return decision,
-            Some(GraphqlPrecheck::Continue(context)) => {
-                graphql_context = *context;
-                &graphql_context
-            }
-            None => request,
-        };
-        #[cfg(feature = "wasm-reactor")]
-        let grpc_context;
-        #[cfg(feature = "wasm-reactor")]
-        let request: &RequestContext = match self.grpc_precheck(request).await {
-            Some(GrpcPrecheck::Reject(decision)) => return decision,
-            Some(GrpcPrecheck::Continue(context)) => {
-                grpc_context = *context;
-                &grpc_context
-            }
-            None => request,
-        };
-
-        let mut triggered_rules = Vec::new();
-        let mut blocking_decision = None;
-        let rules_count;
-
-        // PHASE 1: WASM ModSecurity evaluation (if enabled) - Skip for fast path
-        #[cfg(feature = "wasm-waf")]
-        if let Some(_wasm_engine) = &self.wasm_engine {
-            debug!("Skipping WASM evaluation for fast path (performance optimization)");
-        }
-
-        // PHASE 2: Optimized traditional rule evaluation
-        {
-            let rules = self.rules.read().unwrap();
-            rules_count = rules.len();
-
-            debug!(
-                "Fast evaluating {} traditional rules for request from {}",
-                rules_count, request.client_ip
-            );
-
-            // Optimized rule evaluation - check only lightweight rules first
-            for rule in rules.iter() {
-                if !rule.is_enabled() {
-                    continue;
-                }
-
-                let decision = rule.evaluate(request);
-                match &decision {
-                    Decision::Block { status, reason } => {
-                        triggered_rules.push(rule.name().to_string());
-
-                        debug!(
-                            "Fast rule '{}' blocked request from {}: {} ({})",
-                            rule.name(),
-                            request.client_ip,
-                            reason,
-                            status
-                        );
-
-                        // Store the blocking decision and break early for performance
-                        blocking_decision = Some(decision);
-                        break;
-                    }
-                    Decision::RateLimit { reason } => {
-                        triggered_rules.push(rule.name().to_string());
-
-                        debug!(
-                            "Fast rule '{}' rate limited request from {}: {}",
-                            rule.name(),
-                            request.client_ip,
-                            reason
-                        );
-
-                        // Store the rate limit decision and break early
-                        blocking_decision = Some(decision);
-                        break;
-                    }
-                    Decision::Allow => {
-                        // Continue evaluating other rules quickly
-                    }
-                }
-            }
-        } // RwLockReadGuard is dropped here
-
-        // Now we can safely do async operations (if needed)
-        if let Some(decision) = blocking_decision {
-            // Even the fast path must produce an audit event for blocks.
-            self.event_logger
-                .log_event(request, &decision, triggered_rules)
-                .await;
-            return decision;
-        }
-
-        // If we get here, all rules passed
-        debug!(
-            "Fast evaluation: All {} rules passed for request from {}",
-            rules_count, request.client_ip
-        );
-
-        Decision::Allow
     }
 
-    /// Evaluate all rules against the request context
-    /// Returns the first blocking decision or Allow if all rules pass
-    pub async fn evaluate(&self, request: &RequestContext) -> Decision {
-        if !self.enabled {
-            return Decision::Allow;
-        }
+    /// Emit the audit event for a completed evaluation.
+    ///
+    /// Exactly one event is emitted per evaluation, matching the inline path
+    /// this replaced: blocks, rate limits and allows all produce one event.
+    async fn finish(&self, request: &RequestContext, outcome: CoreOutcome) -> Decision {
+        self.event_logger
+            .log_event(request, &outcome.decision, outcome.triggered_rules)
+            .await;
+        outcome.decision
+    }
 
-        // Admission control covers the protocol pre-checks as well as the rule
-        // chain: a gRPC field-content scan runs a Coraza evaluation before the
-        // main evaluation. Classification uses the original request, because
-        // the pre-checks strip the body that made the scan expensive.
-        let _admission_guard = match self.admission.admit(self.inspection_cost(request)).await {
-            Ok(guard) => guard,
-            Err(rejection) => return self.admission_rejected(request, rejection).await,
-        };
-
+    /// Synchronous protocol pre-checks: GraphQL, then gRPC.
+    ///
+    /// Both run a Coraza evaluation of decoded content (the gRPC field-content
+    /// scan is a full body scan) and neither needs the async runtime, so the
+    /// sequence is safe to run on a blocking thread.
+    #[cfg_attr(not(feature = "wasm-reactor"), allow(unused_variables))]
+    fn precheck_core(&self, request: &RequestContext) -> PrecheckOutcome {
         #[cfg(feature = "wasm-reactor")]
-        let graphql_context;
-        #[cfg(feature = "wasm-reactor")]
-        let request: &RequestContext = match self.graphql_precheck(request).await {
-            Some(GraphqlPrecheck::Reject(decision)) => return decision,
-            Some(GraphqlPrecheck::Continue(context)) => {
-                graphql_context = *context;
-                &graphql_context
-            }
-            None => request,
-        };
-        #[cfg(feature = "wasm-reactor")]
-        let grpc_context;
-        #[cfg(feature = "wasm-reactor")]
-        let request: &RequestContext = match self.grpc_precheck(request).await {
-            Some(GrpcPrecheck::Reject(decision)) => return decision,
-            Some(GrpcPrecheck::Continue(context)) => {
-                grpc_context = *context;
-                &grpc_context
-            }
-            None => request,
-        };
-
-        let mut triggered_rules = Vec::new();
-        let mut blocking_decision = None;
-        let rules_count;
-
-        // A configured-but-unavailable WASM engine must not silently downgrade
-        // to traditional rules when fail-closed is requested.
-        if self.wasm_init_failed && self.fail_closed {
-            let decision = Decision::Block {
-                status: 503,
-                reason: "WAF engine failed to initialise (fail-closed)".to_string(),
+        {
+            let graphql_stripped = match self.graphql_precheck(request) {
+                Some(GraphqlPrecheck::Reject(outcome)) => return PrecheckOutcome::Reject(outcome),
+                Some(GraphqlPrecheck::Continue(context)) => Some(context),
+                None => None,
             };
-            self.event_logger
-                .log_event(request, &decision, vec!["wasm_init_failed".to_string()])
-                .await;
-            return decision;
+            let request: &RequestContext = graphql_stripped.as_deref().unwrap_or(request);
+
+            let grpc_stripped = match self.grpc_precheck(request) {
+                Some(GrpcPrecheck::Reject(outcome)) => return PrecheckOutcome::Reject(outcome),
+                Some(GrpcPrecheck::Continue(context)) => Some(context),
+                None => None,
+            };
+            // The gRPC context is derived from the GraphQL one, so it already
+            // carries the GraphQL body policy.
+            PrecheckOutcome::Continue(grpc_stripped.or(graphql_stripped))
         }
-
-        // PHASE 1: WASM ModSecurity evaluation (if enabled)
-        #[cfg(feature = "wasm-waf")]
-        if let Some(wasm_engine) = &self.wasm_engine {
-            debug!("Evaluating request through WASM ModSecurity engine");
-
-            // Convert RequestContext to WasmRequestContext
-            let wasm_context = self.create_wasm_context(request);
-
-            match wasm_engine.process_request(wasm_context).await {
-                Ok(wasm_decision) => {
-                    let decision = self.convert_wasm_decision(wasm_decision);
-                    match &decision {
-                        Decision::Block { .. } | Decision::RateLimit { .. } => {
-                            info!("Request blocked by WASM ModSecurity engine");
-                            triggered_rules.push("WASM-ModSecurity".to_string());
-
-                            // Log security event and return immediately
-                            self.event_logger
-                                .log_event(request, &decision, triggered_rules)
-                                .await;
-                            return decision;
-                        }
-                        Decision::Allow => {
-                            debug!("Request allowed by WASM ModSecurity engine, continuing with traditional rules");
-                        }
-                    }
-
-                    // Re-export performance optimization modules
-                }
-                Err(e) => {
-                    warn!("WASM ModSecurity engine error: {}", e);
-                    if self.fail_closed {
-                        let decision = Decision::Block {
-                            status: 503,
-                            reason: "WAF engine unavailable (fail-closed)".to_string(),
-                        };
-                        self.event_logger
-                            .log_event(request, &decision, triggered_rules)
-                            .await;
-                        return decision;
-                    }
-                }
-            }
+        #[cfg(not(feature = "wasm-reactor"))]
+        {
+            PrecheckOutcome::Continue(None)
         }
+    }
 
-        // PHASE 2: AI Threat Detection (if enabled)
-        #[cfg(feature = "ai-threat-detection")]
-        if let Some(ai_detector) = &self.ai_detector {
-            debug!("Evaluating request through AI threat detection");
-
-            match ai_detector.analyze_request(request).await {
-                Ok(ai_result) => {
-                    if ai_result.should_block {
-                        info!(
-                            "Request blocked by AI threat detection (score: {:.3})",
-                            ai_result.analysis.threat_score
-                        );
-                        triggered_rules.push("AI-Threat-Detection".to_string());
-
-                        let decision = Decision::Block {
-                            status: 403,
-                            reason: format!(
-                                "AI detected threat (score: {:.3})",
-                                ai_result.analysis.threat_score
-                            ),
-                        };
-
-                        self.event_logger
-                            .log_event(request, &decision, triggered_rules)
-                            .await;
-                        return decision;
-                    } else {
-                        debug!(
-                            "AI analysis passed (score: {:.3})",
-                            ai_result.analysis.threat_score
-                        );
-                    }
-                }
-                Err(e) => {
-                    warn!("AI analysis error: {}", e);
-                    if self.fail_closed {
-                        let decision = Decision::Block {
-                            status: 503,
-                            reason: "WAF AI engine unavailable (fail-closed)".to_string(),
-                        };
-                        self.event_logger
-                            .log_event(request, &decision, triggered_rules)
-                            .await;
-                        return decision;
-                    }
-                }
-            }
+    /// Fail-closed decision when a configured WASM engine never initialised.
+    fn init_failure(&self) -> Option<CoreOutcome> {
+        if self.wasm_init_failed && self.fail_closed {
+            Some(CoreOutcome::new(
+                Decision::Block {
+                    status: 503,
+                    reason: "WAF engine failed to initialise (fail-closed)".to_string(),
+                },
+                vec!["wasm_init_failed".to_string()],
+            ))
+        } else {
+            None
         }
+    }
 
-        // PHASE 3: Traditional rule evaluation
+    /// Synchronous traditional rule chain.
+    ///
+    /// Returns the first blocking decision, or `Allow` when every rule passed.
+    fn rules_core(&self, request: &RequestContext) -> CoreOutcome {
+        let mut triggered_rules = Vec::new();
         {
             let rules = self.rules.read().unwrap();
-            rules_count = rules.len();
+            let rules_count = rules.len();
 
             debug!(
                 "Evaluating {} traditional rules for request from {}",
@@ -1192,9 +1016,7 @@ impl WafEngine {
                             status
                         );
 
-                        // Store the blocking decision and break
-                        blocking_decision = Some(decision);
-                        break;
+                        return CoreOutcome::new(decision, triggered_rules);
                     }
                     Decision::RateLimit { reason } => {
                         triggered_rules.push(rule.name().to_string());
@@ -1206,40 +1028,302 @@ impl WafEngine {
                             reason
                         );
 
-                        // Store the rate limit decision and break
-                        blocking_decision = Some(decision);
-                        break;
+                        return CoreOutcome::new(decision, triggered_rules);
                     }
                     Decision::Allow => {
                         debug!("Rule '{}' allowed request", rule.name());
-                        // Continue evaluating other rules
                     }
                 }
             }
+
+            debug!(
+                "All {} rules passed for request from {}",
+                rules_count, request.client_ip
+            );
         } // RwLockReadGuard is dropped here
 
-        // Now we can safely do async operations
-        if let Some(decision) = blocking_decision {
-            // Log security event with enhanced logging
-            self.event_logger
-                .log_event(request, &decision, triggered_rules)
-                .await;
-            return decision;
+        CoreOutcome::new(Decision::Allow, triggered_rules)
+    }
+
+    /// The complete synchronous inspection: pre-checks, the initialisation
+    /// gate and the rule chain.
+    ///
+    /// This is what [`Self::evaluate_shared`] hands to `spawn_blocking`. It is
+    /// only defined for builds without the async WASM/AI stages; those builds
+    /// keep the inline path (see [`Self::evaluate_shared`]).
+    #[cfg(not(any(feature = "wasm-waf", feature = "ai-threat-detection")))]
+    fn evaluate_core(&self, request: &RequestContext) -> CoreOutcome {
+        let stripped = match self.precheck_core(request) {
+            PrecheckOutcome::Reject(outcome) => return outcome,
+            PrecheckOutcome::Continue(stripped) => stripped,
+        };
+        let request: &RequestContext = stripped.as_deref().unwrap_or(request);
+
+        if let Some(outcome) = self.init_failure() {
+            return outcome;
         }
 
-        // If we get here, all rules passed
-        debug!(
-            "All {} rules passed for request from {}",
-            rules_count, request.client_ip
-        );
+        self.rules_core(request)
+    }
 
-        // Log allowed request if configured to log low-threat events
-        let allow_decision = Decision::Allow;
-        self.event_logger
-            .log_event(request, &allow_decision, triggered_rules)
+    /// Fast evaluation for performance-critical paths.
+    ///
+    /// Runs the protocol pre-checks and the rule chain (which includes the
+    /// Coraza reactor rule) but skips the WASM/AI stages and does not emit an
+    /// audit event for allowed requests.
+    pub async fn fast_evaluate(&self, request: &RequestContext) -> Decision {
+        if !self.enabled {
+            return Decision::Allow;
+        }
+
+        let guard = match self.admit(request).await {
+            Ok(guard) => guard,
+            Err(decision) => return decision,
+        };
+
+        let stripped = match self.precheck_core(request) {
+            PrecheckOutcome::Reject(outcome) => {
+                drop(guard);
+                return self.finish(request, outcome).await;
+            }
+            PrecheckOutcome::Continue(stripped) => stripped,
+        };
+        let request: &RequestContext = stripped.as_deref().unwrap_or(request);
+
+        #[cfg(feature = "wasm-waf")]
+        if let Some(_wasm_engine) = &self.wasm_engine {
+            debug!("Skipping WASM evaluation for fast path (performance optimization)");
+        }
+
+        let outcome = self.rules_core(request);
+        drop(guard);
+
+        // Even the fast path must produce an audit event for blocks.
+        if outcome.decision == Decision::Allow {
+            return Decision::Allow;
+        }
+        self.finish(request, outcome).await
+    }
+
+    /// Evaluate all rules against the request context.
+    ///
+    /// Returns the first blocking decision or `Allow` if all rules pass. The
+    /// synchronous stages run on the calling thread; async callers that hold
+    /// the engine behind an [`Arc`] should prefer [`Self::evaluate_shared`],
+    /// which offloads them.
+    pub async fn evaluate(&self, request: &RequestContext) -> Decision {
+        if !self.enabled {
+            return Decision::Allow;
+        }
+
+        // Admission control covers the protocol pre-checks as well as the rule
+        // chain: a gRPC field-content scan runs a Coraza evaluation before the
+        // main evaluation. Classification uses the original request, because
+        // the pre-checks strip the body that made the scan expensive.
+        let guard = match self.admit(request).await {
+            Ok(guard) => guard,
+            Err(decision) => return decision,
+        };
+
+        #[cfg(not(any(feature = "wasm-waf", feature = "ai-threat-detection")))]
+        let outcome = self.evaluate_core(request);
+
+        #[cfg(any(feature = "wasm-waf", feature = "ai-threat-detection"))]
+        let outcome = self.evaluate_with_async_stages(request).await;
+
+        drop(guard);
+        self.finish(request, outcome).await
+    }
+
+    /// Evaluate a request without blocking the calling Tokio worker.
+    ///
+    /// Identical in behaviour to [`Self::evaluate`], but a *heavy* inspection
+    /// (a CRS body scan or a gRPC field-content scan) runs on a Tokio blocking
+    /// thread instead of the calling worker. Those scans cost 39–706 ms on the
+    /// reference host and used to park a worker for their whole duration, so a
+    /// handful of them stalled unrelated connections even though the Coraza
+    /// reactor has its own thread pool.
+    ///
+    /// Cheap evaluations (no body, or a body withheld from CRS) stay inline:
+    /// they are a header/URI rule pass plus a short reactor round-trip, and
+    /// offloading them measured worse for bodyless p95 without a throughput
+    /// gain.
+    ///
+    /// Only the engine handle and the request are moved into the task, so no
+    /// engine state is cloned per request and the body is shared through
+    /// [`Bytes`]. Admission is still acquired asynchronously *before* the
+    /// offload, and the permit moves into the blocking task so it is released
+    /// when the inspection actually finishes rather than when the caller stops
+    /// waiting.
+    pub async fn evaluate_shared(self: &Arc<Self>, request: &RequestContext) -> Decision {
+        // The WASM and AI stages are async and would need a nested `block_on`
+        // inside the blocking task, so those builds keep the inline path
+        // instead of nesting runtimes.
+        #[cfg(any(feature = "wasm-waf", feature = "ai-threat-detection"))]
+        {
+            return self.evaluate(request).await;
+        }
+
+        #[cfg(not(any(feature = "wasm-waf", feature = "ai-threat-detection")))]
+        {
+            if !self.enabled {
+                return Decision::Allow;
+            }
+
+            let cost = self.inspection_cost(request);
+            let guard = match self.admission.admit(cost).await {
+                Ok(guard) => guard,
+                Err(rejection) => return self.admission_rejected(request, rejection).await,
+            };
+
+            // Cheap evaluations are a header/URI rule pass plus a short reactor
+            // round-trip (no body scan). Running them inline keeps the reactor
+            // queue shallow: offloading them too measured ~25% worse bodyless
+            // p95 at concurrency 64 for no throughput gain, because the extra
+            // thread hop and the deeper queue cost more than the parked worker
+            // does at sub-millisecond inspection times.
+            if cost == admission::InspectionCost::Cheap {
+                let outcome = self.evaluate_core(request);
+                drop(guard);
+                return self.finish(request, outcome).await;
+            }
+
+            let engine = Arc::clone(self);
+            let owned = request.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                // Keep the permit inside the task: dropping the caller's
+                // future must not release admission while the scan still runs.
+                let _guard = guard;
+                engine.evaluate_core(&owned)
+            })
             .await;
 
-        allow_decision
+            match joined {
+                Ok(outcome) => self.finish(request, outcome).await,
+                Err(error) => {
+                    // A panicking rule used to take down the request task. The
+                    // offloaded path can only observe it as a `JoinError`; keep
+                    // the configured fail mode instead of silently allowing.
+                    tracing::error!(error = %error, "WAF evaluation task failed");
+                    let decision = if self.fail_closed {
+                        Decision::Block {
+                            status: 503,
+                            reason: "WAF evaluation failed (fail-closed)".to_string(),
+                        }
+                    } else {
+                        Decision::Allow
+                    };
+                    self.finish(
+                        request,
+                        CoreOutcome::new(decision, vec!["evaluation-task-failed".to_string()]),
+                    )
+                    .await
+                }
+            }
+        }
+    }
+
+    /// Evaluation for builds that carry the async WASM/AI stages.
+    ///
+    /// Same order as the offloaded path: pre-checks, initialisation gate, WASM,
+    /// AI, then the rule chain.
+    #[cfg(any(feature = "wasm-waf", feature = "ai-threat-detection"))]
+    async fn evaluate_with_async_stages(&self, request: &RequestContext) -> CoreOutcome {
+        let stripped = match self.precheck_core(request) {
+            PrecheckOutcome::Reject(outcome) => return outcome,
+            PrecheckOutcome::Continue(stripped) => stripped,
+        };
+        let request: &RequestContext = stripped.as_deref().unwrap_or(request);
+
+        if let Some(outcome) = self.init_failure() {
+            return outcome;
+        }
+
+        // PHASE 1: WASM ModSecurity evaluation (if enabled)
+        #[cfg(feature = "wasm-waf")]
+        if let Some(wasm_engine) = &self.wasm_engine {
+            debug!("Evaluating request through WASM ModSecurity engine");
+
+            // Convert RequestContext to WasmRequestContext
+            let wasm_context = self.create_wasm_context(request);
+
+            match wasm_engine.process_request(wasm_context).await {
+                Ok(wasm_decision) => {
+                    let decision = self.convert_wasm_decision(wasm_decision);
+                    match &decision {
+                        Decision::Block { .. } | Decision::RateLimit { .. } => {
+                            info!("Request blocked by WASM ModSecurity engine");
+                            return CoreOutcome::new(
+                                decision,
+                                vec!["WASM-ModSecurity".to_string()],
+                            );
+                        }
+                        Decision::Allow => {
+                            debug!("Request allowed by WASM ModSecurity engine, continuing with traditional rules");
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("WASM ModSecurity engine error: {}", e);
+                    if self.fail_closed {
+                        return CoreOutcome::new(
+                            Decision::Block {
+                                status: 503,
+                                reason: "WAF engine unavailable (fail-closed)".to_string(),
+                            },
+                            Vec::new(),
+                        );
+                    }
+                }
+            }
+        }
+
+        // PHASE 2: AI Threat Detection (if enabled)
+        #[cfg(feature = "ai-threat-detection")]
+        if let Some(ai_detector) = &self.ai_detector {
+            debug!("Evaluating request through AI threat detection");
+
+            match ai_detector.analyze_request(request).await {
+                Ok(ai_result) => {
+                    if ai_result.should_block {
+                        info!(
+                            "Request blocked by AI threat detection (score: {:.3})",
+                            ai_result.analysis.threat_score
+                        );
+                        return CoreOutcome::new(
+                            Decision::Block {
+                                status: 403,
+                                reason: format!(
+                                    "AI detected threat (score: {:.3})",
+                                    ai_result.analysis.threat_score
+                                ),
+                            },
+                            vec!["AI-Threat-Detection".to_string()],
+                        );
+                    } else {
+                        debug!(
+                            "AI analysis passed (score: {:.3})",
+                            ai_result.analysis.threat_score
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!("AI analysis error: {}", e);
+                    if self.fail_closed {
+                        return CoreOutcome::new(
+                            Decision::Block {
+                                status: 503,
+                                reason: "WAF AI engine unavailable (fail-closed)".to_string(),
+                            },
+                            Vec::new(),
+                        );
+                    }
+                }
+            }
+        }
+
+        // PHASE 3: Traditional rule evaluation
+        self.rules_core(request)
     }
 
     #[cfg(feature = "wasm-waf")]
@@ -2291,6 +2375,312 @@ mod tests {
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(admission.available_permits(), 1);
+    }
+
+    /// Rule with a fixed decision, used for parity checks.
+    struct FixedRule {
+        name: &'static str,
+        decision: Decision,
+    }
+
+    impl WafRule for FixedRule {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn evaluate(&self, _ctx: &RequestContext) -> Decision {
+            self.decision.clone()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn offloaded_evaluation_matches_inline_for_every_outcome() {
+        let cases = [
+            ("allow", Decision::Allow, WafEngine::new()),
+            (
+                "block",
+                Decision::Block {
+                    status: 403,
+                    reason: "parity block".to_string(),
+                },
+                WafEngine::new(),
+            ),
+            (
+                "rate-limit",
+                Decision::RateLimit {
+                    reason: "parity limit".to_string(),
+                },
+                WafEngine::new(),
+            ),
+        ];
+
+        for (label, expected, mut engine) in cases {
+            if expected != Decision::Allow {
+                engine.add_rule(FixedRule {
+                    name: label,
+                    decision: expected.clone(),
+                });
+            }
+            let engine = Arc::new(engine);
+
+            for context in [create_test_context(), admission_context("a=1")] {
+                assert_eq!(engine.evaluate(&context).await, expected, "{label} inline");
+                assert_eq!(
+                    engine.evaluate_shared(&context).await,
+                    expected,
+                    "{label} offloaded"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn offloaded_evaluation_preserves_protocol_precheck_semantics() {
+        use std::sync::atomic::AtomicUsize;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut engine = grpc_content_scan_engine(
+            "strings",
+            Arc::new(ContentScanProbe {
+                calls: Arc::clone(&calls),
+            }),
+            AdmissionController::disabled(),
+        );
+        engine.add_rule(BodyProbeRule {
+            seen: Arc::clone(&seen),
+        });
+        let engine = Arc::new(engine);
+
+        assert_eq!(
+            engine.evaluate(&grpc_content_request()).await,
+            Decision::Allow
+        );
+        assert_eq!(
+            engine.evaluate_shared(&grpc_content_request()).await,
+            Decision::Allow
+        );
+
+        // The pre-check ran once per evaluation, and the rule chain saw no body
+        // on either path: offloading must not reorder or drop the strip.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![None, None],
+            "protobuf bodies must stay withheld from the rule chain"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn offloaded_evaluation_keeps_admission_before_the_offload() {
+        use std::sync::atomic::AtomicBool;
+
+        let started = Arc::new(AtomicBool::new(false));
+        let admission = AdmissionController::with_permits(
+            true,
+            1,
+            std::time::Duration::from_millis(50),
+            2,
+            None,
+        );
+        let mut engine = WafEngine::new().with_admission(admission.clone());
+        engine.add_rule(SlowRule {
+            started: Arc::clone(&started),
+            delay: std::time::Duration::from_millis(250),
+            heavy_only: true,
+        });
+        let engine = Arc::new(engine);
+
+        let first = {
+            let engine = Arc::clone(&engine);
+            tokio::spawn(async move { engine.evaluate_shared(&admission_context("a=1")).await })
+        };
+        wait_for_slow_rule(&started).await;
+
+        // The single heavy permit is held by the running evaluation, so a
+        // second heavy request is rejected instead of queued on the blocking
+        // pool.
+        match engine.evaluate_shared(&admission_context("b=2")).await {
+            Decision::Block { status, reason } => {
+                assert_eq!(status, 503);
+                assert!(reason.contains("admission control"), "{reason}");
+            }
+            other => panic!("admission rejection must never Allow: {other:?}"),
+        }
+
+        assert_eq!(first.await.unwrap(), Decision::Allow);
+        assert_eq!(
+            admission.available_permits(),
+            1,
+            "the permit must return once the offloaded evaluation finishes"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_offloaded_evaluation_holds_its_permit_until_it_finishes() {
+        use std::sync::atomic::AtomicBool;
+
+        let started = Arc::new(AtomicBool::new(false));
+        let admission = AdmissionController::with_permits(
+            true,
+            1,
+            std::time::Duration::from_millis(10),
+            4,
+            None,
+        );
+        let mut engine = WafEngine::new().with_admission(admission.clone());
+        engine.add_rule(SlowRule {
+            started: Arc::clone(&started),
+            delay: std::time::Duration::from_millis(300),
+            heavy_only: true,
+        });
+        let engine = Arc::new(engine);
+
+        // Simulate a client disconnect: the caller stops awaiting the decision.
+        let caller = {
+            let engine = Arc::clone(&engine);
+            tokio::spawn(async move { engine.evaluate_shared(&admission_context("a=1")).await })
+        };
+        wait_for_slow_rule(&started).await;
+        caller.abort();
+        let _ = caller.await;
+
+        // The permit is still owned by the blocking task, so a competing heavy
+        // request is rejected rather than over-admitting.
+        assert_eq!(
+            admission.available_permits(),
+            0,
+            "cancelling the caller must not release the inspection permit"
+        );
+
+        // Once the abandoned scan finishes the permit comes back and normal
+        // admission resumes.
+        for _ in 0..200 {
+            if admission.available_permits() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(admission.available_permits(), 1);
+        assert_eq!(
+            engine.evaluate_shared(&admission_context("c=3")).await,
+            Decision::Allow
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn offloaded_evaluation_does_not_deadlock_under_concurrency() {
+        use std::sync::atomic::AtomicUsize;
+
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut engine = WafEngine::new();
+        engine.add_rule(SlowRule {
+            started,
+            delay: std::time::Duration::from_millis(20),
+            heavy_only: false,
+        });
+        let engine = Arc::new(engine);
+        let completed = Arc::new(AtomicUsize::new(0));
+
+        let mut tasks = Vec::new();
+        for index in 0..48 {
+            let engine = Arc::clone(&engine);
+            let completed = Arc::clone(&completed);
+            tasks.push(tokio::spawn(async move {
+                let context = if index % 2 == 0 {
+                    create_test_context()
+                } else {
+                    admission_context("a=1")
+                };
+                assert_eq!(engine.evaluate_shared(&context).await, Decision::Allow);
+                completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }));
+        }
+
+        let all = futures::future::join_all(tasks);
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), all).await;
+        assert!(
+            outcome.is_ok(),
+            "concurrent offloaded evaluation deadlocked"
+        );
+        for result in outcome.unwrap() {
+            result.expect("evaluation task must not panic");
+        }
+        assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 48);
+    }
+
+    /// Measures how long an unrelated Tokio task waits while slow inspections
+    /// run. Ignored by default because it is a timing measurement rather than a
+    /// correctness gate; run it in release mode:
+    ///
+    /// `cargo test --release --lib --features wasm-reactor \
+    ///   measure_runtime_responsiveness -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    #[ignore = "timing measurement; run in release mode with --nocapture"]
+    async fn measure_runtime_responsiveness_during_slow_inspection() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        const SLOW_MS: u64 = 200;
+        const CONCURRENCY: usize = 6;
+
+        async fn worst_ticker_delay(offload: bool) -> Duration {
+            let started = Arc::new(AtomicBool::new(false));
+            let mut engine = WafEngine::new();
+            engine.add_rule(SlowRule {
+                started: Arc::clone(&started),
+                delay: Duration::from_millis(SLOW_MS),
+                heavy_only: true,
+            });
+            let engine = Arc::new(engine);
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let ticker = {
+                let stop = Arc::clone(&stop);
+                tokio::spawn(async move {
+                    let mut worst = Duration::ZERO;
+                    while !stop.load(Ordering::SeqCst) {
+                        let tick = std::time::Instant::now();
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        worst = worst.max(tick.elapsed());
+                    }
+                    worst
+                })
+            };
+
+            let mut tasks = Vec::new();
+            for _ in 0..CONCURRENCY {
+                let engine = Arc::clone(&engine);
+                tasks.push(tokio::spawn(async move {
+                    let context = admission_context("a=1");
+                    if offload {
+                        engine.evaluate_shared(&context).await
+                    } else {
+                        engine.evaluate(&context).await
+                    }
+                }));
+            }
+            wait_for_slow_rule(&started).await;
+            tokio::time::sleep(Duration::from_millis(SLOW_MS)).await;
+            for task in tasks {
+                assert_eq!(task.await.unwrap(), Decision::Allow);
+            }
+
+            stop.store(true, Ordering::SeqCst);
+            ticker.await.unwrap()
+        }
+
+        let inline = worst_ticker_delay(false).await;
+        let offloaded = worst_ticker_delay(true).await;
+        println!(
+            "{CONCURRENCY} x {SLOW_MS} ms inspection: worst 1 ms ticker delay \
+             inline {inline:?}, offloaded {offloaded:?}"
+        );
+        assert!(
+            offloaded * 2 < inline,
+            "offloaded inspection must not park workers: inline {inline:?}, offloaded {offloaded:?}"
+        );
     }
 
     #[cfg(feature = "wasm-reactor")]

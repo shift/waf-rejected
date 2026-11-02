@@ -306,7 +306,7 @@ async fn handle_request(
     )
     .with_body(Some(body_bytes.clone()));
 
-    match state.waf_engine.evaluate(&request_context).await {
+    match state.waf_engine.evaluate_shared(&request_context).await {
         Decision::Allow => {
             debug!(
                 "WAF allowed HTTP/3 request from {}, forwarding upstream",

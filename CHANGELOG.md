@@ -335,6 +335,30 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Changed
 
+- Heavy WAF evaluation no longer runs on Tokio worker threads.
+  `WafEngine::evaluate` is async but its rule chain — including the Coraza
+  reactor round-trip, which costs 39–706 ms for a 1–16 KiB body and ~3 s for
+  60 KiB — executed inline, so a handful of slow inspections parked every worker
+  and stalled unrelated connections. The proxy now calls
+  `WafEngine::evaluate_shared`, which acquires admission asynchronously and
+  then runs the synchronous stages (protocol pre-checks plus the rule chain) on
+  `tokio::task::spawn_blocking` for heavy inspections only. Only an
+  `Arc<WafEngine>` and a cloned `RequestContext` (body shared through `Bytes`)
+  move into the task, so no engine state is copied per request; the admission
+  permit travels into the task and is released when the inspection finishes,
+  including after a client disconnect. Inspection order, decisions, metrics and
+  audit events are unchanged; `evaluate` remains available for non-`Arc`
+  callers and tests.
+  `block_in_place` was rejected: it converts the calling worker into a blocking
+  thread, cannot observe cancellation while the scan runs, and panics on
+  current-thread runtimes. Cheap (no-body) evaluations stay inline — offloading
+  them too measured worse for cheap p95 at c=64 with no throughput gain. Load
+  validation: end-to-end throughput and latency are unchanged within this
+  host's variance (the Coraza reactor, not the worker count, is the binding
+  constraint), while an unrelated 1 ms Tokio task's worst delay during six
+  concurrent 200 ms inspections drops from 200.4 ms to 4.0 ms. See
+  `docs/operations/performance-validation.md`.
+
 - Replaced wasmtime fuel metering in the Coraza WASI reactor with epoch
   interruption and a wall-clock timeout. `waf.coraza.fuel` is removed and
   replaced by `waf.coraza.eval_timeout_ms` (default 5000 ms, validated as
