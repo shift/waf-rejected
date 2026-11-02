@@ -11,6 +11,11 @@ const DURATION_BUCKETS: [f64; 11] = [
 /// Upper bounds (seconds) for the Coraza evaluation-duration histogram.
 const CORAZA_DURATION_BUCKETS: [f64; 11] = DURATION_BUCKETS;
 
+/// Upper bounds (bytes) for the Coraza inspected-body-size histogram.
+const CORAZA_BODY_BYTES_BUCKETS: [f64; 8] = [
+    0.0, 1024.0, 4096.0, 8192.0, 16384.0, 32768.0, 65536.0, 131072.0,
+];
+
 /// Process-wide counters for the proxy.
 #[derive(Debug)]
 pub struct Metrics {
@@ -37,6 +42,12 @@ pub struct Metrics {
     coraza_duration_inf: AtomicU64,
     coraza_duration_sum_nanos: AtomicU64,
     coraza_duration_count: AtomicU64,
+    coraza_body_truncated_total: AtomicU64,
+    coraza_body_rejected_total: AtomicU64,
+    coraza_body_inspected_buckets: [AtomicU64; 8],
+    coraza_body_inspected_inf: AtomicU64,
+    coraza_body_inspected_sum: AtomicU64,
+    coraza_body_inspected_count: AtomicU64,
     admission_queued_total: AtomicU64,
     admission_queue_depth: AtomicU64,
     admission_admitted_total: AtomicU64,
@@ -82,6 +93,12 @@ impl Metrics {
             coraza_duration_inf: AtomicU64::new(0),
             coraza_duration_sum_nanos: AtomicU64::new(0),
             coraza_duration_count: AtomicU64::new(0),
+            coraza_body_truncated_total: AtomicU64::new(0),
+            coraza_body_rejected_total: AtomicU64::new(0),
+            coraza_body_inspected_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            coraza_body_inspected_inf: AtomicU64::new(0),
+            coraza_body_inspected_sum: AtomicU64::new(0),
+            coraza_body_inspected_count: AtomicU64::new(0),
             admission_queued_total: AtomicU64::new(0),
             admission_queue_depth: AtomicU64::new(0),
             admission_admitted_total: AtomicU64::new(0),
@@ -164,6 +181,36 @@ impl Metrics {
 
     pub fn record_coraza_error(&self) {
         self.coraza_errors_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one body that was truncated to the configured inspection prefix.
+    pub fn record_coraza_body_truncated(&self) {
+        self.coraza_body_truncated_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one body rejected by the oversize policy before evaluation.
+    pub fn record_coraza_body_rejected(&self) {
+        self.coraza_body_rejected_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Observe the number of body bytes actually handed to Coraza.
+    pub fn record_coraza_body_inspected_bytes(&self, bytes: usize) {
+        let value = bytes as f64;
+        self.coraza_body_inspected_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.coraza_body_inspected_sum
+            .fetch_add(bytes.min(u64::MAX as usize) as u64, Ordering::Relaxed);
+
+        for (index, bound) in CORAZA_BODY_BYTES_BUCKETS.iter().enumerate() {
+            if value <= *bound {
+                self.coraza_body_inspected_buckets[index].fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        self.coraza_body_inspected_inf
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn admission_queued(&self) {
@@ -319,6 +366,46 @@ impl Metrics {
             self.coraza_evaluations_total.load(Ordering::Relaxed),
             self.coraza_blocks_total.load(Ordering::Relaxed),
             self.coraza_errors_total.load(Ordering::Relaxed),
+        ));
+
+        out.push_str(&format!(
+            "# HELP waf_coraza_body_truncated_total Bodies truncated to the configured inspection prefix.\n\
+             # TYPE waf_coraza_body_truncated_total counter\n\
+             waf_coraza_body_truncated_total {}\n\
+             # HELP waf_coraza_body_rejected_total Bodies rejected by the oversize policy before evaluation.\n\
+             # TYPE waf_coraza_body_rejected_total counter\n\
+             waf_coraza_body_rejected_total {}\n",
+            self.coraza_body_truncated_total.load(Ordering::Relaxed),
+            self.coraza_body_rejected_total.load(Ordering::Relaxed),
+        ));
+
+        out.push_str(
+            "# HELP waf_coraza_body_inspected_bytes Body bytes handed to Coraza per evaluation.\n\
+             # TYPE waf_coraza_body_inspected_bytes histogram\n",
+        );
+        let mut body_cumulative = 0u64;
+        for (index, bound) in CORAZA_BODY_BYTES_BUCKETS.iter().enumerate() {
+            body_cumulative = body_cumulative
+                .saturating_add(self.coraza_body_inspected_buckets[index].load(Ordering::Relaxed));
+            out.push_str(&format!(
+                "waf_coraza_body_inspected_bytes_bucket{{le=\"{}\"}} {}\n",
+                format_bucket(*bound),
+                body_cumulative
+            ));
+        }
+        let body_total =
+            body_cumulative.saturating_add(self.coraza_body_inspected_inf.load(Ordering::Relaxed));
+        out.push_str(&format!(
+            "waf_coraza_body_inspected_bytes_bucket{{le=\"+Inf\"}} {}\n",
+            body_total
+        ));
+        out.push_str(&format!(
+            "waf_coraza_body_inspected_bytes_sum {}\n",
+            self.coraza_body_inspected_sum.load(Ordering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "waf_coraza_body_inspected_bytes_count {}\n",
+            self.coraza_body_inspected_count.load(Ordering::Relaxed)
         ));
 
         out.push_str(&format!(

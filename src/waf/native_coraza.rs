@@ -23,7 +23,7 @@ use tokio::sync::{mpsc, Mutex, Semaphore};
 use tracing::{info, warn};
 
 use crate::metrics::Metrics;
-use crate::waf::coraza_payload::build_payload;
+use crate::waf::coraza_payload::{build_payload_with_policy, BodyInspectionPolicy, PayloadBuild};
 use crate::waf::{Decision, RequestContext, WafRule};
 
 /// Maximum response frame the client will accept from the sidecar.
@@ -350,6 +350,7 @@ pub struct NativeCorazaRule {
     client: NativeCorazaClient,
     metrics: Option<Arc<Metrics>>,
     fail_closed: bool,
+    body_policy: BodyInspectionPolicy,
 }
 
 impl NativeCorazaRule {
@@ -360,12 +361,19 @@ impl NativeCorazaRule {
             client,
             metrics: None,
             fail_closed: true,
+            body_policy: BodyInspectionPolicy::default(),
         }
     }
 
     /// Attaches process metrics so sidecar evaluations are observable.
     pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Applies an explicit body-size inspection policy.
+    pub fn with_body_policy(mut self, policy: BodyInspectionPolicy) -> Self {
+        self.body_policy = policy;
         self
     }
 
@@ -381,7 +389,9 @@ impl NativeCorazaRule {
         fail_closed: bool,
     ) -> Result<Self, NativeCorazaError> {
         let client = NativeCorazaClient::new(&ClientConfig::from(config))?;
-        Ok(Self::new("coraza-native-sidecar", client).with_fail_closed(fail_closed))
+        Ok(Self::new("coraza-native-sidecar", client)
+            .with_fail_closed(fail_closed)
+            .with_body_policy(BodyInspectionPolicy::from(config)))
     }
 
     fn failure_decision(&self, reason: String) -> Decision {
@@ -408,8 +418,26 @@ impl WafRule for NativeCorazaRule {
 
     fn evaluate(&self, ctx: &RequestContext) -> Decision {
         let started = Instant::now();
-        let payload = match build_payload(ctx) {
-            Ok(payload) => payload,
+        let (payload, inspected_bytes, truncated) = match build_payload_with_policy(
+            ctx,
+            &self.body_policy,
+        ) {
+            Ok(PayloadBuild::Built {
+                payload,
+                inspected_bytes,
+                truncated,
+            }) => (payload, inspected_bytes, truncated),
+            Ok(PayloadBuild::Reject { size, limit }) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_coraza_body_rejected();
+                }
+                return Decision::Block {
+                        status: 413,
+                        reason: format!(
+                            "request body of {size} bytes exceeds the {limit} byte Coraza inspection limit"
+                        ),
+                    };
+            }
             Err(err) => {
                 warn!(rule = %self.name, error = %err, "failed to encode native Coraza payload");
                 if let Some(metrics) = &self.metrics {
@@ -419,6 +447,13 @@ impl WafRule for NativeCorazaRule {
                 return self.failure_decision(err.to_string());
             }
         };
+
+        if let Some(metrics) = &self.metrics {
+            metrics.record_coraza_body_inspected_bytes(inspected_bytes);
+            if truncated {
+                metrics.record_coraza_body_truncated();
+            }
+        }
 
         let result = self.client.evaluate(&payload);
         if let Some(metrics) = &self.metrics {

@@ -673,6 +673,23 @@ pub enum CorazaBackend {
     Native,
 }
 
+/// What the reactor does when a request body is larger than
+/// [`WafCorazaConfig::max_inspect_bytes`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CorazaOversizeAction {
+    /// Inspect the whole body (up to `max_payload_bytes`). This is the default
+    /// and preserves the historical behaviour.
+    #[default]
+    InspectAll,
+    /// Inspect only the first `max_inspect_bytes` bytes and forward the rest
+    /// of the body without CRS body inspection. Header and URI rules still
+    /// run. This is an explicit inspection gap.
+    ForwardUninspected,
+    /// Reject the request with `413 Payload Too Large` before evaluation.
+    Reject,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WafCorazaConfig {
@@ -690,6 +707,14 @@ pub struct WafCorazaConfig {
 
     /// Maximum request payload handed to the reactor.
     pub max_payload_bytes: usize,
+
+    /// Maximum number of request-body bytes inspected by CRS. `0` (the
+    /// default) inspects the whole body, preserving historical behaviour.
+    /// Must not exceed `max_payload_bytes` when non-zero.
+    pub max_inspect_bytes: usize,
+
+    /// Policy applied when the body exceeds `max_inspect_bytes`.
+    pub oversize_action: CorazaOversizeAction,
 
     /// Maximum linear memory the reactor may grow to.
     pub memory_limit_bytes: usize,
@@ -727,6 +752,9 @@ impl Default for WafCorazaConfig {
             native_socket_path: None,
             module_path: None,
             max_payload_bytes: 64 * 1024,
+            // 0 = inspect the whole body (historical behaviour).
+            max_inspect_bytes: 0,
+            oversize_action: CorazaOversizeAction::InspectAll,
             memory_limit_bytes: 256 * 1024 * 1024,
             // Generous DoS bound: CRS body inspection is byte-linear and a
             // 60 KiB body can legitimately take seconds on modest hardware.
@@ -1542,6 +1570,13 @@ impl Config {
         if self.waf.coraza.max_payload_bytes == 0 {
             anyhow::bail!("waf.coraza.max_payload_bytes must be greater than zero");
         }
+        if self.waf.coraza.max_inspect_bytes > 0
+            && self.waf.coraza.max_inspect_bytes > self.waf.coraza.max_payload_bytes
+        {
+            anyhow::bail!(
+                "waf.coraza.max_inspect_bytes must not exceed waf.coraza.max_payload_bytes"
+            );
+        }
         if self.waf.coraza.memory_limit_bytes < 64 * 1024 {
             anyhow::bail!("waf.coraza.memory_limit_bytes must be at least 65536");
         }
@@ -1878,6 +1913,46 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
         assert!(config.validate().is_err());
         config.waf.coraza.pool_size = 4;
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn coraza_body_inspection_policy_is_validated() {
+        let mut config = Config::default();
+        assert_eq!(config.waf.coraza.max_inspect_bytes, 0);
+        assert_eq!(
+            config.waf.coraza.oversize_action,
+            CorazaOversizeAction::InspectAll
+        );
+        assert!(config.validate().is_ok());
+
+        config.waf.coraza.max_inspect_bytes = config.waf.coraza.max_payload_bytes + 1;
+        assert!(config.validate().is_err());
+
+        config.waf.coraza.max_inspect_bytes = config.waf.coraza.max_payload_bytes;
+        assert!(config.validate().is_ok());
+
+        config.waf.coraza.max_inspect_bytes = 1024;
+        config.waf.coraza.oversize_action = CorazaOversizeAction::ForwardUninspected;
+        assert!(config.validate().is_ok());
+        config.waf.coraza.oversize_action = CorazaOversizeAction::Reject;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn coraza_oversize_action_rejects_unknown_values() {
+        let err = toml::from_str::<WafCorazaConfig>(
+            "max_inspect_bytes = 1024\noversize_action = \"drop\"\n",
+        )
+        .expect_err("unknown oversize_action must be rejected");
+        assert!(err.to_string().contains("unknown variant"), "{err}");
+
+        let parsed: WafCorazaConfig =
+            toml::from_str("max_inspect_bytes = 1024\noversize_action = \"forward-uninspected\"\n")
+                .expect("documented action must parse");
+        assert_eq!(
+            parsed.oversize_action,
+            CorazaOversizeAction::ForwardUninspected
+        );
     }
 
     #[test]

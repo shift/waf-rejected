@@ -6,6 +6,17 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Added
 
+- Opt-in Coraza body-inspection size policy (`[waf.coraza]`).
+  `max_inspect_bytes` (default `0` = inspect the whole body) and
+  `oversize_action` (`"inspect-all"` default, `"forward-uninspected"`,
+  `"reject"`) let operators bound the byte-linear CRS body cost. The default
+  is unchanged. `forward-uninspected` sends only the first N bytes to CRS and
+  forwards the rest uninspected (an explicit, documented gap); `reject`
+  returns `413` before evaluation. New metrics
+  `waf_coraza_body_truncated_total`, `waf_coraza_body_rejected_total` and the
+  `waf_coraza_body_inspected_bytes` histogram, plus a start-up warning for
+  non-default policies. See `docs/coraza-wasi-reactor.md`.
+
 - Deterministic GraphQL persisted-query allowlist generation and loading.
   `graphql-allowlist` (`src/bin/graphql-allowlist.rs`,
   `scripts/graphql-allowlist.sh`) builds a sorted, byte-identical artifact

@@ -365,6 +365,16 @@ impl WafEngine {
             return;
         }
 
+        if config.waf.coraza.oversize_action != crate::config::CorazaOversizeAction::InspectAll {
+            warn!(
+                action = ?config.waf.coraza.oversize_action,
+                max_inspect_bytes = config.waf.coraza.max_inspect_bytes,
+                max_payload_bytes = config.waf.coraza.max_payload_bytes,
+                "Coraza body inspection policy is not inspect-all: bodies above \
+                 max_inspect_bytes are not fully inspected by CRS"
+            );
+        }
+
         let backend = config.waf.coraza.backend;
         let result = match backend {
             #[cfg(feature = "wasm-reactor")]

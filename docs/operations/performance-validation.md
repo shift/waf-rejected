@@ -53,6 +53,25 @@ export so the matrix measures inspection capacity rather than the default
 100 req/min/IP limiter or sled I/O. WAF defaults (64 KiB payload cap, 5 s
 `eval_timeout_ms`, fail-closed, auto pool = cores clamped to 8) are unchanged.
 
+## Body-inspection policy and the capacity table
+
+The capacity table above assumes the default `waf.coraza` policy:
+`max_inspect_bytes = 0` and `oversize_action = "inspect-all"`, so every body up
+to the 64 KiB payload cap is fully scanned. The opt-in policy changes which
+rows are meaningful:
+
+| policy | effect on the capacity table |
+| --- | --- |
+| `inspect-all` (default) | Unchanged. `form-8k`, `form-16k` and `form-60k` measure full CRS body cost; bodies above 64 KiB still fail closed with `503`. |
+| `forward-uninspected` with `max_inspect_bytes = N` | Bodies above N are scanned only for their first N bytes. The `form-8k`/`form-16k`/`form-60k` cells then measure the cost of N bytes, not the full body, and the `form-60k-admitted-c1` gate no longer proves full-body inspection. Re-run the matrix with the production policy and record N; do not compare those cells to the default table. |
+| `reject` with `max_inspect_bytes = N` | Bodies above N return `413` before evaluation. Heavy-body cells become rejection-throughput cells, and the `form-60k-*` gates are not applicable. |
+
+The `mixed-dos` isolation gate is the one to watch when choosing a policy: a
+small prefix or `reject` removes the 60 KiB CRS cost that starves bodyless
+traffic, but `forward-uninspected` still forwards the full body upstream and
+still pays the transport cost. Any capacity claim must state the policy and
+`max_inspect_bytes` used for the run.
+
 ## Acceptance gates
 
 Gates are evaluated by the harness and reported PASS/FAIL/SKIP. They are not

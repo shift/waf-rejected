@@ -26,7 +26,7 @@ use wasmtime_wasi::p2::pipe::SinkOutputStream;
 use wasmtime_wasi::WasiCtxBuilder;
 
 use crate::metrics::Metrics;
-use crate::waf::coraza_payload::build_payload;
+use crate::waf::coraza_payload::{build_payload_with_policy, BodyInspectionPolicy, PayloadBuild};
 use crate::waf::{Decision, RequestContext, WafRule};
 
 /// Decision code returned by the reactor for "allow".
@@ -1138,6 +1138,7 @@ pub struct WasmReactorRule {
     reactor: Arc<WasmReactor>,
     metrics: Option<Arc<Metrics>>,
     fail_closed: bool,
+    body_policy: BodyInspectionPolicy,
 }
 
 impl WasmReactorRule {
@@ -1148,6 +1149,7 @@ impl WasmReactorRule {
             reactor,
             metrics: None,
             fail_closed: true,
+            body_policy: BodyInspectionPolicy::default(),
         }
     }
 
@@ -1155,6 +1157,12 @@ impl WasmReactorRule {
     /// observable through `/metrics`.
     pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Applies an explicit body-size inspection policy.
+    pub fn with_body_policy(mut self, policy: BodyInspectionPolicy) -> Self {
+        self.body_policy = policy;
         self
     }
 
@@ -1194,6 +1202,7 @@ impl WasmReactorRule {
             ReactorLimits::from(config),
             fail_closed,
         )
+        .map(|rule| rule.with_body_policy(BodyInspectionPolicy::from(config)))
     }
 
     /// Creates a rule backed by the embedded spike module.
@@ -1227,8 +1236,26 @@ impl WafRule for WasmReactorRule {
 
     fn evaluate(&self, ctx: &RequestContext) -> Decision {
         let started = Instant::now();
-        let payload = match build_payload(ctx) {
-            Ok(payload) => payload,
+        let (payload, inspected_bytes, truncated) = match build_payload_with_policy(
+            ctx,
+            &self.body_policy,
+        ) {
+            Ok(PayloadBuild::Built {
+                payload,
+                inspected_bytes,
+                truncated,
+            }) => (payload, inspected_bytes, truncated),
+            Ok(PayloadBuild::Reject { size, limit }) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_coraza_body_rejected();
+                }
+                return Decision::Block {
+                        status: 413,
+                        reason: format!(
+                            "request body of {size} bytes exceeds the {limit} byte Coraza inspection limit"
+                        ),
+                    };
+            }
             Err(err) => {
                 warn!(rule = %self.name, error = %err, "failed to encode wasm reactor payload");
                 if let Some(metrics) = &self.metrics {
@@ -1238,6 +1265,13 @@ impl WafRule for WasmReactorRule {
                 return self.failure_decision(err.to_string());
             }
         };
+
+        if let Some(metrics) = &self.metrics {
+            metrics.record_coraza_body_inspected_bytes(inspected_bytes);
+            if truncated {
+                metrics.record_coraza_body_truncated();
+            }
+        }
 
         let result = self.reactor.evaluate(&payload);
         if let Some(metrics) = &self.metrics {
@@ -1284,6 +1318,7 @@ impl WasmReactorRule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::waf::coraza_payload::build_payload;
     use bytes::Bytes;
     use hyper::{HeaderMap, Method, Uri};
     use std::net::{IpAddr, Ipv4Addr};
@@ -1386,6 +1421,134 @@ mod tests {
                 .expect("body must be valid base64"),
             raw
         );
+    }
+
+    #[test]
+    fn default_body_policy_inspects_the_whole_body() {
+        let body = "a".repeat(8 * 1024);
+        let built = build_payload_with_policy(
+            &context("/search", Some(&body)),
+            &BodyInspectionPolicy::default(),
+        )
+        .expect("payload must encode");
+        let PayloadBuild::Built {
+            payload,
+            inspected_bytes,
+            truncated,
+        } = built
+        else {
+            panic!("inspect-all must never reject");
+        };
+        assert_eq!(inspected_bytes, body.len());
+        assert!(!truncated);
+        let value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(value["body"], body);
+        assert_eq!(value["body_size"].as_u64(), Some(body.len() as u64));
+        assert_eq!(
+            value["body_original_size"].as_u64(),
+            Some(body.len() as u64)
+        );
+    }
+
+    #[test]
+    fn forward_uninspected_sends_only_the_inspection_prefix() {
+        let body = "a".repeat(8 * 1024);
+        let policy = BodyInspectionPolicy {
+            max_inspect_bytes: 1024,
+            oversize_action: crate::config::CorazaOversizeAction::ForwardUninspected,
+        };
+        let built = build_payload_with_policy(&context("/search", Some(&body)), &policy)
+            .expect("payload must encode");
+        let PayloadBuild::Built {
+            payload,
+            inspected_bytes,
+            truncated,
+        } = built
+        else {
+            panic!("forward-uninspected must not reject");
+        };
+        assert_eq!(inspected_bytes, 1024);
+        assert!(truncated);
+        let value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(value["body"], "a".repeat(1024));
+        // The guest requires body_size to match the decoded body; the original
+        // length is retained separately for observability.
+        assert_eq!(value["body_size"].as_u64(), Some(1024));
+        assert_eq!(
+            value["body_original_size"].as_u64(),
+            Some(body.len() as u64)
+        );
+    }
+
+    #[test]
+    fn reject_policy_returns_a_rejection_without_building_a_payload() {
+        let body = "a".repeat(8 * 1024);
+        let policy = BodyInspectionPolicy {
+            max_inspect_bytes: 1024,
+            oversize_action: crate::config::CorazaOversizeAction::Reject,
+        };
+        let built = build_payload_with_policy(&context("/search", Some(&body)), &policy)
+            .expect("policy decision must not be an encoding error");
+        assert!(matches!(
+            built,
+            PayloadBuild::Reject {
+                size: 8192,
+                limit: 1024
+            }
+        ));
+    }
+
+    #[test]
+    fn reject_policy_returns_413_and_does_not_evaluate_the_reactor() {
+        let metrics = Arc::new(Metrics::new());
+        let rule = WasmReactorRule::spike()
+            .expect("spike module must load")
+            .with_metrics(Arc::clone(&metrics))
+            .with_body_policy(BodyInspectionPolicy {
+                max_inspect_bytes: 1024,
+                oversize_action: crate::config::CorazaOversizeAction::Reject,
+            });
+        let body = "a".repeat(8 * 1024);
+        let decision = rule.evaluate(&context("/search", Some(&body)));
+        assert!(matches!(decision, Decision::Block { status: 413, .. }));
+        let rendered = metrics.render_prometheus();
+        assert!(rendered.contains("waf_coraza_body_rejected_total 1"));
+        assert!(rendered.contains("waf_coraza_evaluations_total 0"));
+    }
+
+    #[test]
+    fn default_policy_still_fails_closed_at_the_payload_cap() {
+        let limits = ReactorLimits {
+            max_payload_bytes: 8,
+            ..ReactorLimits::default()
+        };
+        let reactor = WasmReactor::from_wat(SPIKE_WAT, limits).expect("spike module must load");
+        let rule = WasmReactorRule::new("spike", Arc::new(reactor));
+        assert!(matches!(
+            rule.evaluate(&context("/search", Some("0123456789"))),
+            Decision::Block { status: 503, .. }
+        ));
+    }
+
+    #[test]
+    fn forward_uninspected_records_truncation_and_inspected_bytes() {
+        let metrics = Arc::new(Metrics::new());
+        let rule = WasmReactorRule::spike()
+            .expect("spike module must load")
+            .with_metrics(Arc::clone(&metrics))
+            .with_body_policy(BodyInspectionPolicy {
+                max_inspect_bytes: 1024,
+                oversize_action: crate::config::CorazaOversizeAction::ForwardUninspected,
+            });
+        let body = "a".repeat(8 * 1024);
+        assert_eq!(
+            rule.evaluate(&context("/search", Some(&body))),
+            Decision::Allow
+        );
+        let rendered = metrics.render_prometheus();
+        assert!(rendered.contains("waf_coraza_body_truncated_total 1"));
+        assert!(rendered.contains("waf_coraza_body_inspected_bytes_count 1"));
+        assert!(rendered.contains("waf_coraza_body_inspected_bytes_sum 1024"));
     }
 
     #[test]
@@ -1773,6 +1936,50 @@ mod tests {
                         "expected Coraza CRS to block {kind} payload: {body}"
                     );
                 }
+            })
+            .expect("spawn reactor thread")
+            .join()
+            .expect("reactor thread must not panic");
+    }
+
+    #[test]
+    #[ignore = "Go/WASI reactor is exercised in release mode"]
+    fn coraza_forward_uninspected_blocks_prefix_attack_but_not_suffix_attack() {
+        let reactor = WasmReactor::from_bytes(EMBEDDED_CORAZA_REACTOR, ReactorLimits::coraza())
+            .expect("embedded reactor must load");
+        let rule = WasmReactorRule::new("coraza", Arc::new(reactor)).with_body_policy(
+            BodyInspectionPolicy {
+                max_inspect_bytes: 1024,
+                oversize_action: crate::config::CorazaOversizeAction::ForwardUninspected,
+            },
+        );
+
+        let benign = format!("q={}", "a".repeat(8 * 1024));
+        let prefix_attack = format!("q=<script>alert(1)</script>&pad={}", "a".repeat(8 * 1024));
+        // The attack starts after the 1 KiB inspection prefix. This is the
+        // documented gap of forward-uninspected and is asserted explicitly.
+        let suffix_attack = format!("q={}&x=<script>alert(1)</script>", "a".repeat(1024));
+
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                assert_eq!(
+                    rule.evaluate(&binary_context("/search", benign.as_bytes())),
+                    Decision::Allow,
+                    "benign 8 KiB body must be allowed"
+                );
+                assert!(
+                    matches!(
+                        rule.evaluate(&binary_context("/search", prefix_attack.as_bytes())),
+                        Decision::Block { status: 403, .. }
+                    ),
+                    "an attack inside the inspection prefix must still be blocked"
+                );
+                assert_eq!(
+                    rule.evaluate(&binary_context("/search", suffix_attack.as_bytes())),
+                    Decision::Allow,
+                    "an attack after the inspection prefix is not inspected (documented gap)"
+                );
             })
             .expect("spawn reactor thread")
             .join()

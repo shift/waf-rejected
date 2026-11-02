@@ -20,6 +20,14 @@ json_format = true
 [waf]
 enabled = true
 
+# Opt-in Coraza body-size policy. Defaults preserve full inspection.
+# [waf.coraza]
+# max_inspect_bytes = 0            # 0 = inspect the whole body (default)
+# oversize_action = "inspect-all"  # "inspect-all" | "forward-uninspected" | "reject"
+# SECURITY: "forward-uninspected" skips CRS body rules after the prefix, so an
+# attacker can place a payload past max_inspect_bytes. Use "reject" for
+# endpoints that should never receive large bodies.
+
 [waf.rate_limit]
 per_ip_enabled = true
 per_ip_max_requests = 100

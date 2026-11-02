@@ -401,15 +401,49 @@ fail_mode = "closed"      # "open" logs request-time reactor failures and contin
 enabled = true            # default; set false to skip compilation/warm-up entirely
 # module_path = "/etc/waf/coraza_reactor.wasm"  # omit to use the embedded reactor
 max_payload_bytes = 65536
+# Opt-in body-size policy. Defaults preserve full inspection.
+# max_inspect_bytes = 0   # 0 = inspect the whole body (default)
+# oversize_action = "inspect-all"  # "inspect-all" | "forward-uninspected" | "reject"
 memory_limit_bytes = 268435456
 eval_timeout_ms = 5000    # DoS bound per eval; init gets a fixed 60 s budget
 pool_size = 0             # 0 = one worker per core, clamped to 1..=8
 ```
 
+### Body-inspection size policy (opt-in)
+
+CRS body inspection is byte-linear: on the WASI reactor a 1 KiB body costs
+roughly 39 ms, 8 KiB roughly 350 ms and 60 KiB roughly 2.6 s. The native
+sidecar is about 6x faster. Operators can bound that cost with
+`max_inspect_bytes` and choose what happens above it with `oversize_action`.
+The default (`max_inspect_bytes = 0`, `oversize_action = "inspect-all"`) is
+unchanged: every body up to `max_payload_bytes` is fully inspected.
+
+| `oversize_action` | Body above `max_inspect_bytes` | What is inspected | What is not |
+| --- | --- | --- | --- |
+| `inspect-all` (default) | Sent whole, up to `max_payload_bytes` | URI, headers, full body | Nothing within the cap; bodies above the cap fail closed with `503` |
+| `forward-uninspected` | First `max_inspect_bytes` bytes sent as `body`; `body_size` is the prefix length and `body_original_size` keeps the full length | URI, headers, body prefix | **All body bytes after the prefix.** An attack placed only after the prefix is forwarded upstream |
+| `reject` | Rejected before evaluation | URI and headers are not evaluated either; the request returns `413` | The whole request |
+
+`forward-uninspected` is an explicit, documented inspection gap. It is useful
+for large uploads or form posts where the first N bytes carry the meaningful
+parameters, but it must not be used where an attacker can move a payload past
+the prefix. `reject` is the fail-closed choice for endpoints that should never
+receive large bodies. `max_inspect_bytes` must be non-zero and no larger than
+`max_payload_bytes`; an unknown `oversize_action` is rejected at config load.
+
+Sizing guidance: start from the largest legitimate body that must be fully
+inspected. A 1 KiB prefix keeps the WASI cost near 40 ms per body; 8 KiB is
+near 350 ms. Prefer `reject` for JSON/API endpoints with a known small body
+limit, and `forward-uninspected` only for upload paths whose security does not
+depend on the tail. The native sidecar can afford a larger prefix for the same
+latency budget. Start-up logs a warning whenever `oversize_action` is not
+`inspect-all`.
+
 `module_path` is optional: when omitted the Coraza module is embedded in the
 WAF binary. `Config::validate` rejects zero payload/timeout values, a memory
-limit below 64 KiB, a payload limit larger than the memory limit, an empty
-module path, and a `pool_size` above 8.
+limit below 64 KiB, a payload limit larger than the memory limit, a
+`max_inspect_bytes` larger than `max_payload_bytes`, an empty module path, and
+a `pool_size` above 8. An unknown `oversize_action` fails TOML deserialisation.
 
 `eval_timeout_ms` is a wall-clock denial-of-service bound, not a latency
 target. It is generous because CRS body inspection is byte-linear and a 60 KiB
@@ -482,6 +516,9 @@ The rule then records, under the `wasm-reactor` feature:
 | `waf_coraza_evaluations_total` | counter | Reactor evaluations attempted (including failures) |
 | `waf_coraza_blocks_total` | counter | Decisions returned as block |
 | `waf_coraza_errors_total` | counter | Payload-encoding or evaluation failures |
+| `waf_coraza_body_truncated_total` | counter | Bodies truncated to `max_inspect_bytes` by `forward-uninspected` |
+| `waf_coraza_body_rejected_total` | counter | Bodies rejected with `413` by the `reject` policy before evaluation |
+| `waf_coraza_body_inspected_bytes` | histogram | Body bytes actually handed to Coraza per evaluation |
 | `waf_coraza_evaluation_duration_seconds` | histogram | End-to-end rule path duration, including payload encoding |
 
 Recording is limited to relaxed atomic increments plus one `Instant` read per
