@@ -1,0 +1,56 @@
+[Unit]
+Description=WAF-Rejected native Coraza sidecar
+Documentation=https://github.com/shift/waf-rejected/blob/main/docs/coraza-native-sidecar.md
+After=network.target
+Before=waf-ingress.service
+PartOf=waf-ingress.service
+
+[Service]
+Type=simple
+User=waf
+Group=waf
+RuntimeDirectory=waf
+RuntimeDirectoryMode=0750
+UMask=0077
+ExecStart=/usr/local/bin/coraza-sidecar \
+  --socket /run/waf/coraza.sock \
+  --rules /usr/share/waf/coraza/crs/crs.conf \
+  --max-body 65536 \
+  --max-headers 100 \
+  --max-header-bytes 65536 \
+  --timeout 5s \
+  --grace 10s
+Restart=on-failure
+RestartSec=2s
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+TimeoutStopSec=15s
+KillSignal=SIGTERM
+
+# Hardening. The sidecar only needs the Unix socket and read-only rules.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadOnlyPaths=/usr/share/waf/coraza
+LimitNOFILE=8192
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

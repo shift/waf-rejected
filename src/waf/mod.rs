@@ -384,7 +384,13 @@ impl WafEngine {
             #[cfg(all(feature = "coraza-native", unix))]
             crate::config::CorazaBackend::Native => {
                 native_coraza::NativeCorazaRule::from_config(&config.waf.coraza, self.fail_closed)
-                    .map(|rule| Box::new(rule) as Box<dyn WafRule>)
+                    .map(|rule| {
+                        let rule = match &self.metrics {
+                            Some(metrics) => rule.with_metrics(Arc::clone(metrics)),
+                            None => rule,
+                        };
+                        Box::new(rule) as Box<dyn WafRule>
+                    })
                     .map_err(|err| err.to_string())
             }
             #[cfg(not(all(feature = "coraza-native", unix)))]

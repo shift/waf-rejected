@@ -19,6 +19,10 @@ mod compliance_tests;
 #[path = "integration/maxmind_tests.rs"]
 mod maxmind_tests;
 
+#[cfg(all(feature = "coraza-native", unix))]
+#[path = "integration/native_coraza_tests.rs"]
+mod native_coraza_tests;
+
 #[path = "integration/https_upstream_tests.rs"]
 mod https_upstream_tests;
 

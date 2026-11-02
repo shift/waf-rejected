@@ -1,7 +1,10 @@
 package main
 
 import (
+	"encoding/binary"
 	"encoding/json"
+	"net"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -114,6 +117,53 @@ func equalHeaders(n int) [][2]string {
 		out = append(out, [2]string{"x-test", "value"})
 	}
 	return out
+}
+
+func TestConnectionCleanup(t *testing.T) {
+	s := testServer(t)
+	before := runtime.NumGoroutine()
+	req := payload(t, form("POST", "/hello", "name=world"))
+
+	for i := 0; i < 50; i++ {
+		serverConn, clientConn := net.Pipe()
+		done := make(chan struct{})
+		go func() {
+			s.handle(serverConn)
+			close(done)
+		}()
+
+		var hdr [4]byte
+		binary.BigEndian.PutUint32(hdr[:], uint32(len(req)))
+		if _, err := clientConn.Write(hdr[:]); err != nil {
+			t.Fatalf("write header: %v", err)
+		}
+		if _, err := clientConn.Write(req); err != nil {
+			t.Fatalf("write payload: %v", err)
+		}
+		if _, err := readFrame(clientConn); err != nil {
+			t.Fatalf("read response: %v", err)
+		}
+		_ = clientConn.Close()
+
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("connection handler did not exit after client close")
+		}
+	}
+
+	s.conns.Range(func(key, _ any) bool {
+		t.Fatalf("connection %v leaked in server map", key)
+		return false
+	})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for runtime.NumGoroutine() > before+2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if after := runtime.NumGoroutine(); after > before+2 {
+		t.Fatalf("goroutines leaked: before=%d after=%d", before, after)
+	}
 }
 
 func TestBodyB64Alias(t *testing.T) {

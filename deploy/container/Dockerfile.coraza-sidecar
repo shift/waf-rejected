@@ -1,0 +1,34 @@
+# Minimal native Coraza sidecar image.
+#
+# Build from the repository root so the vendored Coraza module and the shared
+# CRS bundle are available:
+#
+#   docker build -f deploy/container/Dockerfile.coraza-sidecar -t waf-coraza-sidecar .
+#
+# The runtime image is distroless, runs as a non-root user, and contains only
+# the sidecar binary plus the read-only CRS rules.
+
+FROM golang:1.24-bookworm AS build
+
+WORKDIR /src
+COPY wasm/coraza_reactor/vendor ./wasm/coraza_reactor/vendor
+COPY native/coraza-sidecar ./native/coraza-sidecar
+
+WORKDIR /src/native/coraza-sidecar
+RUN CGO_ENABLED=0 GOFLAGS=-mod=vendor \
+    go build -trimpath -ldflags="-s -w" -o /out/coraza-sidecar .
+
+FROM gcr.io/distroless/static-debian12:nonroot
+
+COPY --from=build /out/coraza-sidecar /usr/local/bin/coraza-sidecar
+COPY --from=build /src/wasm/coraza_reactor/rules/crs /usr/share/waf/coraza/crs
+COPY --from=build /src/wasm/coraza_reactor/LICENSE-CRS /usr/share/waf/coraza/LICENSE-CRS
+COPY --from=build /src/wasm/coraza_reactor/PROVENANCE.md /usr/share/waf/coraza/PROVENANCE.md
+
+USER nonroot:nonroot
+ENTRYPOINT ["/usr/local/bin/coraza-sidecar"]
+CMD ["--socket", "/run/waf/coraza.sock", \
+     "--rules", "/usr/share/waf/coraza/crs/crs.conf", \
+     "--max-body", "65536", \
+     "--timeout", "5s", \
+     "--grace", "10s"]

@@ -160,23 +160,36 @@ impl ConnectionPool {
             let mut conn = if attempt == 0 {
                 match self.take_idle().await {
                     Some(conn) => conn,
-                    None => self.connect().await?,
+                    None => self.connect_bounded().await?,
                 }
             } else {
-                self.connect().await?
+                self.connect_bounded().await?
             };
 
-            match round_trip(&mut conn, payload).await {
-                Ok(response) => {
+            // The deadline is enforced here, at the client, because Coraza has
+            // no cancellation API. On expiry the connection is dropped rather
+            // than returned to the pool, which closes the socket and lets the
+            // sidecar's per-connection goroutine exit as soon as its current
+            // evaluation finishes. The sidecar must still bound its own work.
+            match tokio::time::timeout(self.timeout, round_trip(&mut conn, payload)).await {
+                Ok(Ok(response)) => {
                     self.release(conn).await;
                     return Ok(response);
                 }
-                Err(err) => {
+                Ok(Err(err)) => {
                     last_error = Some(err);
                 }
+                Err(_) => return Err(NativeCorazaError::Timeout),
             }
         }
         Err(last_error.unwrap_or_else(|| NativeCorazaError::Io("no attempt made".to_string())))
+    }
+
+    async fn connect_bounded(&self) -> Result<UnixStream, NativeCorazaError> {
+        match tokio::time::timeout(self.timeout, self.connect()).await {
+            Ok(result) => result,
+            Err(_) => Err(NativeCorazaError::Timeout),
+        }
     }
 }
 
@@ -645,5 +658,93 @@ mod tests {
         .unwrap();
         let err = client.evaluate(b"0123456789").unwrap_err();
         assert!(matches!(err, NativeCorazaError::PayloadTooLarge { .. }));
+    }
+
+    #[test]
+    fn timeout_closes_the_connection() {
+        let seq = SOCKET_SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "coraza-native-timeout-{}-{seq}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let (tx, rx) = std_mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut header = [0u8; 4];
+                // The preflight connection sends no frame and closes.
+                if stream.read_exact(&mut header).is_err() {
+                    continue;
+                }
+                let len = u32::from_be_bytes(header) as usize;
+                let mut payload = vec![0u8; len];
+                if stream.read_exact(&mut payload).is_err() {
+                    continue;
+                }
+                tx.send(true).unwrap();
+                // The client deadline must drop the connection, so this read
+                // observes EOF instead of blocking forever.
+                let mut byte = [0u8; 1];
+                let closed = matches!(stream.read(&mut byte), Ok(0));
+                tx.send(closed).unwrap();
+                return;
+            }
+        });
+
+        let client = client(&path, Duration::from_millis(50));
+        let err = client.evaluate(b"{}").unwrap_err();
+        assert!(matches!(err, NativeCorazaError::Timeout), "{err}");
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("sidecar should receive the request");
+        assert!(
+            rx.recv_timeout(Duration::from_secs(2))
+                .expect("sidecar should observe the closed connection"),
+            "client timeout must close the socket"
+        );
+        handle.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn native_rule_records_coraza_metrics() {
+        let sidecar = TestSidecar::start("ok");
+        let metrics = Arc::new(Metrics::new());
+        let rule = NativeCorazaRule::new(
+            "coraza-native-sidecar",
+            client(&sidecar.path, Duration::from_secs(2)),
+        )
+        .with_metrics(Arc::clone(&metrics));
+
+        assert_eq!(
+            rule.evaluate(&context("/hello", Some(b"a=b"))),
+            Decision::Allow
+        );
+        assert!(matches!(
+            rule.evaluate(&context("/attack", Some(b"x=1"))),
+            Decision::Block { status: 403, .. }
+        ));
+
+        let rendered = metrics.render_prometheus();
+        assert!(rendered.contains("waf_coraza_evaluations_total 2"));
+        assert!(rendered.contains("waf_coraza_blocks_total 1"));
+        assert!(rendered.contains("waf_coraza_errors_total 0"));
+        assert!(rendered.contains("waf_coraza_evaluation_duration_seconds_count 2"));
+
+        let malformed = TestSidecar::start("malformed");
+        let error_metrics = Arc::new(Metrics::new());
+        let error_rule = NativeCorazaRule::new(
+            "coraza-native-sidecar",
+            client(&malformed.path, Duration::from_secs(2)),
+        )
+        .with_metrics(Arc::clone(&error_metrics));
+        assert!(matches!(
+            error_rule.evaluate(&context("/hello", None)),
+            Decision::Block { status: 503, .. }
+        ));
+        let rendered = error_metrics.render_prometheus();
+        assert!(rendered.contains("waf_coraza_evaluations_total 1"));
+        assert!(rendered.contains("waf_coraza_errors_total 1"));
     }
 }
