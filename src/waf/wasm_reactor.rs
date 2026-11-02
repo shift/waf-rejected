@@ -2059,7 +2059,14 @@ mod tests {
 
         let reactor = WasmReactor::from_bytes(EMBEDDED_CORAZA_REACTOR, ReactorLimits::coraza())
             .expect("embedded reactor must load");
-        let headers = serde_json::json!([["content-type", "application/x-www-form-urlencoded"]]);
+        // A malformed body must surface as an encoding error, so these
+        // payloads must not also trip a phase-1 rule: with early blocking on,
+        // a phase-1 deny happens before the body is decoded. A missing Host
+        // header alone scores 5 (rule 920280) and would shadow the error.
+        let headers = serde_json::json!([
+            ["host", "example.com"],
+            ["content-type", "application/x-www-form-urlencoded"],
+        ]);
 
         let invalid_base64 = payload(&serde_json::json!({
             "method": "POST",
@@ -2123,6 +2130,25 @@ mod tests {
                         ReactorDecision::Block { status: 403, .. }
                     ),
                     "valid base64 bodies must still be inspected and blocked"
+                );
+
+                // A malformed body on a request that phase 1 already blocks is
+                // denied before the body is decoded. The outcome is still a
+                // deny (403), never an allow.
+                let phase1_blocked_bad_encoding = payload(&serde_json::json!({
+                    "method": "POST",
+                    "uri": "/search",
+                    "headers": [["content-type", "application/x-www-form-urlencoded"]],
+                    "body_encoding": "base64",
+                    "body": "!!!not-base64!!!",
+                    "body_size": 4,
+                }));
+                assert!(
+                    matches!(
+                        reactor.evaluate(&phase1_blocked_bad_encoding).unwrap(),
+                        ReactorDecision::Block { status: 403, .. }
+                    ),
+                    "a phase-1 deny must fail closed even with a malformed body"
                 );
             })
             .expect("spawn reactor thread")

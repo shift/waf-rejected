@@ -250,6 +250,13 @@ in `native/coraza-sidecar/early_blocking_test.go` run 15 attack payloads and 4
 benign payloads in both query and body form through both configurations and
 require identical decisions.
 
+Reactor parity: the WASI reactor now uses the same default (rule 901115 sets
+`tx.early_blocking=1`; see `docs/coraza-wasi-reactor.md`). On the reactor a
+phase-1-blocked 60 KiB body drops from 3.2–7.6 s to ~3.8 ms p50 (850–2 000×),
+1 KiB from 42–51 ms to ~1.8 ms, and 8 KiB from 374–717 ms to ~1.9 ms; benign
+bodies are unchanged. All 2 112 cases of the CRS detection corpus produce
+identical decisions on the old and new module.
+
 Security impact: none on block/allow. Operational impact: fewer phase-2 rule
 hits in audit data for requests blocked by phase 1. This also removes a
 CPU-amplification vector: today an attacker can make the WAF scan an arbitrary
@@ -385,7 +392,7 @@ its own test corpus. Not a safe local edit.
 
 | # | Change | Expected gain (benign 8 KiB) | Detection impact | Effort / owner | Status |
 |---:|---|---|---|---|---|
-| 1 | **Phase-1 early blocking** (`tx.early_blocking=1`) | 0 % benign; **30–1 900×** on requests already blocked in phase 1 (linear in body size) | none on allow/block; phase-2 alerts for already-blocked requests are not emitted | one line, sidecar flag | **implemented** (native). Reactor parity needs a module rebuild — product decision |
+| 1 | **Phase-1 early blocking** (`tx.early_blocking=1`) | 0 % benign; **30–1 900×** on requests already blocked in phase 1 (linear in body size) | none on allow/block; phase-2 alerts for already-blocked requests are not emitted | one line, sidecar flag | **implemented** (native and WASI reactor); reactor bundle patched in `scripts/vendor-coraza-crs.sh` |
 | 2 | **Required-literal prefilter for big `@rx` rules** | **25–40 %** (932+942+941 are 64 % of cost; top 4 rules 23–29 %) | none if extraction is proven; a bad extraction is a bypass | medium, Coraza/upstream | research; needs differential corpus + fuzz proof |
 | 3 | **Hyperscan/Vectorscan via cgo** | 20–40 % overall, 2–4× on regex families | none if pattern-equivalent; capture semantics risk | high, native only, cgo + BSD-3 dependency | research; not recommended before #2 |
 | 4 | **Inspect-body cap** (`SecRequestBodyLimit`, `ProcessPartial` or `Reject`) | linear: −50 % at 4 KiB, −87 % at 1 KiB, −99.6 % with `Reject` | **explicit**: `ProcessPartial` leaves the tail uninspected; `Reject` breaks large forms/uploads | config policy | product decision; not changed |

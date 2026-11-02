@@ -29,6 +29,20 @@ SRC="$WORK"
 perl -0pi -e "s#setvar:'tx\\.allowed_request_content_type=\\|application/x-www-form-urlencoded\\| \\|multipart/form-data\\| \\|text/xml\\| \\|application/xml\\| \\|application/soap\\+xml\\| \\|application/json\\|'#setvar:'tx.allowed_request_content_type=|application/x-www-form-urlencoded| |multipart/form-data| |text/xml| |application/xml| |application/soap+xml| |application/json| |application/grpc| |application/grpc+proto| |application/grpc+json| |application/grpc-web| |application/grpc-web+proto| |application/grpc-web-text|'#g" \
   "$SRC/rules/REQUEST-901-INITIALIZATION.conf"
 
+# Enable CRS phase-1 early blocking (tx.early_blocking=1) by default. Upstream
+# leaves the default at 0 and asks operators to uncomment rule 900120 in
+# crs-setup.conf. The reactor is a self-contained module with no operator
+# overlay, so the default itself is flipped here: rule 901115 only applies its
+# default when tx.early_blocking is unset, which makes the final value 1
+# deterministically and still lets a caller set 0 explicitly.
+#
+# Effect: a request whose phase-1 anomaly score already reaches the threshold
+# is denied before the request body is scanned. The block decision is
+# unchanged; only phase-2 alerts for an already-blocked request are skipped,
+# which is the documented CRS tradeoff for this mode.
+perl -0pi -e "s#setvar:'tx\\.early_blocking=0'#setvar:'tx.early_blocking=1'#" \
+  "$SRC/rules/REQUEST-901-INITIALIZATION.conf"
+
 rm -rf "$DEST"
 mkdir -p "$DEST/rules"
 
@@ -115,9 +129,26 @@ rules through \`@pmFromFile\`.
 
 ## Transforming directives
 
-The bundle is concatenated verbatim. \`@pmFromFile\` keeps its upstream filename
-and resolves through Coraza's \`WithRootFS\`, which is an embedded copy of
-\`rules/\`; no runtime filesystem access is required.
+The bundle is concatenated verbatim, except for two documented patches applied
+by \`scripts/vendor-coraza-crs.sh\` to \`REQUEST-901-INITIALIZATION.conf\` before
+it is copied and flattened:
+
+1. **gRPC media types.** \`tx.allowed_request_content_type\` is extended with
+   the \`application/grpc*\` types so rule 920420 does not reject the gRPC
+   requests the reactor inspects itself. \`crs-setup.conf\` stays upstream-clean.
+2. **Phase-1 early blocking.** Rule 901115 (the default for rule 900120) sets
+   \`tx.early_blocking=1\` instead of upstream's \`0\`. Rule 901115 only applies
+   its default when \`tx.early_blocking\` is unset, so the final value is
+   deterministically 1 and an explicit \`0\` from a caller still wins. With
+   early blocking on, a request whose phase-1 anomaly score already reaches
+   the threshold is denied before its body is scanned. The block decision is
+   identical; only phase-2 alerts for an already-blocked request are skipped,
+   which is the documented CRS tradeoff for this mode. This matches the native
+   sidecar default (\`--early-blocking\`).
+
+\`@pmFromFile\` keeps its upstream filename and resolves through Coraza's
+\`WithRootFS\`, which is an embedded copy of \`rules/\`; no runtime filesystem
+access is required.
 EOF
 
 echo "vendored CRS ${CRS_VERSION} (${CRS_COMMIT}) into ${DEST}"

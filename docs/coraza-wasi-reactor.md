@@ -374,11 +374,64 @@ Included request-side rule files:
 Default policy: anomaly scoring, inbound threshold `5`, blocking paranoia
 level `1`, detection paranoia level `1`. `SecDefaultAction` is CRS `pass`,
 and `REQUEST-949` denies with `403` when the inbound score reaches the
-threshold.
+threshold. Phase-1 early blocking is **on** by default (see below).
 
 `crs-setup.conf` is the upstream example configuration unmodified; the reactor
 prepends the ModSecurity engine preamble (`SecRuleEngine On`,
 `SecRequestBodyAccess On`, body limits, `SecResponseBodyAccess Off`).
+
+The vendored `REQUEST-901-INITIALIZATION.conf` carries two documented patches
+applied by `scripts/vendor-coraza-crs.sh`, so a regenerated bundle keeps them:
+the gRPC media types added to `tx.allowed_request_content_type` (rule 920420),
+and `tx.early_blocking=1` as the default (rule 901115). Both are recorded in
+`rules/crs/PROVENANCE.md`.
+
+### Early blocking (phase-1 anomaly evaluation)
+
+The reactor enables CRS phase-1 early blocking (`tx.early_blocking=1`), the
+same default as the native sidecar. When a request's phase-1 anomaly score
+already reaches the blocking threshold (missing Host, scanner User-Agent,
+protocol/header/cookie attack rules), CRS rule 949111 denies in phase 1 and the
+request body is never scanned.
+
+The patch flips the *default* in rule 901115 rather than uncommenting rule
+900120 in `crs-setup.conf`. Rule 901115 only applies its default when
+`tx.early_blocking` is unset, so the final value is deterministically `1`
+regardless of rule order, while an explicit `0` from a caller still wins.
+There is no runtime toggle: the rules are embedded in the module, so disabling
+early blocking means rebuilding the module from the vendored tree with the
+default restored (the vendor script is the single source of truth).
+
+The block decision is unchanged: the phase-1 score is already over the
+threshold, so the request would be denied in phase 2 as well. The documented
+CRS tradeoff applies: phase-2 alerts for an already-blocked request are not
+emitted, so the alert *set* for such a request is smaller. Benign traffic is
+unaffected (no phase-1 score, so phase 2 still runs and the body is fully
+scanned).
+
+Measured on 2026-11-02 with a release build, a one-worker pre-warmed pool
+pinned with `taskset -c 2`, and the old/new modules evaluated alternately in
+one process (p50 of 5–9 evaluations). "Phase-1-blocked" is a scanner
+User-Agent with a form body:
+
+| Body | Before p50 | After p50 | Speedup |
+| ---: | ---: | ---: | ---: |
+| 1 KiB | 42–51 ms | 1.6–1.9 ms | ~27× |
+| 8 KiB | 374–717 ms | 1.9 ms | 200–390× |
+| 60 KiB | 3.2–7.6 s | 3.8 ms | 850–2 000× |
+
+The development host throttles heavily, so the baseline for a given body size
+varies by up to ~2.3× between runs; the post-change cost is flat because the
+body is never scanned. Benign bodies are unchanged within that variance
+(1 KiB p50 ≈ 41–43 ms on both modules; larger bodies remain dominated by the
+full body scan). This also removes a timeout hazard: before the change a
+60 KiB phase-1-blocked body could exceed the default 5 s `eval_timeout_ms` and
+surface as a fail-closed `503`; it is now a `403` in a few milliseconds.
+
+One observable ordering change: a malformed body (`body_encoding` error,
+`body_size` mismatch) on a request that phase 1 already blocks now returns the
+phase-1 `403` instead of `ReactorError::InvalidBodyEncoding`. The outcome is
+still a deny; it is never an allow.
 
 **Not included:** response inspection rules (`RESPONSE-950`–`980`), the
 deployment-specific example exclusion files (`REQUEST-900`, `REQUEST-999`),

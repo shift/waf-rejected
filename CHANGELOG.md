@@ -187,6 +187,19 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Changed
 
+- The WASI Coraza reactor enables CRS phase-1 early blocking
+  (`tx.early_blocking=1`, the default of rule 901115) to match the native
+  sidecar. Requests whose phase-1 anomaly score already reaches the blocking
+  threshold are denied before the request body is scanned: a scanner
+  User-Agent with a 60 KiB body drops from 3.2–7.6 s to ~3.8 ms p50 on the
+  WASI reactor, and a 60 KiB body can no longer hit the 5 s `eval_timeout_ms`.
+  Allow/block decisions are unchanged: all 2 112 cases of the CRS detection
+  corpus produce identical decisions before and after, and the release
+  `--ignored` reactor and gRPC h2 suites pass. The documented CRS tradeoff is
+  that phase-2 alerts for an already-blocked request are not emitted.
+  `scripts/vendor-coraza-crs.sh` re-applies the patch and
+  `wasm/coraza_reactor/rules/crs/PROVENANCE.md` records the deviation. See
+  `docs/coraza-wasi-reactor.md`.
 - The native Coraza sidecar enables CRS phase-1 early blocking
   (`tx.early_blocking=1`, rule 900120) by default (`--early-blocking`, opt-out).
   Requests whose phase-1 anomaly score already exceeds the blocking threshold
