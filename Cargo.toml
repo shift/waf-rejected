@@ -46,6 +46,10 @@ required-features = ["wasm-reactor"]
 name = "load-validate"
 path = "src/bin/load_validate.rs"
 
+[[bin]]
+name = "crs_corpus"
+path = "src/bin/crs_corpus.rs"
+
 [dependencies]
 # Async runtime and HTTP
 tokio = { version = "1.0", features = ["full"] }

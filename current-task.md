@@ -725,3 +725,23 @@ rules to be gated, it never fires on stock CRS; the prefilter is sound but the
 fast path is blocked by `@detectSQLi`, `@detectXSS`, size/validation checks and
 the obfuscation-tolerant 932 regexes. Details and measurements:
 `docs/suggestions_from_agents/crs-prefilter.md`.
+
+## test: CRS detection corpus (worktree `.worktrees/crs-corpus`)
+
+Branch: `test/crs-corpus`. Task: pinned OWASP CRS 4.14.0 regression corpus plus
+a harness that proves decision parity between the WASI reactor and the native
+sidecar without changing detection rules or defaults.
+
+- Vendored request-phase cases at commit
+  `b5b788b5bc50e68836e17995b191f72e848fed75`; source archive SHA-256 and
+  per-file manifest recorded in `tests/corpus/crs/`.
+- Corpus format v1: `{id, description, request, expected, expected_rule_ids,
+  tags, source}` with upstream provenance.
+- Harness: `src/bin/crs_corpus.rs` + `src/waf/coraza_corpus.rs`; wrapper
+  `scripts/run-crs-corpus.sh`; optional opt-in CI job.
+- Baseline: 2,112 cases (1,700 block / 412 allow), wasm and native
+  2,016/2,112 passed, detection 1,695/1,700 (99.7%), FN=5, FP=91, parity
+  2,112/2,112. Details in `docs/operations/detection-corpus.md`.
+- Verified: `cargo fmt -- --check`, `cargo test --lib` (default and
+  `wasm-reactor,coraza-native`), clippy for lib and harness, harness build with
+  both features.

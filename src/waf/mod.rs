@@ -2,6 +2,7 @@ pub mod admission;
 pub mod ai;
 pub mod auth;
 pub mod content_inspection;
+pub mod coraza_corpus;
 pub mod exporters;
 pub mod geoip;
 pub mod grpc_allowlist;
