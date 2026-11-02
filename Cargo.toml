@@ -164,6 +164,10 @@ aho-corasick = { version = "1.1", optional = true }
 # Non-default feature `allow-cache`; see
 # docs/suggestions_from_agents/allow-cache.md.
 siphasher = { version = "1.0", optional = true }
+
+# Precompiled DFA regex sets for the experimental native engine kernel
+# (`engine-kernel`). Already in the lockfile as a `regex` transitive dep.
+regex-automata = { version = "0.4", optional = true }
 once_cell = "1.19"
 uuid = { version = "1.6", features = ["v4", "serde"] }
 notify = "6.1"
@@ -253,6 +257,12 @@ fastpath = ["dep:aho-corasick"]
 # it only memoises the verdict of pure content rules for a short TTL and never
 # caches blocks. See docs/suggestions_from_agents/allow-cache.md.
 allow-cache = ["dep:siphasher"]
+
+# Experimental native Rust WAF evaluation kernel (prototype, non-default).
+# Demonstrates the execution model for a future Coraza replacement: parsed
+# request state, per-value transform cache, compiled matcher DAG, anomaly
+# scoring and early exit. See docs/suggestions_from_agents/engine-kernel.md.
+engine-kernel = ["dep:aho-corasick", "dep:regex-automata"]
 
 # Native (Rust) ports of Coraza's `@detectSQLi` and `@detectXSS` operators,
 # with decision parity pinned against the CRS corpus. Non-default: the request
@@ -398,3 +408,15 @@ required-features = ["crs-prefilter"]
 name = "crs-prefilter-bench"
 path = "src/bin/crs_prefilter_bench.rs"
 required-features = ["crs-prefilter"]
+
+# Native engine kernel prototype benchmark (p50/p95/p99, MB/s, alloc/request).
+[[bin]]
+name = "engine-kernel-bench"
+path = "src/bin/engine_kernel_bench.rs"
+required-features = ["engine-kernel"]
+
+# Native engine kernel soundness harness over the pinned CRS corpus.
+[[bin]]
+name = "engine-kernel-corpus"
+path = "src/bin/engine_kernel_corpus.rs"
+required-features = ["engine-kernel"]

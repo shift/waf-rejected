@@ -29,6 +29,13 @@ pub mod allow_cache;
 /// it is an opt-in evaluation mode until the detection-parity corpus proves it.
 #[cfg(any(feature = "crs-prefilter", feature = "fastpath"))]
 pub mod prefilter;
+
+/// Experimental native Rust evaluation kernel (prototype, non-default).
+/// Demonstrates the execution model for a future Coraza replacement; it does
+/// not replace the Coraza backends. See
+/// `docs/suggestions_from_agents/engine-kernel.md`.
+#[cfg(feature = "engine-kernel")]
+pub mod engine_kernel;
 /// Offline extractor that emits `rules/crs/prefilter.json`.
 #[cfg(any(feature = "crs-prefilter", feature = "fastpath"))]
 pub mod prefilter_extract;

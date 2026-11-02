@@ -4149,6 +4149,7 @@ dependencies = [
  "rcgen",
  "redb",
  "regex",
+ "regex-automata",
  "reqwest",
  "rustls",
  "rustls-pemfile",

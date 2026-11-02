@@ -6,6 +6,16 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Added
 
+- Experimental native Rust evaluation kernel (`engine-kernel`, non-default).
+  Standalone prototype of a Coraza replacement: zero-copy request spans, a
+  per-value transform-pipeline cache, a compiled DAG of cheap predicates,
+  shared Aho-Corasick literal automata and precompiled regex DFAs, sound
+  literal gating from `rules/crs/prefilter.json`, and anomaly scoring with
+  phase-1/phase-2 early exit. Includes a benchmark binary and a pinned-corpus
+  soundness harness; the covered 1,077-case subset has zero false negatives.
+  Coraza remains the default backend and no production defaults changed. See
+  `docs/suggestions_from_agents/engine-kernel.md`.
+
 - Native (Rust) ports of Coraza's `@detectSQLi` and `@detectXSS` operators
   (`native-detect`, non-default). `detect_sqli`/`detect_xss` are allocation-free,
   single-pass, and byte-for-byte ports of `libinjection-go` v0.2.2 — the library
