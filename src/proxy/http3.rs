@@ -482,6 +482,7 @@ fn ensure_host_header(headers: &mut HeaderMap, uri: &Uri) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::Full;
     use hyper::service::service_fn;
     use hyper_util::rt::TokioIo;
     use rustls::pki_types::CertificateDer;

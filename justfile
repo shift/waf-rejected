@@ -16,6 +16,10 @@ test:
 ci-local:
     ./scripts/ci-local.sh
 
+# Run the cross-feature compile/test matrix (pass --quick to skip all-targets)
+ci-feature-matrix *ARGS:
+    ./scripts/ci-feature-matrix.sh {{ARGS}}
+
 benchmark:
     cargo bench
 

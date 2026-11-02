@@ -1,0 +1,108 @@
+name: Feature Matrix
+
+# Guards against feature-combination regressions (for example a test module
+# that only compiles with `coraza-native`, which the default feature set did
+# not catch). Mirrors scripts/ci-feature-matrix.sh so the same combinations
+# run locally without GitHub Actions.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "benches/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "flake.nix"
+      - "flake.lock"
+      - "rust-toolchain.toml"
+      - "scripts/ci-feature-matrix.sh"
+      - ".github/workflows/feature-matrix.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "benches/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "flake.nix"
+      - "flake.lock"
+      - "rust-toolchain.toml"
+      - "scripts/ci-feature-matrix.sh"
+      - ".github/workflows/feature-matrix.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: feature-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt-clippy:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Nix
+        uses: cachix/install-nix-action@v25
+      - name: Check formatting
+        run: nix develop -c cargo fmt -- --check
+      - name: Clippy (default features)
+        run: nix develop -c cargo clippy --lib -- --deny warnings
+
+  lib-tests:
+    name: test --lib (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            args: ""
+          - name: wasm-reactor
+            args: "--features wasm-reactor"
+          - name: wasm-reactor,coraza-native
+            args: "--features wasm-reactor,coraza-native"
+          - name: no-default-features
+            args: "--no-default-features"
+          - name: no-default-features,wasm-reactor
+            args: "--no-default-features --features wasm-reactor"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Nix
+        uses: cachix/install-nix-action@v25
+      - name: Run library tests
+        run: nix develop -c cargo test --lib ${{ matrix.args }}
+
+  compile:
+    name: check ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: all-targets + wasm-reactor,coraza-native
+            args: "--all-targets --features wasm-reactor,coraza-native"
+          - name: all-targets + http3,webtransport,wasm-reactor
+            args: "--all-targets --features http3,webtransport,wasm-reactor"
+          - name: bin graphql-allowlist + wasm-reactor
+            args: "--bin graphql-allowlist --features wasm-reactor"
+          - name: bin grpc-allowlist + wasm-reactor
+            args: "--bin grpc-allowlist --features wasm-reactor"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Nix
+        uses: cachix/install-nix-action@v25
+      - name: Check target compilation
+        run: nix develop -c cargo check ${{ matrix.args }}

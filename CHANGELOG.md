@@ -6,6 +6,14 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Added
 
+- Cross-feature CI matrix. `scripts/ci-feature-matrix.sh` (also
+  `just ci-feature-matrix`) and `.github/workflows/feature-matrix.yml` compile
+  and test the default, `wasm-reactor`, `wasm-reactor,coraza-native`,
+  `--no-default-features`, `--no-default-features,wasm-reactor`,
+  `http3,webtransport,wasm-reactor` and allowlist-binary combinations, so
+  feature-gated test imports fail locally instead of only in an optional
+  build. See `docs/developer-guide/feature-matrix.md`.
+
 - gRPC field-content scanning. Decoded `string` and UTF-8 `bytes` values are
   evaluated by the configured Coraza backend as a synthetic
   `application/x-www-form-urlencoded` request (URI

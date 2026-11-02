@@ -2185,8 +2185,11 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
         let mut config = Config::default();
         config.waf.graphql.allowlist_file = Some(missing.to_string());
         let error = config.validate().unwrap_err().to_string();
+        // With the reactor feature the artifact is parsed; without it the
+        // loader is not compiled and validation only checks readability.
         assert!(
-            error.contains(missing) && error.contains("could not be loaded"),
+            error.contains(missing)
+                && (error.contains("could not be loaded") || error.contains("could not be read")),
             "unexpected error: {error}"
         );
 
@@ -2204,14 +2207,28 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
         let mut config = Config::default();
         config.waf.graphql.allowlist_file = Some(artifact.display().to_string());
         config.waf.graphql.body_scan = "graphql-only".to_string();
-        assert!(config.validate().is_ok());
 
-        std::fs::write(&artifact, b"{not json").unwrap();
-        let error = config.validate().unwrap_err().to_string();
-        assert!(
-            error.contains("allowlist.json") && error.contains("could not be loaded"),
-            "unexpected error: {error}"
-        );
+        // Without the reactor feature the artifact cannot be parsed, so the
+        // `graphql-only` mode requirement fails rather than succeeding.
+        #[cfg(feature = "wasm-reactor")]
+        {
+            assert!(config.validate().is_ok());
+
+            std::fs::write(&artifact, b"{not json").unwrap();
+            let error = config.validate().unwrap_err().to_string();
+            assert!(
+                error.contains("allowlist.json") && error.contains("could not be loaded"),
+                "unexpected error: {error}"
+            );
+        }
+        #[cfg(not(feature = "wasm-reactor"))]
+        {
+            let error = config.validate().unwrap_err().to_string();
+            assert!(
+                error.contains("requires a non-empty"),
+                "unexpected error: {error}"
+            );
+        }
     }
 
     #[test]
