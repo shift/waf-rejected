@@ -38,6 +38,11 @@ name = "grpc-allowlist"
 path = "src/bin/grpc-allowlist.rs"
 
 [[bin]]
+name = "graphql-allowlist"
+path = "src/bin/graphql-allowlist.rs"
+required-features = ["wasm-reactor"]
+
+[[bin]]
 name = "load-validate"
 path = "src/bin/load_validate.rs"
 

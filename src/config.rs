@@ -1056,13 +1056,13 @@ impl WafGraphqlConfig {
             }
             #[cfg(feature = "wasm-reactor")]
             {
-                let operations =
-                    crate::waf::graphql::load_operation_allowlist(path).map_err(|error| {
+                let allowlist =
+                    crate::waf::graphql_allowlist::load_allowlist(path).map_err(|error| {
                         anyhow::anyhow!(
                             "waf.graphql.allowlist_file '{path}' could not be loaded: {error}"
                         )
                     })?;
-                artifact_entries = operations.len();
+                artifact_entries = allowlist.operations.len();
             }
             #[cfg(not(feature = "wasm-reactor"))]
             {

@@ -37,6 +37,9 @@ pub mod grpc;
 /// withheld from CRS body rules in `graphql-only` mode).
 #[cfg(feature = "wasm-reactor")]
 pub mod graphql;
+/// Deterministic persisted-query allowlist generation and loading.
+#[cfg(feature = "wasm-reactor")]
+pub mod graphql_allowlist;
 /// Minimal protobuf wire decoder used by gRPC field-level inspection.
 #[cfg(feature = "wasm-reactor")]
 pub mod protobuf;
@@ -1616,6 +1619,26 @@ mod tests {
             only_engine.evaluate(&graphql_context(body)).await,
             Decision::Block { status: 503, .. }
         ));
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    #[test]
+    fn graphql_allowlist_init_failure_is_recorded_for_startup_abort() {
+        let mut config = crate::config::Config::default();
+        // Keep the reactor from loading so the failure under test is the
+        // GraphQL allowlist artifact.
+        config.waf.coraza.module_path = Some("/nonexistent/coraza-reactor.wasm".to_string());
+        config.waf.graphql.allowlist_file = Some("/nonexistent/graphql/allowlist.json".to_string());
+
+        let engine = WafEngine::with_config(&config);
+        let error = engine
+            .waf_init_error()
+            .expect("an unreadable GraphQL allowlist must abort start-up");
+        assert!(
+            error.contains("GraphQL allowlist failed to load")
+                && error.contains("/nonexistent/graphql/allowlist.json"),
+            "unexpected error: {error}"
+        );
     }
 
     #[cfg(feature = "wasm-reactor")]

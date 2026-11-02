@@ -25,14 +25,13 @@
 //! non-empty allowlist.
 
 use std::collections::HashSet;
-use std::path::Path;
 
 use hyper::{Method, Uri};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::debug;
 
 use crate::config::{WafGraphqlConfig, WafGraphqlScanMode};
+use crate::waf::graphql_allowlist::{load_allowlist, GraphqlAllowlist};
 use crate::waf::{Decision, RequestContext, WafRule};
 
 /// Header/URI rule label used for GraphQL pre-check blocks and failures.
@@ -136,73 +135,6 @@ impl GraphqlVerdict {
     }
 }
 
-/// One entry in a persisted-query allowlist artifact.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct PersistedOperation {
-    /// Operation name.
-    pub name: String,
-    /// Lowercase hex SHA-256 of the normalised query.
-    pub sha256: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum AllowlistArtifact {
-    List(Vec<PersistedOperation>),
-    Wrapped { operations: Vec<PersistedOperation> },
-}
-
-/// Loads and validates a persisted-query allowlist artifact.
-///
-/// The canonical artifact is a JSON list of `{ "name": ..., "sha256": ... }`
-/// objects. An object with an `operations` array is also accepted for
-/// forward compatibility.
-pub fn load_operation_allowlist(path: impl AsRef<Path>) -> Result<Vec<PersistedOperation>, String> {
-    let path = path.as_ref();
-    let bytes = std::fs::read(path)
-        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-    let artifact: AllowlistArtifact = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("invalid JSON in {}: {error}", path.display()))?;
-    let operations = match artifact {
-        AllowlistArtifact::List(operations) | AllowlistArtifact::Wrapped { operations } => {
-            operations
-        }
-    };
-    validate_operations(&operations).map_err(|error| {
-        format!(
-            "invalid persisted-query allowlist {}: {error}",
-            path.display()
-        )
-    })?;
-    Ok(operations)
-}
-
-fn validate_operations(operations: &[PersistedOperation]) -> Result<(), String> {
-    if operations.is_empty() {
-        return Err("operation allowlist must not be empty".to_string());
-    }
-    let mut seen = HashSet::new();
-    for operation in operations {
-        if operation.name.trim().is_empty() {
-            return Err("operation name must not be empty".to_string());
-        }
-        if !is_sha256_hex(&operation.sha256) {
-            return Err(format!(
-                "operation '{}' has an invalid sha256 (expected 64 hex characters)",
-                operation.name
-            ));
-        }
-        if !seen.insert((
-            operation.name.as_str(),
-            operation.sha256.to_ascii_lowercase(),
-        )) {
-            return Err(format!("duplicate operation '{}'", operation.name));
-        }
-    }
-    Ok(())
-}
-
 fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -235,13 +167,13 @@ impl GraphqlInspector {
     /// set.
     pub fn try_from_config(config: &WafGraphqlConfig) -> Result<Self, String> {
         let artifact = match config.allowlist_file.as_deref() {
-            Some(path) => Some(load_operation_allowlist(path)?),
+            Some(path) => Some(load_allowlist(path).map_err(|error| error.to_string())?),
             None => None,
         };
-        Ok(Self::build(config, artifact.as_deref()))
+        Ok(Self::build(config, artifact.as_ref()))
     }
 
-    fn build(config: &WafGraphqlConfig, artifact: Option<&[PersistedOperation]>) -> Self {
+    fn build(config: &WafGraphqlConfig, artifact: Option<&GraphqlAllowlist>) -> Self {
         let mut operation_names = HashSet::new();
         let mut query_hashes = HashSet::new();
         for entry in &config.operation_allowlist {
@@ -253,7 +185,7 @@ impl GraphqlInspector {
             }
         }
         if let Some(artifact) = artifact {
-            for operation in artifact {
+            for operation in &artifact.operations {
                 operation_names.insert(operation.name.clone());
                 query_hashes.insert(operation.sha256.to_ascii_lowercase());
             }
@@ -261,7 +193,10 @@ impl GraphqlInspector {
 
         let unknown_operation_blocked = match config.unknown_operation_action.as_deref() {
             Some(action) => action == "block",
-            None => !config.operation_allowlist.is_empty() || artifact.is_some(),
+            None => match artifact {
+                Some(artifact) => artifact.unknown_operation_action == "block",
+                None => !config.operation_allowlist.is_empty(),
+            },
         };
 
         Self {
@@ -715,7 +650,9 @@ pub fn normalize_query(query: &str) -> String {
             }
             continue;
         }
-        if ch.is_whitespace() {
+        // GraphQL commas are insignificant separators, so treat them like
+        // whitespace rather than deleting them (which would merge tokens).
+        if ch == ',' || ch.is_whitespace() {
             if !out.is_empty() && !out.ends_with(' ') {
                 out.push(' ');
             }
@@ -737,7 +674,7 @@ pub fn query_hash(query: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn parse_query(query: &str) -> Result<GraphqlDocument, GraphqlInspectionError> {
+pub(crate) fn parse_query(query: &str) -> Result<GraphqlDocument, GraphqlInspectionError> {
     let normalized = normalize_query(query);
     let tokens = tokenize(&normalized).map_err(GraphqlInspectionError::malformed)?;
     let mut parser = QueryParser::new(&tokens);
@@ -1356,13 +1293,127 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let operations = load_operation_allowlist(&path).unwrap();
-        assert_eq!(operations.len(), 1);
-        assert_eq!(operations[0].name, "GetUser");
+        let operations = load_allowlist(&path).unwrap();
+        assert_eq!(operations.operations.len(), 1);
+        assert_eq!(operations.operations[0].name, "GetUser");
 
         std::fs::write(&path, r#"[{"name":"x","sha256":"nope"}]"#).unwrap();
-        assert!(load_operation_allowlist(&path).is_err());
+        assert!(load_allowlist(&path).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn artifact_operations_merge_with_inline_allowlist_and_explicit_action_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("allowlist.json");
+        let artifact_query = "query GetUser { user { id } }";
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!([
+                {"name": "GetUser", "sha256": query_hash(artifact_query)}
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut config = config(WafGraphqlScanMode::Crs);
+        config.operation_allowlist = vec!["InlineOnly".to_string()];
+        config.allowlist_file = Some(path.display().to_string());
+        let inspector = GraphqlInspector::try_from_config(&config).unwrap();
+
+        let artifact_ctx = context(
+            Method::POST,
+            "/graphql",
+            "application/json",
+            Some(&json_body(artifact_query)),
+        );
+        assert!(matches!(
+            inspector.inspect(&artifact_ctx).unwrap(),
+            GraphqlVerdict::Allow { .. }
+        ));
+
+        let inline_ctx = context(
+            Method::POST,
+            "/graphql",
+            "application/json",
+            Some(&json_body("query InlineOnly { user { id } }")),
+        );
+        assert!(matches!(
+            inspector.inspect(&inline_ctx).unwrap(),
+            GraphqlVerdict::Allow { .. }
+        ));
+
+        // The artifact defaults to block, so an unknown operation is blocked.
+        let unknown_body = serde_json::json!({
+            "query": "query Unknown { user { id } }",
+            "operationName": "Unknown",
+        })
+        .to_string();
+        let unknown_ctx = context(
+            Method::POST,
+            "/graphql",
+            "application/json",
+            Some(&unknown_body),
+        );
+        assert!(matches!(
+            inspector.inspect(&unknown_ctx).unwrap(),
+            GraphqlVerdict::Block { status: 403, .. }
+        ));
+
+        // An explicit config action wins over the artifact's default.
+        config.unknown_operation_action = Some("monitor".to_string());
+        let inspector = GraphqlInspector::try_from_config(&config).unwrap();
+        assert!(matches!(
+            inspector.inspect(&unknown_ctx).unwrap(),
+            GraphqlVerdict::Allow {
+                monitored: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn artifact_unknown_action_is_used_when_config_does_not_override_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("allowlist.json");
+        let query = "query GetUser { user { id } }";
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "ir_version": 1,
+                "source": {"kind": "manifest", "sha256": "a".repeat(64)},
+                "operations": [{
+                    "name": "GetUser",
+                    "sha256": query_hash(query),
+                    "type": "query"
+                }],
+                "unknown_operation_action": "allow"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut config = config(WafGraphqlScanMode::Crs);
+        config.allowlist_file = Some(path.display().to_string());
+        let inspector = GraphqlInspector::try_from_config(&config).unwrap();
+        let unknown_body = serde_json::json!({
+            "query": "query Unknown { user { id } }",
+            "operationName": "Unknown",
+        })
+        .to_string();
+        let unknown_ctx = context(
+            Method::POST,
+            "/graphql",
+            "application/json",
+            Some(&unknown_body),
+        );
+        assert!(matches!(
+            inspector.inspect(&unknown_ctx).unwrap(),
+            GraphqlVerdict::Allow {
+                monitored: true,
+                ..
+            }
+        ));
     }
 }
 

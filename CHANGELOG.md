@@ -6,6 +6,21 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Added
 
+- Deterministic GraphQL persisted-query allowlist generation and loading.
+  `graphql-allowlist` (`src/bin/graphql-allowlist.rs`,
+  `scripts/graphql-allowlist.sh`) builds a sorted, byte-identical artifact
+  from a JSON manifest of `{name, query}` / `{name, sha256}` entries and/or a
+  directory of `.graphql` files. Queries are normalised (comments removed,
+  commas and whitespace collapsed outside strings) before hashing, and the
+  artifact records `ir_version`, input provenance (`source.kind`,
+  `source.sha256`), operation `type`, and `unknown_operation_action`.
+  `src/waf/graphql_allowlist.rs` provides strict `load_allowlist`,
+  `allows_name` / `allows_hash`, and the `waf.graphql.allowlist_file` hook;
+  file operations merge with the inline `operation_allowlist`, an explicit
+  config `unknown_operation_action` wins over the artifact, and an unreadable
+  file aborts start-up through `waf_init_error`. See
+  `docs/graphql-inspection.md`.
+
 - Property and fuzz hardening for the security-critical parsers. `proptest`
   suites now cover the protobuf wire decoder, gRPC frame/path/content-type
   parsing, GraphQL body/query parsing and counters, allowlist/descriptor
