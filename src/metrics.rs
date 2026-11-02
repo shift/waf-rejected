@@ -48,6 +48,11 @@ pub struct Metrics {
     coraza_body_inspected_inf: AtomicU64,
     coraza_body_inspected_sum: AtomicU64,
     coraza_body_inspected_count: AtomicU64,
+    crs_prefilter_evaluations_total: AtomicU64,
+    crs_prefilter_hits_total: AtomicU64,
+    crs_prefilter_withheld_total: AtomicU64,
+    crs_prefilter_duration_sum_nanos: AtomicU64,
+    crs_prefilter_duration_count: AtomicU64,
     admission_queued_total: AtomicU64,
     admission_queue_depth: AtomicU64,
     admission_admitted_total: AtomicU64,
@@ -107,6 +112,11 @@ impl Metrics {
             coraza_body_inspected_inf: AtomicU64::new(0),
             coraza_body_inspected_sum: AtomicU64::new(0),
             coraza_body_inspected_count: AtomicU64::new(0),
+            crs_prefilter_evaluations_total: AtomicU64::new(0),
+            crs_prefilter_hits_total: AtomicU64::new(0),
+            crs_prefilter_withheld_total: AtomicU64::new(0),
+            crs_prefilter_duration_sum_nanos: AtomicU64::new(0),
+            crs_prefilter_duration_count: AtomicU64::new(0),
             admission_queued_total: AtomicU64::new(0),
             admission_queue_depth: AtomicU64::new(0),
             admission_admitted_total: AtomicU64::new(0),
@@ -189,6 +199,26 @@ impl Metrics {
             }
         }
         self.coraza_duration_inf.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records one CRS literal-prefilter evaluation.
+    pub fn record_crs_prefilter(&self, duration: Duration, hit: bool, withheld: bool) {
+        self.crs_prefilter_evaluations_total
+            .fetch_add(1, Ordering::Relaxed);
+        if hit {
+            self.crs_prefilter_hits_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if withheld {
+            self.crs_prefilter_withheld_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.crs_prefilter_duration_sum_nanos.fetch_add(
+            duration.as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+        self.crs_prefilter_duration_count
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_coraza_block(&self) {
@@ -417,6 +447,25 @@ impl Metrics {
             self.coraza_evaluations_total.load(Ordering::Relaxed),
             self.coraza_blocks_total.load(Ordering::Relaxed),
             self.coraza_errors_total.load(Ordering::Relaxed),
+        ));
+
+        out.push_str(&format!(
+            "# HELP waf_crs_prefilter_evaluations_total CRS literal-prefilter evaluations.\n\
+             # TYPE waf_crs_prefilter_evaluations_total counter\n\
+             waf_crs_prefilter_evaluations_total {}\n\
+             # HELP waf_crs_prefilter_hits_total CRS prefilter evaluations that found an indicator.\n\
+             # TYPE waf_crs_prefilter_hits_total counter\n\
+             waf_crs_prefilter_hits_total {}\n\
+             # HELP waf_crs_prefilter_withheld_total Bodies withheld from CRS after a clean prefilter.\n\
+             # TYPE waf_crs_prefilter_withheld_total counter\n\
+             waf_crs_prefilter_withheld_total {}\n\
+             # HELP waf_crs_prefilter_duration_seconds_total Time spent in the CRS prefilter.\n\
+             # TYPE waf_crs_prefilter_duration_seconds_total counter\n\
+             waf_crs_prefilter_duration_seconds_total {}\n",
+            self.crs_prefilter_evaluations_total.load(Ordering::Relaxed),
+            self.crs_prefilter_hits_total.load(Ordering::Relaxed),
+            self.crs_prefilter_withheld_total.load(Ordering::Relaxed),
+            self.crs_prefilter_duration_sum_nanos.load(Ordering::Relaxed) as f64 / 1e9,
         ));
 
         out.push_str(&format!(

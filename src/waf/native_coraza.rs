@@ -38,6 +38,12 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use tracing::{info, warn};
 
+#[cfg(feature = "crs-prefilter")]
+use tracing::debug;
+
+#[cfg(feature = "crs-prefilter")]
+use crate::waf::prefilter::{Prefilter, PrefilterError, PrefilterMode};
+
 use crate::metrics::Metrics;
 use crate::waf::coraza_payload::BodyInspectionPolicy;
 use crate::waf::coraza_wire::{
@@ -662,6 +668,11 @@ pub struct NativeCorazaRule {
     metrics: Option<Arc<Metrics>>,
     fail_closed: bool,
     body_policy: BodyInspectionPolicy,
+    /// Experimental CRS literal prefilter (non-default `crs-prefilter` feature).
+    #[cfg(feature = "crs-prefilter")]
+    prefilter: Option<Arc<Prefilter>>,
+    #[cfg(feature = "crs-prefilter")]
+    prefilter_mode: PrefilterMode,
 }
 
 impl NativeCorazaRule {
@@ -673,6 +684,10 @@ impl NativeCorazaRule {
             metrics: None,
             fail_closed: true,
             body_policy: BodyInspectionPolicy::default(),
+            #[cfg(feature = "crs-prefilter")]
+            prefilter: None,
+            #[cfg(feature = "crs-prefilter")]
+            prefilter_mode: PrefilterMode::Off,
         }
     }
 
@@ -698,6 +713,29 @@ impl NativeCorazaRule {
     pub fn with_fail_closed(mut self, fail_closed: bool) -> Self {
         self.fail_closed = fail_closed;
         self
+    }
+
+    /// Enables the experimental CRS literal prefilter.
+    ///
+    /// `PrefilterMode::DryRun` only measures; `PrefilterMode::BodyWithhold`
+    /// additionally withholds the body when the prefilter is clean **and** the
+    /// artifact proves every body-relevant rule is gated. On the stock CRS
+    /// bundle the latter condition is false (see the coverage report), so the
+    /// mode is a no-op there by construction. This is opt-in and non-default.
+    #[cfg(feature = "crs-prefilter")]
+    pub fn with_prefilter(mut self, mode: PrefilterMode) -> Result<Self, PrefilterError> {
+        self.prefilter_mode = mode;
+        if mode != PrefilterMode::Off {
+            let prefilter = Prefilter::from_json(crate::waf::prefilter::EMBEDDED_ARTIFACT)?;
+            self.prefilter = Some(Arc::new(prefilter));
+        }
+        Ok(self)
+    }
+
+    /// The loaded prefilter, when the mode is enabled.
+    #[cfg(feature = "crs-prefilter")]
+    pub fn prefilter(&self) -> Option<&Prefilter> {
+        self.prefilter.as_deref()
     }
 
     /// Builds a rule from `waf.coraza` configuration, verifying the socket.
@@ -734,8 +772,59 @@ impl WafRule for NativeCorazaRule {
     }
 
     fn evaluate(&self, ctx: &RequestContext) -> Decision {
+        #[allow(unused_mut)]
+        let mut evaluation_ctx = ctx;
+        // Keeps a body-withheld clone alive for the duration of the call.
+        #[cfg(feature = "crs-prefilter")]
+        let mut scrubbed: Option<RequestContext> = None;
+
+        #[cfg(feature = "crs-prefilter")]
+        if let (Some(prefilter), mode) = (self.prefilter.as_deref(), self.prefilter_mode) {
+            if mode != PrefilterMode::Off {
+                if let Some(body) = ctx.body.as_deref().filter(|body| !body.is_empty()) {
+                    let prefilter_started = Instant::now();
+                    let hit = prefilter.evaluate(body);
+                    let mut withheld = false;
+                    if !hit.hit
+                        && mode == PrefilterMode::BodyWithhold
+                        && prefilter.all_body_rules_gated()
+                    {
+                        let mut stripped = ctx.clone();
+                        stripped.body = None;
+                        scrubbed = Some(stripped);
+                        withheld = true;
+                        debug!(
+                            rule = %self.name,
+                            body_bytes = body.len(),
+                            representations = hit.representations,
+                            "CRS prefilter clean and all body rules gated; withholding body"
+                        );
+                    } else if hit.hit {
+                        debug!(
+                            rule = %self.name,
+                            rules = ?hit.matched_rules,
+                            forced = ?hit.forced_reason,
+                            "CRS prefilter found an indicator; running full evaluation"
+                        );
+                    }
+                    if let Some(metrics) = &self.metrics {
+                        metrics.record_crs_prefilter(
+                            prefilter_started.elapsed(),
+                            hit.hit,
+                            withheld,
+                        );
+                    }
+                    if withheld {
+                        evaluation_ctx = scrubbed.as_ref().expect("scrubbed context");
+                    }
+                }
+            }
+        }
+
         let started = Instant::now();
-        let result = self.client.evaluate_context(ctx, &self.body_policy);
+        let result = self
+            .client
+            .evaluate_context(evaluation_ctx, &self.body_policy);
         if let Some(metrics) = &self.metrics {
             metrics.record_coraza_evaluation(started.elapsed());
         }

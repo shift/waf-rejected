@@ -137,6 +137,9 @@ serde_bytes = "0.11"
 # Additional dependencies for new features
 regex = "1.10"
 memchr = "2.7"
+# Multi-pattern matcher used by the experimental CRS literal prefilter
+# (`crs-prefilter`). Already in the lockfile as a `regex` transitive dep.
+aho-corasick = { version = "1.1", optional = true }
 once_cell = "1.19"
 uuid = { version = "1.6", features = ["v4", "serde"] }
 notify = "6.1"
@@ -207,6 +210,10 @@ wasm-reactor = ["dep:wasmtime", "dep:wasmtime-wasi"]
 # in native/coraza-sidecar and is built separately. See
 # docs/coraza-native-sidecar.md.
 coraza-native = []
+# Experimental required-literal prefilter for CRS request bodies. Non-default:
+# it is an opt-in evaluation mode until the detection-parity corpus proves it
+# on the deployed rule set. See docs/suggestions_from_agents/crs-prefilter.md.
+crs-prefilter = ["dep:aho-corasick"]
 # Protocol support features
 websocket = []
 # HTTP/3 over QUIC. Not part of default features: it pulls in quinn/h3 and
@@ -325,3 +332,17 @@ path = "src/bin/phase4_standalone_test.rs"
 [[bin]]
 name = "benchmark_core"
 path = "src/bin/benchmark_core.rs"
+
+# Offline CRS literal-extraction tool. Emits rules/crs/prefilter.json and the
+# human-readable summary. Requires the non-default `crs-prefilter` feature.
+[[bin]]
+name = "crs-prefilter-extract"
+path = "src/bin/crs_prefilter_extract.rs"
+required-features = ["crs-prefilter"]
+
+# Prefilter latency / hit-rate / detection-parity harness. The sidecar half
+# needs `coraza-native` in addition to `crs-prefilter`.
+[[bin]]
+name = "crs-prefilter-bench"
+path = "src/bin/crs_prefilter_bench.rs"
+required-features = ["crs-prefilter"]

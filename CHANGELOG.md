@@ -6,6 +6,18 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Added
 
+- Experimental CRS required-literal prefilter (`crs-prefilter`, non-default).
+  The offline `crs-prefilter-extract` tool parses the vendored CRS 4.14 rules
+  and emits `rules/crs/prefilter.json` plus a coverage summary; the Rust
+  runtime scans the request body with Aho-Corasick over the proven literal
+  sets and the transform pipelines it can reproduce exactly. The native
+  sidecar backend gains `PrefilterMode::{DryRun, BodyWithhold}` (default
+  `Off`) and three metrics. Stock CRS has ungated body-relevant rules
+  (`@detectSQLi`, `@detectXSS`, argument/file size checks, the
+  obfuscation-tolerant 932 regexes), so `BodyWithhold` never fires on the
+  stock bundle; the mode is an experimental measurement path until per-rule
+  gating lands. See `docs/suggestions_from_agents/crs-prefilter.md`.
+
 - Cross-feature CI matrix. `scripts/ci-feature-matrix.sh` (also
   `just ci-feature-matrix`) and `.github/workflows/feature-matrix.yml` compile
   and test the default, `wasm-reactor`, `wasm-reactor,coraza-native`,

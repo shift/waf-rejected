@@ -691,3 +691,37 @@ SQLi/XSS/LFI/RCE corpus (query + body). Documented in
 Not implemented (product decisions): reactor (wasm) parity requires a module
 rebuild; inspected-body caps; literal prefilter; Hyperscan via cgo; upstream
 `SecArgumentsLimit` fix.
+
+---
+
+# Delegated: CRS required-literal prefilter (`perf/crs-prefilter`)
+
+**Status:** implemented, experimental (non-default feature `crs-prefilter`).
+**Goal:** prove and implement a sound multi-pattern prefilter that can skip CRS
+body work on benign traffic, with zero false negatives as the acceptance gate.
+
+## Plan
+
+- [x] Parse the vendored CRS bundle (rules, chains, `@rx`/`@pm`/`@pmFromFile`,
+      targets, transforms) in an offline Rust extractor.
+- [x] Extract disjunctive required-literal sets; mark unproven rules `ungated`.
+- [x] Emit deterministic `rules/crs/prefilter.json` + `PREFILTER_SUMMARY.md`.
+- [x] Add the `crs-prefilter` runtime (Aho-Corasick over representation ×
+      transform pipelines) and adversarial extraction tests.
+- [x] Add `PrefilterMode::{DryRun, BodyWithhold}` to the native backend
+      (default `Off`); document the wasm equivalent.
+- [x] Add a corpus, benchmark/parity harness, design + soundness report,
+      CHANGELOG entry.
+- [ ] Per-rule gating (sidecar `RemoveRuleByID` + wasm ABI) so the gated share
+      can be skipped while `@detectSQLi`/`@detectXSS` still see the body.
+- [ ] Gapped-subsequence gates for 932250/932260; full HTML5 entity table for
+      `t:htmlEntityDecode`.
+
+## Result
+
+Stock CRS 4.14 has 200 body-relevant entries; the extractor gates 64 and
+leaves 136 ungated. Because the body-withholding mode requires *all* body
+rules to be gated, it never fires on stock CRS; the prefilter is sound but the
+fast path is blocked by `@detectSQLi`, `@detectXSS`, size/validation checks and
+the obfuscation-tolerant 932 regexes. Details and measurements:
+`docs/suggestions_from_agents/crs-prefilter.md`.
