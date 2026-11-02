@@ -2,12 +2,15 @@ FROM rust:1.99-bookworm AS builder
 
 WORKDIR /build
 COPY . .
-RUN cargo build --release --bin waf-ingress --features http3,webtransport,wasm-reactor
+# `coraza-native` only enables the opt-in native sidecar backend; the default
+# `waf.coraza.backend` remains "wasm". It lets the same image run the
+# high-throughput profile (config/performance-native.toml).
+RUN cargo build --release --bin waf-ingress --features http3,webtransport,wasm-reactor,coraza-native
 
 FROM debian:bookworm-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 1000 --create-home waf \
     && mkdir -p /var/lib/waf/data /var/lib/waf/logs \
@@ -34,5 +37,7 @@ USER 1000
 EXPOSE 8080 8081
 ENV RUST_LOG=info WAF_CONFIG_FILE=/etc/waf/config.toml
 ENV WAF_UPSTREAM_URI=http://127.0.0.1:3000
+HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=3 \
+    CMD ["curl", "-fsS", "http://127.0.0.1:8081/health/ready"]
 
 ENTRYPOINT ["/usr/local/bin/waf-ingress"]

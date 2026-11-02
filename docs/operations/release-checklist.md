@@ -7,10 +7,14 @@
 - [ ] `./scripts/ci-local.sh` (or `just ci-local`) passes locally
 - [ ] `cargo fmt -- --check`
 - [ ] `cargo clippy --lib -- --deny warnings`
+- [ ] `cargo clippy --lib --features wasm-reactor,coraza-native -- --deny warnings`
 - [ ] `cargo check --all-targets`
 - [ ] `cargo test --lib`
 - [ ] `cargo test --test integration`
 - [ ] `nix build .#waf-ingress`
+- [ ] `nix build .#coraza-native-sidecar`
+- [ ] `./scripts/run-native-profile.sh` passes (benign 200, SQLi/XSS 403,
+      gRPC 200) and the sidecar `--probe` readiness check works
 - [ ] `./scripts/check-coraza-reactor-size.sh` passes (digest matches and the
       module is at most 32 MiB; current build is about 18 MiB)
 - [ ] `result/share/waf/wasm/coraza_reactor.wasm` exists in the Nix
@@ -19,6 +23,9 @@
       the module digest matches `SHA256SUMS`
 - [ ] The default release build includes `wasm-reactor` and a default
       `Config` has `waf.coraza.enabled = true`
+- [ ] The release build also includes `coraza-native`, but the default
+      `Config` still resolves `waf.coraza.backend = "wasm"` (the native profile
+      is opt-in via `config/performance-native.toml`)
 - [ ] A `wasm-reactor` build fails closed when the module is missing or has
       broken exports (see `docs/coraza-wasi-reactor.md`)
 - [ ] Startup smoke test: with default config the binary compiles/warms the
@@ -63,7 +70,10 @@ curl -o /dev/null -w '%{http_code}\n' -X POST --data '<script>alert(1)</script>'
 - [ ] Confirm the Release workflow built and attached every asset:
       - `waf-rejected-v<version>-x86_64-linux.tar.gz` (binary tarball,
         includes `wasm/coraza_reactor.wasm`, `wasm/LICENSE-CRS`,
-        `wasm/PROVENANCE.md` and `wasm/SHA256SUMS`)
+        `wasm/PROVENANCE.md`, `wasm/SHA256SUMS`, and the native profile
+        under `native/coraza-sidecar` + `native/coraza/`)
+      - `waf-rejected-v<version>-coraza-sidecar-x86_64-linux.tar.gz`
+        (standalone sidecar binary + CRS rules)
       - `waf-rejected-<version>-image.tar.gz` (prebuilt container image)
       - `waf-rejected-<version>.cdx.json` (CycloneDX SBOM, with the reactor
         file component, SHA-256 and Apache-2.0 licence note)

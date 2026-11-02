@@ -239,6 +239,12 @@ Key points:
   built with Rust 1.99.1. See
   [`docs/coraza-wasi-reactor.md`](docs/coraza-wasi-reactor.md) and
   [`docs/wasm-integration-status.md`](docs/wasm-integration-status.md).
+- **A native Coraza sidecar profile is available for high-throughput body
+  inspection.** It is opt-in (`config/performance-native.toml`, Compose and
+  Kubernetes examples under `deploy/`), requires the `coraza-native` feature and
+  a sidecar process, and is about 6× faster on body inspection than wasm. The
+  default backend remains `wasm`. See
+  [`docs/operations/native-performance-profile.md`](docs/operations/native-performance-profile.md).
 - **WebTransport is feature-gated and terminating.** Build with
   `--features webtransport`, enable `server.webtransport`, and configure Origin
   and path allowlists. It inspects sessions locally; it does **not** proxy

@@ -85,8 +85,10 @@
           pname = "waf-ingress";
           
           # Build main binary
-          cargoBuildCommand = "cargo build --release --bin waf-ingress --features http3,webtransport,wasm-reactor";
-          cargoCheckCommand = "cargo check --release --bin waf-ingress --features http3,webtransport,wasm-reactor";
+          # `coraza-native` enables the opt-in native sidecar backend only; the
+          # default `waf.coraza.backend` stays "wasm".
+          cargoBuildCommand = "cargo build --release --bin waf-ingress --features http3,webtransport,wasm-reactor,coraza-native";
+          cargoCheckCommand = "cargo check --release --bin waf-ingress --features http3,webtransport,wasm-reactor,coraza-native";
           # Tests run in the dedicated CI/test jobs; keeping them out of the
           # package build avoids compiling every test utility binary twice.
           doCheck = false;

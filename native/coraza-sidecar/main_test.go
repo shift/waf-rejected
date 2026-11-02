@@ -66,6 +66,21 @@ func form(method, uri, body string) map[string]any {
 	}
 }
 
+func TestProbeSocket(t *testing.T) {
+	path := t.TempDir() + "/probe.sock"
+	if got := probeSocket(path); got != 1 {
+		t.Fatalf("probe of missing socket = %d, want 1", got)
+	}
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	if got := probeSocket(path); got != 0 {
+		t.Fatalf("probe of listening socket = %d, want 0", got)
+	}
+}
+
 func TestDecisionParity(t *testing.T) {
 	s := testServer(t)
 	cases := []struct {

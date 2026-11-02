@@ -1744,6 +1744,7 @@ mod tests {
             "test_config.toml",
             "config/development-production.toml",
             "config/enterprise.toml",
+            "config/performance-native.toml",
         ];
 
         for file in files {

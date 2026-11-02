@@ -1,7 +1,10 @@
-# Native Coraza sidecar (experimental)
+# Native Coraza sidecar
 
-**Status:** prototype, non-default backend. `wasm-reactor` remains the default
-and `waf.coraza.enabled` / existing wasm behaviour are unchanged.
+**Status:** supported, opt-in backend. `wasm-reactor` remains the default and
+`waf.coraza.enabled` / existing wasm behaviour are unchanged. For the curated,
+tested high-throughput deployment (Compose, Kubernetes, measured capacity and
+operational requirements), see
+[`docs/operations/native-performance-profile.md`](operations/native-performance-profile.md).
 **Feature:** `coraza-native` (not in `default`).
 **Wire protocol:** binary v1 with a negotiated JSON fallback (see
 [Architecture](#architecture)).
@@ -14,7 +17,7 @@ Go-compiled-to-wasm execution penalty: a constant ~5.2× on top of native Go for
 CRS operator scanning. Moving Coraza out of wasm removes that dominant cost
 without reducing inspection depth or the inspected body size.
 
-This prototype runs the **same vendored Coraza 3.3.3 and OWASP CRS 4.14.0
+This backend runs the **same vendored Coraza 3.3.3 and OWASP CRS 4.14.0
 bundle** used by the WASI reactor as a native Go process and talks to it over a
 Unix domain socket. The request envelope is the same JSON payload as the wasm
 ABI, so decisions and configuration can be compared directly.
@@ -122,7 +125,15 @@ nix develop -c cargo run --release --features coraza-native -- \
 
 A Nix package is available as `nix build .#coraza-native-sidecar`; it installs
 the binary to `$out/bin/coraza-sidecar` and the ruleset to
-`$out/share/waf/coraza/crs/`.
+`$out/share/waf/coraza/crs/`. The release tarball also contains the binary and
+rules under `native/`, and a standalone sidecar tarball is published.
+
+For container and Kubernetes probes, the sidecar has a probe mode that works
+in the distroless image (no shell required):
+
+```sh
+coraza-sidecar --probe --socket /run/waf/coraza.sock   # exit 0 when ready
+```
 
 ## Deployment
 

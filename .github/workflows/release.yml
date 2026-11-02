@@ -177,8 +177,22 @@ jobs:
         uses: cachix/install-nix-action@v25
       - name: Build release binary
         run: nix build .#waf-ingress
+      - name: Build native Coraza sidecar
+        run: nix build .#coraza-native-sidecar --out-link result-sidecar
       - name: Verify Coraza reactor digest and size budget
         run: ./scripts/check-coraza-reactor-size.sh
+      - name: Verify native sidecar executable
+        run: |
+          set -euo pipefail
+          test -x result-sidecar/bin/coraza-sidecar
+          # A probe of a missing socket must exit 1, proving the binary runs in
+          # this environment without starting an engine.
+          if result-sidecar/bin/coraza-sidecar --probe --socket /nonexistent/coraza.sock; then
+            echo "probe unexpectedly succeeded" >&2
+            exit 1
+          else
+            test "$?" -eq 1
+          fi
       - name: Package artifacts
         run: |
           set -euo pipefail
@@ -196,7 +210,14 @@ jobs:
             "waf-rejected-v${VERSION}/wasm/PROVENANCE.md"
           install -Dm644 wasm/coraza_reactor/SHA256SUMS \
             "waf-rejected-v${VERSION}/wasm/SHA256SUMS"
+          # Native Coraza sidecar: binary plus the same read-only CRS bundle.
+          install -Dm755 result-sidecar/bin/coraza-sidecar \
+            "waf-rejected-v${VERSION}/native/coraza-sidecar"
+          cp -r result-sidecar/share/waf/coraza \
+            "waf-rejected-v${VERSION}/native/coraza"
           tar -czf "dist/waf-rejected-v${VERSION}-x86_64-linux.tar.gz" "waf-rejected-v${VERSION}"
+          tar -czf "dist/waf-rejected-v${VERSION}-coraza-sidecar-x86_64-linux.tar.gz" \
+            -C result-sidecar bin share
           cp "image/waf-rejected-${VERSION}-image.tar.gz" dist/
           cp "sbom/waf-rejected-${VERSION}.cdx.json" dist/
           cp wasm/coraza_reactor/coraza_reactor.wasm \
@@ -208,6 +229,7 @@ jobs:
           cd dist
           for asset in \
             "waf-rejected-v${VERSION}-x86_64-linux.tar.gz" \
+            "waf-rejected-v${VERSION}-coraza-sidecar-x86_64-linux.tar.gz" \
             "waf-rejected-${VERSION}-image.tar.gz" \
             "waf-rejected-${VERSION}.cdx.json" \
             "waf-rejected-${VERSION}-coraza_reactor.wasm" \
@@ -222,6 +244,7 @@ jobs:
         with:
           subject-path: |
             dist/waf-rejected-v*-x86_64-linux.tar.gz
+            dist/waf-rejected-v*-coraza-sidecar-x86_64-linux.tar.gz
             dist/waf-rejected-*-image.tar.gz
             dist/waf-rejected-*.cdx.json
             dist/waf-rejected-*-coraza_reactor.wasm
@@ -234,6 +257,7 @@ jobs:
           generate_release_notes: true
           files: |
             dist/waf-rejected-v*-x86_64-linux.tar.gz
+            dist/waf-rejected-v*-coraza-sidecar-x86_64-linux.tar.gz
             dist/waf-rejected-*-image.tar.gz
             dist/waf-rejected-*.cdx.json
             dist/waf-rejected-*-coraza_reactor.wasm

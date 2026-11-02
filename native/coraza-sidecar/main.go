@@ -69,6 +69,20 @@ type server struct {
 	conns          sync.Map
 }
 
+// probeSocket reports whether the sidecar is accepting connections on path.
+// It deliberately does not evaluate a transaction: readiness means the engine
+// has loaded and the listener is up, which is enough for restart/liveness
+// decisions. The caller exits with the returned status.
+func probeSocket(path string) int {
+	conn, err := net.DialTimeout("unix", path, 2*time.Second)
+	if err != nil {
+		log.Printf("probe: socket %s not ready: %v", path, err)
+		return 1
+	}
+	_ = conn.Close()
+	return 0
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.LUTC)
 	log.SetPrefix("coraza-sidecar: ")
@@ -83,8 +97,16 @@ func main() {
 		timeout        = flag.Duration("timeout", 5*time.Second, "per-request wall-clock budget")
 		grace          = flag.Duration("grace", 10*time.Second, "graceful shutdown drain budget")
 		earlyBlocking  = flag.Bool("early-blocking", true, "enable CRS phase-1 early blocking (rule 900120) so requests already over the anomaly threshold are denied before the body is scanned")
+		probe          = flag.Bool("probe", false, "connect to the socket, print readiness and exit (for container/k8s probes)")
 	)
 	flag.Parse()
+
+	// Container and Kubernetes probes cannot run a shell in the distroless
+	// image. `--probe` connects to the already-bound socket and exits 0 only
+	// when the listener accepts, so it can be used directly as an exec probe.
+	if *probe {
+		os.Exit(probeSocket(*socketPath))
+	}
 
 	engine, err := newEngine(*rulesPath, *maxBody, *earlyBlocking)
 	if err != nil {

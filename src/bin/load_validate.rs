@@ -325,6 +325,7 @@ fn build_templates(seed: u64) -> Vec<RequestTemplate> {
 
     for (class, len) in [
         ("form-1k", 1024usize),
+        ("form-4k", 4 * 1024),
         ("form-8k", 8 * 1024),
         ("form-16k", 16 * 1024),
         ("form-60k", 60_000),
@@ -426,6 +427,12 @@ fn profiles() -> Vec<Profile> {
             mix: vec![("form-1k", 100)],
             p95_target_ms: Some(250.0),
             description: "1 KiB urlencoded POST",
+        },
+        Profile {
+            name: "form-4k",
+            mix: vec![("form-4k", 100)],
+            p95_target_ms: Some(500.0),
+            description: "4 KiB urlencoded POST (CRS body scan)",
         },
         Profile {
             name: "form-8k",

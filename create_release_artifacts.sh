@@ -13,11 +13,11 @@ fi
 echo "📦 Creating release artifacts for WAF-Rejected v$VERSION"
 echo "======================================================="
 
-# Ensure we have a release build
-if [[ ! -f "target/release/waf-ingress" ]]; then
-    echo "🏗️  Building release binary..."
-    cargo build --release
-fi
+# Ensure we have a release build. `coraza-native` enables the opt-in native
+# sidecar backend; the default `waf.coraza.backend` remains "wasm". Cargo is
+# incremental, so this is cheap when the tree is already built.
+echo "🏗️  Building release binary..."
+cargo build --release --features wasm-reactor,coraza-native
 
 # Create release directory
 RELEASE_DIR="waf-rejected-v$VERSION"
@@ -81,6 +81,19 @@ install -Dm644 wasm/coraza_reactor/LICENSE-CRS "$RELEASE_DIR/wasm/LICENSE-CRS"
 install -Dm644 wasm/coraza_reactor/PROVENANCE.md "$RELEASE_DIR/wasm/PROVENANCE.md"
 install -Dm644 wasm/coraza_reactor/SHA256SUMS "$RELEASE_DIR/wasm/SHA256SUMS"
 echo "✅ Added Coraza reactor ($(stat -c%s wasm/coraza_reactor/coraza_reactor.wasm) bytes)"
+
+# Native Coraza sidecar: binary plus the shared read-only CRS bundle. The
+# high-throughput profile (config/performance-native.toml) needs both.
+if [[ ! -x "target/native/coraza-sidecar" ]]; then
+    echo "🏗️  Building native Coraza sidecar..."
+    ./scripts/build-coraza-sidecar.sh
+fi
+install -Dm755 target/native/coraza-sidecar "$RELEASE_DIR/native/coraza-sidecar"
+mkdir -p "$RELEASE_DIR/native/coraza"
+cp -r wasm/coraza_reactor/rules/crs "$RELEASE_DIR/native/coraza/crs"
+install -Dm644 wasm/coraza_reactor/LICENSE-CRS "$RELEASE_DIR/native/coraza/LICENSE-CRS"
+install -Dm644 wasm/coraza_reactor/PROVENANCE.md "$RELEASE_DIR/native/coraza/PROVENANCE.md"
+echo "✅ Added native Coraza sidecar and CRS rules"
 
 # Create startup script
 cat > "$RELEASE_DIR/start_waf.sh" << 'EOF'
