@@ -54,8 +54,11 @@ The release pipeline enforces a **32 MiB** ceiling
 (`CORAZA_MAX_MODULE_BYTES`, 33,554,432 bytes) in the Nix package, the
 container build, `scripts/check-coraza-reactor-size.sh` and the host loader.
 Exceeding it fails the build or startup instead of silently shipping a debug
-or unstripped binary. Shrinking the module with `wasm-opt -Oz` remains
-desirable, but the budget leaves headroom for a pinned CRS bundle.
+or unstripped binary. `wasm-opt -O3` was evaluated as a size lever: it yields
+a valid 18,975,699-byte module (−5.6%) with identical decisions, but it does
+not change steady-state evaluation cost, so the committed artifact stays the
+plain Go build (see [Runtime and module tuning](#runtime-and-module-tuning-measured)).
+`-Oz` is smaller still (18,087,425 bytes) and no faster.
 
 ## Startup validation (fail closed)
 
@@ -130,6 +133,11 @@ GOTOOLCHAIN=local go build \
 CRS `@pmFromFile` data files are resolved through an embedded `fs.FS`. The
 output is about 20 MiB because it contains the Go runtime, Coraza and the CRS
 rule/data bundle.
+
+The script deliberately does **not** run Binaryen. `wasm-opt -O3` was measured
+(see [Runtime and module tuning](#runtime-and-module-tuning-measured)): it
+shrinks the module by 5.6% with identical decisions but no measurable change
+in evaluation cost, so it is not wired into the reproducible build.
 
 ### Reproducibility and checksum
 
@@ -726,6 +734,59 @@ forced `eval_timeout_ms = 20` made an 8 KiB evaluation return
 freshly created instance, and the rule maps the timeout to `503` when
 `fail_mode = "closed"`.
 
+### Runtime and module tuning (measured)
+
+A second tuning pass on 2026-11-02 re-measured the wasmtime `Config`, the
+compiled module and the pool against the same form-body workload. The headline
+result is that **no runtime or module knob moved steady-state cost**: the body
+cost is inherent Go→wasm CRS scanning, not a tuning artefact. The measurements
+are recorded here so the options are not re-litigated.
+
+Method: release build, one pre-warmed worker, `data=AAA…` bodies, variants
+interleaved round-robin on a shared host. Because wall-clock time was dominated
+by preemption, the comparison used per-`eval` **thread CPU time** (measured
+around the guest call) as well as wall p50; both agreed. A 4 KiB body was
+169–170 ms p50 for every variant below (1 KiB 39.7 ms, 8 KiB 353 ms, 16 KiB
+727 ms, 60 KiB 2.74 s), matching the table above.
+
+| Experiment | Result | Kept |
+| --- | --- | --- |
+| `wasm-opt -O3` module (20,112,739 → 18,975,699 bytes) | 0% (±2%) on 1/4/8/16/60 KiB | No |
+| `wasm-opt -Oz` module (18,087,425 bytes) | 0% vs `-O3` on every size | No |
+| `memory_may_move(false)` (static memory base) | 0% | No |
+| `native_unwind_info(false)` | 0% | No |
+| `cranelift_regalloc_algorithm(SinglePass)` (control) | 1.17–1.85× **slower** | No |
+| `wasm_backtrace_max_frames(None)` + no debug info | no steady-state change; less work per trap | Yes |
+| `cranelift_debug_verifier`, `nan_canonicalization`, `memory_init_cow` | already the release defaults | n/a |
+| `pooling_allocator` | not applicable: needs the non-enabled `pooling-allocator` feature and forbids memory growth; the pre-warmed pool already removes per-request instantiation | No |
+| `async_stack_size` / `max_wasm_stack` | address-space reservation only; 8 MiB is the validated Go start-up requirement | unchanged |
+
+The SinglePass control is the important row: it changes codegen quality and
+costs 1.17–1.85×, so the method can see codegen effects. `-O3` therefore
+genuinely adds nothing on top of Cranelift's own optimiser for this workload —
+the module only gets 5.6% smaller. Disabling backtraces is kept because every
+fail-closed timeout (an attacker-influenced path) otherwise walks frames and
+retains guest debug info; it does not change steady-state latency.
+
+**Precompiled modules.** Serialising the compiled module with
+`Engine::precompile_module` and reloading it with `Module::deserialize_file`
+cuts module compile plus pool warm-up from ~5.6 s to ~1.3 s (cache-hit runs
+measured 1.26 s and 1.68 s on a loaded host). It is not shipped: the artifact
+is ~40 MB, is tied to the exact wasmtime version, CPU and host configuration,
+and `deserialize_file` is `unsafe`, so a writable cache path would be a
+code-execution boundary. A deployment that wants the ~4 s of start-up back
+should generate the cache at install time under a root-owned path.
+
+**Pool memory.** Peak RSS grows by ~65 MiB per pre-warmed worker: 434 MiB at
+`pool_size = 1`, 501 MiB at 2, 626 MiB at 4 and 756 MiB at 6 on the reference
+laptop (the first worker includes the ~20 MiB module plus its compiled code).
+The default (one worker per core, at most 8) therefore costs roughly
+`cores × 65 MiB` on top of that shared footprint. Body scans are CPU-bound and
+admission control already caps concurrent heavy scans, so an explicit smaller
+`pool_size` trades throughput for memory roughly linearly; the default is
+unchanged because lowering it would cut cheap (bodyless) throughput without a
+measured memory-pressure signal.
+
 ## Remaining work
 
 - **Response coverage:** enable `SecResponseBodyAccess` and the
@@ -737,6 +798,9 @@ freshly created instance, and the rule maps the timeout to `503` when
   cost: CRS operators scan the whole body byte-for-byte and Go→wasm adds a
   ~5× constant factor. Epoch interruption and GC tuning help the tail, but an
   8 KiB body still costs ~350 ms and 60 KiB ~2.6 s on the reference laptop.
+  Runtime and module tuning (`wasm-opt`, memory style, unwind info, stack
+  sizing, allocator) was measured and does not move steady-state cost; see
+  [Runtime and module tuning](#runtime-and-module-tuning-measured).
   Sub-second large-body inspection needs a body-size policy or native Coraza,
   not a faster runtime.
 - **Tokio interaction:** wasmtime-wasi's sync preview1 adapters cannot run
@@ -747,8 +811,11 @@ freshly created instance, and the rule maps the timeout to `503` when
   suite. Pool threads are created by the host with an explicit 32 MiB native
   stack, so initialisation no longer depends on the stack size of the calling
   Tokio worker.
-- **Module size:** run `wasm-opt -Oz` and/or split unused Coraza features;
-  20 MiB is large for an embedded security control.
+- **Module size:** `wasm-opt -O3` (−5.6%) and `-Oz` (−10%) were measured as
+  size levers: both produce valid modules with identical decisions and no
+  latency change, so neither is wired into the build. Splitting unused Coraza
+  features or a lighter CRS profile remains the way to shrink the 20 MiB
+  artifact.
 - **Default enablement:** `wasm-reactor` is now default-on. Watch the
   ~4.5 s compile + ~1.1 s pool warm at start-up and the body-size-dependent
   per-request cost (~2 ms bodyless, ~350 ms per 8 KiB body); provide a

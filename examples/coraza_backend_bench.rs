@@ -10,6 +10,9 @@
 //! - `CORAZA_SOCKET` (default `/tmp/coraza-native-bench.sock`)
 //! - `CORAZA_REPS` scales every case (default 1.0)
 //! - `CORAZA_ONLY` = `wasm` | `native` to skip one backend
+//! - `CORAZA_MODULE` loads a specific reactor `.wasm` file instead of the
+//!   embedded module (used to A/B `wasm-opt` output without rebuilding)
+//! - `CORAZA_POOL_SIZE` overrides the wasm pool size (default 4)
 //!
 //! The measurement method mirrors `docs/suggestions_from_agents/coraza-body-performance.md`:
 //! release build, warmed engine, whole `WafRule::evaluate` call (payload build +
@@ -114,6 +117,7 @@ fn cases(scale: f64) -> Vec<Case> {
 
 struct Stats {
     p50: Duration,
+    p95: Duration,
     mean: Duration,
     decision: Decision,
 }
@@ -129,9 +133,11 @@ fn measure(rule: &dyn WafRule, case: &Case) -> Stats {
     }
     samples.sort_unstable();
     let p50 = samples[samples.len() / 2];
+    let p95 = samples[(samples.len() * 95 / 100).min(samples.len() - 1)];
     let total: Duration = samples.iter().sum();
     Stats {
         p50,
+        p95,
         mean: total / samples.len() as u32,
         decision,
     }
@@ -160,6 +166,48 @@ fn fmt_ms(d: Duration) -> String {
     format!("{:.2}", d.as_secs_f64() * 1000.0)
 }
 
+/// Peak resident set size of this process in MiB, from `/proc/self/status`.
+fn peak_rss_mib() -> f64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status.lines().find_map(|line| {
+                let rest = line.strip_prefix("VmHWM:")?;
+                let kib: f64 = rest.trim().trim_end_matches(" kB").trim().parse().ok()?;
+                Some(kib / 1024.0)
+            })
+        })
+        .unwrap_or(f64::NAN)
+}
+
+/// Throughput at several client concurrencies for the two pool-sizing cases.
+fn throughput_matrix(rule: &dyn WafRule, pool_size: usize) {
+    println!("\n## Throughput vs pool size (requests/second)\n");
+    println!("| pool | case | concurrency | requests/s | peak RSS MiB |");
+    println!("|---|---|---|---|---|");
+    for (name, body) in [
+        ("1 KiB form", form_body(1024)),
+        ("8 KiB form", form_body(8192)),
+    ] {
+        for concurrency in [1usize, 4, 16] {
+            let case = Case {
+                name,
+                body: Some(body.clone()),
+                uri: "/submit",
+                reps: 1,
+            };
+            // Keep total work roughly constant across concurrencies so a run
+            // of the matrix takes about the same time per row.
+            let reps = (16 / concurrency).max(1);
+            let rps = throughput(rule, &case, concurrency, reps);
+            println!(
+                "| {pool_size} | {name} | {concurrency} | {rps:.1} | {:.1} |",
+                peak_rss_mib()
+            );
+        }
+    }
+}
+
 fn main() {
     let socket = std::env::var("CORAZA_SOCKET")
         .unwrap_or_else(|_| "/tmp/coraza-native-bench.sock".to_string());
@@ -175,7 +223,11 @@ fn main() {
 
     let mut config = WafCorazaConfig {
         eval_timeout_ms: 30_000,
-        pool_size: 4,
+        pool_size: std::env::var("CORAZA_POOL_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4),
+        module_path: std::env::var("CORAZA_MODULE").ok(),
         ..Default::default()
     };
 
@@ -183,8 +235,16 @@ fn main() {
 
     if only != "native" {
         config.backend = CorazaBackend::Wasm;
+        let started = Instant::now();
         match waf_ingress::waf::wasm_reactor::WasmReactorRule::from_config(&config, true) {
-            Ok(rule) => backends.push(("wasm", Box::new(rule))),
+            Ok(rule) => {
+                eprintln!(
+                    "wasm backend compiled and warmed in {:.2} s (pool {})",
+                    started.elapsed().as_secs_f64(),
+                    config.resolved_pool_size()
+                );
+                backends.push(("wasm", Box::new(rule)))
+            }
             Err(err) => eprintln!("wasm backend unavailable: {err}"),
         }
     }
@@ -218,29 +278,39 @@ fn main() {
         }
     }
 
-    println!("\n## Single-request latency (p50 / mean, ms)\n");
-    print!("| case |");
-    for (name, _) in &backends {
-        print!(" {name} p50 | {name} mean | {name} decision |");
-    }
-    println!();
-    print!("|---|");
-    for _ in &backends {
-        print!("---|---|---|");
-    }
-    println!();
-    for case in &all_cases {
-        print!("| {} |", case.name);
-        for (_, rule) in &backends {
-            let stats = measure(rule.as_ref(), case);
-            print!(
-                " {} | {} | {:?} |",
-                fmt_ms(stats.p50),
-                fmt_ms(stats.mean),
-                stats.decision
-            );
+    if std::env::var("CORAZA_SKIP_LATENCY").is_err() {
+        println!("\n## Single-request latency (p50 / p95 / mean, ms)\n");
+        print!("| case |");
+        for (name, _) in &backends {
+            print!(" {name} p50 | {name} p95 | {name} mean | {name} decision |");
         }
         println!();
+        print!("|---|");
+        for _ in &backends {
+            print!("---|---|---|---|");
+        }
+        println!();
+        for case in &all_cases {
+            print!("| {} |", case.name);
+            for (_, rule) in &backends {
+                let stats = measure(rule.as_ref(), case);
+                print!(
+                    " {} | {} | {} | {:?} |",
+                    fmt_ms(stats.p50),
+                    fmt_ms(stats.p95),
+                    fmt_ms(stats.mean),
+                    stats.decision
+                );
+            }
+            println!();
+        }
+    }
+
+    if std::env::var("CORAZA_THROUGHPUT").is_ok() {
+        for (_, rule) in &backends {
+            throughput_matrix(rule.as_ref(), config.resolved_pool_size());
+        }
+        return;
     }
 
     let throughput_case = Case {

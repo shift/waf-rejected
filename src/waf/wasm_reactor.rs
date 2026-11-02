@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 use wasmtime::{
     Caller, Config, Engine, Extern, Linker, Memory, Module, OptLevel, Store, StoreLimits,
-    StoreLimitsBuilder, TypedFunc,
+    StoreLimitsBuilder, TypedFunc, WasmBacktraceDetails,
 };
 use wasmtime_wasi::p1::{self, WasiP1Ctx};
 use wasmtime_wasi::p2::pipe::SinkOutputStream;
@@ -915,6 +915,35 @@ impl WorkerConfig {
     }
 }
 
+/// Builds the wasmtime engine configuration for the reactor.
+///
+/// Only settings that change measured behaviour are set explicitly; the rest
+/// are wasmtime defaults (Cranelift `Speed`, no IR verifier or NaN
+/// canonicalisation in release, copy-on-write data segments). See
+/// `docs/coraza-wasi-reactor.md` for the tuning measurements behind this list.
+fn reactor_engine_config() -> Config {
+    let mut config = Config::new();
+    // Epoch interruption bounds wall-clock execution without the per-block
+    // instrumentation cost of fuel metering. The ticker below advances the
+    // epoch; stores set a deadline before each guest call.
+    config.epoch_interruption(true);
+    config.cranelift_opt_level(OptLevel::Speed);
+    // A trapped reactor is discarded and reported as an error, and the host
+    // never symbolises guest frames. Disabling backtraces keeps the
+    // fail-closed timeout path (the DoS-facing path) from walking frames and
+    // retaining debug info. This does not affect steady-state `eval`.
+    config.wasm_backtrace_max_frames(None);
+    config.wasm_backtrace_details(WasmBacktraceDetails::Disable);
+    // The Go runtime uses more wasm stack than a typical Rust/C guest.
+    // Exceeding this limit traps in wasm instead of overflowing the host
+    // thread stack. wasmtime requires `max_wasm_stack` to fit inside the
+    // async stack, even for synchronous calls. Both only reserve address
+    // space, so they do not affect steady-state throughput.
+    config.async_stack_size(8 * 1024 * 1024);
+    config.max_wasm_stack(8 * 1024 * 1024);
+    config
+}
+
 impl WasmReactor {
     /// Compiles a reactor from WAT or Wasm bytes.
     pub fn from_wat(wat: &str, limits: ReactorLimits) -> Result<Self, ReactorError> {
@@ -923,18 +952,7 @@ impl WasmReactor {
 
     /// Compiles a reactor from Wasm bytes. WAT text is accepted as well.
     pub fn from_bytes(bytes: &[u8], limits: ReactorLimits) -> Result<Self, ReactorError> {
-        let mut config = Config::new();
-        // Epoch interruption bounds wall-clock execution without the per-block
-        // instrumentation cost of fuel metering. The ticker below advances the
-        // epoch; stores set a deadline before each guest call.
-        config.epoch_interruption(true);
-        config.cranelift_opt_level(OptLevel::Speed);
-        // The Go runtime uses more wasm stack than a typical Rust/C guest.
-        // Exceeding this limit traps in wasm instead of overflowing the host
-        // thread stack. wasmtime requires `max_wasm_stack` to fit inside the
-        // async stack, even for synchronous calls.
-        config.async_stack_size(8 * 1024 * 1024);
-        config.max_wasm_stack(8 * 1024 * 1024);
+        let config = reactor_engine_config();
         let engine = Engine::new(&config).map_err(|err| ReactorError::Compile(err.to_string()))?;
         let module =
             Module::new(&engine, bytes).map_err(|err| ReactorError::Compile(err.to_string()))?;

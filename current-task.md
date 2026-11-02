@@ -745,3 +745,41 @@ sidecar without changing detection rules or defaults.
 - Verified: `cargo fmt -- --check`, `cargo test --lib` (default and
   `wasm-reactor,coraza-native`), clippy for lib and harness, harness build with
   both features.
+
+---
+
+# Perf: WASM Coraza runtime tuning (delegated spike)
+
+**Branch**: `perf/wasm-runtime-tuning`
+**Status**: in progress
+**Constraint**: no change to inspected bytes, rules, or default policy.
+
+## Plan
+
+- [x] Extend `examples/coraza_backend_bench.rs` into the A/B harness: p95,
+      `CORAZA_MODULE`, `CORAZA_POOL_SIZE`, load/warm timing, throughput matrix.
+- [x] Experiment 1: wasmtime `Config` knobs. Only the backtrace knobs were
+      kept (failure path); the rest are defaults or measured no-ops.
+- [x] Experiment 2: `wasm-opt -O3` / `-Oz`; valid modules, 5.6%/10% smaller,
+      **no** latency change -> not integrated (per "keep only wins").
+- [x] Experiment 3: compile/instantiation. Precompiled cache: ~5.6 s -> ~1.3 s
+      start-up, not shipped (host-specific, `unsafe` deserialize).
+- [x] Experiment 4: `pool_size` 1/2/4/6 RSS: ~434/501/626/756 MiB (~65 MiB per
+      worker). Throughput scaling not resolvable on the shared host; default
+      unchanged.
+- [x] Keep a Criterion artifact for the chosen configuration.
+- [x] Update `docs/coraza-wasi-reactor.md` and `CHANGELOG.md`.
+
+## Log
+
+- Baseline harness `examples/coraza_backend_bench.rs` already measured the
+  documented 1/4/8/16/60 KiB numbers; reused it as the A/B harness.
+- `wasm-opt -O3` and `-Oz` build cleanly from the committed module once the
+  Go-emitted bulk-memory features are enabled; exports unchanged.
+- The host was shared with another build/test workload for the whole session,
+  so wall-clock A/B was unusable. Added temporary per-`eval` thread-CPU
+  instrumentation and compared variants round-robin: stock vs `-O3` vs `-Oz`
+  vs `nomove` vs `nounwind` were all within ±2%. A `SinglePass` regalloc
+  control was 1.17-1.85x slower, proving the method detects codegen changes.
+- Consequence: no perf win to ship; the branch keeps the benchmark harness,
+  the backtrace hardening, the docs' measured findings and the Criterion rows.

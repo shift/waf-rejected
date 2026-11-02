@@ -218,6 +218,24 @@ All notable changes to WAF-Rejected are documented here.
   earlier prototype claim of ~46 req/s at 4 KiB was a single-core measurement;
   the same harness reports ~134 req/s at four callers on six cores.
 
+### Performance
+
+- Coraza WASI reactor tuning pass, with a reusable A/B harness. The
+  `coraza_backend_bench` example now reports p95, accepts `CORAZA_MODULE` and
+  `CORAZA_POOL_SIZE`, prints compile/warm time and can run a pool-size
+  throughput matrix; the Criterion bench covers the documented
+  1/4/8/16 KiB body rows. Measurements (documented in
+  `docs/coraza-wasi-reactor.md`) found **no steady-state win** from
+  `wasm-opt -O3`/`-Oz`, `memory_may_move(false)`, `native_unwind_info(false)`,
+  `pooling_allocator` or stack sizing — CRS body cost is inherent Go→wasm
+  scanning (a `SinglePass` regalloc control is 1.17–1.85× slower, so the
+  method does detect codegen changes). Guest backtraces are now disabled on
+  the reactor engine so the fail-closed timeout path does not walk frames or
+  retain debug info. Precompiled-module caching was measured at ~5.6 s → ~1.3 s
+  start-up but is not shipped (host-specific 40 MB artifact, `unsafe`
+  deserialize). Peak RSS is ~65 MiB per pre-warmed worker; the default pool
+  size is unchanged. No inspection coverage or default policy changed.
+
 ### Fixed
 
 - gRPC field-content scans no longer bypass heavy-inspection admission control.

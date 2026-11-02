@@ -8,6 +8,11 @@
 //!
 //! The Go/WASI reactor needs a large native stack for Go runtime start-up, so
 //! the whole Criterion run happens on a dedicated thread with a 256 MiB stack.
+//!
+//! The body rows mirror the request-body table in
+//! `docs/coraza-wasi-reactor.md` (1/4/8/16 KiB plus the largest representable
+//! body). They measure the shipped engine configuration: Cranelift `Speed`,
+//! no guest backtraces, and the committed (unoptimised) Go module.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -17,7 +22,13 @@ use waf_ingress::waf::wasm_reactor::{
     ReactorDecision, ReactorLimits, WasmReactor, CORAZA_MAX_PAYLOAD_BYTES,
 };
 
-const BODY_SIZES: [(&str, usize); 3] = [("1kb", 1024), ("16kb", 16 * 1024), ("64kb", 64 * 1024)];
+const BODY_SIZES: [(&str, usize); 5] = [
+    ("1kb", 1024),
+    ("4kb", 4 * 1024),
+    ("8kb", 8 * 1024),
+    ("16kb", 16 * 1024),
+    ("64kb", 64 * 1024),
+];
 
 static MODULE_BYTES: OnceLock<Vec<u8>> = OnceLock::new();
 
