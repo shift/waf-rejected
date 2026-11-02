@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use waf_ingress::waf::prefilter_extract::{
-    default_artifact_path, default_summary_path, extract_from_path_with_paranoia, render_summary,
+    default_artifact_path, default_reactor_artifact_path, default_summary_path,
+    extract_from_path_with_paranoia, render_summary,
 };
 
 const DEFAULT_RULES: &str = "wasm/coraza_reactor/rules/crs/crs.conf";
@@ -80,6 +81,11 @@ fn run(
     let json = serde_json::to_string_pretty(&artifact)?;
     write(out, json.as_bytes())?;
     write(summary, render_summary(&artifact).as_bytes())?;
+    // Keep the guest-embedded copy byte-identical to the host artifact.
+    let reactor_copy = default_reactor_artifact_path();
+    if reactor_copy != out {
+        write(&reactor_copy, json.as_bytes())?;
+    }
 
     let cov = &artifact.coverage;
     println!(

@@ -6,6 +6,21 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Added
 
+- Per-rule CRS gating (`waf.coraza.prefilter = "gated"`, default `off`). The
+  host scans the URI, query, headers, cookies and body with the required-literal
+  prefilter and removes only the gated CRS rules whose proven mandatory literals
+  are absent, keeping every ungated rule. The bounded `remove_rule_ids` list
+  (`<= 256`) travels in the JSON ABI and in binary sidecar v1 (negotiated
+  through handshake capabilities); both guests validate it against their own
+  `prefilter.json` copy and call `tx.RemoveRuleByID` before phase 1, so a
+  forged payload cannot disable an ungated or unknown rule and removal is per
+  transaction. The vendored Coraza `types.Transaction` interface now exposes
+  `RemoveRuleByID` via `patches/coraza-v3.3.3-remove-rule-by-id.patch`, applied
+  by both Go build paths. Measured on the native sidecar: 1.3-1.6x p50
+  improvement on benign 1-60 KiB bodies, 57-58 of 61 gated rules removed, and
+  0 false negatives / 0 false positives on the 51-case corpus. Requires the
+  non-default `crs-prefilter` feature; builds without it reject the config.
+
 - Experimental CRS required-literal prefilter (`crs-prefilter`, non-default).
   The offline `crs-prefilter-extract` tool parses the vendored CRS 4.14 rules
   and emits `rules/crs/prefilter.json` plus a coverage summary; the Rust

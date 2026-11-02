@@ -147,6 +147,16 @@ type Transaction interface {
 	// It returns the corresponding interruption, the number of bytes written an error if any.
 	ReadResponseBodyFrom(io.Reader) (*Interruption, int, error)
 
+	// RemoveRuleByID removes a rule from this transaction only. It does not
+	// affect the shared WAF, so it is safe to call per request. Rules removed
+	// this way are skipped in every phase, including chained members.
+	//
+	// It is intended for host-side gating: a rule whose required literals are
+	// provably absent from the request cannot match, so removing it before the
+	// first phase avoids evaluating it. Callers must only pass rule ids that
+	// are safe to skip for the whole request.
+	RemoveRuleByID(id int)
+
 	// ProcessLogging Logging all information relative to this transaction.
 	// At this point there is not need to hold the connection, the response can be
 	// delivered prior to the execution of this method.

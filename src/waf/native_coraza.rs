@@ -31,7 +31,7 @@
 use std::io::{self, IoSlice, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -47,8 +47,9 @@ use crate::waf::prefilter::{Prefilter, PrefilterError, PrefilterMode};
 use crate::metrics::Metrics;
 use crate::waf::coraza_payload::BodyInspectionPolicy;
 use crate::waf::coraza_wire::{
-    decode_handshake, decode_response, encode_request, handshake_frame, BinaryRequest, WireBuild,
-    DECISION_ALLOW, FRAME_MAGIC_BINARY, WIRE_VERSION,
+    decode_handshake, decode_handshake_capabilities, decode_response, encode_request_with_rules,
+    handshake_frame, BinaryRequest, WireBuild, CAP_REMOVE_RULES, DECISION_ALLOW,
+    FRAME_MAGIC_BINARY, WIRE_VERSION,
 };
 use crate::waf::{Decision, RequestContext, WafRule};
 
@@ -84,6 +85,10 @@ pub enum NativeCorazaError {
     /// The sidecar returned a decision the client does not understand.
     #[error("native Coraza sidecar returned unknown decision `{0}`")]
     UnknownDecision(String),
+    /// The experimental CRS prefilter artifact could not be loaded.
+    #[cfg(feature = "crs-prefilter")]
+    #[error("CRS prefilter: {0}")]
+    Prefilter(String),
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +157,8 @@ struct Pool {
     timeout: Duration,
     max: usize,
     negotiated: AtomicU8,
+    /// True when the sidecar advertised [`CAP_REMOVE_RULES`].
+    remove_rules: AtomicBool,
     state: Mutex<PoolState>,
     available: Condvar,
 }
@@ -163,6 +170,7 @@ impl Pool {
             timeout: config.timeout,
             max: config.pool_size.max(1),
             negotiated: AtomicU8::new(NEGOTIATION_UNKNOWN),
+            remove_rules: AtomicBool::new(false),
             state: Mutex::new(PoolState {
                 idle: Vec::new(),
                 open: 0,
@@ -246,7 +254,7 @@ impl Pool {
         match self.negotiated.load(Ordering::Relaxed) {
             NEGOTIATION_BINARY | NEGOTIATION_JSON => {}
             _ => match conn.negotiate() {
-                Ok(protocol) => {
+                Ok((protocol, capabilities)) => {
                     self.negotiated.store(
                         if protocol == WireProtocol::Binary {
                             NEGOTIATION_BINARY
@@ -255,6 +263,8 @@ impl Pool {
                         },
                         Ordering::Relaxed,
                     );
+                    self.remove_rules
+                        .store(capabilities & CAP_REMOVE_RULES != 0, Ordering::Relaxed);
                 }
                 Err(err) => {
                     // A legacy sidecar answers the handshake with a JSON block
@@ -284,19 +294,25 @@ impl Pool {
     fn uses_binary(&self) -> bool {
         self.negotiated.load(Ordering::Relaxed) == NEGOTIATION_BINARY
     }
+
+    fn supports_remove_rules(&self) -> bool {
+        self.uses_binary() && self.remove_rules.load(Ordering::Relaxed)
+    }
 }
 
 impl Conn {
     /// Sends the handshake frame and reads the ack.
-    fn negotiate(&mut self) -> Result<WireProtocol, NativeCorazaError> {
+    fn negotiate(&mut self) -> Result<(WireProtocol, u8), NativeCorazaError> {
         self.stream
             .write_all(&handshake_frame())
             .map_err(io_error)?;
         let n = self.read_len()?;
         self.fill(n)?;
-        Ok(match decode_handshake(&self.read_buf[..n]) {
-            Some(version) if version >= WIRE_VERSION => WireProtocol::Binary,
-            _ => WireProtocol::Json,
+        let frame = &self.read_buf[..n];
+        let capabilities = decode_handshake_capabilities(frame);
+        Ok(match decode_handshake(frame) {
+            Some(version) if version >= WIRE_VERSION => (WireProtocol::Binary, capabilities),
+            _ => (WireProtocol::Json, 0),
         })
     }
 
@@ -518,6 +534,11 @@ impl NativeCorazaClient {
         self.pool.uses_binary()
     }
 
+    /// True when the sidecar can apply a per-request removal list.
+    pub fn supports_remove_rules(&self) -> bool {
+        self.pool.supports_remove_rules()
+    }
+
     /// Encodes the request in the negotiated format, applies the body-size
     /// policy and evaluates it.
     pub fn evaluate_context(
@@ -525,8 +546,27 @@ impl NativeCorazaClient {
         ctx: &RequestContext,
         policy: &BodyInspectionPolicy,
     ) -> Result<Evaluation, NativeCorazaError> {
+        self.evaluate_context_with_rules(ctx, policy, &[])
+    }
+
+    /// Evaluates a request with an explicit per-rule removal list.
+    ///
+    /// Removals are only sent when the sidecar advertised the capability. A
+    /// legacy sidecar therefore evaluates every rule, which is slower but
+    /// never changes a decision.
+    pub fn evaluate_context_with_rules(
+        &self,
+        ctx: &RequestContext,
+        policy: &BodyInspectionPolicy,
+        remove_rule_ids: &[u32],
+    ) -> Result<Evaluation, NativeCorazaError> {
+        let remove_rule_ids = if self.supports_remove_rules() {
+            remove_rule_ids
+        } else {
+            &[]
+        };
         let (encoded, inspected_bytes, truncated) = if self.uses_binary() {
-            match encode_request(ctx, policy) {
+            match encode_request_with_rules(ctx, policy, remove_rule_ids) {
                 Ok(WireBuild::Built {
                     request,
                     inspected_bytes,
@@ -542,7 +582,11 @@ impl NativeCorazaClient {
                 }
             }
         } else {
-            match crate::waf::coraza_payload::build_payload_with_policy(ctx, policy) {
+            match crate::waf::coraza_payload::build_payload_with_policy_and_rules(
+                ctx,
+                policy,
+                remove_rule_ids,
+            ) {
                 Ok(crate::waf::coraza_payload::PayloadBuild::Built {
                     payload,
                     inspected_bytes,
@@ -744,9 +788,17 @@ impl NativeCorazaRule {
         fail_closed: bool,
     ) -> Result<Self, NativeCorazaError> {
         let client = NativeCorazaClient::new(&ClientConfig::from(config))?;
-        Ok(Self::new("coraza-native-sidecar", client)
+        #[allow(unused_mut)]
+        let mut rule = Self::new("coraza-native-sidecar", client)
             .with_fail_closed(fail_closed)
-            .with_body_policy(BodyInspectionPolicy::from(config)))
+            .with_body_policy(BodyInspectionPolicy::from(config));
+        #[cfg(feature = "crs-prefilter")]
+        {
+            rule = rule
+                .with_prefilter(PrefilterMode::from(config.prefilter))
+                .map_err(|err| NativeCorazaError::Prefilter(err.to_string()))?;
+        }
+        Ok(rule)
     }
 
     fn failure_decision(&self, reason: String) -> Decision {
@@ -777,51 +829,74 @@ impl WafRule for NativeCorazaRule {
         // Keeps a body-withheld clone alive for the duration of the call.
         #[cfg(feature = "crs-prefilter")]
         let mut scrubbed: Option<RequestContext> = None;
+        #[cfg(feature = "crs-prefilter")]
+        let mut remove_rule_ids: Vec<u32> = Vec::new();
 
         #[cfg(feature = "crs-prefilter")]
         if let (Some(prefilter), mode) = (self.prefilter.as_deref(), self.prefilter_mode) {
             if mode != PrefilterMode::Off {
-                if let Some(body) = ctx.body.as_deref().filter(|body| !body.is_empty()) {
-                    let prefilter_started = Instant::now();
-                    let hit = prefilter.evaluate(body);
-                    let mut withheld = false;
-                    if !hit.hit
-                        && mode == PrefilterMode::BodyWithhold
-                        && prefilter.all_body_rules_gated()
-                    {
-                        let mut stripped = ctx.clone();
-                        stripped.body = None;
-                        scrubbed = Some(stripped);
-                        withheld = true;
-                        debug!(
-                            rule = %self.name,
-                            body_bytes = body.len(),
-                            representations = hit.representations,
-                            "CRS prefilter clean and all body rules gated; withholding body"
-                        );
-                    } else if hit.hit {
-                        debug!(
-                            rule = %self.name,
-                            rules = ?hit.matched_rules,
-                            forced = ?hit.forced_reason,
-                            "CRS prefilter found an indicator; running full evaluation"
-                        );
+                let prefilter_started = Instant::now();
+                let gate = prefilter.evaluate_request(ctx);
+                let hit = gate.forced_reason.is_some() || !gate.matched_rules.is_empty();
+                let mut withheld = false;
+
+                match mode {
+                    PrefilterMode::Gated => {
+                        remove_rule_ids = gate.removable_rule_ids.clone();
+                        if !remove_rule_ids.is_empty() {
+                            debug!(
+                                rule = %self.name,
+                                removed = remove_rule_ids.len(),
+                                matched = ?gate.matched_rules,
+                                forced = ?gate.forced_reason,
+                                "CRS prefilter gated rules for this transaction"
+                            );
+                        }
                     }
-                    if let Some(metrics) = &self.metrics {
-                        metrics.record_crs_prefilter(
-                            prefilter_started.elapsed(),
-                            hit.hit,
-                            withheld,
-                        );
+                    PrefilterMode::BodyWithhold => {
+                        if !hit && prefilter.all_body_rules_gated() {
+                            let mut stripped = ctx.clone();
+                            stripped.body = None;
+                            scrubbed = Some(stripped);
+                            withheld = true;
+                            debug!(
+                                rule = %self.name,
+                                body_bytes = ctx.body.as_deref().map_or(0, <[u8]>::len),
+                                representations = gate.scanned_bytes,
+                                "CRS prefilter clean and all body rules gated; withholding body"
+                            );
+                        }
                     }
-                    if withheld {
-                        evaluation_ctx = scrubbed.as_ref().expect("scrubbed context");
+                    PrefilterMode::DryRun => {
+                        if hit {
+                            debug!(
+                                rule = %self.name,
+                                rules = ?gate.matched_rules,
+                                forced = ?gate.forced_reason,
+                                "CRS prefilter found an indicator; running full evaluation"
+                            );
+                        }
                     }
+                    PrefilterMode::Off => {}
+                }
+
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_crs_prefilter(prefilter_started.elapsed(), hit, withheld);
+                }
+                if withheld {
+                    evaluation_ctx = scrubbed.as_ref().expect("scrubbed context");
                 }
             }
         }
 
         let started = Instant::now();
+        #[cfg(feature = "crs-prefilter")]
+        let result = self.client.evaluate_context_with_rules(
+            evaluation_ctx,
+            &self.body_policy,
+            &remove_rule_ids,
+        );
+        #[cfg(not(feature = "crs-prefilter"))]
         let result = self
             .client
             .evaluate_context(evaluation_ctx, &self.body_policy);
@@ -889,7 +964,7 @@ pub fn socket_available(path: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::waf::coraza_payload::build_payload;
-    use crate::waf::coraza_wire::{FRAME_MAGIC_BINARY, FRAME_MAGIC_HANDSHAKE};
+    use crate::waf::coraza_wire::{encode_request, FRAME_MAGIC_BINARY, FRAME_MAGIC_HANDSHAKE};
     use bytes::Bytes;
     use hyper::{HeaderMap, Method, Uri};
     use std::net::IpAddr;

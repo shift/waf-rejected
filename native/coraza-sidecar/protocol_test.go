@@ -284,8 +284,11 @@ func TestHandshakeNegotiation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read handshake ack: %v", err)
 	}
-	if !isHandshake(frame) || frame[1] != wireVersion || frame[2] != 1 {
+	if !isHandshake(frame) || frame[1] != wireVersion || frame[2]&capBinaryV1 == 0 {
 		t.Fatalf("unexpected handshake ack: %v", frame)
+	}
+	if frame[2]&capRemoveRules == 0 {
+		t.Fatalf("handshake ack does not advertise per-rule removal: %v", frame)
 	}
 
 	// The connection stays usable for binary requests after negotiation.
@@ -377,5 +380,81 @@ func TestFrameReaderReusesBuffer(t *testing.T) {
 		if &frame[:1][0] != firstPtr {
 			t.Fatalf("frame %d used a new buffer", i)
 		}
+	}
+}
+
+func TestBinaryRequestRoundTripRemoveRuleIDs(t *testing.T) {
+	req := &wireRequest{
+		Method:        "POST",
+		URI:           "/submit",
+		HTTPVersion:   "HTTP/1.1",
+		Headers:       [][2]string{{"host", "example.test"}},
+		Body:          []byte("a=1"),
+		HasBody:       true,
+		BodySize:      3,
+		RemoveRuleIDs: []uint32{941100, 942100, 942200},
+	}
+	got, err := decodeBinaryRequest(appendBinaryRequest(nil, req))
+	if err != nil {
+		t.Fatalf("decodeBinaryRequest: %v", err)
+	}
+	if len(got.RemoveRuleIDs) != 3 {
+		t.Fatalf("remove ids = %v, want 3 entries", got.RemoveRuleIDs)
+	}
+	for i := range req.RemoveRuleIDs {
+		if got.RemoveRuleIDs[i] != req.RemoveRuleIDs[i] {
+			t.Fatalf("remove id %d = %d, want %d", i, got.RemoveRuleIDs[i], req.RemoveRuleIDs[i])
+		}
+	}
+	if !bytes.Equal(got.Body, req.Body) {
+		t.Fatalf("body mismatch: %q", got.Body)
+	}
+}
+
+func TestBinaryRemoveRuleIDsRejectOversizedList(t *testing.T) {
+	payload := appendBinaryRequest(nil, &wireRequest{
+		Method:      "GET",
+		URI:         "/",
+		HTTPVersion: "HTTP/1.1",
+	})
+	// Set the flag and append a count above the bound. The layout check must
+	// reject it before any allocation based on the count.
+	payload[2] |= flagHasRemoveRules
+	var count [4]byte
+	binary.BigEndian.PutUint32(count[:], maxRemoveRuleIDs+1)
+	payload = append(payload, count[:]...)
+	if _, err := decodeBinaryRequest(payload); err == nil {
+		t.Fatal("oversized remove_rule_ids list was accepted")
+	}
+}
+
+func TestFilteredRemoveRuleIDsOnlyGated(t *testing.T) {
+	gated := map[int]struct{}{941100: {}, 942100: {}}
+	got := filteredRemoveRuleIDs([]uint32{941100, 942100, 942100, 942200, 0, 1}, gated)
+	if len(got) != 2 || got[0] != 941100 || got[1] != 942100 {
+		t.Fatalf("filtered = %v, want [941100 942100]", got)
+	}
+	if got := filteredRemoveRuleIDs([]uint32{942200}, gated); len(got) != 0 {
+		t.Fatalf("ungated id was removable: %v", got)
+	}
+	if got := filteredRemoveRuleIDs([]uint32{941100}, nil); len(got) != 0 {
+		t.Fatalf("empty gated set must remove nothing: %v", got)
+	}
+}
+
+func TestGatedArtifactLoadsAndExcludesUngatedRules(t *testing.T) {
+	gated, err := loadGatedRuleIDs("../../wasm/coraza_reactor/rules/crs/prefilter.json")
+	if err != nil {
+		t.Fatalf("loadGatedRuleIDs: %v", err)
+	}
+	if len(gated) == 0 {
+		t.Fatal("gated set is empty")
+	}
+	if _, ok := gated[941100]; !ok {
+		t.Fatal("941100 should be gated")
+	}
+	// 942100 is @detectSQLi: ungated on stock CRS and must never be removable.
+	if _, ok := gated[942100]; ok {
+		t.Fatal("942100 is ungated and must not be removable")
 	}
 }

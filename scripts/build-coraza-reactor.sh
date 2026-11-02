@@ -40,6 +40,8 @@ esac
     exit 1
 }
 
+"$ROOT/scripts/apply-coraza-patches.sh"
+
 cd "$SRC"
 
 # Pinned, offline, deterministic Go 1.24 WASI build settings.

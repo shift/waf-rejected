@@ -152,3 +152,13 @@ access is required.
 EOF
 
 echo "vendored CRS ${CRS_VERSION} (${CRS_COMMIT}) into ${DEST}"
+
+# The Go reactor embeds and the native sidecar reads this copy of the gated
+# rule artifact. Keep it aligned with the canonical host artifact; if the CRS
+# bundle changed, regenerate the artifact with
+# `cargo run --features crs-prefilter --bin crs-prefilter-extract`.
+if [[ -f "$ROOT/rules/crs/prefilter.json" ]]; then
+    cp "$ROOT/rules/crs/prefilter.json" "$DEST/prefilter.json"
+else
+    echo "warning: rules/crs/prefilter.json missing; per-rule gating will be disabled" >&2
+fi

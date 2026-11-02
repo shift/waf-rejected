@@ -32,6 +32,45 @@ clean result is a proof, so it is safe to run in `DryRun` mode on any rule set
 for measurement; the hit rate and the per-request cost are the two levers to
 tune before a per-rule integration.
 
+## Update: per-rule gating (implemented)
+
+Per-rule gating has landed behind `waf.coraza.prefilter = "gated"` (default
+`off`). Instead of withholding the body, the host scans **every request
+representation** — method, URI, query string, header names/values, cookies and
+body — with the same automata and removes only the gated rules whose mandatory
+literals are absent from all of them. Ungated rules always run, so the decision
+is unchanged on stock CRS.
+
+* The Rust host computes the list with `Prefilter::evaluate_request` (bounded
+  to `MAX_REMOVE_RULE_IDS = 256`) and `sanitize_remove_rule_ids`.
+* The list travels as `remove_rule_ids` in the JSON envelope and as an optional
+  section in binary v1, negotiated via handshake capability bits.
+* Both guests validate every id against their own copy of
+  `rules/crs/prefilter.json` (embedded in the WASI reactor, read next to
+  `--rules` by the sidecar) and call `tx.RemoveRuleByID` before `ProcessURI`.
+  A forged payload therefore cannot disable an ungated or unknown rule, and
+  removal is per transaction.
+* The vendored Coraza patch that exposes `RemoveRuleByID` on
+  `types.Transaction` is in `patches/` and is re-applied by both Go build
+  paths.
+
+Measured on the pinned native sidecar (release, 5 reps, benign synthetic
+bodies, stock CRS 4.14 PL1):
+
+| body | off p50 | gated p50 | speedup | rules removed |
+|---:|---:|---:|---:|---:|
+| 1 KiB | 35.11 ms | 27.65 ms | 1.3x | 58 |
+| 4 KiB | 39.43 ms | 26.24 ms | 1.5x | 58 |
+| 8 KiB | 78.37 ms | 49.72 ms | 1.6x | 58 |
+| 16 KiB | 148.71 ms | 96.02 ms | 1.5x | 58 |
+| 60 KiB | 543.82 ms | 354.03 ms | 1.5x | 58 |
+
+Detection parity on the 51-case corpus: **0 false negatives, 0 false
+positives**. Benign corpus removal: 57.3 rules per request (of 61 distinct
+gated ids; the remaining matches are literal false positives such as `ord` in
+`password`). The prefilter scan itself is included in the gated timings.
+
+
 ## 1. What the prefilter does
 
 For each body-relevant rule the offline extractor emits a **disjunctive
@@ -146,6 +185,20 @@ exhaustive.
 * URL/JSON/HTML extraction and `lowercase`/`removeNulls`/`jsDecode`/`cssDecode`
   transforms,
 * DTD/entity declaration forces full evaluation.
+
+### 2.2 Non-body representations
+
+Per-rule gating must also cover rules whose targets include `ARGS`,
+`ARGS_NAMES`, `REQUEST_HEADERS`, `REQUEST_COOKIES`, `REQUEST_FILENAME`,
+`QUERY_STRING`, `REQUEST_URI`, `FILES` and `MULTIPART_PART_HEADERS`. The host
+scans each of those values independently: method, the full URI (path and
+query), every header name and value (which includes `Cookie`), and the body
+(which contains multipart parts and file names). Each value is transformed on
+its own, never concatenated, because `replaceComments`, `normalizePath` and
+`cmdLine` are not monotonic across value boundaries. A literal that is absent
+from every value is therefore absent from every target, which is the same
+one-sided proof as the body case. Rules whose targets cannot be covered this
+way stay ungated and always run.
 
 ## 3. Coverage on CRS 4.14
 
@@ -323,16 +376,21 @@ mode refuses to take that path.
 
 ## 7. Recommended integration
 
+> **Status: implemented.** The body-withholding mode remains available for
+> measurement, but production gating is per-rule
+> (`waf.coraza.prefilter = "gated"`). The steps below describe what landed and
+> why.
+
 The body-withholding mode is the wrong integration for stock CRS because the
-ungated rules must still see the body. The recommended next step is **per-rule
-gating**:
+ungated rules must still see the body. The integration is **per-rule gating**:
 
 1. The prefilter returns the set of gated rule ids that *did not* match (all of
-   them on a clean body).
+   them on a clean body) after scanning the URI, query, headers, cookies and
+   body.
 2. The native sidecar calls `tx.RemoveRuleByID(id)` for each before
-   `ProcessRequestHeaders` (Coraza already supports this through `ctl`).
-3. The wasm reactor needs the same list in its ABI; until then it can keep
-   using the body-withholding path only when `all_body_rules_gated` is true.
+   `ProcessURI` (Coraza already supports this through `ctl`).
+3. The wasm reactor has the same list in its ABI; the guest validates it
+   against the embedded artifact copy before applying it.
 4. Rules that cannot be gated (libinjection, size/validation checks) still run;
    they are cheap and preserve the decision exactly.
 
@@ -341,15 +399,12 @@ any decision, and it degrades gracefully as the extractor improves.
 
 ### Wasm equivalent
 
-The WASI reactor has no per-rule removal ABI. The equivalent of
-`PrefilterMode::BodyWithhold` is the same `strip_body` helper already used by
-`graphql-only` (`body = None`, `body_size` preserved), and it is only valid when
-`all_body_rules_gated` is true. `PrefilterMode::DryRun` can run the prefilter in
-the host before `eval` and record the verdict without changing the payload.
-Per-rule gating needs a new ABI field carrying the rule-ID list (or a
-`skip_rules` flag plus a sidecar/guest-side artifact) to the Go guest, where
-`tx.RemoveRuleByID` is already available. Until that lands, the wasm backend
-should stay at `Off`/`DryRun`.
+The WASI reactor now has the per-rule removal ABI: `remove_rule_ids` in the
+JSON payload. The guest embeds `rules/crs/prefilter.json` (a byte-identical
+copy of the host artifact, enforced by a unit test), validates every id, and
+calls `tx.RemoveRuleByID` before `ProcessURI`. `PrefilterMode::BodyWithhold`
+remains as a measurement path and is only valid when `all_body_rules_gated` is
+true; `PrefilterMode::DryRun` records the verdict without changing the payload.
 
 ## 8. Reproduction
 

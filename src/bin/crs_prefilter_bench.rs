@@ -269,13 +269,14 @@ fn run_sidecar(
     println!("## Sidecar measurements ({} reps)", reps);
     println!();
 
-    // Full vs withheld latency for synthetic bodies.
-    println!("| body | full CRS p50 | withheld p50 | speedup | full p95 | withheld p95 |");
-    println!("|---:|---:|---:|---:|---:|---:|");
+    // Full CRS (off) vs host-gated latency for synthetic benign bodies.
+    println!("| body | off p50 | gated p50 | speedup | off p95 | gated p95 | rules removed |");
+    println!("|---:|---:|---:|---:|---:|---:|---:|");
     for kib in [1usize, 4, 8, 16, 60] {
         let body = synthetic_body(kib * 1024);
         let mut full = Vec::with_capacity(reps);
-        let mut withheld = Vec::with_capacity(reps);
+        let mut gated = Vec::with_capacity(reps);
+        let mut removed = 0usize;
         for _ in 0..reps {
             let ctx = context(
                 "POST",
@@ -287,39 +288,41 @@ fn run_sidecar(
             let _ = client.evaluate_context(&ctx, &policy);
             full.push(started.elapsed());
 
-            let mut stripped = ctx.clone();
-            stripped.body = None;
+            let gate = prefilter.evaluate_request(&ctx);
+            removed = gate.removable_rule_ids.len();
             let started = Instant::now();
-            let _ = client.evaluate_context(&stripped, &policy);
-            withheld.push(started.elapsed());
+            let _ = client.evaluate_context_with_rules(&ctx, &policy, &gate.removable_rule_ids);
+            gated.push(started.elapsed());
         }
         let (full_p50, full_p95) = percentiles(&full);
-        let (with_p50, with_p95) = percentiles(&withheld);
-        let speedup = if with_p50.is_zero() {
+        let (gated_p50, gated_p95) = percentiles(&gated);
+        let speedup = if gated_p50.is_zero() {
             0.0
         } else {
-            full_p50.as_secs_f64() / with_p50.as_secs_f64()
+            full_p50.as_secs_f64() / gated_p50.as_secs_f64()
         };
         println!(
-            "| {} KiB | {:.2} ms | {:.2} ms | {:.1}x | {:.2} ms | {:.2} ms |",
+            "| {} KiB | {:.2} ms | {:.2} ms | {:.1}x | {:.2} ms | {:.2} ms | {} |",
             kib,
             full_p50.as_secs_f64() * 1e3,
-            with_p50.as_secs_f64() * 1e3,
+            gated_p50.as_secs_f64() * 1e3,
             speedup,
             full_p95.as_secs_f64() * 1e3,
-            with_p95.as_secs_f64() * 1e3,
+            gated_p95.as_secs_f64() * 1e3,
+            removed,
         );
     }
 
-    // Detection parity: full CRS vs prefilter-gated body withholding.
+    // Detection parity: full CRS vs host-gated removals.
     println!();
-    println!("## Detection parity");
+    println!("## Detection parity (off vs gated)");
     println!();
-    println!("| case | full CRS | prefilter | withheld | parity |");
+    println!("| case | full CRS | gated | removed | parity |");
     println!("|---|---|---|---|---|");
     let mut false_negatives = 0usize;
     let mut false_positives = 0usize;
-    let mut clean = 0usize;
+    let mut benign_removed = 0usize;
+    let mut benign_cases = 0usize;
     for case in corpus.attacks.iter().chain(corpus.benign.iter()) {
         let ctx = context(
             &case.method,
@@ -331,53 +334,48 @@ fn run_sidecar(
                 Some(case.body.as_bytes())
             },
         );
+        let gate = prefilter.evaluate_request(&ctx);
+        let removed = gate.removable_rule_ids.len();
         let full = eval_decision(&client, &ctx, &policy);
-        let prefilter_hit = prefilter.evaluate(case.body.as_bytes()).hit;
-        let withheld_decision = if case.body.is_empty() {
-            full
+        let gated_decision =
+            eval_decision_with_rules(&client, &ctx, &policy, &gate.removable_rule_ids);
+        let parity = if full == "block" && gated_decision != "block" {
+            false_negatives += 1;
+            "FALSE NEGATIVE".to_string()
+        } else if full != "block" && gated_decision == "block" {
+            false_positives += 1;
+            "false positive".to_string()
         } else {
-            let mut stripped = ctx.clone();
-            stripped.body = None;
-            eval_decision(&client, &stripped, &policy)
+            "ok".to_string()
         };
-        let parity = if case.body.is_empty() || prefilter_hit {
-            // A hit means full CRS runs, so parity is by construction.
-            "n/a".to_string()
-        } else {
-            clean += 1;
-            if full == "block" && withheld_decision != "block" {
-                false_negatives += 1;
-                "FALSE NEGATIVE".to_string()
-            } else if full != "block" && withheld_decision == "block" {
-                false_positives += 1;
-                "false positive".to_string()
-            } else {
-                "ok".to_string()
-            }
-        };
-        if parity != "ok" && parity != "n/a" {
+        if corpus.benign.iter().any(|b| b.name == case.name) {
+            benign_cases += 1;
+            benign_removed += removed;
+        }
+        if parity != "ok" {
             println!(
                 "| {} ({}) | {} | {} | {} | {} |",
-                case.name,
-                case.family,
-                full,
-                if prefilter_hit { "hit" } else { "clean" },
-                withheld_decision,
-                parity
+                case.name, case.family, full, gated_decision, removed, parity
             );
         }
     }
     println!();
     println!(
-        "Unsafe body-withhold parity: {clean} clean cases, {false_negatives} false negatives, {false_positives} false positives."
+        "Detection parity: {} false negatives, {} false positives over {} cases.",
+        false_negatives,
+        false_positives,
+        corpus.attacks.len() + corpus.benign.len()
     );
-    if false_negatives > 0 {
-        println!(
-            "The false negatives are the expected consequence of ungated rules \
-             (`@detectSQLi`, `@detectXSS`, size/validation checks). The production \
-             mode refuses to withhold while any ungated body rule exists."
-        );
-    }
+    println!(
+        "Rules removed on benign corpus: {} total over {} cases ({:.1} per request).",
+        benign_removed,
+        benign_cases,
+        if benign_cases == 0 {
+            0.0
+        } else {
+            benign_removed as f64 / benign_cases as f64
+        }
+    );
 }
 
 #[cfg(feature = "coraza-native")]
@@ -420,10 +418,20 @@ fn eval_decision(
     ctx: &waf_ingress::waf::RequestContext,
     policy: &waf_ingress::waf::coraza_payload::BodyInspectionPolicy,
 ) -> &'static str {
+    eval_decision_with_rules(client, ctx, policy, &[])
+}
+
+#[cfg(feature = "coraza-native")]
+fn eval_decision_with_rules(
+    client: &waf_ingress::waf::native_coraza::NativeCorazaClient,
+    ctx: &waf_ingress::waf::RequestContext,
+    policy: &waf_ingress::waf::coraza_payload::BodyInspectionPolicy,
+    remove_rule_ids: &[u32],
+) -> &'static str {
     use waf_ingress::waf::native_coraza::Evaluation;
     use waf_ingress::waf::Decision;
 
-    match client.evaluate_context(ctx, policy) {
+    match client.evaluate_context_with_rules(ctx, policy, remove_rule_ids) {
         Ok(Evaluation::Decided { decision, .. }) => match decision {
             Decision::Block { .. } => "block",
             Decision::Allow => "allow",

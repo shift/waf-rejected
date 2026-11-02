@@ -39,6 +39,17 @@ const (
 
 	flagHasBody   = 1 << 0
 	flagTruncated = 1 << 1
+	// flagHasRemoveRules appends a u32 count and count*4 bytes of big-endian
+	// rule ids after the header block and before the body. It is only sent by
+	// clients whose handshake ack advertised capRemoveRules.
+	flagHasRemoveRules = 1 << 2
+
+	// Handshake capability bits.
+	capBinaryV1     = 1 << 0
+	capRemoveRules  = 1 << 1
+
+	// maxRemoveRuleIDs mirrors the host-side ABI bound.
+	maxRemoveRuleIDs = 256
 
 	decisionAllow = 0
 	decisionBlock = 1
@@ -68,6 +79,9 @@ type wireRequest struct {
 	BodySize     int
 	OriginalSize int
 	Truncated    bool
+	// RemoveRuleIDs is the host-side gate list. It is untrusted input and is
+	// filtered against the gated set before any rule is removed.
+	RemoveRuleIDs []uint32
 }
 
 // frameReader reads length-prefixed frames, reusing one buffer per connection
@@ -135,7 +149,8 @@ func decodeBinaryRequest(payload []byte) (*wireRequest, error) {
 	stringsLen := methodLen + uriLen + protoLen
 	// bodyLen/blobLen come from uint32s, so this cannot overflow int on 64-bit
 	// and the comparison below is exact.
-	if binaryRequestHeaderLen+stringsLen+blobLen+bodyLen != len(payload) {
+	base := binaryRequestHeaderLen + stringsLen + blobLen
+	if base > len(payload) {
 		return nil, errFrameLayout
 	}
 
@@ -174,6 +189,25 @@ func decodeBinaryRequest(payload []byte) (*wireRequest, error) {
 	}
 	req.Headers = headers
 
+	if flags&flagHasRemoveRules != 0 {
+		if len(payload)-off < 4 {
+			return nil, errFrameLayout
+		}
+		count := int(binary.BigEndian.Uint32(payload[off : off+4]))
+		off += 4
+		if count > maxRemoveRuleIDs || len(payload)-off < count*4 {
+			return nil, errFrameLayout
+		}
+		req.RemoveRuleIDs = make([]uint32, count)
+		for i := 0; i < count; i++ {
+			req.RemoveRuleIDs[i] = binary.BigEndian.Uint32(payload[off : off+4])
+			off += 4
+		}
+	}
+
+	if off+bodyLen != len(payload) {
+		return nil, errFrameLayout
+	}
 	if flags&flagHasBody != 0 {
 		if bodyLen == 0 {
 			return nil, errFrameBodyFlag
@@ -200,6 +234,13 @@ func appendBinaryRequest(dst []byte, req *wireRequest) []byte {
 	}
 	if req.Truncated {
 		flags |= flagTruncated
+	}
+	removeIDs := req.RemoveRuleIDs
+	if len(removeIDs) > maxRemoveRuleIDs {
+		removeIDs = removeIDs[:maxRemoveRuleIDs]
+	}
+	if len(removeIDs) > 0 {
+		flags |= flagHasRemoveRules
 	}
 	bodySize := req.BodySize
 	if bodySize == 0 && req.HasBody {
@@ -229,6 +270,16 @@ func appendBinaryRequest(dst []byte, req *wireRequest) []byte {
 		dst = append(dst, entry[:]...)
 		dst = append(dst, h[0]...)
 		dst = append(dst, h[1]...)
+	}
+	if len(removeIDs) > 0 {
+		var count [4]byte
+		binary.BigEndian.PutUint32(count[:], uint32(len(removeIDs)))
+		dst = append(dst, count[:]...)
+		for _, id := range removeIDs {
+			var raw [4]byte
+			binary.BigEndian.PutUint32(raw[:], id)
+			dst = append(dst, raw[:]...)
+		}
 	}
 	dst = append(dst, req.Body...)
 	return dst

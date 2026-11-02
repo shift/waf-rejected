@@ -140,6 +140,19 @@ pub fn build_payload_with_policy(
     ctx: &RequestContext,
     policy: &BodyInspectionPolicy,
 ) -> Result<PayloadBuild, serde_json::Error> {
+    build_payload_with_policy_and_rules(ctx, policy, &[])
+}
+
+/// Serialises the request context with an explicit per-rule removal list.
+///
+/// `remove_rule_ids` is the bounded, pre-validated set of gated rules that
+/// provably cannot match this request. An empty list produces exactly the same
+/// bytes as [`build_payload_with_policy`], so the `off` path is unchanged.
+pub fn build_payload_with_policy_and_rules(
+    ctx: &RequestContext,
+    policy: &BodyInspectionPolicy,
+    remove_rule_ids: &[u32],
+) -> Result<PayloadBuild, serde_json::Error> {
     let headers: Vec<(String, String)> = ctx
         .headers
         .iter()
@@ -178,7 +191,7 @@ pub fn build_payload_with_policy(
     let body_size = inspected.map(<[u8]>::len).or(ctx.body_size);
     let inspected_bytes = inspected.map(<[u8]>::len).unwrap_or(0);
 
-    let payload = serde_json::to_vec(&serde_json::json!({
+    let mut payload = serde_json::json!({
         "method": ctx.method.as_str(),
         "uri": ctx.uri.to_string(),
         "http_version": ctx.http_version,
@@ -187,11 +200,68 @@ pub fn build_payload_with_policy(
         "body_original_size": original_size,
         "body_encoding": body_encoding,
         "body": body,
-    }))?;
+    });
+    if !remove_rule_ids.is_empty() {
+        payload["remove_rule_ids"] = serde_json::json!(remove_rule_ids);
+    }
 
     Ok(PayloadBuild::Built {
-        payload,
+        payload: serde_json::to_vec(&payload)?,
         inspected_bytes,
         truncated,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use hyper::{HeaderMap, Method, Uri};
+    use std::net::IpAddr;
+
+    fn context() -> RequestContext {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "example.test".parse().unwrap());
+        RequestContext::new(
+            "127.0.0.1".parse::<IpAddr>().unwrap(),
+            Method::POST,
+            "/submit".parse::<Uri>().unwrap(),
+            headers,
+            Some(3),
+        )
+        .with_body(Some(Bytes::from_static(b"a=1")))
+    }
+
+    #[test]
+    fn empty_remove_list_keeps_the_legacy_payload() {
+        let ctx = context();
+        let policy = BodyInspectionPolicy::default();
+        let plain = match build_payload_with_policy(&ctx, &policy).unwrap() {
+            PayloadBuild::Built { payload, .. } => payload,
+            PayloadBuild::Reject { .. } => panic!("default policy must not reject"),
+        };
+        let with_rules = match build_payload_with_policy_and_rules(&ctx, &policy, &[]).unwrap() {
+            PayloadBuild::Built { payload, .. } => payload,
+            PayloadBuild::Reject { .. } => panic!("default policy must not reject"),
+        };
+        assert_eq!(plain, with_rules);
+        let value: serde_json::Value = serde_json::from_slice(&plain).unwrap();
+        assert!(value.get("remove_rule_ids").is_none());
+    }
+
+    #[test]
+    fn remove_list_is_serialised_when_present() {
+        let ctx = context();
+        let policy = BodyInspectionPolicy::default();
+        let payload =
+            match build_payload_with_policy_and_rules(&ctx, &policy, &[941100, 942200]).unwrap() {
+                PayloadBuild::Built { payload, .. } => payload,
+                PayloadBuild::Reject { .. } => panic!("default policy must not reject"),
+            };
+        let value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            value["remove_rule_ids"],
+            serde_json::json!([941100, 942200])
+        );
+    }
 }

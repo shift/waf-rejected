@@ -699,6 +699,31 @@ pub enum CorazaOversizeAction {
     Reject,
 }
 
+/// Host-side CRS required-literal gating mode (`waf.coraza.prefilter`).
+///
+/// `off` (the default) evaluates every rule. `dry-run` measures the prefilter
+/// verdict without changing the payload. `gated` removes only the gated rules
+/// whose mandatory literals are provably absent from the request; ungated rules
+/// always run, so no rule coverage is lost.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CorazaPrefilterMode {
+    /// Evaluate every CRS rule (default).
+    #[default]
+    Off,
+    /// Run the prefilter and record metrics, but send no removals.
+    DryRun,
+    /// Remove gated rules whose required literals are absent.
+    Gated,
+}
+
+impl CorazaPrefilterMode {
+    /// True when the prefilter should run at all.
+    pub fn is_enabled(self) -> bool {
+        self != Self::Off
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WafCorazaConfig {
@@ -736,6 +761,12 @@ pub struct WafCorazaConfig {
     /// Number of pre-warmed reactor instances, one dedicated OS thread each.
     /// `0` selects the number of available cores clamped to `1..=8`.
     pub pool_size: usize,
+
+    /// Host-side CRS required-literal gating. `off` (default) evaluates every
+    /// rule; `gated` removes only the rules whose proven mandatory literals are
+    /// absent from the request. Requires the non-default `crs-prefilter`
+    /// feature.
+    pub prefilter: CorazaPrefilterMode,
 }
 
 impl WafCorazaConfig {
@@ -770,6 +801,7 @@ impl Default for WafCorazaConfig {
             eval_timeout_ms: 5000,
             // Auto: one pre-warmed reactor per available core (clamped).
             pool_size: 0,
+            prefilter: CorazaPrefilterMode::Off,
         }
     }
 }
@@ -1629,6 +1661,16 @@ impl Config {
         if self.waf.coraza.pool_size > 8 {
             anyhow::bail!("waf.coraza.pool_size must be between 0 (auto) and 8");
         }
+        if self.waf.coraza.prefilter.is_enabled() && !cfg!(feature = "crs-prefilter") {
+            anyhow::bail!(
+                "waf.coraza.prefilter = \"{}\" requires a build with the `crs-prefilter` feature",
+                match self.waf.coraza.prefilter {
+                    CorazaPrefilterMode::Off => "off",
+                    CorazaPrefilterMode::DryRun => "dry-run",
+                    CorazaPrefilterMode::Gated => "gated",
+                }
+            );
+        }
         if self
             .waf
             .coraza
@@ -1951,6 +1993,24 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
         assert!(config.validate().is_err());
         config.waf.coraza.pool_size = 4;
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn coraza_prefilter_defaults_off_and_parses_modes() {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            prefilter: CorazaPrefilterMode,
+        }
+
+        let config = Config::default();
+        assert_eq!(config.waf.coraza.prefilter, CorazaPrefilterMode::Off);
+        assert!(!config.waf.coraza.prefilter.is_enabled());
+        let parsed: Wrapper = toml::from_str("prefilter = \"gated\"").expect("gated parses");
+        assert_eq!(parsed.prefilter, CorazaPrefilterMode::Gated);
+        let parsed: Wrapper = toml::from_str("prefilter = \"dry-run\"").expect("dry-run parses");
+        assert_eq!(parsed.prefilter, CorazaPrefilterMode::DryRun);
+        let parsed: Wrapper = toml::from_str("prefilter = \"off\"").expect("off parses");
+        assert_eq!(parsed.prefilter, CorazaPrefilterMode::Off);
     }
 
     #[test]

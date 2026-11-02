@@ -43,6 +43,18 @@ pub const RESPONSE_HEADER_LEN: usize = 8;
 pub const FLAG_HAS_BODY: u8 = 1 << 0;
 /// The inspected body was truncated to the configured prefix.
 pub const FLAG_TRUNCATED: u8 = 1 << 1;
+/// The frame carries a per-rule removal list between the header block and the
+/// body. Only sent when the sidecar advertises [`CAP_REMOVE_RULES`].
+pub const FLAG_HAS_REMOVE_RULES: u8 = 1 << 2;
+
+/// Handshake capability bit: binary v1 framing.
+pub const CAP_BINARY_V1: u8 = 1 << 0;
+/// Handshake capability bit: `FLAG_HAS_REMOVE_RULES` frames are understood.
+pub const CAP_REMOVE_RULES: u8 = 1 << 1;
+
+/// Hard bound on the per-request removal list, matching the JSON ABI and the
+/// guest-side validator.
+pub const MAX_REMOVE_RULE_IDS: usize = 256;
 
 /// Response decision: allow.
 pub const DECISION_ALLOW: u8 = 0;
@@ -132,6 +144,20 @@ pub fn encode_request(
     ctx: &RequestContext,
     policy: &BodyInspectionPolicy,
 ) -> Result<WireBuild, WireError> {
+    encode_request_with_rules(ctx, policy, &[])
+}
+
+/// Encodes a request context with an optional per-rule removal list.
+///
+/// The list is only written when non-empty; the frame then sets
+/// [`FLAG_HAS_REMOVE_RULES`] and appends `u32 count` followed by `count`
+/// big-endian ids after the header block and before the body. An empty list is
+/// byte-for-byte identical to [`encode_request`].
+pub fn encode_request_with_rules(
+    ctx: &RequestContext,
+    policy: &BodyInspectionPolicy,
+    remove_rule_ids: &[u32],
+) -> Result<WireBuild, WireError> {
     let (body, inspected_bytes, original_size, truncated) = match select_body(ctx, policy) {
         BodySelection::Inspect {
             body,
@@ -144,6 +170,8 @@ pub fn encode_request(
         }
     };
 
+    let remove_rule_ids = &remove_rule_ids[..remove_rule_ids.len().min(MAX_REMOVE_RULE_IDS)];
+
     let method = ctx.method.as_str();
     let uri = ctx.uri.to_string();
     let version = ctx.http_version.as_str();
@@ -154,9 +182,19 @@ pub fn encode_request(
     for (name, value) in ctx.headers.iter() {
         header_blob_len += 4 + name.as_str().len() + value.as_bytes().len();
     }
+    let remove_len = if remove_rule_ids.is_empty() {
+        0
+    } else {
+        4 + remove_rule_ids.len() * 4
+    };
 
-    let capacity =
-        4 + REQUEST_HEADER_LEN + method.len() + uri.len() + version.len() + header_blob_len;
+    let capacity = 4
+        + REQUEST_HEADER_LEN
+        + method.len()
+        + uri.len()
+        + version.len()
+        + header_blob_len
+        + remove_len;
     let mut head = Vec::with_capacity(capacity);
     head.extend_from_slice(&[0u8; 4 + REQUEST_HEADER_LEN]);
 
@@ -169,6 +207,9 @@ pub fn encode_request(
     }
     if truncated {
         flags |= FLAG_TRUNCATED;
+    }
+    if remove_len > 0 {
+        flags |= FLAG_HAS_REMOVE_RULES;
     }
 
     let h = &mut head[4..];
@@ -200,6 +241,13 @@ pub fn encode_request(
         put_u16(&mut head[entry..], 2, value.len(), "header value")?;
         head.extend_from_slice(name.as_bytes());
         head.extend_from_slice(value);
+    }
+
+    if remove_len > 0 {
+        head.extend_from_slice(&(remove_rule_ids.len() as u32).to_be_bytes());
+        for id in remove_rule_ids {
+            head.extend_from_slice(&id.to_be_bytes());
+        }
     }
 
     let frame_len = head.len() - 4 + body_len;
@@ -289,6 +337,18 @@ pub fn decode_handshake(frame: &[u8]) -> Option<u8> {
         Some(frame[1])
     } else {
         None
+    }
+}
+
+/// Returns the capability bits announced by a handshake ack.
+///
+/// A two-byte ack (the original v1 format) has no capabilities and reports
+/// zero, which makes the client fall back to the baseline frame layout.
+pub fn decode_handshake_capabilities(frame: &[u8]) -> u8 {
+    if frame.len() >= 3 && frame[0] == FRAME_MAGIC_HANDSHAKE {
+        frame[2]
+    } else {
+        0
     }
 }
 
@@ -542,5 +602,78 @@ mod tests {
                 other => panic!("expected a field-too-long error, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn empty_remove_list_is_byte_identical() {
+        let ctx = context("/submit", Some(b"a=1"));
+        let plain = built(&ctx);
+        let explicit =
+            match encode_request_with_rules(&ctx, &BodyInspectionPolicy::default(), &[]).unwrap() {
+                WireBuild::Built { request, .. } => request,
+                WireBuild::Reject { .. } => panic!("default policy must not reject"),
+            };
+        assert_eq!(plain.head(), explicit.head());
+        assert_eq!(plain.body(), explicit.body());
+    }
+
+    #[test]
+    fn remove_list_is_appended_after_headers() {
+        let body = b"a=1";
+        let ctx = context("/submit", Some(body));
+        let request = match encode_request_with_rules(
+            &ctx,
+            &BodyInspectionPolicy::default(),
+            &[941100, 942200],
+        )
+        .unwrap()
+        {
+            WireBuild::Built { request, .. } => request,
+            WireBuild::Reject { .. } => panic!("default policy must not reject"),
+        };
+        let head = request.head();
+        assert_eq!(head[6] & FLAG_HAS_REMOVE_RULES, FLAG_HAS_REMOVE_RULES);
+        let method_len = read_u16(head, 8) as usize;
+        let uri_len = read_u16(head, 10) as usize;
+        let version_len = read_u16(head, 12) as usize;
+        let blob_len = read_u32(head, 28) as usize;
+        let ids_at = 32 + method_len + uri_len + version_len + blob_len;
+        assert_eq!(read_u32(head, ids_at), 2);
+        assert_eq!(read_u32(head, ids_at + 4), 941100);
+        assert_eq!(read_u32(head, ids_at + 8), 942200);
+        // The ids section is part of the head, not the body.
+        assert_eq!(request.body(), Some(&body[..]));
+        assert_eq!(read_u32(head, 0) as usize, request.frame_len());
+    }
+
+    #[test]
+    fn remove_list_is_bounded() {
+        let ctx = context("/submit", Some(b"a=1"));
+        let ids = vec![941100u32; MAX_REMOVE_RULE_IDS + 10];
+        let request = match encode_request_with_rules(&ctx, &BodyInspectionPolicy::default(), &ids)
+            .unwrap()
+        {
+            WireBuild::Built { request, .. } => request,
+            WireBuild::Reject { .. } => panic!("default policy must not reject"),
+        };
+        let head = request.head();
+        let method_len = read_u16(head, 8) as usize;
+        let uri_len = read_u16(head, 10) as usize;
+        let version_len = read_u16(head, 12) as usize;
+        let blob_len = read_u32(head, 28) as usize;
+        let ids_at = 32 + method_len + uri_len + version_len + blob_len;
+        assert_eq!(read_u32(head, ids_at) as usize, MAX_REMOVE_RULE_IDS);
+    }
+
+    #[test]
+    fn handshake_capabilities_are_optional() {
+        let mut frame = vec![FRAME_MAGIC_HANDSHAKE, WIRE_VERSION];
+        assert_eq!(decode_handshake_capabilities(&frame), 0);
+        frame.push(CAP_BINARY_V1 | CAP_REMOVE_RULES);
+        assert_eq!(
+            decode_handshake_capabilities(&frame),
+            CAP_BINARY_V1 | CAP_REMOVE_RULES
+        );
+        assert_eq!(decode_handshake_capabilities(b"{}"), 0);
     }
 }

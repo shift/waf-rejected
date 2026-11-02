@@ -26,7 +26,9 @@ use wasmtime_wasi::p2::pipe::SinkOutputStream;
 use wasmtime_wasi::WasiCtxBuilder;
 
 use crate::metrics::Metrics;
-use crate::waf::coraza_payload::{build_payload_with_policy, BodyInspectionPolicy, PayloadBuild};
+use crate::waf::coraza_payload::{
+    build_payload_with_policy_and_rules, BodyInspectionPolicy, PayloadBuild,
+};
 use crate::waf::{Decision, RequestContext, WafRule};
 
 /// Decision code returned by the reactor for "allow".
@@ -195,6 +197,10 @@ pub enum ReactorError {
     /// `body_encoding`, or a decoded length that disagrees with `body_size`.
     #[error("reactor rejected request body encoding: {0}")]
     InvalidBodyEncoding(&'static str),
+    /// The experimental CRS prefilter artifact could not be loaded.
+    #[cfg(feature = "crs-prefilter")]
+    #[error("CRS prefilter: {0}")]
+    Prefilter(String),
 }
 
 /// Per-`Store` state. `WasiP1Ctx` supplies the preview1 imports the Go
@@ -1167,6 +1173,11 @@ pub struct WasmReactorRule {
     metrics: Option<Arc<Metrics>>,
     fail_closed: bool,
     body_policy: BodyInspectionPolicy,
+    /// Experimental CRS literal prefilter (non-default `crs-prefilter` feature).
+    #[cfg(feature = "crs-prefilter")]
+    prefilter: Option<Arc<crate::waf::prefilter::Prefilter>>,
+    #[cfg(feature = "crs-prefilter")]
+    prefilter_mode: crate::waf::prefilter::PrefilterMode,
 }
 
 impl WasmReactorRule {
@@ -1178,6 +1189,10 @@ impl WasmReactorRule {
             metrics: None,
             fail_closed: true,
             body_policy: BodyInspectionPolicy::default(),
+            #[cfg(feature = "crs-prefilter")]
+            prefilter: None,
+            #[cfg(feature = "crs-prefilter")]
+            prefilter_mode: crate::waf::prefilter::PrefilterMode::Off,
         }
     }
 
@@ -1207,6 +1222,30 @@ impl WasmReactorRule {
         self
     }
 
+    /// Enables host-side CRS required-literal gating.
+    ///
+    /// `Gated` removes only the rules whose mandatory literals are absent from
+    /// the request; ungated rules always run. This is opt-in and non-default.
+    #[cfg(feature = "crs-prefilter")]
+    pub fn with_prefilter(
+        mut self,
+        mode: crate::waf::prefilter::PrefilterMode,
+    ) -> Result<Self, crate::waf::prefilter::PrefilterError> {
+        self.prefilter_mode = mode;
+        if mode != crate::waf::prefilter::PrefilterMode::Off {
+            self.prefilter = Some(Arc::new(crate::waf::prefilter::Prefilter::from_json(
+                crate::waf::prefilter::EMBEDDED_ARTIFACT,
+            )?));
+        }
+        Ok(self)
+    }
+
+    /// The loaded prefilter, when the mode is enabled.
+    #[cfg(feature = "crs-prefilter")]
+    pub fn prefilter(&self) -> Option<&crate::waf::prefilter::Prefilter> {
+        self.prefilter.as_deref()
+    }
+
     /// Creates a Coraza rule from either an explicit module file or the
     /// embedded reactor, together with the configured limits.
     pub fn from_module(
@@ -1231,12 +1270,17 @@ impl WasmReactorRule {
         config: &crate::config::WafCorazaConfig,
         fail_closed: bool,
     ) -> Result<Self, ReactorError> {
-        Self::from_module(
+        let rule = Self::from_module(
             config.module_path.as_deref(),
             ReactorLimits::from(config),
             fail_closed,
-        )
-        .map(|rule| rule.with_body_policy(BodyInspectionPolicy::from(config)))
+        )?
+        .with_body_policy(BodyInspectionPolicy::from(config));
+        #[cfg(feature = "crs-prefilter")]
+        let rule = rule
+            .with_prefilter(crate::waf::prefilter::PrefilterMode::from(config.prefilter))
+            .map_err(|err| ReactorError::Prefilter(err.to_string()))?;
+        Ok(rule)
     }
 
     /// Creates a rule backed by the embedded spike module.
@@ -1270,10 +1314,27 @@ impl WafRule for WasmReactorRule {
 
     fn evaluate(&self, ctx: &RequestContext) -> Decision {
         let started = Instant::now();
-        let (payload, inspected_bytes, truncated) = match build_payload_with_policy(
-            ctx,
-            &self.body_policy,
-        ) {
+        #[cfg(feature = "crs-prefilter")]
+        let mut remove_rule_ids: Vec<u32> = Vec::new();
+        #[cfg(feature = "crs-prefilter")]
+        if let (Some(prefilter), mode) = (self.prefilter.as_deref(), self.prefilter_mode) {
+            if mode != crate::waf::prefilter::PrefilterMode::Off {
+                let prefilter_started = Instant::now();
+                let gate = prefilter.evaluate_request(ctx);
+                let hit = gate.forced_reason.is_some() || !gate.matched_rules.is_empty();
+                if mode == crate::waf::prefilter::PrefilterMode::Gated {
+                    remove_rule_ids = gate.removable_rule_ids.clone();
+                }
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_crs_prefilter(prefilter_started.elapsed(), hit, false);
+                }
+            }
+        }
+        #[cfg(not(feature = "crs-prefilter"))]
+        let remove_rule_ids: Vec<u32> = Vec::new();
+        let payload_result =
+            build_payload_with_policy_and_rules(ctx, &self.body_policy, &remove_rule_ids);
+        let (payload, inspected_bytes, truncated) = match payload_result {
             Ok(PayloadBuild::Built {
                 payload,
                 inspected_bytes,
@@ -1353,6 +1414,7 @@ impl WasmReactorRule {
 mod tests {
     use super::*;
     use crate::waf::coraza_payload::build_payload;
+    use crate::waf::coraza_payload::build_payload_with_policy;
     use bytes::Bytes;
     use hyper::{HeaderMap, Method, Uri};
     use std::net::{IpAddr, Ipv4Addr};
@@ -1885,6 +1947,57 @@ mod tests {
     // Initialising the Go runtime and compiling CRS is slow in debug builds,
     // so this test is kept out of the default run. Run it with:
     //   cargo test --release --lib --features wasm-reactor -- --ignored
+    #[test]
+    #[ignore = "Go/WASI reactor is exercised in release mode"]
+    #[cfg(feature = "crs-prefilter")]
+    fn gated_prefilter_preserves_wasm_decisions() {
+        use crate::waf::prefilter::PrefilterMode;
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/wasm/coraza_reactor/coraza_reactor.wasm"
+        );
+        let rule = WasmReactorRule::from_module(Some(path), ReactorLimits::coraza(), true)
+            .expect("reactor must load")
+            .with_prefilter(PrefilterMode::Gated)
+            .expect("prefilter artifact must load");
+
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                let benign = context(
+                    "/login",
+                    Some("username=alice&password=CorrectHorseBattery123&remember=1"),
+                );
+                let gate = rule
+                    .prefilter()
+                    .expect("prefilter enabled")
+                    .evaluate_request(&benign);
+                assert!(
+                    !gate.removable_rule_ids.is_empty(),
+                    "a benign form must gate some rules"
+                );
+                // @detectSQLi (942100) is ungated and must never be offered.
+                assert!(!gate.removable_rule_ids.contains(&942100));
+                assert_eq!(rule.evaluate(&benign), Decision::Allow);
+
+                for (kind, body) in [
+                    ("SQLi", "username=admin' OR '1'='1"),
+                    ("XSS", "q=<script>alert(1)</script>"),
+                    ("RCE", "cmd=/bin/cat /etc/passwd"),
+                ] {
+                    let decision = rule.evaluate(&context("/check", Some(body)));
+                    assert!(
+                        matches!(decision, Decision::Block { status: 403, .. }),
+                        "gated mode must still block {kind}: {body}"
+                    );
+                }
+            })
+            .expect("reactor test thread")
+            .join()
+            .expect("reactor test thread panicked");
+    }
+
     #[test]
     #[ignore = "Go/WASI reactor is exercised in release mode"]
     fn coraza_reactor_allows_benign_and_blocks_attacks() {

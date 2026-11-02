@@ -16,6 +16,7 @@ import (
 	"unsafe"
 
 	"github.com/corazawaf/coraza/v3"
+	"github.com/corazawaf/coraza/v3/types"
 )
 
 // GC tuning. A default GOGC=100 collects roughly every 10 MiB of allocation;
@@ -61,6 +62,100 @@ SecRequestBodyInMemoryLimit 131072
 SecResponseBodyAccess Off
 `
 
+// maxRemoveRuleIDs is the hard ABI bound shared with the host
+// (crate::waf::prefilter::MAX_REMOVE_RULE_IDS) and the binary wire format.
+const maxRemoveRuleIDs = 256
+
+// prefilterArtifact mirrors the fields of rules/crs/prefilter.json that the
+// guest needs. Unknown fields are ignored.
+type prefilterArtifact struct {
+	Rules []struct {
+		ID           int  `json:"id"`
+		BodyRelevant bool `json:"body_relevant"`
+		Gated        bool `json:"gated"`
+	} `json:"rules"`
+	UngatedRules []struct {
+		ID           int  `json:"id"`
+		BodyRelevant bool `json:"body_relevant"`
+	} `json:"ungated_rules"`
+}
+
+// gatedRuleIDs is the only set of rules the guest will remove. It is built
+// once at init from the embedded artifact; rules absent from it (ungated,
+// unknown, or a chain member with no proof) are never removable, regardless of
+// what the payload asks for.
+var gatedRuleIDs = map[int]struct{}{}
+
+// loadGatedRuleIDs reads the embedded prefilter artifact. A missing or invalid
+// artifact leaves the set empty, which disables removals and evaluates every
+// rule: slow but always sound.
+func loadGatedRuleIDs() map[int]struct{} {
+	ids := make(map[int]struct{})
+	data, err := fs.ReadFile(embeddedCRS, "rules/crs/prefilter.json")
+	if err != nil {
+		return ids
+	}
+	var artifact prefilterArtifact
+	if err := json.Unmarshal(data, &artifact); err != nil {
+		return ids
+	}
+	ungated := make(map[int]struct{})
+	for _, rule := range artifact.Rules {
+		if !rule.BodyRelevant {
+			continue
+		}
+		if rule.Gated {
+			ids[rule.ID] = struct{}{}
+		} else {
+			ungated[rule.ID] = struct{}{}
+		}
+	}
+	for _, rule := range artifact.UngatedRules {
+		if rule.BodyRelevant {
+			ungated[rule.ID] = struct{}{}
+		}
+	}
+	for id := range ungated {
+		delete(ids, id)
+	}
+	return ids
+}
+
+// removeRules applies the validated subset of ids to this transaction only.
+// Coraza's RemoveRuleByID appends to a per-transaction exclusion list, so the
+// shared WAF and other in-flight transactions are unaffected.
+func removeRules(tx types.Transaction, ids []uint32) {
+	for _, id := range filteredRemoveRuleIDs(ids) {
+		tx.RemoveRuleByID(id)
+	}
+}
+
+// filteredRemoveRuleIDs is the pure validation step: duplicates, unknown ids
+// and ungated rules are dropped, and the result is bounded by
+// maxRemoveRuleIDs. A forged payload cannot disable a rule outside the gated
+// set.
+func filteredRemoveRuleIDs(ids []uint32) []int {
+	if len(ids) == 0 || len(gatedRuleIDs) == 0 {
+		return nil
+	}
+	out := make([]int, 0, len(ids))
+	seen := make(map[uint32]struct{}, len(ids))
+	for _, id := range ids {
+		if len(out) >= maxRemoveRuleIDs {
+			break
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		if _, ok := gatedRuleIDs[int(id)]; !ok {
+			continue
+		}
+		out = append(out, int(id))
+	}
+	return out
+}
+
 // inputBuf is static storage whose address is advertised through input_base.
 // It must never move (Go's GC is non-moving for this kind of global), so the
 // host may keep using the returned offset for the lifetime of the instance.
@@ -81,14 +176,20 @@ var (
 // inspection instead of being replaced with U+FFFD. BodySize is a pointer so
 // payloads that omit it stay compatible; when present it must equal the
 // decoded body length.
+//
+// RemoveRuleIDs is the host-side gate: gated CRS rules whose required literals
+// are provably absent from the request. The guest validates every id against
+// its own copy of the prefilter artifact, so a forged payload cannot disable an
+// ungated or unknown rule.
 type Request struct {
-	Method       string          `json:"method"`
-	URI          string          `json:"uri"`
-	HTTPVersion  string          `json:"http_version"`
-	Headers      json.RawMessage `json:"headers"`
-	Body         *string         `json:"body"`
-	BodySize     *int            `json:"body_size"`
-	BodyEncoding string          `json:"body_encoding"`
+	Method        string          `json:"method"`
+	URI           string          `json:"uri"`
+	HTTPVersion   string          `json:"http_version"`
+	Headers       json.RawMessage `json:"headers"`
+	Body          *string         `json:"body"`
+	BodySize      *int            `json:"body_size"`
+	BodyEncoding  string          `json:"body_encoding"`
+	RemoveRuleIDs []uint32        `json:"remove_rule_ids"`
 }
 
 // Guest error codes. The host maps -5 to a body-encoding error.
@@ -175,6 +276,9 @@ func ensureEngine() {
 			WithRootFS(crsData).
 			WithDirectives(strings.TrimSpace(directives)),
 	)
+	if initErr == nil {
+		gatedRuleIDs = loadGatedRuleIDs()
+	}
 }
 
 //go:wasmexport input_base
@@ -217,9 +321,16 @@ func wafEval(ptr int32, length int32) int32 {
 	if err := json.Unmarshal(payload, &req); err != nil {
 		return errPayload
 	}
+	if len(req.RemoveRuleIDs) > maxRemoveRuleIDs {
+		return errPayload
+	}
 
 	tx := engine.NewTransaction()
 	defer tx.Close()
+
+	// Remove only the host-proven gated rules before the first phase so they
+	// never evaluate. Ungated and unknown ids are ignored by removeRules.
+	removeRules(tx, req.RemoveRuleIDs)
 
 	version := req.HTTPVersion
 	if version == "" {

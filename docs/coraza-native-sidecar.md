@@ -93,7 +93,25 @@ native_socket_path = "/run/waf/coraza.sock"
 max_payload_bytes = 65536  # cap on the inspected body per request
 eval_timeout_ms = 5000     # client budget per request
 pool_size = 0              # 0 = 8 connections for the native backend
+prefilter = "off"          # "off" | "dry-run" | "gated" (requires crs-prefilter)
 ```
+
+### Per-rule CRS gating
+
+With `prefilter = "gated"` the host removes the gated CRS rules whose proven
+mandatory literals are absent from the request (URI, query, headers, cookies,
+body) and sends the bounded list (`<= 256` ids) in the request payload. The
+sidecar applies `tx.RemoveRuleByID` before `ProcessURI`, so the rules never
+evaluate; the removal is per transaction and never mutates the shared WAF.
+Ungated rules always run.
+
+The sidecar validates the list against `prefilter.json` before applying it.
+By default it reads `prefilter.json` next to `--rules`; override with
+`--prefilter <path>`. If the artifact is missing or invalid the sidecar logs a
+warning and disables removals, which is slower but always sound. The JSON
+envelope carries `remove_rule_ids`; binary v1 carries an optional ids section
+negotiated through the handshake capability bits, so an older client or
+sidecar simply evaluates every rule.
 
 Validation rejects `backend = "native"` without a non-empty
 `native_socket_path`. If the socket is not accepting connections at start-up,

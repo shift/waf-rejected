@@ -1833,6 +1833,13 @@ pub fn default_summary_path() -> PathBuf {
     PathBuf::from("rules/crs/PREFILTER_SUMMARY.md")
 }
 
+/// Copy of the artifact embedded by the Go reactor and read by the native
+/// sidecar. It is written by the extractor so the guest's gated-rule set can
+/// never skew from the host's.
+pub fn default_reactor_artifact_path() -> PathBuf {
+    PathBuf::from("wasm/coraza_reactor/rules/crs/prefilter.json")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

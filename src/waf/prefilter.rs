@@ -34,6 +34,13 @@ pub const EMBEDDED_ARTIFACT: &str = include_str!("../../rules/crs/prefilter.json
 /// Maximum number of rule ids reported for one hit.
 const MAX_REPORTED_RULES: usize = 32;
 
+/// Maximum number of per-rule removals accepted in one transaction payload.
+///
+/// This is a hard ABI bound, not a tuning knob: the guest rejects larger lists
+/// outright. The stock CRS artifact has 62 gated rules, so the limit leaves
+/// room for higher paranoia levels while keeping the payload bounded.
+pub const MAX_REMOVE_RULE_IDS: usize = 256;
+
 /// Errors returned while loading or building the prefilter.
 #[derive(Debug, thiserror::Error)]
 pub enum PrefilterError {
@@ -64,6 +71,20 @@ pub enum PrefilterMode {
     /// because `@detectSQLi`/`@detectXSS` and the body-size rules are ungated;
     /// see `docs/suggestions_from_agents/crs-prefilter.md`.
     BodyWithhold,
+    /// Remove only the gated rules whose mandatory literals are absent from
+    /// the request (body, URI, headers, cookies). Ungated rules always run, so
+    /// this is sound on stock CRS and is the production integration.
+    Gated,
+}
+
+impl From<crate::config::CorazaPrefilterMode> for PrefilterMode {
+    fn from(mode: crate::config::CorazaPrefilterMode) -> Self {
+        match mode {
+            crate::config::CorazaPrefilterMode::Off => Self::Off,
+            crate::config::CorazaPrefilterMode::DryRun => Self::DryRun,
+            crate::config::CorazaPrefilterMode::Gated => Self::Gated,
+        }
+    }
 }
 
 /// Outcome of one prefilter evaluation.
@@ -89,6 +110,30 @@ impl PrefilterHit {
             forced_reason: Some(reason),
             ..Self::default()
         }
+    }
+}
+
+/// Outcome of a per-rule gate evaluation over every request representation.
+///
+/// `removable_rule_ids` is the sound, bounded set of gated rules that cannot
+/// match any scanned representation. Ungated rules are never included, even if
+/// a caller asks for them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuleGate {
+    /// Why full evaluation is required even without a literal hit.
+    pub forced_reason: Option<&'static str>,
+    /// Number of bytes scanned across all inputs and groups.
+    pub scanned_bytes: usize,
+    /// Gated rule ids that produced a literal hit (must keep running).
+    pub matched_rules: Vec<u32>,
+    /// Gated rule ids that can be removed for this transaction.
+    pub removable_rule_ids: Vec<u32>,
+}
+
+impl RuleGate {
+    /// True when no rule can be removed for this request.
+    pub fn is_empty(&self) -> bool {
+        self.removable_rule_ids.is_empty()
     }
 }
 
@@ -295,6 +340,120 @@ impl Prefilter {
     /// Number of compiled automata (representations × transform pipelines).
     pub fn automaton_count(&self) -> usize {
         self.groups.len()
+    }
+
+    /// Scans every request representation and returns the gated rules that
+    /// provably cannot match.
+    ///
+    /// Unlike [`Prefilter::evaluate`], this does not stop at the first hit: it
+    /// collects the union of matching rule ids across every group and input so
+    /// a body that hits one rule can still remove the others. A miss for a
+    /// rule across **all** inputs is the same proof as [`Prefilter::evaluate`],
+    /// extended to the URI, query string, headers and cookies.
+    ///
+    /// Inputs are scanned independently (never concatenated): some transforms
+    /// (`replaceComments`, `normalizePath`, `cmdLine`) are not monotonic across
+    /// value boundaries, so a concatenated representation could hide a literal
+    /// that is present in one value. Scanning each value separately keeps the
+    /// over-approximation sound.
+    pub fn evaluate_inputs(&self, inputs: &[&[u8]]) -> RuleGate {
+        // XML entity expansion can hide an arbitrary literal inside a DTD.
+        // Force full evaluation whenever a declaration is present.
+        for input in inputs {
+            if contains_ascii_case_insensitive(input, b"<!DOCTYPE")
+                || contains_ascii_case_insensitive(input, b"<!ENTITY")
+            {
+                return RuleGate {
+                    forced_reason: Some("request contains an XML DTD/entity declaration"),
+                    ..RuleGate::default()
+                };
+            }
+        }
+
+        let mut scanned = 0usize;
+        let mut matched: Vec<u32> = Vec::new();
+        for group in &self.groups {
+            for input in inputs {
+                if input.is_empty() {
+                    continue;
+                }
+                let representation = apply_pipeline(input, group.extract, &group.transforms);
+                scanned += representation.len();
+                if !group.automaton.is_match(&representation) {
+                    continue;
+                }
+                for mat in group.automaton.find_iter(&representation) {
+                    for &rule in &group.rules[mat.pattern().as_usize()] {
+                        if !matched.contains(&rule) {
+                            matched.push(rule);
+                        }
+                    }
+                }
+            }
+        }
+        matched.sort_unstable();
+        matched.dedup();
+
+        let removable_rule_ids = self
+            .gated_rule_ids
+            .iter()
+            .copied()
+            .filter(|id| !matched.contains(id))
+            .filter(|id| self.ungated_body_rule_ids.binary_search(id).is_err())
+            .take(MAX_REMOVE_RULE_IDS)
+            .collect();
+
+        RuleGate {
+            forced_reason: None,
+            scanned_bytes: scanned,
+            matched_rules: matched,
+            removable_rule_ids,
+        }
+    }
+
+    /// Scans the request context (URI, query, headers, cookies and body) and
+    /// returns the rules that may be removed for this transaction.
+    pub fn evaluate_request(&self, ctx: &crate::waf::RequestContext) -> RuleGate {
+        let uri = ctx.uri.to_string();
+        let mut inputs: Vec<&[u8]> = Vec::with_capacity(2 + ctx.headers.len() * 2);
+        inputs.push(ctx.method.as_str().as_bytes());
+        inputs.push(uri.as_bytes());
+        if let Some(query) = ctx.uri.query() {
+            inputs.push(query.as_bytes());
+        }
+        for (name, value) in ctx.headers.iter() {
+            inputs.push(name.as_str().as_bytes());
+            inputs.push(value.as_bytes());
+        }
+        if let Some(body) = ctx.body.as_deref() {
+            inputs.push(body);
+        }
+        self.evaluate_inputs(&inputs)
+    }
+
+    /// Filters an untrusted id list down to the gated set.
+    ///
+    /// Unknown ids, ungated rules and duplicates are dropped, and the result is
+    /// truncated to [`MAX_REMOVE_RULE_IDS`]. The host uses this before encoding
+    /// a payload; the guest repeats the check against its own artifact copy so
+    /// a forged payload cannot disable an ungated rule.
+    pub fn sanitize_remove_rule_ids(&self, ids: &[u32]) -> Vec<u32> {
+        let mut out = Vec::with_capacity(ids.len().min(MAX_REMOVE_RULE_IDS));
+        for &id in ids {
+            if out.len() >= MAX_REMOVE_RULE_IDS {
+                break;
+            }
+            if self.gated_rule_ids.binary_search(&id).is_err() {
+                continue;
+            }
+            if self.ungated_body_rule_ids.binary_search(&id).is_ok() {
+                continue;
+            }
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        out
     }
 }
 
@@ -1281,5 +1440,81 @@ mod tests {
         let second = Prefilter::from_json(EMBEDDED_ARTIFACT).expect("valid");
         assert_eq!(first.automaton_count(), second.automaton_count());
         assert_eq!(first.gated_rule_ids(), second.gated_rule_ids());
+    }
+
+    #[test]
+    fn removal_bound_matches_the_wire_abi() {
+        assert_eq!(
+            MAX_REMOVE_RULE_IDS,
+            crate::waf::coraza_wire::MAX_REMOVE_RULE_IDS
+        );
+    }
+
+    #[test]
+    fn guest_artifact_copy_is_byte_identical() {
+        // The Go reactor embeds this copy and the native sidecar reads it at
+        // runtime. They must never skew from the host's canonical artifact.
+        let guest = include_str!("../../wasm/coraza_reactor/rules/crs/prefilter.json");
+        assert_eq!(EMBEDDED_ARTIFACT, guest);
+    }
+
+    #[test]
+    fn clean_request_removes_every_gated_rule() {
+        let prefilter = Prefilter::embedded().expect("embedded artifact is valid");
+        let gate = prefilter.evaluate_inputs(&[b"name=alice&city=paris"]);
+        assert!(gate.forced_reason.is_none());
+        assert!(gate.matched_rules.is_empty());
+        assert_eq!(gate.removable_rule_ids, prefilter.gated_rule_ids());
+    }
+
+    #[test]
+    fn literal_hit_keeps_the_matching_rule() {
+        let prefilter = simple(&["union", "select"], true, &["none"]);
+        let gate = prefilter.evaluate_inputs(&[b"q=1%20UNION%20SELECT%20password"]);
+        assert_eq!(gate.matched_rules, vec![942100]);
+        assert!(gate.removable_rule_ids.is_empty());
+    }
+
+    #[test]
+    fn dtd_forces_no_removals() {
+        let prefilter = simple(&["script"], false, &["none"]);
+        let gate = prefilter
+            .evaluate_inputs(&[b"<!DOCTYPE x [<!ENTITY e SYSTEM \"file:///etc/passwd\">]>"]);
+        assert!(gate.forced_reason.is_some());
+        assert!(gate.removable_rule_ids.is_empty());
+    }
+
+    #[test]
+    fn ungated_rules_are_never_removable() {
+        let prefilter = Prefilter::from_artifact(artifact(
+            vec![LiteralGroup {
+                transforms: vec![],
+                case_insensitive: false,
+                literals: vec!["select".to_string()],
+            }],
+            true,
+        ))
+        .expect("prefilter builds");
+        // 942100 is gated, 942101 is an ungated member of the same id space.
+        let gate = prefilter.evaluate_inputs(&[b"benign"]);
+        assert_eq!(gate.removable_rule_ids, vec![942100]);
+        assert_eq!(
+            prefilter.sanitize_remove_rule_ids(&[942100, 942101, 999999, 942100]),
+            vec![942100]
+        );
+    }
+
+    #[test]
+    fn sanitize_bounds_the_removal_list() {
+        let prefilter = Prefilter::embedded().expect("embedded artifact is valid");
+        let ids = prefilter.gated_rule_ids().to_vec();
+        // Duplicates and unknown ids collapse; the result is a subset of the
+        // gated set and never exceeds the ABI bound.
+        let mut noisy = ids.clone();
+        noisy.extend_from_slice(&ids);
+        noisy.extend([999999u32; 64]);
+        let sanitized = prefilter.sanitize_remove_rule_ids(&noisy);
+        assert_eq!(sanitized, ids);
+        assert!(sanitized.len() <= MAX_REMOVE_RULE_IDS);
     }
 }

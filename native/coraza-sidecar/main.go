@@ -44,14 +44,15 @@ const (
 // backend. body_b64 is accepted as a convenience alias for body +
 // body_encoding=base64.
 type Request struct {
-	Method       string          `json:"method"`
-	URI          string          `json:"uri"`
-	HTTPVersion  string          `json:"http_version"`
-	Headers      json.RawMessage `json:"headers"`
-	Body         *string         `json:"body"`
-	BodyB64      *string         `json:"body_b64"`
-	BodySize     *int            `json:"body_size"`
-	BodyEncoding string          `json:"body_encoding"`
+	Method        string          `json:"method"`
+	URI           string          `json:"uri"`
+	HTTPVersion   string          `json:"http_version"`
+	Headers       json.RawMessage `json:"headers"`
+	Body          *string         `json:"body"`
+	BodyB64       *string         `json:"body_b64"`
+	BodySize      *int            `json:"body_size"`
+	BodyEncoding  string          `json:"body_encoding"`
+	RemoveRuleIDs []uint32        `json:"remove_rule_ids"`
 }
 
 type Response struct {
@@ -67,6 +68,9 @@ type server struct {
 	maxHeaderBytes int
 	requestTimeout time.Duration
 	conns          sync.Map
+	// gatedRuleIDs is the only set of rule ids the sidecar will remove. It is
+	// loaded once from prefilter.json; an empty set disables removals.
+	gatedRuleIDs map[int]struct{}
 }
 
 // probeSocket reports whether the sidecar is accepting connections on path.
@@ -97,6 +101,7 @@ func main() {
 		timeout        = flag.Duration("timeout", 5*time.Second, "per-request wall-clock budget")
 		grace          = flag.Duration("grace", 10*time.Second, "graceful shutdown drain budget")
 		earlyBlocking  = flag.Bool("early-blocking", true, "enable CRS phase-1 early blocking (rule 900120) so requests already over the anomaly threshold are denied before the body is scanned")
+		prefilterPath  = flag.String("prefilter", "", "path to the prefilter.json gated-rule artifact (default: next to --rules); an unavailable artifact disables rule removal")
 		probe          = flag.Bool("probe", false, "connect to the socket, print readiness and exit (for container/k8s probes)")
 	)
 	flag.Parse()
@@ -112,12 +117,21 @@ func main() {
 	if err != nil {
 		log.Fatalf("initialise Coraza: %v", err)
 	}
+	gatedPath := *prefilterPath
+	if gatedPath == "" {
+		gatedPath = filepath.Join(filepath.Dir(*rulesPath), "prefilter.json")
+	}
+	gated, err := loadGatedRuleIDs(gatedPath)
+	if err != nil {
+		log.Printf("per-rule gating disabled: %v", err)
+	}
 	srv := &server{
 		engine:         engine,
 		maxBody:        *maxBody,
 		maxHeaderCount: *maxHeaders,
 		maxHeaderBytes: *maxHeaderBytes,
 		requestTimeout: *timeout,
+		gatedRuleIDs:   gated,
 	}
 
 	if err := os.Remove(*socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -261,7 +275,7 @@ func (s *server) handle(conn net.Conn) {
 			binary.BigEndian.PutUint32(ack[:4], 3)
 			ack[4] = frameMagicHandshake
 			ack[5] = wireVersion
-			ack[6] = 1 // binary v1 supported
+			ack[6] = capBinaryV1 | capRemoveRules
 			_ = conn.SetWriteDeadline(time.Now().Add(s.requestTimeout))
 			if _, err := conn.Write(ack[:]); err != nil {
 				log.Printf("write handshake: %v", err)
@@ -339,6 +353,10 @@ func (s *server) evaluate(payload []byte) Response {
 // evaluateParsed applies the limits and runs the CRS transaction. It is shared
 // by the JSON and binary decoders so both paths make identical decisions.
 func (s *server) evaluateParsed(req *wireRequest) Response {
+	if len(req.RemoveRuleIDs) > maxRemoveRuleIDs {
+		return Response{Decision: "block", Status: 400,
+			Reason: fmt.Sprintf("remove_rule_ids count %d exceeds limit %d", len(req.RemoveRuleIDs), maxRemoveRuleIDs)}
+	}
 	if req.BodySize < 0 || req.BodySize > s.maxBody {
 		return Response{Decision: "block", Status: 413, Reason: "request body exceeds sidecar limit"}
 	}
@@ -366,6 +384,11 @@ func (s *server) evaluateParsed(req *wireRequest) Response {
 
 	tx := s.engine.NewTransaction()
 	defer tx.Close()
+
+	// Apply the host-proven gated removals before phase 1. Only ids present in
+	// the gated artifact are removed; ungated, unknown and duplicate ids are
+	// ignored so a forged payload cannot disable coverage.
+	s.removeRules(tx, req.RemoveRuleIDs)
 
 	if req.HTTPVersion != "" {
 		tx.ProcessURI(req.URI, req.Method, req.HTTPVersion)
@@ -406,6 +429,87 @@ func blockResponse(it *types.Interruption, phase string) Response {
 	return Response{Decision: "block", Status: status, Reason: reason}
 }
 
+// prefilterArtifact mirrors the fields of prefilter.json that the sidecar
+// needs. Unknown fields are ignored.
+type prefilterArtifact struct {
+	Rules []struct {
+		ID           int  `json:"id"`
+		BodyRelevant bool `json:"body_relevant"`
+		Gated        bool `json:"gated"`
+	} `json:"rules"`
+	UngatedRules []struct {
+		ID           int  `json:"id"`
+		BodyRelevant bool `json:"body_relevant"`
+	} `json:"ungated_rules"`
+}
+
+// loadGatedRuleIDs reads the gated-rule artifact. A missing or invalid file is
+// an error; the caller logs it and disables removals, which is always sound.
+func loadGatedRuleIDs(path string) (map[int]struct{}, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read prefilter artifact %s: %w", path, err)
+	}
+	var artifact prefilterArtifact
+	if err := json.Unmarshal(data, &artifact); err != nil {
+		return nil, fmt.Errorf("parse prefilter artifact %s: %w", path, err)
+	}
+	ids := make(map[int]struct{})
+	ungated := make(map[int]struct{})
+	for _, rule := range artifact.Rules {
+		if !rule.BodyRelevant {
+			continue
+		}
+		if rule.Gated {
+			ids[rule.ID] = struct{}{}
+		} else {
+			ungated[rule.ID] = struct{}{}
+		}
+	}
+	for _, rule := range artifact.UngatedRules {
+		if rule.BodyRelevant {
+			ungated[rule.ID] = struct{}{}
+		}
+	}
+	for id := range ungated {
+		delete(ids, id)
+	}
+	return ids, nil
+}
+
+// filteredRemoveRuleIDs is the pure validation step shared by the removal
+// path: duplicates, unknown ids and ungated rules are dropped, and the result
+// is bounded by maxRemoveRuleIDs. A forged payload therefore cannot disable a
+// rule outside the gated set.
+func filteredRemoveRuleIDs(ids []uint32, gated map[int]struct{}) []int {
+	if len(ids) == 0 || len(gated) == 0 {
+		return nil
+	}
+	out := make([]int, 0, len(ids))
+	seen := make(map[uint32]struct{}, len(ids))
+	for _, id := range ids {
+		if len(out) >= maxRemoveRuleIDs {
+			break
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		if _, ok := gated[int(id)]; !ok {
+			continue
+		}
+		out = append(out, int(id))
+	}
+	return out
+}
+
+// removeRules applies the validated subset of ids to one transaction.
+func (s *server) removeRules(tx types.Transaction, ids []uint32) {
+	for _, id := range filteredRemoveRuleIDs(ids, s.gatedRuleIDs) {
+		tx.RemoveRuleByID(id)
+	}
+}
+
 // decodeJSONRequest converts the legacy JSON envelope into the shared
 // wireRequest representation.
 func decodeJSONRequest(payload []byte) (*wireRequest, error) {
@@ -426,13 +530,14 @@ func decodeJSONRequest(payload []byte) (*wireRequest, error) {
 		bodySize = *req.BodySize
 	}
 	return &wireRequest{
-		Method:      req.Method,
-		URI:         req.URI,
-		HTTPVersion: req.HTTPVersion,
-		Headers:     headers,
-		Body:        body,
-		HasBody:     hasBody,
-		BodySize:    bodySize,
+		Method:        req.Method,
+		URI:           req.URI,
+		HTTPVersion:   req.HTTPVersion,
+		Headers:       headers,
+		Body:          body,
+		HasBody:       hasBody,
+		BodySize:      bodySize,
+		RemoveRuleIDs: req.RemoveRuleIDs,
 	}, nil
 }
 

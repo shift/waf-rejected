@@ -468,7 +468,27 @@ max_payload_bytes = 65536
 memory_limit_bytes = 268435456
 eval_timeout_ms = 5000    # DoS bound per eval; init gets a fixed 60 s budget
 pool_size = 0             # 0 = one worker per core, clamped to 1..=8
+prefilter = "off"         # "off" | "dry-run" | "gated" (requires crs-prefilter)
 ```
+
+### Per-rule CRS gating (`prefilter = "gated"`)
+
+`gated` runs the host-side required-literal prefilter over the URI, query
+string, header names/values, cookies and body, then removes only the gated CRS
+rules whose proven mandatory literals are absent from every one of those
+values. Ungated rules (`@detectSQLi`, `@detectXSS`, size/validation checks, the
+obfuscation-tolerant 932 regexes) always run, so the decision is identical to
+`off`; only evaluation work changes. The guest validates every id against the
+embedded `rules/crs/prefilter.json` copy, so a forged payload cannot disable an
+ungated or unknown rule.
+
+The mode is opt-in and non-default because it requires the non-default
+`crs-prefilter` feature. A build without the feature rejects the config at
+validation time. `dry-run` measures the prefilter without sending removals.
+On the stock CRS 4.14 bundle the host removes 57-58 of the 61 distinct gated
+rules for benign requests; measured p50 improves by 1.3-1.6x (native sidecar).
+See `docs/suggestions_from_agents/crs-prefilter.md` for the soundness argument
+and measurements.
 
 ### Body-inspection size policy (opt-in)
 
