@@ -4,9 +4,11 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ServerConfig as RustlsServerConfig, WebPkiClientVerifier};
 use rustls::version::{TLS12, TLS13};
 use rustls::RootCertStore;
+use socket2::{SockRef, TcpKeepalive};
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor as TokioTlsAcceptor;
@@ -73,12 +75,27 @@ impl TlsManager {
         .map_err(|e| WafError::Configuration(format!("TLS configuration error: {}", e)))?;
 
         if !config.alpn_protocols.is_empty() {
+            // Preserve server preference order while dropping duplicates: an
+            // ALPN list with repeated entries is rejected at config load, but
+            // programmatically built configs (tests, embedders) bypass that.
+            let mut seen = std::collections::HashSet::new();
             let alpn: Vec<Vec<u8>> = config
                 .alpn_protocols
                 .iter()
+                .filter(|s| seen.insert(s.as_str()))
                 .map(|s| s.as_bytes().to_vec())
                 .collect();
             server_config.alpn_protocols = alpn;
+        }
+
+        if config.session_resumption {
+            // Stateful TLS 1.2 resumption plus stateless TLS 1.3 tickets.
+            server_config.session_storage =
+                rustls::server::ServerSessionMemoryCache::new(config.session_cache_size.max(1));
+            server_config.ticketer = rustls::crypto::ring::Ticketer::new().map_err(|e| {
+                WafError::Configuration(format!("Failed to create TLS ticket generator: {}", e))
+            })?;
+            server_config.send_tls13_tickets = config.tls13_tickets;
         }
 
         let acceptor = TokioTlsAcceptor::from(Arc::new(server_config));
@@ -162,6 +179,7 @@ impl TlsManager {
     }
 
     pub async fn accept(&self, stream: TcpStream) -> Result<TlsStream<TcpStream>, WafError> {
+        self.apply_stream_tuning(&stream);
         match &self.acceptor {
             Some(acceptor) => acceptor
                 .accept(stream)
@@ -171,6 +189,56 @@ impl TlsManager {
                 "TLS not enabled, cannot accept TLS connections".to_string(),
             )),
         }
+    }
+
+    /// Apply socket-level tuning configured for accepted TLS connections.
+    ///
+    /// Best effort: an unsupported socket option is logged at debug level and
+    /// never fails the handshake. Tuning runs once per accepted connection,
+    /// before the TLS handshake, so it costs no allocations on the hot path.
+    fn apply_stream_tuning(&self, stream: &TcpStream) {
+        if self.config.tcp_nodelay {
+            if let Err(e) = stream.set_nodelay(true) {
+                debug!("TCP_NODELAY tuning failed: {}", e);
+            }
+        }
+
+        let keepalive_requested =
+            self.config.tcp_keepalive_secs > 0 || self.config.tcp_keepalive_interval_secs > 0;
+        if !keepalive_requested {
+            return;
+        }
+
+        let socket = SockRef::from(stream);
+        let mut keepalive = TcpKeepalive::new();
+        if self.config.tcp_keepalive_secs > 0 {
+            keepalive = keepalive.with_time(Duration::from_secs(self.config.tcp_keepalive_secs));
+        }
+        #[cfg(not(any(
+            target_os = "openbsd",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "nto",
+            target_os = "espidf",
+            target_os = "vita",
+            target_os = "haiku",
+            target_os = "horizon"
+        )))]
+        if self.config.tcp_keepalive_interval_secs > 0 {
+            keepalive = keepalive
+                .with_interval(Duration::from_secs(self.config.tcp_keepalive_interval_secs));
+        }
+        if let Err(e) = socket.set_tcp_keepalive(&keepalive) {
+            debug!("TCP keepalive tuning failed: {}", e);
+        }
+    }
+
+    /// Whether the listener should request TCP Fast Open where supported.
+    ///
+    /// The listener socket itself is owned by the proxy service; this accessor
+    /// lets that layer apply the flag without re-reading the configuration.
+    pub fn tcp_fast_open(&self) -> bool {
+        self.config.tcp_fast_open
     }
 }
 
@@ -289,5 +357,68 @@ mod tests {
 
         let error = manager.quic_server_config().unwrap_err();
         assert!(format!("{}", error).contains("TLS 1.3"));
+    }
+
+    fn self_signed_manager(
+        overrides: impl FnOnce(&mut TlsConfig),
+    ) -> (tempfile::TempDir, TlsManager) {
+        let dir = tempfile::tempdir().unwrap();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, certified.cert.pem()).unwrap();
+        std::fs::write(&key_path, certified.signing_key.serialize_pem()).unwrap();
+
+        let mut config = TlsConfig {
+            enabled: true,
+            cert_path: cert_path.to_string_lossy().into_owned(),
+            key_path: key_path.to_string_lossy().into_owned(),
+            ..TlsConfig::default()
+        };
+        overrides(&mut config);
+        (dir, TlsManager::new(config).unwrap())
+    }
+
+    #[test]
+    fn session_resumption_is_off_by_default() {
+        let (_dir, manager) = self_signed_manager(|_| {});
+        let config = manager.acceptor.as_ref().unwrap().config();
+        assert!(!config.ticketer.enabled(), "tickets must stay opt-in");
+    }
+
+    #[test]
+    fn session_resumption_enables_cache_and_tickets() {
+        let (_dir, manager) = self_signed_manager(|config| {
+            config.session_resumption = true;
+            config.session_cache_size = 512;
+            config.tls13_tickets = 4;
+        });
+        let config = manager.acceptor.as_ref().unwrap().config();
+        assert!(config.ticketer.enabled());
+        assert!(config.session_storage.can_cache());
+        assert_eq!(config.send_tls13_tickets, 4);
+    }
+
+    #[test]
+    fn alpn_is_deduplicated_and_preserves_server_order() {
+        let (_dir, manager) = self_signed_manager(|config| {
+            config.alpn_protocols =
+                vec!["h2".to_string(), "http/1.1".to_string(), "h2".to_string()];
+        });
+        let config = manager.acceptor.as_ref().unwrap().config();
+        assert_eq!(
+            config.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+    }
+
+    #[test]
+    fn alpn_defaults_advertise_h2_then_http1() {
+        let (_dir, manager) = self_signed_manager(|_| {});
+        let config = manager.acceptor.as_ref().unwrap().config();
+        assert_eq!(
+            config.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
     }
 }

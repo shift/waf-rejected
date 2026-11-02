@@ -286,6 +286,31 @@ pub struct TlsConfig {
 
     /// Path to client CA certificate file (PEM format)
     pub client_ca_path: Option<String>,
+
+    /// Enable TLS session resumption (TLS 1.2 session cache and TLS 1.3
+    /// tickets). Disabled by default to preserve existing behaviour.
+    pub session_resumption: bool,
+
+    /// Number of cached TLS 1.2 sessions when `session_resumption` is enabled.
+    pub session_cache_size: usize,
+
+    /// Number of TLS 1.3 tickets issued per connection when resumption is
+    /// enabled. `0` disables ticket issuance (stateful cache only).
+    pub tls13_tickets: usize,
+
+    /// Set `TCP_NODELAY` on accepted TLS connections to remove Nagle latency.
+    pub tcp_nodelay: bool,
+
+    /// TCP keep-alive idle time in seconds for accepted TLS connections.
+    /// `0` leaves the operating-system default in place.
+    pub tcp_keepalive_secs: u64,
+
+    /// TCP keep-alive probe interval in seconds. `0` leaves the OS default.
+    pub tcp_keepalive_interval_secs: u64,
+
+    /// Request TCP Fast Open on the listening socket where the platform
+    /// supports it. Best effort; unsupported platforms ignore the flag.
+    pub tcp_fast_open: bool,
 }
 
 /// WebTransport over HTTP/3 (QUIC) listener configuration.
@@ -1659,6 +1684,13 @@ impl Default for TlsConfig {
             alpn_protocols: vec!["h2".to_string(), "http/1.1".to_string()],
             require_client_cert: false,
             client_ca_path: None,
+            session_resumption: false,
+            session_cache_size: 256,
+            tls13_tickets: 2,
+            tcp_nodelay: false,
+            tcp_keepalive_secs: 0,
+            tcp_keepalive_interval_secs: 0,
+            tcp_fast_open: false,
         }
     }
 }
@@ -1929,6 +1961,43 @@ impl Config {
             cidr.parse::<ipnetwork::IpNetwork>().map_err(|e| {
                 anyhow::anyhow!("invalid server.trusted_proxies entry '{}': {}", cidr, e)
             })?;
+        }
+
+        if self.server.tls.enabled {
+            for protocol in &self.server.tls.alpn_protocols {
+                if protocol.is_empty() || protocol.len() > 255 || protocol.contains('\0') {
+                    anyhow::bail!(
+                        "server.tls.alpn_protocols entry '{protocol}' is not a valid ALPN token"
+                    );
+                }
+            }
+            let mut seen = std::collections::HashSet::new();
+            for protocol in &self.server.tls.alpn_protocols {
+                if !seen.insert(protocol.as_str()) {
+                    anyhow::bail!(
+                        "server.tls.alpn_protocols contains duplicate entry '{protocol}'"
+                    );
+                }
+            }
+            if !self.server.enable_http2
+                && self
+                    .server
+                    .tls
+                    .alpn_protocols
+                    .iter()
+                    .any(|protocol| protocol == "h2")
+            {
+                anyhow::bail!(
+                    "server.tls.alpn_protocols advertises 'h2' but server.enable_http2 is false"
+                );
+            }
+            if self.server.tls.tls13_tickets > 10 {
+                anyhow::bail!("server.tls.tls13_tickets must be between 0 and 10");
+            }
+            if self.server.tls.session_resumption && self.server.tls.session_cache_size > 1_000_000
+            {
+                anyhow::bail!("server.tls.session_cache_size must not exceed 1000000");
+            }
         }
 
         if self.server.webtransport.enabled {
@@ -2660,5 +2729,43 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
             error.contains("allow_audit_sample_rate"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn tls_alpn_validation_rejects_duplicates_and_invalid_tokens() {
+        let mut config = Config::default();
+        config.server.tls.enabled = true;
+        config.server.tls.alpn_protocols =
+            vec!["h2".to_string(), "http/1.1".to_string(), "h2".to_string()];
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("duplicate"), "unexpected error: {error}");
+
+        config.server.tls.alpn_protocols = vec!["".to_string()];
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("valid ALPN token"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn tls_alpn_validation_rejects_h2_when_http2_disabled() {
+        let mut config = Config::default();
+        config.server.tls.enabled = true;
+        config.server.enable_http2 = false;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("enable_http2"), "unexpected error: {error}");
+
+        config.server.tls.alpn_protocols = vec!["http/1.1".to_string()];
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn tls_tuning_validation_bounds_ticket_count() {
+        let mut config = Config::default();
+        config.server.tls.enabled = true;
+        config.server.tls.tls13_tickets = 11;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("tls13_tickets"), "unexpected error: {error}");
     }
 }

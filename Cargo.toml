@@ -110,6 +110,7 @@ rustls = { version = "0.23", features = ["ring"] }
 tokio-rustls = "0.26"
 rustls-pemfile = "2.0"
 webpki-roots = "1"
+socket2 = "0.6"
 
 # HTTP connector for clients
 hyper-rustls = { version = "0.27", features = ["http1", "http2"] }
