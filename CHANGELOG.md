@@ -6,6 +6,16 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Added
 
+- Native (Rust) ports of Coraza's `@detectSQLi` and `@detectXSS` operators
+  (`native-detect`, non-default). `detect_sqli`/`detect_xss` are allocation-free,
+  single-pass, and byte-for-byte ports of `libinjection-go` v0.2.2 — the library
+  Coraza v3.3.3 calls for those operators — so decisions match Coraza exactly.
+  A pinned oracle (`tests/corpus/native-detect/oracle.json`, 11,039 values from
+  the CRS corpus plus generated variants) pins parity at 0 false negatives and
+  0 false positives. `NativeOperator::from_coraza_name` exposes them to the
+  native engine and prefilter; Coraza remains the default request path. See
+  `docs/suggestions_from_agents/native-detect.md`.
+
 - Per-rule CRS gating (`waf.coraza.prefilter = "gated"`, default `off`). The
   host scans the URI, query, headers, cookies and body with the required-literal
   prefilter and removes only the gated CRS rules whose proven mandatory literals

@@ -61,6 +61,11 @@ name = "fastpath_bench"
 path = "src/bin/fastpath_bench.rs"
 required-features = ["fastpath"]
 
+[[bin]]
+name = "native_detect_bench"
+path = "src/bin/native_detect_bench.rs"
+required-features = ["native-detect"]
+
 [dependencies]
 # Async runtime and HTTP
 tokio = { version = "1.0", features = ["full"] }
@@ -248,6 +253,12 @@ fastpath = ["dep:aho-corasick"]
 # it only memoises the verdict of pure content rules for a short TTL and never
 # caches blocks. See docs/suggestions_from_agents/allow-cache.md.
 allow-cache = ["dep:siphasher"]
+
+# Native (Rust) ports of Coraza's `@detectSQLi` and `@detectXSS` operators,
+# with decision parity pinned against the CRS corpus. Non-default: the request
+# path keeps using Coraza until a caller opts in. See
+# docs/suggestions_from_agents/native-detect.md.
+native-detect = []
 # Protocol support features
 websocket = []
 # HTTP/3 over QUIC. Not part of default features: it pulls in quinn/h3 and

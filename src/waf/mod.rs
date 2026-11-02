@@ -43,6 +43,11 @@ pub mod hyperscan;
 #[cfg(feature = "fastpath")]
 pub mod fastpath;
 
+/// Native (Rust) ports of Coraza's `@detectSQLi` and `@detectXSS` operators.
+/// Non-default: Coraza remains the request-path engine until a caller opts in.
+#[cfg(feature = "native-detect")]
+pub mod native_detect;
+
 /// Shared JSON payload envelope for the wasm reactor and native sidecar.
 #[cfg(any(feature = "wasm-reactor", feature = "coraza-native"))]
 pub mod coraza_payload;

@@ -793,6 +793,11 @@ fn gate_member(
             }
             (vec![literal], (false, true))
         }
+        // `@detectSQLi`/`@detectXSS` expose no required literal, so they can
+        // never be gated. They *are* evaluable natively (feature
+        // `native-detect`, `crate::waf::native_detect`) with corpus-pinned
+        // Coraza parity; using that to keep them out of the ungated set is
+        // future work. See docs/suggestions_from_agents/native-detect.md.
         "unconditionalmatch" | "nomatch" | "detectsqli" => {
             return (
                 false,
