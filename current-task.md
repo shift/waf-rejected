@@ -784,6 +784,51 @@ sidecar without changing detection rules or defaults.
 - Consequence: no perf win to ship; the branch keeps the benchmark harness,
   the backtrace hardening, the docs' measured findings and the Criterion rows.
 
+---
+
+# Rust engine vertical slice (`feat/rust-engine`)
+
+**Status:** core slice implemented, differential parity measured, committed on
+`feat/rust-engine` (not pushed, not merged, default backend unchanged).
+
+## Plan
+
+- [x] `src/waf/rust_engine/`: SecLang parser, compiled IR, transform/operator
+      implementations, request collections, phase engine, CRS anomaly scoring.
+- [x] Strict load: unsupported constructs abort with rule id + construct.
+- [x] Parse the pinned `wasm/coraza_reactor/rules/crs/crs.conf` and report the
+      support matrix (501/505 compiled; 4 libinjection rules unsupported).
+- [x] Differential harness `src/bin/rust_engine_parity.rs` over
+      `tests/corpus/crs/corpus.json` (2,112 cases).
+- [x] Criterion bench `benches/rust_engine.rs` and a p50/p95 `--bench` mode.
+- [x] Docs: `docs/suggestions_from_agents/rust-engine.md`.
+
+## Log
+
+- Parser compiles 501 of 505 directives. Unsupported: `@detectSQLi` (942100,
+  942101) and `@detectXSS` (941100, 941101).
+- PCRE normalisation added for `\x{XX}` byte escapes, literal `{...}` braces and
+  escapes of non-metacharacters (`\!`, `\<`, ...), keeping the pinned regexes
+  compilable by Rust `regex`.
+- Collection/macro fixes: per-match non-disruptive actions, dynamic `setvar`
+  names, `ARGS.*`/`REQUEST_HEADERS.*` macros, selector lowercasing, Go-like
+  request-URI validity (spaces/backslashes, scheme only at the start), and
+  quote-aware multipart parameter parsing.
+- Differential parity (native vs Coraza): **2,099 / 2,112 (99.38 %)** after the
+  final fixes. The 13 disagreements are the four libinjection rules (8 cases),
+  2 old-cookie `$Version` cases where the native decision matches the corpus and
+  Coraza does not, and 3 Coraza false positives where the native engine correctly
+  allows. The native engine has 88 corpus false positives vs Coraza's 91; both
+  miss the same 3 JSON Log4Shell cases (944150-12/13/14).
+- The native engine's only corpus false negatives beyond the shared corpus
+  expectations are the 8 libinjection cases; its only native-vs-oracle false
+  positives were fixed (multipart `_charset_`).
+- Benchmark (release, 200 reps, shared host): native p50 0.93 ms / 1.08 ms /
+  2.70 ms / 5.02 ms for bodyless / 1 / 4 / 8 KiB; Coraza p50 3.55 ms / 57.1 ms
+  / 414.2 ms / 599.8 ms on the same loaded host.
+
+
+
 ## research: native Rust fast path (worktree `.worktrees/fastpath`)
 
 Branch: `research/fastpath`. Task: prototype a compiled Rust prefilter that can

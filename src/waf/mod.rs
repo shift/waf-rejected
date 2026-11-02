@@ -55,6 +55,11 @@ pub mod fastpath;
 #[cfg(feature = "native-detect")]
 pub mod native_detect;
 
+/// Native Rust replacement for the Coraza request engine (experimental,
+/// non-default). See `docs/suggestions_from_agents/rust-engine.md`.
+#[cfg(feature = "rust-engine")]
+pub mod rust_engine;
+
 /// Shared JSON payload envelope for the wasm reactor and native sidecar.
 #[cfg(any(feature = "wasm-reactor", feature = "coraza-native"))]
 pub mod coraza_payload;

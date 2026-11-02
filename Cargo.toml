@@ -76,6 +76,12 @@ required-features = ["wasm-reactor"]
 name = "rule_accounting"
 path = "src/bin/rule_accounting.rs"
 
+
+[[bin]]
+name = "rust-engine-parity"
+path = "src/bin/rust_engine_parity.rs"
+required-features = ["rust-engine"]
+
 [dependencies]
 # Async runtime and HTTP
 tokio = { version = "1.0", features = ["full"] }
@@ -284,6 +290,12 @@ engine-kernel = ["dep:aho-corasick", "dep:regex-automata"]
 # path keeps using Coraza until a caller opts in. See
 # docs/suggestions_from_agents/native-detect.md.
 native-detect = []
+
+
+# Native Rust replacement for the Coraza request engine (core vertical slice).
+# Non-default until differential parity against Coraza is proven. See
+# docs/suggestions_from_agents/rust-engine.md.
+rust-engine = ["dep:aho-corasick"]
 # Protocol support features
 websocket = []
 # HTTP/3 over QUIC. Not part of default features: it pulls in quinn/h3 and
@@ -331,6 +343,14 @@ required-features = ["wasm-reactor"]
 [[example]]
 name = "allow_cache_bench"
 required-features = ["wasm-reactor", "allow-cache"]
+
+
+# Native Rust CRS engine microbenchmarks (bodyless / 1 / 4 / 8 KiB).
+#   cargo bench --features rust-engine --bench rust_engine
+[[bench]]
+name = "rust_engine"
+harness = false
+required-features = ["rust-engine"]
 
 # wasmtime compiles to native code once per module; optimising it in debug
 # builds keeps `cargo test --features wasm-reactor` responsive without
