@@ -21,12 +21,14 @@
 //! by default.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 
 use crate::waf::prefilter_extract::{Coverage, PrefilterArtifact, SCHEMA_VERSION};
+use crate::waf::transforms::{Transform, TransformCache, TransformError};
 
 /// The committed artifact, embedded so the prefilter works in a single binary.
 pub const EMBEDDED_ARTIFACT: &str = include_str!("../../rules/crs/prefilter.json");
@@ -137,18 +139,47 @@ impl RuleGate {
     }
 }
 
-/// One Aho-Corasick automaton over a (representation, transform, case) group.
+/// One logical (representation, transform, case) group.
 struct CompiledGroup {
-    extract: Extract,
-    transforms: Vec<Transform>,
+    /// Chain prefix ids for every step of this group's pipeline. Prefix 0 is
+    /// the raw input; each later id adds one step.
+    plan: Vec<u32>,
+    case_insensitive: bool,
+}
+
+/// One Aho-Corasick automaton over the union of every literal with the same
+/// case sensitivity, plus the groups that require each literal.
+///
+/// Scanning a representation once and attributing matches to the groups that
+/// actually use that representation is equivalent to running one automaton per
+/// group, but turns 84 passes into one pass per unique representation.
+struct UnionAutomaton {
     automaton: AhoCorasick,
-    /// Pattern index -> rule ids that share this literal.
-    rules: Vec<Vec<u32>>,
+    /// Pattern index -> (group index, rule ids that require this literal).
+    pattern_groups: PatternGroups,
+}
+
+/// Pattern index -> (group index, rule ids that require this literal).
+type PatternGroups = Vec<Vec<(u32, Vec<u32>)>>;
+
+/// Literal -> (group index, rule ids) for one case sensitivity.
+type LiteralGroups = BTreeMap<String, Vec<(u32, Vec<u32>)>>;
+
+/// Reusable scan buffers (resolved group ranges and a group bitset).
+#[derive(Default)]
+struct ScanScratch {
+    /// `(start, end, group index)` for every group, sorted by range.
+    resolved: Vec<(u32, u32, u32)>,
+    bits: Vec<u64>,
 }
 
 /// A loaded prefilter.
 pub struct Prefilter {
     groups: Vec<CompiledGroup>,
+    /// Registered transform-chain prefixes. `prefixes[0]` is empty.
+    prefixes: Vec<Vec<Transform>>,
+    sensitive: Option<UnionAutomaton>,
+    insensitive: Option<UnionAutomaton>,
     gated_rule_ids: Vec<u32>,
     ungated_body_rule_ids: Vec<u32>,
     all_body_rules_gated: bool,
@@ -209,10 +240,12 @@ impl Prefilter {
             gated.push(gate.id);
             for literal_group in &gate.literal_groups {
                 let transforms = parse_transforms(&literal_group.transforms)?;
-                for extract in Extract::ALL {
+                for extract in EXTRACT_STEPS {
+                    let mut steps = Vec::with_capacity(1 + transforms.len());
+                    steps.push(extract);
+                    steps.extend(transforms.iter().copied());
                     let key = GroupKey {
-                        extract,
-                        transforms: transforms.clone(),
+                        steps,
                         case_insensitive: literal_group.case_insensitive,
                     };
                     let entry = pending.entry(key).or_default();
@@ -237,28 +270,63 @@ impl Prefilter {
         ungated_body.dedup();
 
         let mut groups = Vec::with_capacity(pending.len());
-        for (key, patterns) in pending {
-            let (patterns, rules): (Vec<String>, Vec<Vec<u32>>) = patterns
-                .into_iter()
-                .map(|(literal, ids)| (literal, ids.into_iter().collect()))
-                .unzip();
+        let mut prefix_index: BTreeMap<Vec<Transform>, u32> = BTreeMap::new();
+        prefix_index.insert(Vec::new(), 0);
+        // One literal map per case sensitivity: literal -> (group, rules).
+        let mut case_maps: [LiteralGroups; 2] = [BTreeMap::new(), BTreeMap::new()];
+        for (index, (key, patterns)) in pending.into_iter().enumerate() {
+            let mut plan = Vec::with_capacity(key.steps.len());
+            for length in 1..=key.steps.len() {
+                let prefix = key.steps[..length].to_vec();
+                let next = prefix_index.len() as u32;
+                let id = *prefix_index.entry(prefix).or_insert(next);
+                plan.push(id);
+            }
+            let case = usize::from(key.case_insensitive);
+            for (literal, ids) in patterns {
+                case_maps[case]
+                    .entry(literal)
+                    .or_default()
+                    .push((index as u32, ids.into_iter().collect()));
+            }
+            groups.push(CompiledGroup {
+                plan,
+                case_insensitive: key.case_insensitive,
+            });
+        }
+        let mut prefixes = vec![Vec::new(); prefix_index.len()];
+        for (steps, id) in prefix_index {
+            prefixes[id as usize] = steps;
+        }
+
+        let build_union = |map: LiteralGroups,
+                           case_insensitive: bool|
+         -> Result<Option<UnionAutomaton>, PrefilterError> {
+            if map.is_empty() {
+                return Ok(None);
+            }
+            let (patterns, pattern_groups): (Vec<String>, PatternGroups) = map.into_iter().unzip();
             let automaton = AhoCorasickBuilder::new()
-                .ascii_case_insensitive(key.case_insensitive)
+                .ascii_case_insensitive(case_insensitive)
                 .match_kind(MatchKind::Standard)
                 .build(&patterns)
                 .map_err(|err| PrefilterError::Build(err.to_string()))?;
-            groups.push(CompiledGroup {
-                extract: key.extract,
-                transforms: key.transforms,
+            Ok(Some(UnionAutomaton {
                 automaton,
-                rules,
-            });
-        }
+                pattern_groups,
+            }))
+        };
+        let [sensitive_map, insensitive_map] = case_maps;
+        let sensitive = build_union(sensitive_map, false)?;
+        let insensitive = build_union(insensitive_map, true)?;
 
         let all_body_rules_gated =
             artifact.coverage.all_body_rules_gated && ungated_body.is_empty();
         Ok(Self {
             groups,
+            prefixes,
+            sensitive,
+            insensitive,
             gated_rule_ids: gated,
             ungated_body_rule_ids: ungated_body,
             all_body_rules_gated,
@@ -299,47 +367,176 @@ impl Prefilter {
         {
             return PrefilterHit::forced("body contains an XML DTD/entity declaration");
         }
+        with_transform_cache(|cache| self.evaluate_with_cache(body, cache))
+    }
 
+    /// [`Self::evaluate`] with an explicit cache (benchmarks and callers that
+    /// already own a per-request arena).
+    pub fn evaluate_with_cache(&self, body: &[u8], cache: &mut TransformCache) -> PrefilterHit {
+        cache.begin_request(self.prefixes.len());
+        let mut matched = Vec::new();
         let mut scanned = 0usize;
         let mut representations = 0usize;
-        for group in &self.groups {
-            let representation = apply_pipeline(body, group.extract, &group.transforms);
-            scanned += representation.len();
-            representations += 1;
-            if group.automaton.is_match(&representation) {
-                let mut matched = Vec::new();
-                'outer: for mat in group.automaton.find_iter(&representation) {
-                    for &rule in &group.rules[mat.pattern().as_usize()] {
-                        if !matched.contains(&rule) {
-                            matched.push(rule);
-                            if matched.len() >= MAX_REPORTED_RULES {
-                                break 'outer;
-                            }
-                        }
-                    }
-                }
-                return PrefilterHit {
-                    hit: true,
-                    forced_reason: None,
-                    scanned_bytes: scanned,
-                    representations,
-                    matched_rules: matched,
-                };
-            }
-        }
-
-        PrefilterHit {
-            hit: false,
-            forced_reason: None,
-            scanned_bytes: scanned,
-            representations,
-            matched_rules: Vec::new(),
+        match self.scan_value(
+            cache,
+            body,
+            &mut matched,
+            &mut scanned,
+            &mut representations,
+            true,
+        ) {
+            Ok(true) => PrefilterHit {
+                hit: true,
+                forced_reason: None,
+                scanned_bytes: scanned,
+                representations,
+                matched_rules: matched,
+            },
+            Ok(false) => PrefilterHit {
+                hit: false,
+                forced_reason: None,
+                scanned_bytes: scanned,
+                representations,
+                matched_rules: Vec::new(),
+            },
+            Err(_) => PrefilterHit::forced(TRANSFORM_OVERFLOW),
         }
     }
 
-    /// Number of compiled automata (representations × transform pipelines).
+    /// Resolves every group for one value, then scans each distinct
+    /// representation once with the union automaton for its case sensitivity.
+    ///
+    /// Returns whether any literal of a group that owns the representation
+    /// matched. When `stop_on_hit` is set, scanning stops at the first
+    /// attributed match (the body-withhold path).
+    fn scan_value(
+        &self,
+        cache: &mut TransformCache,
+        input: &[u8],
+        matched: &mut Vec<u32>,
+        scanned: &mut usize,
+        representations: &mut usize,
+        stop_on_hit: bool,
+    ) -> Result<bool, TransformError> {
+        let value = cache.begin_value(input)?;
+        with_scan_scratch(|scratch| {
+            let ScanScratch { resolved, bits } = scratch;
+            resolved.clear();
+            for (index, group) in self.groups.iter().enumerate() {
+                let range = cache.resolve(value, input, &group.plan, &self.prefixes)?;
+                resolved.push((range.start as u32, range.end as u32, index as u32));
+            }
+            resolved.sort_unstable();
+
+            let mut found = false;
+            let mut index = 0usize;
+            while index < resolved.len() {
+                let (start, end, _) = resolved[index];
+                let mut next = index + 1;
+                while next < resolved.len() && resolved[next].0 == start && resolved[next].1 == end
+                {
+                    next += 1;
+                }
+                bits.fill(0);
+                let mut has_sensitive = false;
+                let mut has_insensitive = false;
+                for &(_, _, group) in &resolved[index..next] {
+                    let words = self.groups.len().div_ceil(64);
+                    if bits.len() < words {
+                        bits.resize(words, 0);
+                    }
+                    bits[group as usize / 64] |= 1u64 << (group % 64);
+                    if self.groups[group as usize].case_insensitive {
+                        has_insensitive = true;
+                    } else {
+                        has_sensitive = true;
+                    }
+                }
+                let representation = cache.bytes(start as usize..end as usize);
+                *scanned += representation.len();
+                *representations += 1;
+                if has_sensitive
+                    && self.scan_representation(representation, bits, false, matched, stop_on_hit)
+                {
+                    found = true;
+                }
+                if has_insensitive
+                    && self.scan_representation(representation, bits, true, matched, stop_on_hit)
+                {
+                    found = true;
+                }
+                if found && stop_on_hit {
+                    return Ok(true);
+                }
+                index = next;
+            }
+            Ok(found)
+        })
+    }
+
+    /// Scans one representation with the union automaton and keeps only the
+    /// literals that belong to a group owning this representation.
+    fn scan_representation(
+        &self,
+        representation: &[u8],
+        groups: &[u64],
+        case_insensitive: bool,
+        matched: &mut Vec<u32>,
+        stop_on_hit: bool,
+    ) -> bool {
+        let union = if case_insensitive {
+            self.insensitive.as_ref()
+        } else {
+            self.sensitive.as_ref()
+        };
+        let Some(union) = union else {
+            return false;
+        };
+        // `is_match` uses the DFA/prefilter path and is much faster than the
+        // overlapping iterator. Clean values (the common case) stop here.
+        if !union.automaton.is_match(representation) {
+            return false;
+        }
+        let mut found = false;
+        for mat in union.automaton.find_overlapping_iter(representation) {
+            for (group, rules) in &union.pattern_groups[mat.pattern().as_usize()] {
+                let bit = 1u64 << (group % 64);
+                if groups
+                    .get(*group as usize / 64)
+                    .is_none_or(|word| word & bit == 0)
+                {
+                    continue;
+                }
+                for &rule in rules {
+                    if !matched.contains(&rule) {
+                        matched.push(rule);
+                        if matched.len() >= MAX_REPORTED_RULES {
+                            return true;
+                        }
+                    }
+                }
+                found = true;
+            }
+            if found && stop_on_hit {
+                return true;
+            }
+        }
+        found
+    }
+
+    /// Number of logical (representation × transform pipeline) groups.
     pub fn automaton_count(&self) -> usize {
         self.groups.len()
+    }
+
+    /// Number of physical Aho-Corasick automata (one per case sensitivity).
+    pub fn union_automaton_count(&self) -> usize {
+        usize::from(self.sensitive.is_some()) + usize::from(self.insensitive.is_some())
+    }
+
+    /// Number of distinct transform-chain prefixes, including the empty one.
+    pub fn prefix_count(&self) -> usize {
+        self.prefixes.len()
     }
 
     /// Scans every request representation and returns the gated rules that
@@ -369,39 +566,51 @@ impl Prefilter {
                 };
             }
         }
+        with_transform_cache(|cache| self.evaluate_inputs_with_cache(inputs, cache))
+    }
+
+    /// [`Self::evaluate_inputs`] with an explicit cache.
+    pub fn evaluate_inputs_with_cache(
+        &self,
+        inputs: &[&[u8]],
+        cache: &mut TransformCache,
+    ) -> RuleGate {
+        cache.begin_request(self.prefixes.len());
 
         let mut scanned = 0usize;
         let mut matched: Vec<u32> = Vec::new();
-        for group in &self.groups {
-            for input in inputs {
-                if input.is_empty() {
-                    continue;
-                }
-                let representation = apply_pipeline(input, group.extract, &group.transforms);
-                scanned += representation.len();
-                if !group.automaton.is_match(&representation) {
-                    continue;
-                }
-                for mat in group.automaton.find_iter(&representation) {
-                    for &rule in &group.rules[mat.pattern().as_usize()] {
-                        if !matched.contains(&rule) {
-                            matched.push(rule);
-                        }
-                    }
-                }
+        for input in inputs {
+            if input.is_empty() {
+                continue;
+            }
+            let mut representations = 0usize;
+            if self
+                .scan_value(
+                    cache,
+                    input,
+                    &mut matched,
+                    &mut scanned,
+                    &mut representations,
+                    false,
+                )
+                .is_err()
+            {
+                return transform_overflow_gate();
             }
         }
         matched.sort_unstable();
         matched.dedup();
 
-        let removable_rule_ids = self
-            .gated_rule_ids
-            .iter()
-            .copied()
-            .filter(|id| !matched.contains(id))
-            .filter(|id| self.ungated_body_rule_ids.binary_search(id).is_err())
-            .take(MAX_REMOVE_RULE_IDS)
-            .collect();
+        let mut removable_rule_ids =
+            Vec::with_capacity(self.gated_rule_ids.len().min(MAX_REMOVE_RULE_IDS));
+        removable_rule_ids.extend(
+            self.gated_rule_ids
+                .iter()
+                .copied()
+                .filter(|id| !matched.contains(id))
+                .filter(|id| self.ungated_body_rule_ids.binary_search(id).is_err())
+                .take(MAX_REMOVE_RULE_IDS),
+        );
 
         RuleGate {
             forced_reason: None,
@@ -459,11 +668,12 @@ impl Prefilter {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct GroupKey {
-    extract: Extract,
-    transforms: Vec<Transform>,
+    /// Full pipeline: body-processor extraction followed by rule transforms.
+    steps: Vec<Transform>,
     case_insensitive: bool,
 }
 
+/// The extraction variants a CRS body processor can apply to a value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Extract {
     Identity,
@@ -482,76 +692,69 @@ impl Extract {
     ];
 
     pub(crate) fn apply(self, input: &[u8]) -> Cow<'_, [u8]> {
-        match self {
-            Extract::Identity => Cow::Borrowed(input),
-            Extract::UrlDecode => Cow::Owned(url_decode(input, false)),
-            Extract::JsonUnescape => Cow::Owned(json_unescape(input)),
-            Extract::HtmlEntityDecode => Cow::Owned(html_entity_decode(input)),
+        let step = match self {
+            Extract::Identity => Transform::Identity,
+            Extract::UrlDecode => Transform::UrlDecode,
+            Extract::JsonUnescape => Transform::JsonUnescape,
+            Extract::HtmlEntityDecode => Transform::HtmlEntityDecode,
+        };
+        if step.is_identity_on(input) {
+            Cow::Borrowed(input)
+        } else {
+            let mut output = Vec::new();
+            step.apply_into(input, &mut output);
+            Cow::Owned(output)
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Transform {
-    Lowercase,
-    Uppercase,
-    UrlDecode,
-    UrlDecodeUni,
-    RemoveNulls,
-    ReplaceNulls,
-    CompressWhitespace,
-    RemoveWhitespace,
-    Trim,
-    TrimLeft,
-    TrimRight,
-    NormalizePath,
-    NormalizePathWin,
-    EscapeSeqDecode,
-    ReplaceComments,
-    JsDecode,
-    CssDecode,
-    HtmlEntityDecode,
-    CmdLine,
+/// The extraction variants a CRS body processor can apply to a value.
+const EXTRACT_STEPS: [Transform; 4] = [
+    Transform::Identity,
+    Transform::UrlDecode,
+    Transform::JsonUnescape,
+    Transform::HtmlEntityDecode,
+];
+
+/// Reason reported when the shared transform pipeline hits a bound.
+const TRANSFORM_OVERFLOW: &str = "transform pipeline exceeded its bound";
+
+fn transform_overflow_gate() -> RuleGate {
+    RuleGate {
+        forced_reason: Some(TRANSFORM_OVERFLOW),
+        ..RuleGate::default()
+    }
 }
 
-pub(crate) fn parse_transforms(names: &[String]) -> Result<Vec<Transform>, PrefilterError> {
-    let mut out = Vec::new();
+/// Per-thread reusable arena so `evaluate`/`evaluate_inputs` allocate nothing
+/// per request after the first one. The cache is scoped to a single call.
+fn with_transform_cache<R>(f: impl FnOnce(&mut TransformCache) -> R) -> R {
+    thread_local! {
+        static CACHE: RefCell<TransformCache> = RefCell::new(TransformCache::new());
+    }
+    CACHE.with(|cell| f(&mut cell.borrow_mut()))
+}
+
+/// Reusable per-thread scan buffers for the union-automaton pass.
+fn with_scan_scratch<R>(f: impl FnOnce(&mut ScanScratch) -> R) -> R {
+    thread_local! {
+        static SCRATCH: RefCell<ScanScratch> = RefCell::new(ScanScratch::default());
+    }
+    SCRATCH.with(|cell| f(&mut cell.borrow_mut()))
+}
+
+fn parse_transforms(names: &[String]) -> Result<Vec<Transform>, PrefilterError> {
+    let mut out = Vec::with_capacity(names.len());
     for name in names {
-        match name.as_str() {
-            // `none` is a reset marker; `utf8tounicode` is the identity for the
-            // ASCII literals the extractor accepts.
-            "none" | "utf8tounicode" => {}
-            "lowercase" => out.push(Transform::Lowercase),
-            "uppercase" => out.push(Transform::Uppercase),
-            "urldecode" => out.push(Transform::UrlDecode),
-            "urldecodeuni" => out.push(Transform::UrlDecodeUni),
-            "removenulls" => out.push(Transform::RemoveNulls),
-            "replacenulls" => out.push(Transform::ReplaceNulls),
-            "compresswhitespace" => out.push(Transform::CompressWhitespace),
-            "removewhitespace" => out.push(Transform::RemoveWhitespace),
-            "trim" => out.push(Transform::Trim),
-            "trimleft" => out.push(Transform::TrimLeft),
-            "trimright" => out.push(Transform::TrimRight),
-            "normalizepath" | "normalisepath" => out.push(Transform::NormalizePath),
-            "normalizepathwin" | "normalisepathwin" => out.push(Transform::NormalizePathWin),
-            "escapeseqdecode" => out.push(Transform::EscapeSeqDecode),
-            "replacecomments" => out.push(Transform::ReplaceComments),
-            "jsdecode" => out.push(Transform::JsDecode),
-            "cssdecode" => out.push(Transform::CssDecode),
-            "htmlentitydecode" => out.push(Transform::HtmlEntityDecode),
-            "cmdline" => out.push(Transform::CmdLine),
-            other => return Err(PrefilterError::UnknownTransform(other.to_string())),
+        if Transform::is_noop_name(name) {
+            continue;
+        }
+        match Transform::from_rule_name(name) {
+            Some(transform) => out.push(transform),
+            None => return Err(PrefilterError::UnknownTransform(name.clone())),
         }
     }
     Ok(out)
-}
-
-pub(crate) fn apply_pipeline(input: &[u8], extract: Extract, transforms: &[Transform]) -> Vec<u8> {
-    let mut current = extract.apply(input);
-    for transform in transforms {
-        current = Cow::Owned(transform.apply(&current));
-    }
-    current.into_owned()
 }
 
 /// Number of body extraction variants a CRS body processor can produce.
@@ -578,9 +781,6 @@ impl TransformChain {
     }
 
     /// Apply the chain to a body for one extraction variant.
-    ///
-    /// This is the naive path: extraction and every transform run for every
-    /// group, matching the existing Aho-Corasick prefilter's structure.
     #[doc(hidden)]
     pub fn apply(&self, body: &[u8], extraction: usize) -> Vec<u8> {
         self.apply_view(&extract_view(body, extraction))
@@ -589,18 +789,16 @@ impl TransformChain {
 
     /// Apply the chain to an already-extracted view, skipping transforms that
     /// are provably the identity on this input.
-    ///
-    /// The skip predicate is conservative: a `false` result only means the
-    /// transform runs. Reusing the input buffer when every transform is a
-    /// no-op is what lets one extracted view feed every group's database.
     #[doc(hidden)]
-    pub fn apply_view<'a>(&self, input: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
-        let mut current = std::borrow::Cow::Borrowed(input);
+    pub fn apply_view<'a>(&self, input: &'a [u8]) -> Cow<'a, [u8]> {
+        let mut current = Cow::Borrowed(input);
         for transform in &self.transforms {
-            if transform.is_identity_for(&current) {
+            if transform.is_identity_on(&current) {
                 continue;
             }
-            current = std::borrow::Cow::Owned(transform.apply(&current));
+            let mut output = Vec::new();
+            transform.apply_into(&current, &mut output);
+            current = Cow::Owned(output);
         }
         current
     }
@@ -609,9 +807,11 @@ impl TransformChain {
     /// comparison with the existing per-group prefilter.
     #[doc(hidden)]
     pub fn apply_view_naive(&self, input: &[u8]) -> Vec<u8> {
-        let mut current = std::borrow::Cow::Borrowed(input);
+        let mut current = Cow::Borrowed(input);
         for transform in &self.transforms {
-            current = std::borrow::Cow::Owned(transform.apply(&current));
+            let mut output = Vec::new();
+            transform.apply_into(&current, &mut output);
+            current = Cow::Owned(output);
         }
         current.into_owned()
     }
@@ -624,757 +824,12 @@ impl TransformChain {
 
 /// Apply one body extraction variant without any rule transform.
 #[doc(hidden)]
-pub fn extract_view(body: &[u8], extraction: usize) -> std::borrow::Cow<'_, [u8]> {
+pub fn extract_view(body: &[u8], extraction: usize) -> Cow<'_, [u8]> {
     Extract::ALL
         .get(extraction)
         .copied()
         .unwrap_or(Extract::Identity)
         .apply(body)
-}
-
-impl Transform {
-    /// Conservative identity test: true only when [`Self::apply`] would
-    /// return the input unchanged.
-    fn is_identity_for(self, input: &[u8]) -> bool {
-        match self {
-            Transform::Lowercase => {
-                input.iter().all(u8::is_ascii) && !input.iter().any(u8::is_ascii_uppercase)
-            }
-            Transform::Uppercase => {
-                input.iter().all(u8::is_ascii) && !input.iter().any(u8::is_ascii_lowercase)
-            }
-            Transform::UrlDecode | Transform::UrlDecodeUni => {
-                !input.iter().any(|b| *b == b'%' || *b == b'+')
-            }
-            Transform::RemoveNulls | Transform::ReplaceNulls => !input.contains(&0),
-            Transform::CompressWhitespace => !input
-                .windows(2)
-                .any(|pair| is_latin_space(pair[0]) && is_latin_space(pair[1])),
-            Transform::RemoveWhitespace => !input.iter().any(|b| is_latin_space(*b)),
-            Transform::Trim => {
-                !input.first().is_some_and(|b| is_latin_space(*b))
-                    && !input.last().is_some_and(|b| is_latin_space(*b))
-            }
-            Transform::TrimLeft => !input.first().is_some_and(|b| is_latin_space(*b)),
-            Transform::TrimRight => !input.last().is_some_and(|b| is_latin_space(*b)),
-            Transform::NormalizePath => !input.is_empty() && !input.contains(&b'/'),
-            Transform::NormalizePathWin => {
-                !input.is_empty() && !input.contains(&b'/') && !input.contains(&b'\\')
-            }
-            Transform::EscapeSeqDecode => !input.contains(&b'\\'),
-            Transform::ReplaceComments => !input.windows(2).any(|pair| pair == b"/*"),
-            Transform::JsDecode | Transform::CssDecode => !input.contains(&b'\\'),
-            Transform::HtmlEntityDecode => !input.contains(&b'&'),
-            Transform::CmdLine => {
-                input.iter().all(u8::is_ascii)
-                    && !input.iter().any(|b| {
-                        matches!(
-                            b,
-                            b'"' | b'\''
-                                | b'\\'
-                                | b'^'
-                                | b' '
-                                | b','
-                                | b';'
-                                | b'\t'
-                                | b'\r'
-                                | b'\n'
-                                | b'/'
-                                | b'('
-                        ) || b.is_ascii_uppercase()
-                    })
-            }
-        }
-    }
-
-    fn apply(self, input: &[u8]) -> Vec<u8> {
-        match self {
-            Transform::Lowercase => map_case(input, true),
-            Transform::Uppercase => map_case(input, false),
-            Transform::UrlDecode => url_decode(input, false),
-            Transform::UrlDecodeUni => url_decode(input, true),
-            Transform::RemoveNulls => input.iter().copied().filter(|b| *b != 0).collect(),
-            Transform::ReplaceNulls => input
-                .iter()
-                .map(|b| if *b == 0 { b' ' } else { *b })
-                .collect(),
-            Transform::CompressWhitespace => compress_whitespace(input),
-            Transform::RemoveWhitespace => remove_whitespace(input),
-            Transform::Trim => trim_bytes(input, true, true),
-            Transform::TrimLeft => trim_bytes(input, true, false),
-            Transform::TrimRight => trim_bytes(input, false, true),
-            Transform::NormalizePath => clean_path(input),
-            Transform::NormalizePathWin => {
-                let replaced: Vec<u8> = input
-                    .iter()
-                    .map(|b| if *b == b'\\' { b'/' } else { *b })
-                    .collect();
-                clean_path(&replaced)
-            }
-            Transform::EscapeSeqDecode => escape_seq_decode(input),
-            Transform::ReplaceComments => replace_comments(input),
-            Transform::JsDecode => js_decode(input),
-            Transform::CssDecode => css_decode(input),
-            Transform::HtmlEntityDecode => html_entity_decode(input),
-            Transform::CmdLine => cmd_line(input),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Byte transforms
-// ---------------------------------------------------------------------------
-
-fn map_case(input: &[u8], lower: bool) -> Vec<u8> {
-    // Preserve invalid UTF-8 bytes; only transform valid sequences.
-    let mut out = Vec::with_capacity(input.len());
-    let mut rest = input;
-    loop {
-        match std::str::from_utf8(rest) {
-            Ok(text) => {
-                for c in text.chars() {
-                    if lower {
-                        out.extend_from_slice(c.to_lowercase().collect::<String>().as_bytes());
-                    } else {
-                        out.extend_from_slice(c.to_uppercase().collect::<String>().as_bytes());
-                    }
-                }
-                break;
-            }
-            Err(err) => {
-                let valid = err.valid_up_to();
-                if valid > 0 {
-                    let text = std::str::from_utf8(&rest[..valid]).expect("valid prefix");
-                    for c in text.chars() {
-                        if lower {
-                            out.extend_from_slice(c.to_lowercase().collect::<String>().as_bytes());
-                        } else {
-                            out.extend_from_slice(c.to_uppercase().collect::<String>().as_bytes());
-                        }
-                    }
-                }
-                match err.error_len() {
-                    Some(len) => {
-                        out.extend_from_slice(&rest[valid..valid + len]);
-                        rest = &rest[valid + len..];
-                    }
-                    None => {
-                        out.extend_from_slice(&rest[valid..]);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    out
-}
-
-fn hex_value(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn hex_pair(input: &[u8], at: usize) -> Option<u8> {
-    let hi = hex_value(*input.get(at)?)?;
-    let lo = hex_value(*input.get(at + 1)?)?;
-    Some((hi << 4) | lo)
-}
-
-/// Coraza-compatible `urlDecode`/`urlDecodeUni`.
-fn url_decode(input: &[u8], uni: bool) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len());
-    let mut i = 0usize;
-    while i < input.len() {
-        match input[i] {
-            b'%' => {
-                if uni && i + 5 < input.len() && matches!(input[i + 1], b'u' | b'U') {
-                    if let (Some(hi), Some(lo)) = (hex_pair(input, i + 2), hex_pair(input, i + 4)) {
-                        let mut byte = lo;
-                        if hi == 0xff && (1..=0x5e).contains(&byte) {
-                            byte = byte.wrapping_add(0x20);
-                        }
-                        out.push(byte);
-                        i += 6;
-                        continue;
-                    }
-                }
-                if let Some(byte) = hex_pair(input, i + 1) {
-                    out.push(byte);
-                    i += 3;
-                } else {
-                    out.push(b'%');
-                    i += 1;
-                }
-            }
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            byte => {
-                out.push(byte);
-                i += 1;
-            }
-        }
-    }
-    out
-}
-
-/// Decodes JSON string escapes (`\"`, `\\`, `\uXXXX`, ...).
-fn json_unescape(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len());
-    let mut i = 0usize;
-    while i < input.len() {
-        if input[i] != b'\\' || i + 1 >= input.len() {
-            out.push(input[i]);
-            i += 1;
-            continue;
-        }
-        let escape = input[i + 1];
-        match escape {
-            b'"' | b'\\' | b'/' => {
-                out.push(escape);
-                i += 2;
-            }
-            b'b' => {
-                out.push(0x08);
-                i += 2;
-            }
-            b'f' => {
-                out.push(0x0c);
-                i += 2;
-            }
-            b'n' => {
-                out.push(b'\n');
-                i += 2;
-            }
-            b'r' => {
-                out.push(b'\r');
-                i += 2;
-            }
-            b't' => {
-                out.push(b'\t');
-                i += 2;
-            }
-            b'u' => {
-                if let Some((ch, consumed)) = decode_json_unicode(&input[i..]) {
-                    out.extend_from_slice(ch.to_string().as_bytes());
-                    i += consumed;
-                } else {
-                    out.push(b'\\');
-                    out.push(escape);
-                    i += 2;
-                }
-            }
-            _ => {
-                out.push(b'\\');
-                out.push(escape);
-                i += 2;
-            }
-        }
-    }
-    out
-}
-
-fn decode_json_unicode(input: &[u8]) -> Option<(char, usize)> {
-    // input starts with `\uXXXX`
-    let first = u32::from(hex_pair(input, 2)?) << 8 | u32::from(hex_pair(input, 4)?);
-    if (0xd800..=0xdbff).contains(&first) {
-        if input.get(6) == Some(&b'\\') && input.get(7) == Some(&b'u') {
-            let second = u32::from(hex_pair(input, 8)?) << 8 | u32::from(hex_pair(input, 10)?);
-            if (0xdc00..=0xdfff).contains(&second) {
-                let code = 0x10000 + ((first - 0xd800) << 10) + (second - 0xdc00);
-                return char::from_u32(code).map(|ch| (ch, 12));
-            }
-        }
-        return None;
-    }
-    char::from_u32(first).map(|ch| (ch, 6))
-}
-
-/// Decodes the XML/HTML entity forms that can hide a literal from a raw scan.
-///
-/// This is deliberately liberal: extra decodes can only create false
-/// positives, and the raw (`Identity`) representation is always scanned too.
-fn html_entity_decode(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len());
-    let mut i = 0usize;
-    while i < input.len() {
-        if input[i] != b'&' {
-            out.push(input[i]);
-            i += 1;
-            continue;
-        }
-        if let Some((decoded, consumed)) = decode_entity(&input[i..]) {
-            out.extend_from_slice(decoded.as_bytes());
-            i += consumed;
-        } else {
-            out.push(b'&');
-            i += 1;
-        }
-    }
-    out
-}
-
-fn decode_entity(input: &[u8]) -> Option<(String, usize)> {
-    debug_assert_eq!(input.first(), Some(&b'&'));
-    if input.get(1) == Some(&b'#') {
-        let (radix, start) = match input.get(2).copied() {
-            Some(b'x') | Some(b'X') => (16, 3),
-            _ => (10, 2),
-        };
-        let mut end = start;
-        while end < input.len() && input[end].is_ascii_hexdigit() && radix == 16 {
-            end += 1;
-        }
-        while end < input.len() && input[end].is_ascii_digit() && radix == 10 {
-            end += 1;
-        }
-        if end == start {
-            return None;
-        }
-        let digits = std::str::from_utf8(&input[start..end]).ok()?;
-        let code = u32::from_str_radix(digits, radix).ok()?;
-        let consumed = if input.get(end) == Some(&b';') {
-            end + 1
-        } else {
-            // HTML5 allows numeric references without a semicolon.
-            end
-        };
-        return char::from_u32(code).map(|ch| (ch.to_string(), consumed));
-    }
-
-    // Consume the maximum alphanumeric run, then look for a semicolon.
-    let mut end = 1usize;
-    while end < input.len() && input[end].is_ascii_alphanumeric() {
-        end += 1;
-    }
-    if end == 1 {
-        return None;
-    }
-    let run = std::str::from_utf8(&input[1..end])
-        .ok()?
-        .to_ascii_lowercase();
-    if input.get(end) == Some(&b';') {
-        if let Some(decoded) = decode_named_entity(&run) {
-            return Some((decoded.to_string(), end + 1));
-        }
-    }
-    // Legacy no-semicolon forms: Go tries the longest prefix (up to six
-    // characters) against the entity table. Only `lt`, `gt`, `amp`, `quot`
-    // and `nbsp` are relevant to the ASCII characters the extractor accepts.
-    let max_len = run.len().min(6);
-    for len in (2..=max_len).rev() {
-        if let Some(decoded) = decode_legacy_entity(&run[..len]) {
-            return Some((decoded.to_string(), 1 + len));
-        }
-    }
-    None
-}
-
-fn decode_legacy_entity(name: &str) -> Option<&'static str> {
-    match name {
-        "lt" => Some("<"),
-        "gt" => Some(">"),
-        "amp" => Some("&"),
-        "quot" => Some("\""),
-        "nbsp" => Some("\u{00a0}"),
-        _ => None,
-    }
-}
-
-fn decode_named_entity(name: &str) -> Option<&'static str> {
-    let decoded = match name {
-        "lt" => "<",
-        "gt" => ">",
-        "amp" => "&",
-        "quot" => "\"",
-        "apos" => "'",
-        "nbsp" => "\u{00a0}",
-        "colon" => ":",
-        "sol" => "/",
-        "bsol" => "\\",
-        "lpar" => "(",
-        "rpar" => ")",
-        "period" => ".",
-        "comma" => ",",
-        "semi" => ";",
-        "num" => "#",
-        "percnt" => "%",
-        "equals" => "=",
-        "quest" => "?",
-        "plus" => "+",
-        "lowbar" | "underbar" => "_",
-        "ast" | "midast" => "*",
-        "verbar" | "vert" | "verticalline" => "|",
-        "grave" | "diacriticalgrave" => "`",
-        "hat" => "^",
-        "excl" => "!",
-        "dollar" => "$",
-        "commat" => "@",
-        "lsqb" | "lbrack" => "[",
-        "rsqb" | "rbrack" => "]",
-        "lcub" | "lbrace" => "{",
-        "rcub" | "rbrace" => "}",
-        "tab" => "\t",
-        "newline" => "\n",
-        _ => return None,
-    };
-    Some(decoded)
-}
-
-/// `isLatinSpace` from Coraza's `compressWhitespace`.
-fn is_latin_space(b: u8) -> bool {
-    matches!(b, b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | b' ' | 0x85 | 0xa0)
-}
-
-fn compress_whitespace(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len());
-    let mut in_space = false;
-    for &byte in input {
-        if is_latin_space(byte) {
-            if !in_space {
-                out.push(b' ');
-                in_space = true;
-            }
-        } else {
-            out.push(byte);
-            in_space = false;
-        }
-    }
-    out
-}
-
-fn remove_whitespace(input: &[u8]) -> Vec<u8> {
-    // Conservative subset of Go's `unicode.IsSpace`: removing fewer
-    // characters can only leave extra bytes, which is safe.
-    input
-        .iter()
-        .copied()
-        .filter(|b| !matches!(b, b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | b' ' | 0x85 | 0xa0))
-        .collect()
-}
-
-fn trim_bytes(input: &[u8], left: bool, right: bool) -> Vec<u8> {
-    let is_trim = |b: u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0c | 0x0b);
-    let mut start = 0usize;
-    let mut end = input.len();
-    if left {
-        while start < end && is_trim(input[start]) {
-            start += 1;
-        }
-    }
-    if right {
-        while end > start && is_trim(input[end - 1]) {
-            end -= 1;
-        }
-    }
-    input[start..end].to_vec()
-}
-
-/// Mirrors Go's `filepath.Clean` on Unix.
-fn clean_path(input: &[u8]) -> Vec<u8> {
-    if input.is_empty() {
-        return b".".to_vec();
-    }
-    let rooted = input[0] == b'/';
-    let mut parts: Vec<&[u8]> = Vec::new();
-    for part in input.split(|b| *b == b'/') {
-        if part.is_empty() || part == b"." {
-            continue;
-        }
-        if part == b".." {
-            if parts.last().is_some_and(|last| *last != b"..".as_slice()) {
-                parts.pop();
-            } else if !rooted {
-                parts.push(part);
-            }
-            continue;
-        }
-        parts.push(part);
-    }
-    let mut out = Vec::with_capacity(input.len());
-    if rooted {
-        out.push(b'/');
-    }
-    for (index, part) in parts.iter().enumerate() {
-        if index > 0 {
-            out.push(b'/');
-        }
-        out.extend_from_slice(part);
-    }
-    if out.is_empty() {
-        out.push(b'.');
-    }
-    out
-}
-
-/// Coraza's `escapeSeqDecode`.
-fn escape_seq_decode(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len());
-    let mut i = 0usize;
-    while i < input.len() {
-        if input[i] == b'\\' && i + 1 < input.len() {
-            let next = input[i + 1];
-            let simple = match next {
-                b'a' => Some(0x07),
-                b'b' => Some(0x08),
-                b'f' => Some(0x0c),
-                b'n' => Some(b'\n'),
-                b'r' => Some(b'\r'),
-                b't' => Some(b'\t'),
-                b'v' => Some(0x0b),
-                b'\\' => Some(b'\\'),
-                b'?' => Some(b'?'),
-                b'\'' => Some(b'\''),
-                b'"' => Some(b'"'),
-                _ => None,
-            };
-            if let Some(byte) = simple {
-                out.push(byte);
-                i += 2;
-                continue;
-            }
-            if matches!(next, b'x' | b'X') {
-                if let Some(byte) = hex_pair(input, i + 2) {
-                    out.push(byte);
-                    i += 4;
-                    continue;
-                }
-            }
-            if (b'0'..=b'7').contains(&next) {
-                let mut j = 2usize;
-                while j < 4 && i + j < input.len() && (b'0'..=b'7').contains(&input[i + j]) {
-                    j += 1;
-                }
-                let digits = std::str::from_utf8(&input[i + 1..i + j]).unwrap_or("0");
-                let value = u32::from_str_radix(digits, 8).unwrap_or(0) as u8;
-                out.push(value);
-                i += j;
-                continue;
-            }
-            out.push(next);
-            i += 2;
-        } else {
-            out.push(input[i]);
-            i += 1;
-        }
-    }
-    out
-}
-
-/// Coraza's `cmdLine` (ModSecurity `cmd_line`).
-fn cmd_line(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len());
-    let mut space = false;
-    for &byte in input {
-        match byte {
-            b'"' | b'\'' | b'\\' | b'^' => {}
-            b' ' | b',' | b';' | b'\t' | b'\r' | b'\n' => {
-                if !space {
-                    out.push(b' ');
-                    space = true;
-                }
-            }
-            b'/' | b'(' => {
-                if space {
-                    out.pop();
-                }
-                space = false;
-                out.push(byte);
-            }
-            other => {
-                out.push(other.to_ascii_lowercase());
-                space = false;
-            }
-        }
-    }
-    out
-}
-
-/// Coraza's `replaceComments`.
-fn replace_comments(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len());
-    let mut i = 0usize;
-    let mut in_comment = false;
-    while i < input.len() {
-        if !in_comment {
-            if input[i] == b'/' && input.get(i + 1) == Some(&b'*') {
-                in_comment = true;
-                i += 2;
-            } else {
-                out.push(input[i]);
-                i += 1;
-            }
-        } else if input[i] == b'*' && input.get(i + 1) == Some(&b'/') {
-            in_comment = false;
-            i += 2;
-            out.push(b' ');
-        } else {
-            i += 1;
-        }
-    }
-    if in_comment {
-        out.push(b' ');
-    }
-    out
-}
-
-/// Coraza's `jsDecode` (ModSecurity `js_decode`).
-fn js_decode(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len());
-    let mut i = 0usize;
-    while i < input.len() {
-        if input[i] != b'\\' {
-            out.push(input[i]);
-            i += 1;
-            continue;
-        }
-        if i + 5 < input.len()
-            && input[i + 1] == b'u'
-            && input[i + 2..i + 6].iter().all(u8::is_ascii_hexdigit)
-        {
-            let mut byte = hex_pair(input, i + 4).unwrap_or(0);
-            if byte > 0
-                && byte < 0x5f
-                && matches!(input[i + 2], b'f' | b'F')
-                && matches!(input[i + 3], b'f' | b'F')
-            {
-                byte = byte.wrapping_add(0x20);
-            }
-            out.push(byte);
-            i += 6;
-            continue;
-        }
-        if i + 3 < input.len()
-            && input[i + 1] == b'x'
-            && input[i + 2].is_ascii_hexdigit()
-            && input[i + 3].is_ascii_hexdigit()
-        {
-            out.push(hex_pair(input, i + 2).unwrap_or(0));
-            i += 4;
-            continue;
-        }
-        if i + 1 < input.len() && (b'0'..=b'7').contains(&input[i + 1]) {
-            let mut j = 0usize;
-            while j < 3 && i + 1 + j < input.len() && (b'0'..=b'7').contains(&input[i + 1 + j]) {
-                j += 1;
-            }
-            let digits = std::str::from_utf8(&input[i + 1..i + 1 + j]).unwrap_or("0");
-            let value = u32::from_str_radix(digits, 8).unwrap_or(0) as u8;
-            out.push(value);
-            i += 1 + j;
-            continue;
-        }
-        if i + 1 < input.len() {
-            let decoded = match input[i + 1] {
-                b'a' => 0x07,
-                b'b' => 0x08,
-                b'f' => 0x0c,
-                b'n' => b'\n',
-                b'r' => b'\r',
-                b't' => b'\t',
-                b'v' => 0x0b,
-                other => other,
-            };
-            out.push(decoded);
-            i += 2;
-            continue;
-        }
-        out.extend_from_slice(&input[i..]);
-        break;
-    }
-    out
-}
-
-/// Coraza's `cssDecode` (ModSecurity `css_decode`).
-fn css_decode(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len());
-    let mut i = 0usize;
-    while i < input.len() {
-        if input[i] != b'\\' {
-            out.push(input[i]);
-            i += 1;
-            continue;
-        }
-        if i + 1 >= input.len() {
-            i += 1;
-            continue;
-        }
-        i += 1;
-        let mut j = 0usize;
-        while j < 6 && i + j < input.len() && input[i + j].is_ascii_hexdigit() {
-            j += 1;
-        }
-        if j > 0 {
-            let mut full_check = false;
-            let byte = match j {
-                1 => {
-                    let digit = input[i];
-                    if digit >= b'A' {
-                        ((digit & 0xdf) - b'A') + 10
-                    } else {
-                        digit - b'0'
-                    }
-                }
-                2 | 3 => hex_pair(input, i + j - 2).unwrap_or(0),
-                4 => {
-                    full_check = true;
-                    hex_pair(input, i + j - 2).unwrap_or(0)
-                }
-                5 => {
-                    let byte = hex_pair(input, i + j - 2).unwrap_or(0);
-                    if input[i] == b'0' {
-                        full_check = true;
-                        byte
-                    } else {
-                        out.push(byte);
-                        i += j;
-                        continue;
-                    }
-                }
-                _ => {
-                    let byte = hex_pair(input, i + j - 2).unwrap_or(0);
-                    if input[i] == b'0' && input[i + 1] == b'0' {
-                        full_check = true;
-                        byte
-                    } else {
-                        out.push(byte);
-                        i += j;
-                        continue;
-                    }
-                }
-            };
-            let mut byte = byte;
-            if full_check
-                && byte > 0
-                && byte < 0x5f
-                && j >= 4
-                && matches!(input[i + j - 3], b'f' | b'F')
-                && matches!(input[i + j - 4], b'f' | b'F')
-            {
-                byte = byte.wrapping_add(0x20);
-            }
-            out.push(byte);
-            if i + j < input.len() && is_css_space(input[i + j]) {
-                j += 1;
-            }
-            i += j;
-        } else if input[i] == b'\n' {
-            i += 1;
-        } else {
-            out.push(input[i]);
-            i += 1;
-        }
-    }
-    out
-}
-
-fn is_css_space(b: u8) -> bool {
-    matches!(b, b' ' | 0x0c | b'\n' | b'\t' | b'\r' | 0x0b)
 }
 
 fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
@@ -1522,24 +977,49 @@ mod tests {
         assert_eq!(prefilter.ungated_body_rule_ids(), &[942101]);
     }
 
+    fn apply(transform: Transform, input: &[u8]) -> Vec<u8> {
+        let mut output = Vec::new();
+        transform.apply_into(input, &mut output);
+        output
+    }
+
     #[test]
     fn cmd_line_matches_coraza() {
         // `cmdLine` removes spaces before `/` and `(`.
-        assert_eq!(cmd_line(b"CAT /etc/passwd"), b"cat/etc/passwd");
-        assert_eq!(cmd_line(b"cat  /etc/passwd"), b"cat/etc/passwd");
-        assert_eq!(cmd_line(b"cat (x)"), b"cat(x)");
-        assert_eq!(cmd_line(b"a;b,c"), b"a b c");
-        assert_eq!(cmd_line(b"a\"b'c\\d^e"), b"abcde");
+        assert_eq!(
+            apply(Transform::CmdLine, b"CAT /etc/passwd"),
+            b"cat/etc/passwd"
+        );
+        assert_eq!(
+            apply(Transform::CmdLine, b"cat  /etc/passwd"),
+            b"cat/etc/passwd"
+        );
+        assert_eq!(apply(Transform::CmdLine, b"cat (x)"), b"cat(x)");
+        assert_eq!(apply(Transform::CmdLine, b"a;b,c"), b"a b c");
+        assert_eq!(apply(Transform::CmdLine, b"a\"b'c\\d^e"), b"abcde");
     }
 
     #[test]
     fn html_entity_forms_decode_like_go() {
-        assert_eq!(html_entity_decode(b"&lt;script"), b"<script");
-        assert_eq!(html_entity_decode(b"&#60;script"), b"<script");
-        assert_eq!(html_entity_decode(b"&#x3c;script"), b"<script");
-        assert_eq!(html_entity_decode(b"a&sol;b"), b"a/b");
-        // `&hyphen;` is U+2010, not ASCII `-`; do not decode it as a hyphen.
-        assert_eq!(html_entity_decode(b"a&hyphen;b"), b"a&hyphen;b");
+        assert_eq!(
+            apply(Transform::HtmlEntityDecode, b"&lt;script"),
+            b"<script"
+        );
+        assert_eq!(
+            apply(Transform::HtmlEntityDecode, b"&#60;script"),
+            b"<script"
+        );
+        assert_eq!(
+            apply(Transform::HtmlEntityDecode, b"&#x3c;script"),
+            b"<script"
+        );
+        assert_eq!(apply(Transform::HtmlEntityDecode, b"a&sol;b"), b"a/b");
+        // `&hyphen;` is U+2010 (E2 80 90), not ASCII `-`; Coraza decodes it to
+        // the Unicode hyphen.
+        assert_eq!(
+            apply(Transform::HtmlEntityDecode, b"a&hyphen;b"),
+            b"a\xe2\x80\x90b"
+        );
     }
 
     #[test]
@@ -1549,12 +1029,13 @@ mod tests {
     }
 
     #[test]
-    fn clean_path_matches_go_examples() {
-        assert_eq!(clean_path(b"/a/b/../c"), b"/a/c");
-        assert_eq!(clean_path(b"a//b/./c/"), b"a/b/c");
-        assert_eq!(clean_path(b""), b".");
-        assert_eq!(clean_path(b"/"), b"/");
-        assert_eq!(clean_path(b"../a"), b"../a");
+    fn clean_path_matches_coraza_quirks() {
+        assert_eq!(apply(Transform::NormalizePath, b"/a/b/../c"), b"/a/c");
+        assert_eq!(apply(Transform::NormalizePath, b"a//b/./c/"), b"a/b/c/");
+        assert_eq!(apply(Transform::NormalizePath, b""), b"");
+        // Coraza re-appends the trailing slash, so "/" becomes "//".
+        assert_eq!(apply(Transform::NormalizePath, b"/"), b"//");
+        assert_eq!(apply(Transform::NormalizePath, b"../a"), b"../a");
     }
 
     #[test]
@@ -1697,7 +1178,7 @@ mod tests {
         ];
         for transform in transforms {
             for sample in samples {
-                if transform.is_identity_for(sample) {
+                if transform.is_identity_on(sample) {
                     assert_eq!(
                         transform.apply(sample),
                         *sample,

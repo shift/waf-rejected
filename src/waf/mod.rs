@@ -26,6 +26,11 @@ pub mod wasm_reactor;
 #[cfg(feature = "allow-cache")]
 pub mod allow_cache;
 
+/// Shared, bounded, allocation-free transform pipeline used by the prefilter.
+/// Compiled for unit tests even without the feature so parity tests always run.
+#[cfg(any(feature = "crs-prefilter", feature = "fastpath", test))]
+pub mod transforms;
+
 /// Experimental required-literal prefilter for CRS request bodies. Non-default:
 /// it is an opt-in evaluation mode until the detection-parity corpus proves it.
 #[cfg(any(feature = "crs-prefilter", feature = "fastpath"))]

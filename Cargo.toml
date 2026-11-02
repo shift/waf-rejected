@@ -466,3 +466,9 @@ required-features = ["engine-kernel"]
 name = "engine-kernel-corpus"
 path = "src/bin/engine_kernel_corpus.rs"
 required-features = ["engine-kernel"]
+
+# Transform-pipeline latency and allocation harness (p50/p99, allocs/request).
+[[bin]]
+name = "transform-bench"
+path = "src/bin/transform_bench.rs"
+required-features = ["crs-prefilter"]
