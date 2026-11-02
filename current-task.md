@@ -783,3 +783,30 @@ sidecar without changing detection rules or defaults.
   control was 1.17-1.85x slower, proving the method detects codegen changes.
 - Consequence: no perf win to ship; the branch keeps the benchmark harness,
   the backtrace hardening, the docs' measured findings and the Criterion rows.
+
+---
+
+# Research: content-addressed allow-verdict cache (worktree `.worktrees/allow-cache`)
+
+**Branch:** `research/allow-cache`. **Feature:** `allow-cache` (non-default,
+opt-in via `[waf.allow_cache]`). **Status:** prototype complete, local
+verification done, not pushed.
+
+- [x] Canonical key: version + policy generation + method + exact URI + HTTP
+      version + sorted complete header multimap + body presence/size/bytes;
+      no lossy normalisation.
+- [x] Keyed SipHash-2-4 (128-bit) with a process-lifetime secret and
+      length-prefixed fields.
+- [x] Only `Allow` inserted; TTL, bounded sharded map, metrics, policy
+      invalidation.
+- [x] Integration after pre-checks/admission; stateful rules still run on a
+      hit; blocks never cached.
+- [x] Injectivity, smuggling/encoding/duplicate-header, TTL/eviction,
+      concurrency, parity and metrics tests.
+- [x] Replay benchmark (`examples/allow_cache_bench.rs`) and measured results.
+- [x] Docs `docs/suggestions_from_agents/allow-cache.md`, CHANGELOG Unreleased.
+- Verified: `cargo fmt -- --check`, `cargo test --lib --features
+  wasm-reactor,allow-cache` (365 passed), `cargo clippy --lib --features
+  wasm-reactor,allow-cache -- --deny warnings`.
+- Gap: native sidecar replay not measured in this session; wasm measured, hit
+  path is backend-independent. See the doc's Follow-ups.

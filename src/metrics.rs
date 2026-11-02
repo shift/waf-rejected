@@ -72,6 +72,13 @@ pub struct Metrics {
     graphql_allow_total: AtomicU64,
     graphql_block_total: AtomicU64,
     graphql_error_total: AtomicU64,
+    allow_cache_hits_total: AtomicU64,
+    allow_cache_misses_total: AtomicU64,
+    allow_cache_evictions_total: AtomicU64,
+    allow_cache_expired_total: AtomicU64,
+    allow_cache_skipped_total: AtomicU64,
+    allow_cache_invalidations_total: AtomicU64,
+    allow_cache_entries: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -136,6 +143,13 @@ impl Metrics {
             graphql_allow_total: AtomicU64::new(0),
             graphql_block_total: AtomicU64::new(0),
             graphql_error_total: AtomicU64::new(0),
+            allow_cache_hits_total: AtomicU64::new(0),
+            allow_cache_misses_total: AtomicU64::new(0),
+            allow_cache_evictions_total: AtomicU64::new(0),
+            allow_cache_expired_total: AtomicU64::new(0),
+            allow_cache_skipped_total: AtomicU64::new(0),
+            allow_cache_invalidations_total: AtomicU64::new(0),
+            allow_cache_entries: AtomicU64::new(0),
         }
     }
 
@@ -378,6 +392,48 @@ impl Metrics {
 
     pub fn record_graphql_error(&self) {
         self.graphql_error_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records one allow-verdict cache lookup that hit a live entry.
+    pub fn record_allow_cache_hit(&self) {
+        self.allow_cache_hits_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records one allow-verdict cache lookup that did not hit a live entry.
+    pub fn record_allow_cache_miss(&self) {
+        self.allow_cache_misses_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records one entry evicted because a shard was at capacity.
+    pub fn record_allow_cache_eviction(&self) {
+        self.allow_cache_evictions_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records one entry dropped because its TTL elapsed.
+    pub fn record_allow_cache_expired(&self) {
+        self.allow_cache_expired_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records one request the cache declined to key (for example an
+    /// over-cap body).
+    pub fn record_allow_cache_skipped(&self) {
+        self.allow_cache_skipped_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records one full cache invalidation (policy generation change).
+    pub fn record_allow_cache_invalidation(&self) {
+        self.allow_cache_invalidations_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Publishes the current number of live cache entries as a gauge.
+    pub fn set_allow_cache_entries(&self, entries: usize) {
+        self.allow_cache_entries
+            .store(entries.min(u64::MAX as usize) as u64, Ordering::Relaxed);
     }
 
     pub fn uptime_seconds(&self) -> u64 {
@@ -646,6 +702,37 @@ impl Metrics {
         out.push_str(&format!(
             "waf_request_duration_seconds_count {}\n",
             self.duration_count.load(Ordering::Relaxed)
+        ));
+
+        out.push_str(&format!(
+            "# HELP waf_allow_cache_hits_total Allow-verdict cache lookups that hit a live entry.\n\
+             # TYPE waf_allow_cache_hits_total counter\n\
+             waf_allow_cache_hits_total {}\n\
+             # HELP waf_allow_cache_misses_total Allow-verdict cache lookups that missed.\n\
+             # TYPE waf_allow_cache_misses_total counter\n\
+             waf_allow_cache_misses_total {}\n\
+             # HELP waf_allow_cache_evictions_total Allow-verdict cache entries evicted at capacity.\n\
+             # TYPE waf_allow_cache_evictions_total counter\n\
+             waf_allow_cache_evictions_total {}\n\
+             # HELP waf_allow_cache_expired_total Allow-verdict cache entries dropped after their TTL.\n\
+             # TYPE waf_allow_cache_expired_total counter\n\
+             waf_allow_cache_expired_total {}\n\
+             # HELP waf_allow_cache_skipped_total Requests the allow-verdict cache declined to key.\n\
+             # TYPE waf_allow_cache_skipped_total counter\n\
+             waf_allow_cache_skipped_total {}\n\
+             # HELP waf_allow_cache_invalidations_total Allow-verdict cache invalidations.\n\
+             # TYPE waf_allow_cache_invalidations_total counter\n\
+             waf_allow_cache_invalidations_total {}\n\
+             # HELP waf_allow_cache_entries Live allow-verdict cache entries.\n\
+             # TYPE waf_allow_cache_entries gauge\n\
+             waf_allow_cache_entries {}\n",
+            self.allow_cache_hits_total.load(Ordering::Relaxed),
+            self.allow_cache_misses_total.load(Ordering::Relaxed),
+            self.allow_cache_evictions_total.load(Ordering::Relaxed),
+            self.allow_cache_expired_total.load(Ordering::Relaxed),
+            self.allow_cache_skipped_total.load(Ordering::Relaxed),
+            self.allow_cache_invalidations_total.load(Ordering::Relaxed),
+            self.allow_cache_entries.load(Ordering::Relaxed),
         ));
 
         out.push_str(&format!(

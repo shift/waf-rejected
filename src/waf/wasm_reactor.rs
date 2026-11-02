@@ -1312,6 +1312,10 @@ impl WafRule for WasmReactorRule {
         &self.name
     }
 
+    fn cacheable(&self) -> bool {
+        true
+    }
+
     fn evaluate(&self, ctx: &RequestContext) -> Decision {
         let started = Instant::now();
         #[cfg(feature = "crs-prefilter")]

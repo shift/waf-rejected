@@ -372,6 +372,10 @@ impl WafRule for ContentInspectionRule {
         self.enabled
     }
 
+    fn cacheable(&self) -> bool {
+        true
+    }
+
     fn evaluate(&self, ctx: &RequestContext) -> Decision {
         if !self.enabled {
             return Decision::Allow;

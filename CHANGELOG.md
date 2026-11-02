@@ -21,6 +21,21 @@ All notable changes to WAF-Rejected are documented here.
   0 false negatives / 0 false positives on the 51-case corpus. Requires the
   non-default `crs-prefilter` feature; builds without it reject the config.
 
+- Experimental content-addressed allow-verdict cache (`allow-cache`,
+  non-default, opt-in via `[waf.allow_cache]`). It memoises only the `Allow`
+  verdict of pure content rules (the Coraza backend and the built-in content
+  inspector) for a short TTL; blocks and rate limits are never cached, and
+  stateful/IP-dependent rules (rate limits, GeoIP, size/method checks, custom
+  rules) still run on every hit. Keys are a length-prefixed canonical encoding
+  of method, exact URI, HTTP version, the complete sorted header multimap,
+  exact body bytes (capped), declared body size and a ruleset/policy generation
+  hash, hashed with keyed SipHash-2-4 (128-bit) under a process-lifetime
+  secret. Bounded sharded map with TTL, hit/miss/eviction/entry metrics, and
+  immediate invalidation on policy change. `WafRule::cacheable()` defaults to
+  `false`, so custom rules are never memoised. Design, injectivity argument,
+  threat model, measured replay results and disable conditions:
+  `docs/suggestions_from_agents/allow-cache.md`.
+
 - Experimental CRS required-literal prefilter (`crs-prefilter`, non-default).
   The offline `crs-prefilter-extract` tool parses the vendored CRS 4.14 rules
   and emits `rules/crs/prefilter.json` plus a coverage summary; the Rust

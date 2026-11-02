@@ -472,6 +472,53 @@ pub struct WafConfig {
 
     /// Admission control for expensive (CRS body) inspections.
     pub admission: WafAdmissionConfig,
+
+    /// Experimental content-addressed allow-verdict cache (`allow-cache`
+    /// feature). Disabled by default; see
+    /// `docs/suggestions_from_agents/allow-cache.md`.
+    pub allow_cache: AllowCacheConfig,
+}
+
+/// Opt-in allow-verdict cache.
+///
+/// The cache only memoises the verdict of pure content rules (the Coraza
+/// backend and the built-in content inspector) for requests that produced an
+/// `Allow`. Stateful and IP-dependent rules (rate limits, GeoIP, method and
+/// size checks) are always evaluated, including on a hit. Blocks are never
+/// cached.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AllowCacheConfig {
+    /// Enable the cache. Off by default; this is a research prototype.
+    pub enabled: bool,
+
+    /// Entry lifetime in seconds. Short by design so a policy or threat-feed
+    /// change is picked up quickly even without an explicit invalidation.
+    pub ttl_secs: u64,
+
+    /// Maximum number of cached verdicts across all shards.
+    pub max_entries: usize,
+
+    /// Bodies larger than this are evaluated but never cached, which bounds
+    /// key-construction cost.
+    pub max_body_bytes: usize,
+
+    /// Optional path prefixes the cache applies to. Empty means every route
+    /// when `enabled = true`. A prefix matches on a `/` boundary, so `/api`
+    /// matches `/api` and `/api/x` but not `/apix`.
+    pub routes: Vec<String>,
+}
+
+impl Default for AllowCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ttl_secs: 30,
+            max_entries: 8192,
+            max_body_bytes: 64 * 1024,
+            routes: Vec::new(),
+        }
+    }
 }
 
 /// Admission control for expensive inspections.
@@ -1487,6 +1534,7 @@ impl Default for WafConfig {
             grpc: WafGrpcConfig::default(),
             graphql: WafGraphqlConfig::default(),
             admission: WafAdmissionConfig::default(),
+            allow_cache: AllowCacheConfig::default(),
         }
     }
 }
@@ -1697,6 +1745,24 @@ impl Config {
         }
         if self.waf.admission.heavy_permits > 8 {
             anyhow::bail!("waf.admission.heavy_permits must be between 0 (auto) and 8");
+        }
+        if self.waf.allow_cache.enabled {
+            if self.waf.allow_cache.ttl_secs == 0 {
+                anyhow::bail!("waf.allow_cache.ttl_secs must be greater than zero");
+            }
+            if self.waf.allow_cache.max_entries == 0 {
+                anyhow::bail!("waf.allow_cache.max_entries must be greater than zero");
+            }
+            if self.waf.allow_cache.max_body_bytes == 0 {
+                anyhow::bail!("waf.allow_cache.max_body_bytes must be greater than zero");
+            }
+            for route in &self.waf.allow_cache.routes {
+                if !route.starts_with('/') {
+                    anyhow::bail!(
+                        "waf.allow_cache.routes entry '{route}' must be an absolute path prefix"
+                    );
+                }
+            }
         }
         self.waf.grpc.validate()?;
         self.waf.graphql.validate()?;

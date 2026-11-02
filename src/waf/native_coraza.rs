@@ -823,6 +823,10 @@ impl WafRule for NativeCorazaRule {
         &self.name
     }
 
+    fn cacheable(&self) -> bool {
+        true
+    }
+
     fn evaluate(&self, ctx: &RequestContext) -> Decision {
         #[allow(unused_mut)]
         let mut evaluation_ctx = ctx;

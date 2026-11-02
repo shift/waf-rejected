@@ -21,6 +21,10 @@ pub mod tls_config;
 #[cfg(feature = "wasm-reactor")]
 pub mod wasm_reactor;
 
+/// Experimental content-addressed allow-verdict cache (non-default feature).
+#[cfg(feature = "allow-cache")]
+pub mod allow_cache;
+
 /// Experimental required-literal prefilter for CRS request bodies. Non-default:
 /// it is an opt-in evaluation mode until the detection-parity corpus proves it.
 #[cfg(feature = "crs-prefilter")]
@@ -157,6 +161,16 @@ pub trait WafRule: Send + Sync {
     fn is_enabled(&self) -> bool {
         true
     }
+    /// Whether this rule's verdict is a pure function of the canonical request
+    /// content and may therefore be memoised by the experimental allow-verdict
+    /// cache.
+    ///
+    /// The safe default is `false`: custom and stateful rules always run, even
+    /// on a cache hit. Only the Coraza backend and the built-in content
+    /// inspector opt in.
+    fn cacheable(&self) -> bool {
+        false
+    }
 }
 
 /// Fail-closed placeholder used when a configured reactor cannot be loaded.
@@ -210,6 +224,9 @@ pub struct WafEngine {
     admission: AdmissionController,
     /// Shared runtime metrics, when the caller supplied them.
     metrics: Option<Arc<crate::metrics::Metrics>>,
+    /// Experimental content-addressed allow-verdict cache (`allow-cache`).
+    #[cfg(feature = "allow-cache")]
+    allow_cache: Option<Arc<allow_cache::AllowCache>>,
 }
 
 /// Result of the synchronous inspection stages.
@@ -285,6 +302,8 @@ impl Clone for WafEngine {
             ai_detector: self.ai_detector.clone(),
             admission: self.admission.clone(),
             metrics: self.metrics.clone(),
+            #[cfg(feature = "allow-cache")]
+            allow_cache: self.allow_cache.clone(),
         }
     }
 }
@@ -310,6 +329,8 @@ impl WafEngine {
             ai_detector: None,
             admission: AdmissionController::disabled(),
             metrics: None,
+            #[cfg(feature = "allow-cache")]
+            allow_cache: None,
         }
     }
 
@@ -354,6 +375,8 @@ impl WafEngine {
                 metrics.clone(),
             ),
             metrics,
+            #[cfg(feature = "allow-cache")]
+            allow_cache: None,
         };
 
         // gRPC is protocol-aware: validate the envelope before Coraza runs so
@@ -411,6 +434,40 @@ impl WafEngine {
 
         // Add default rules based on configuration
         engine.add_default_rules(config);
+
+        #[cfg(feature = "allow-cache")]
+        if config.waf.enabled && config.waf.allow_cache.enabled {
+            let key = allow_cache::Key::random();
+            let generation = {
+                let rules = engine.rules.read().unwrap();
+                allow_cache::policy_generation(
+                    &key,
+                    &config.waf,
+                    rules.iter().map(|rule| (rule.name(), rule.is_enabled())),
+                )
+            };
+            engine.allow_cache = Some(Arc::new(allow_cache::AllowCache::new(
+                &config.waf.allow_cache,
+                generation,
+                key,
+                engine.metrics.clone(),
+            )));
+            info!(
+                ttl_secs = config.waf.allow_cache.ttl_secs,
+                max_entries = config.waf.allow_cache.max_entries,
+                max_body_bytes = config.waf.allow_cache.max_body_bytes,
+                routes = ?config.waf.allow_cache.routes,
+                "Enabled experimental allow-verdict cache"
+            );
+        }
+
+        #[cfg(not(feature = "allow-cache"))]
+        if config.waf.allow_cache.enabled {
+            warn!(
+                "waf.allow_cache.enabled is set but this build was compiled without \
+                 the `allow-cache` feature; the cache stays disabled"
+            );
+        }
 
         engine
     }
@@ -706,6 +763,13 @@ impl WafEngine {
     fn add_rule_boxed(&mut self, rule: Box<dyn WafRule>) {
         let mut rules = self.rules.write().unwrap();
         rules.push(rule);
+        drop(rules);
+        // A rule-set change is a policy change: never serve an entry produced
+        // under the previous rule chain.
+        #[cfg(feature = "allow-cache")]
+        if let Some(cache) = &self.allow_cache {
+            cache.invalidate();
+        }
     }
 
     /// Outcome of the gRPC protocol pre-check.
@@ -989,6 +1053,18 @@ impl WafEngine {
     ///
     /// Returns the first blocking decision, or `Allow` when every rule passed.
     fn rules_core(&self, request: &RequestContext) -> CoreOutcome {
+        self.rules_core_filtered(request, false)
+    }
+
+    /// Rule-chain pass used by an allow-cache hit: pure content rules are
+    /// skipped because their `Allow` was memoised, while every stateful or
+    /// IP-dependent rule still runs.
+    #[cfg(feature = "allow-cache")]
+    fn rules_core_cache_hit(&self, request: &RequestContext) -> CoreOutcome {
+        self.rules_core_filtered(request, true)
+    }
+
+    fn rules_core_filtered(&self, request: &RequestContext, skip_cacheable: bool) -> CoreOutcome {
         let mut triggered_rules = Vec::new();
         {
             let rules = self.rules.read().unwrap();
@@ -1001,6 +1077,9 @@ impl WafEngine {
 
             for rule in rules.iter() {
                 if !rule.is_enabled() {
+                    continue;
+                }
+                if skip_cacheable && rule.cacheable() {
                     continue;
                 }
 
@@ -1046,6 +1125,38 @@ impl WafEngine {
         CoreOutcome::new(Decision::Allow, triggered_rules)
     }
 
+    /// Rule chain with the experimental allow-verdict cache in front.
+    ///
+    /// The cache is consulted after the protocol pre-checks and admission (the
+    /// callers acquire admission before this function), so a hit skips only
+    /// the pure content rules. A miss evaluates the full chain and inserts
+    /// only when the result is `Allow`; blocks and rate limits are never
+    /// stored. When the feature or configuration is off this is exactly
+    /// [`Self::rules_core`].
+    fn rules_with_cache(&self, request: &RequestContext) -> CoreOutcome {
+        #[cfg(feature = "allow-cache")]
+        if let Some(cache) = &self.allow_cache {
+            if cache.applies_to(&request.uri) {
+                match cache.build_key(request) {
+                    allow_cache::KeyBuild::Key(key) => {
+                        if cache.get(key) {
+                            return self.rules_core_cache_hit(request);
+                        }
+                        let outcome = self.rules_core(request);
+                        if outcome.decision == Decision::Allow {
+                            cache.insert(key);
+                        }
+                        return outcome;
+                    }
+                    allow_cache::KeyBuild::NotCacheable(reason) => {
+                        cache.record_skipped(reason);
+                    }
+                }
+            }
+        }
+        self.rules_core(request)
+    }
+
     /// The complete synchronous inspection: pre-checks, the initialisation
     /// gate and the rule chain.
     ///
@@ -1064,7 +1175,7 @@ impl WafEngine {
             return outcome;
         }
 
-        self.rules_core(request)
+        self.rules_with_cache(request)
     }
 
     /// Fast evaluation for performance-critical paths.
@@ -1096,7 +1207,7 @@ impl WafEngine {
             debug!("Skipping WASM evaluation for fast path (performance optimization)");
         }
 
-        let outcome = self.rules_core(request);
+        let outcome = self.rules_with_cache(request);
         drop(guard);
 
         // Even the fast path must produce an audit event for blocks.
@@ -1324,7 +1435,7 @@ impl WafEngine {
         }
 
         // PHASE 3: Traditional rule evaluation
-        self.rules_core(request)
+        self.rules_with_cache(request)
     }
 
     #[cfg(feature = "wasm-waf")]
@@ -1385,6 +1496,21 @@ impl WafEngine {
             .iter()
             .filter(|r| r.is_enabled())
             .count()
+    }
+
+    /// The experimental allow-verdict cache, when the `allow-cache` feature is
+    /// compiled in and `waf.allow_cache.enabled` is true.
+    #[cfg(feature = "allow-cache")]
+    pub fn allow_cache(&self) -> Option<&Arc<allow_cache::AllowCache>> {
+        self.allow_cache.as_ref()
+    }
+
+    /// Invalidate every allow-cache entry and move to a new policy generation.
+    #[cfg(feature = "allow-cache")]
+    pub fn invalidate_allow_cache(&self) {
+        if let Some(cache) = &self.allow_cache {
+            cache.invalidate();
+        }
     }
 }
 
@@ -2721,5 +2847,325 @@ mod tests {
             .expect("spawn reactor thread")
             .join()
             .expect("reactor thread must not panic");
+    }
+
+    #[cfg(feature = "allow-cache")]
+    mod allow_cache_integration {
+        use super::*;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct CacheableContentRule {
+            name: &'static str,
+            evaluations: Arc<AtomicUsize>,
+            block_marker: &'static str,
+        }
+
+        impl CacheableContentRule {
+            fn new(
+                name: &'static str,
+                evaluations: Arc<AtomicUsize>,
+                block_marker: &'static str,
+            ) -> Self {
+                Self {
+                    name,
+                    evaluations,
+                    block_marker,
+                }
+            }
+        }
+
+        impl WafRule for CacheableContentRule {
+            fn name(&self) -> &str {
+                self.name
+            }
+
+            fn cacheable(&self) -> bool {
+                true
+            }
+
+            fn evaluate(&self, ctx: &RequestContext) -> Decision {
+                self.evaluations.fetch_add(1, Ordering::SeqCst);
+                let body_hit = ctx
+                    .body
+                    .as_deref()
+                    .is_some_and(|body| String::from_utf8_lossy(body).contains(self.block_marker));
+                if body_hit || ctx.uri.to_string().contains(self.block_marker) {
+                    Decision::Block {
+                        status: 403,
+                        reason: format!("marker {} found", self.block_marker),
+                    }
+                } else {
+                    Decision::Allow
+                }
+            }
+        }
+
+        struct StatefulRule {
+            name: &'static str,
+            evaluations: Arc<AtomicUsize>,
+            block: Arc<AtomicBool>,
+        }
+
+        impl StatefulRule {
+            fn new(name: &'static str, evaluations: Arc<AtomicUsize>) -> Self {
+                Self {
+                    name,
+                    evaluations,
+                    block: Arc::new(AtomicBool::new(false)),
+                }
+            }
+        }
+
+        impl WafRule for StatefulRule {
+            fn name(&self) -> &str {
+                self.name
+            }
+
+            fn evaluate(&self, _ctx: &RequestContext) -> Decision {
+                self.evaluations.fetch_add(1, Ordering::SeqCst);
+                if self.block.load(Ordering::SeqCst) {
+                    Decision::RateLimit {
+                        reason: "stateful limit".to_string(),
+                    }
+                } else {
+                    Decision::Allow
+                }
+            }
+        }
+
+        fn cache_engine(
+            enabled: bool,
+            ttl_secs: u64,
+            routes: Vec<String>,
+            max_body_bytes: usize,
+        ) -> WafEngine {
+            let mut config = crate::config::Config::default();
+            config.waf.coraza.enabled = false;
+            config.waf.content_inspection.enabled = false;
+            config.waf.rate_limit.per_ip_enabled = false;
+            config.waf.rate_limit.global_enabled = false;
+            config.waf.geo_blocking.enabled = false;
+            config.waf.allow_cache.enabled = enabled;
+            config.waf.allow_cache.ttl_secs = ttl_secs;
+            config.waf.allow_cache.max_entries = 64;
+            config.waf.allow_cache.max_body_bytes = max_body_bytes;
+            config.waf.allow_cache.routes = routes;
+            WafEngine::with_config(&config)
+        }
+
+        fn post_context(body: &str) -> RequestContext {
+            RequestContext::new(
+                IpAddr::from_str("192.168.1.100").unwrap(),
+                Method::POST,
+                Uri::from_str("/submit").unwrap(),
+                HeaderMap::new(),
+                Some(body.len()),
+            )
+            .with_body(Some(Bytes::copy_from_slice(body.as_bytes())))
+        }
+
+        #[tokio::test]
+        async fn hit_skips_cacheable_rules_but_runs_stateful_rules() {
+            let mut engine = cache_engine(true, 30, Vec::new(), 1024);
+            let cacheable = Arc::new(AtomicUsize::new(0));
+            let stateful = Arc::new(AtomicUsize::new(0));
+            engine.add_rule(CacheableContentRule::new(
+                "cacheable-allow",
+                Arc::clone(&cacheable),
+                "never-present",
+            ));
+            engine.add_rule(StatefulRule::new("stateful", Arc::clone(&stateful)));
+
+            let request = create_test_context();
+            assert_eq!(engine.evaluate(&request).await, Decision::Allow);
+            assert_eq!(cacheable.load(Ordering::SeqCst), 1);
+            assert_eq!(stateful.load(Ordering::SeqCst), 1);
+
+            assert_eq!(engine.evaluate(&request).await, Decision::Allow);
+            assert_eq!(
+                cacheable.load(Ordering::SeqCst),
+                1,
+                "cache hit must skip the pure content rule"
+            );
+            assert_eq!(
+                stateful.load(Ordering::SeqCst),
+                2,
+                "stateful rules must run on every request"
+            );
+            assert_eq!(engine.allow_cache().unwrap().stats().hits, 1);
+        }
+
+        #[tokio::test]
+        async fn cache_hit_cannot_bypass_a_stateful_block() {
+            let mut engine = cache_engine(true, 30, Vec::new(), 1024);
+            let cacheable = Arc::new(AtomicUsize::new(0));
+            let stateful = Arc::new(AtomicUsize::new(0));
+            engine.add_rule(CacheableContentRule::new(
+                "cacheable-allow",
+                Arc::clone(&cacheable),
+                "never-present",
+            ));
+            let rule = StatefulRule::new("stateful", Arc::clone(&stateful));
+            let block = Arc::clone(&rule.block);
+            engine.add_rule(rule);
+
+            let request = create_test_context();
+            assert_eq!(engine.evaluate(&request).await, Decision::Allow);
+            block.store(true, Ordering::SeqCst);
+            assert!(matches!(
+                engine.evaluate(&request).await,
+                Decision::RateLimit { .. }
+            ));
+            assert_eq!(cacheable.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn blocks_are_never_cached() {
+            let mut engine = cache_engine(true, 30, Vec::new(), 1024);
+            let cacheable = Arc::new(AtomicUsize::new(0));
+            engine.add_rule(CacheableContentRule::new(
+                "cacheable-block",
+                Arc::clone(&cacheable),
+                "attack",
+            ));
+
+            let request = post_context("data=attack");
+            assert!(matches!(
+                engine.evaluate(&request).await,
+                Decision::Block { status: 403, .. }
+            ));
+            assert!(matches!(
+                engine.evaluate(&request).await,
+                Decision::Block { status: 403, .. }
+            ));
+            assert_eq!(
+                cacheable.load(Ordering::SeqCst),
+                2,
+                "a block must never be memoised"
+            );
+            assert_eq!(engine.allow_cache().unwrap().stats().entries, 0);
+        }
+
+        #[tokio::test]
+        async fn policy_invalidation_forces_re_evaluation() {
+            let mut engine = cache_engine(true, 30, Vec::new(), 1024);
+            let cacheable = Arc::new(AtomicUsize::new(0));
+            engine.add_rule(CacheableContentRule::new(
+                "cacheable-allow",
+                Arc::clone(&cacheable),
+                "never-present",
+            ));
+
+            let request = create_test_context();
+            assert_eq!(engine.evaluate(&request).await, Decision::Allow);
+            engine.invalidate_allow_cache();
+            assert_eq!(engine.evaluate(&request).await, Decision::Allow);
+            assert_eq!(cacheable.load(Ordering::SeqCst), 2);
+        }
+
+        #[tokio::test]
+        async fn route_opt_in_leaves_other_paths_uncached() {
+            let mut engine = cache_engine(true, 30, vec!["/api".to_string()], 1024);
+            let cacheable = Arc::new(AtomicUsize::new(0));
+            engine.add_rule(CacheableContentRule::new(
+                "cacheable-allow",
+                Arc::clone(&cacheable),
+                "never-present",
+            ));
+
+            let outside = create_test_context();
+            assert_eq!(engine.evaluate(&outside).await, Decision::Allow);
+            assert_eq!(engine.evaluate(&outside).await, Decision::Allow);
+            assert_eq!(cacheable.load(Ordering::SeqCst), 2);
+
+            let mut inside = create_test_context();
+            inside.uri = Uri::from_str("/api/items").unwrap();
+            assert_eq!(engine.evaluate(&inside).await, Decision::Allow);
+            assert_eq!(engine.evaluate(&inside).await, Decision::Allow);
+            assert_eq!(cacheable.load(Ordering::SeqCst), 3);
+        }
+
+        #[tokio::test]
+        async fn over_cap_bodies_are_evaluated_but_not_cached() {
+            let mut engine = cache_engine(true, 30, Vec::new(), 4);
+            let cacheable = Arc::new(AtomicUsize::new(0));
+            engine.add_rule(CacheableContentRule::new(
+                "cacheable-allow",
+                Arc::clone(&cacheable),
+                "never-present",
+            ));
+
+            let request = post_context("data=12345");
+            assert_eq!(engine.evaluate(&request).await, Decision::Allow);
+            assert_eq!(engine.evaluate(&request).await, Decision::Allow);
+            assert_eq!(cacheable.load(Ordering::SeqCst), 2);
+            let stats = engine.allow_cache().unwrap().stats();
+            assert_eq!(stats.entries, 0);
+            assert_eq!(stats.skipped, 2);
+        }
+
+        #[tokio::test]
+        async fn decision_parity_with_the_uncached_engine() {
+            let mut cached = cache_engine(true, 30, Vec::new(), 1024);
+            let mut uncached = cache_engine(false, 30, Vec::new(), 1024);
+            for engine in [&mut cached, &mut uncached] {
+                engine.add_rule(CacheableContentRule::new(
+                    "cacheable-content",
+                    Arc::new(AtomicUsize::new(0)),
+                    "attack",
+                ));
+                engine.add_rule(StatefulRule::new("stateful", Arc::new(AtomicUsize::new(0))));
+            }
+
+            let requests = vec![
+                create_test_context(),
+                post_context("data=benign"),
+                post_context("data=attack"),
+                post_context("data="),
+            ];
+
+            for request in &requests {
+                for _ in 0..3 {
+                    assert_eq!(
+                        cached.evaluate(request).await,
+                        uncached.evaluate(request).await,
+                        "cached and fresh decisions diverged for {:?}",
+                        request.uri
+                    );
+                }
+            }
+            assert!(
+                cached.allow_cache().unwrap().stats().hits > 0,
+                "the parity corpus must exercise at least one hit"
+            );
+        }
+
+        #[tokio::test]
+        async fn cache_metrics_are_exported() {
+            let metrics = Arc::new(crate::metrics::Metrics::new());
+            let mut config = crate::config::Config::default();
+            config.waf.coraza.enabled = false;
+            config.waf.content_inspection.enabled = false;
+            config.waf.rate_limit.per_ip_enabled = false;
+            config.waf.rate_limit.global_enabled = false;
+            config.waf.allow_cache.enabled = true;
+            config.waf.allow_cache.max_entries = 64;
+            let mut engine =
+                WafEngine::with_config_and_metrics(&config, Some(Arc::clone(&metrics)));
+            engine.add_rule(CacheableContentRule::new(
+                "cacheable-allow",
+                Arc::new(AtomicUsize::new(0)),
+                "never-present",
+            ));
+
+            let request = create_test_context();
+            assert_eq!(engine.evaluate(&request).await, Decision::Allow);
+            assert_eq!(engine.evaluate(&request).await, Decision::Allow);
+
+            let rendered = metrics.render_prometheus();
+            assert!(rendered.contains("waf_allow_cache_hits_total 1"));
+            assert!(rendered.contains("waf_allow_cache_misses_total 1"));
+            assert!(rendered.contains("waf_allow_cache_entries 1"));
+        }
     }
 }
