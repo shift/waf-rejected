@@ -331,6 +331,12 @@ impl NativeCorazaClient {
     }
 }
 
+impl crate::waf::grpc::GrpcContentScanner for NativeCorazaClient {
+    fn scan(&self, payload: &[u8]) -> Result<Decision, String> {
+        self.evaluate(payload).map_err(|error| error.to_string())
+    }
+}
+
 fn preflight(path: &Path) -> Result<(), NativeCorazaError> {
     std::os::unix::net::UnixStream::connect(path)
         .map(|_| ())
@@ -347,7 +353,7 @@ fn preflight(path: &Path) -> Result<(), NativeCorazaError> {
 /// closed with `503` when evaluation cannot be completed.
 pub struct NativeCorazaRule {
     name: String,
-    client: NativeCorazaClient,
+    client: Arc<NativeCorazaClient>,
     metrics: Option<Arc<Metrics>>,
     fail_closed: bool,
     body_policy: BodyInspectionPolicy,
@@ -358,11 +364,17 @@ impl NativeCorazaRule {
     pub fn new(name: impl Into<String>, client: NativeCorazaClient) -> Self {
         Self {
             name: name.into(),
-            client,
+            client: Arc::new(client),
             metrics: None,
             fail_closed: true,
             body_policy: BodyInspectionPolicy::default(),
         }
+    }
+
+    /// Returns the shared sidecar client, for direct (non-recursive)
+    /// evaluations such as gRPC field-content scanning.
+    pub fn client(&self) -> Arc<NativeCorazaClient> {
+        Arc::clone(&self.client)
     }
 
     /// Attaches process metrics so sidecar evaluations are observable.

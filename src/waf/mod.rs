@@ -62,6 +62,12 @@ use crate::config::Config;
 #[cfg(feature = "wasm-waf")]
 use crate::wasm::{SecurityDecision as WasmDecision, WasmEngine, WasmRequestContext};
 
+/// Direct Coraza backend handle used for gRPC field-content scanning.
+#[cfg(feature = "wasm-reactor")]
+type GrpcContentScannerHandle = Arc<dyn grpc::GrpcContentScanner>;
+#[cfg(not(feature = "wasm-reactor"))]
+type GrpcContentScannerHandle = ();
+
 /// WAF decision on how to handle a request
 #[derive(Debug, Clone, PartialEq)]
 pub enum Decision {
@@ -317,6 +323,10 @@ impl WafEngine {
         if config.waf.enabled && config.waf.coraza.enabled && config.waf.grpc.enabled {
             match grpc::GrpcInspector::try_from_config(&config.waf.grpc) {
                 Ok(inspector) => {
+                    let inspector = match &engine.metrics {
+                        Some(metrics) => inspector.with_metrics(Arc::clone(metrics)),
+                        None => inspector,
+                    };
                     engine.grpc_inspector = Some(inspector);
                     info!("Enabled protocol-aware gRPC inspection");
                 }
@@ -351,7 +361,14 @@ impl WafEngine {
 
         // The Coraza reactor must run before the traditional heuristics.
         #[cfg(any(feature = "wasm-reactor", feature = "coraza-native"))]
-        engine.add_coraza_rule(config);
+        let content_scanner = engine.add_coraza_rule(config);
+
+        // gRPC field-content scanning reuses the same backend directly. It is
+        // attached after the Coraza rule so no second reactor is compiled.
+        #[cfg(feature = "wasm-reactor")]
+        if let (Some(inspector), Some(scanner)) = (engine.grpc_inspector.take(), content_scanner) {
+            engine.grpc_inspector = Some(inspector.with_content_scanner(scanner));
+        }
 
         // Add default rules based on configuration
         engine.add_default_rules(config);
@@ -360,9 +377,9 @@ impl WafEngine {
     }
 
     #[cfg(any(feature = "wasm-reactor", feature = "coraza-native"))]
-    fn add_coraza_rule(&mut self, config: &Config) {
+    fn add_coraza_rule(&mut self, config: &Config) -> Option<GrpcContentScannerHandle> {
         if !config.waf.enabled || !config.waf.coraza.enabled {
-            return;
+            return None;
         }
 
         if config.waf.coraza.oversize_action != crate::config::CorazaOversizeAction::InspectAll {
@@ -381,11 +398,12 @@ impl WafEngine {
             crate::config::CorazaBackend::Wasm => {
                 wasm_reactor::WasmReactorRule::from_config(&config.waf.coraza, self.fail_closed)
                     .map(|rule| {
+                        let scanner: GrpcContentScannerHandle = rule.reactor();
                         let rule = match &self.metrics {
                             Some(metrics) => rule.with_metrics(Arc::clone(metrics)),
                             None => rule,
                         };
-                        Box::new(rule) as Box<dyn WafRule>
+                        (Box::new(rule) as Box<dyn WafRule>, Some(scanner))
                     })
                     .map_err(|err| err.to_string())
             }
@@ -398,11 +416,15 @@ impl WafEngine {
             crate::config::CorazaBackend::Native => {
                 native_coraza::NativeCorazaRule::from_config(&config.waf.coraza, self.fail_closed)
                     .map(|rule| {
+                        #[cfg(feature = "wasm-reactor")]
+                        let scanner: GrpcContentScannerHandle = rule.client();
+                        #[cfg(not(feature = "wasm-reactor"))]
+                        let scanner: GrpcContentScannerHandle = ();
                         let rule = match &self.metrics {
                             Some(metrics) => rule.with_metrics(Arc::clone(metrics)),
                             None => rule,
                         };
-                        Box::new(rule) as Box<dyn WafRule>
+                        (Box::new(rule) as Box<dyn WafRule>, Some(scanner))
                     })
                     .map_err(|err| err.to_string())
             }
@@ -414,9 +436,10 @@ impl WafEngine {
         };
 
         match result {
-            Ok(rule) => {
+            Ok((rule, scanner)) => {
                 info!(backend = ?backend, "Added Coraza backend as the first WAF rule");
                 self.add_rule_boxed(rule);
+                return scanner;
             }
             Err(err) => {
                 warn!(backend = ?backend, error = %err, "failed to initialise Coraza backend");
@@ -436,6 +459,7 @@ impl WafEngine {
                 }
             }
         }
+        None
     }
 
     /// Records a start-up failure, keeping earlier ones so the operator sees

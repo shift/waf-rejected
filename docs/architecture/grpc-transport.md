@@ -64,13 +64,28 @@ because they bind local ports and generate certificates).
 | Streaming request (no `content-length`) | HTTP/2 + ALPN h2 | Relayed frame by frame; request and response trailers preserved |
 | Malformed frame (truncated prefix) | HTTP/2 + ALPN h2 | `400` before the upstream is called |
 | Oversized frame | HTTP/2 + ALPN h2 | `413` before the upstream is called |
-| SQLi/XSS text in a declared protobuf string field | HTTP/2 + ALPN h2 | Allowed: descriptor field policy is structural (length/UTF-8/unknown-field/enum), not content matching |
+| SQLi/XSS text in a declared protobuf string field | HTTP/2 + ALPN h2 | `403` (or gRPC-aware rejection): decoded field content is scanned by Coraza via a synthetic form payload |
+| Benign text in a declared protobuf string field | HTTP/2 + ALPN h2 | Allowed; `grpc-status: 0` |
+| SQLi text with `waf.grpc.content_scan = "off"` | HTTP/2 + ALPN h2 | Allowed: structural-only behaviour preserved |
 | SQLi text in an undeclared field with `reject_unknown_fields` | HTTP/2 + ALPN h2 | `400` by descriptor policy |
 | gRPC-Web binary framing | HTTP/1.1 + ALPN http/1.1 | Body-encoded trailer frame forwarded unchanged |
 
 Malformed and oversized frames are client errors: the gRPC inspector maps
 `FrameError::status()` (`400`/`413`) directly instead of taking the fail-closed
 `503` inspection-error path.
+
+## Field-content scanning
+
+After structural protobuf validation, the inspector collects decoded `string`
+and UTF-8 `bytes` values (bounded by `waf.grpc.max_content_scan_bytes`, default
+64 KiB) and evaluates them through the same Coraza backend as a synthetic
+`application/x-www-form-urlencoded` request with URI
+`/__grpc__/package.Service/Method`. The raw protobuf body is never sent to CRS.
+The direct backend call bypasses the gRPC pre-check, so there is no recursion.
+A block is returned as `403` (or a gRPC-aware rejection when
+`server.grpc_aware_rejections = true`) with the field paths in the reason.
+`waf.grpc.content_scan = "off"` disables the extra evaluation. See
+[gRPC inspection](../grpc-inspection.md#field-content-scanning).
 
 ## gRPC-aware rejections
 

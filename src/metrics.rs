@@ -62,6 +62,8 @@ pub struct Metrics {
     grpc_allow_total: AtomicU64,
     grpc_block_total: AtomicU64,
     grpc_error_total: AtomicU64,
+    grpc_content_scan_total: AtomicU64,
+    grpc_content_block_total: AtomicU64,
     graphql_allow_total: AtomicU64,
     graphql_block_total: AtomicU64,
     graphql_error_total: AtomicU64,
@@ -119,6 +121,8 @@ impl Metrics {
             grpc_allow_total: AtomicU64::new(0),
             grpc_block_total: AtomicU64::new(0),
             grpc_error_total: AtomicU64::new(0),
+            grpc_content_scan_total: AtomicU64::new(0),
+            grpc_content_block_total: AtomicU64::new(0),
             graphql_allow_total: AtomicU64::new(0),
             graphql_block_total: AtomicU64::new(0),
             graphql_error_total: AtomicU64::new(0),
@@ -323,6 +327,17 @@ impl Metrics {
         self.grpc_error_total.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records one gRPC field-content scan (one synthetic evaluation).
+    pub fn record_grpc_content_scan(&self) {
+        self.grpc_content_scan_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records one gRPC request blocked by field-content scanning.
+    pub fn record_grpc_content_block(&self) {
+        self.grpc_content_block_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn record_graphql_allow(&self) {
         self.graphql_allow_total.fetch_add(1, Ordering::Relaxed);
     }
@@ -477,6 +492,12 @@ impl Metrics {
              waf_grpc_decisions_total{{decision=\"allow\"}} {}\n\
              waf_grpc_decisions_total{{decision=\"block\"}} {}\n\
              waf_grpc_decisions_total{{decision=\"error\"}} {}\n\
+             # HELP waf_grpc_content_scans_total gRPC field-content scans sent to Coraza.\n\
+             # TYPE waf_grpc_content_scans_total counter\n\
+             waf_grpc_content_scans_total {}\n\
+             # HELP waf_grpc_content_blocks_total gRPC requests blocked by field-content scanning.\n\
+             # TYPE waf_grpc_content_blocks_total counter\n\
+             waf_grpc_content_blocks_total {}\n\
              # HELP waf_graphql_decisions_total GraphQL protocol pre-check decisions by outcome.\n\
              # TYPE waf_graphql_decisions_total counter\n\
              waf_graphql_decisions_total{{decision=\"allow\"}} {}\n\
@@ -485,6 +506,8 @@ impl Metrics {
             self.grpc_allow_total.load(Ordering::Relaxed),
             self.grpc_block_total.load(Ordering::Relaxed),
             self.grpc_error_total.load(Ordering::Relaxed),
+            self.grpc_content_scan_total.load(Ordering::Relaxed),
+            self.grpc_content_block_total.load(Ordering::Relaxed),
             self.graphql_allow_total.load(Ordering::Relaxed),
             self.graphql_block_total.load(Ordering::Relaxed),
             self.graphql_error_total.load(Ordering::Relaxed),

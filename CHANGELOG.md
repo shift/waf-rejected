@@ -6,6 +6,18 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Added
 
+- gRPC field-content scanning. Decoded `string` and UTF-8 `bytes` values are
+  evaluated by the configured Coraza backend as a synthetic
+  `application/x-www-form-urlencoded` request (URI
+  `/__grpc__/package.Service/Method`), so SQLi/XSS text inside a structurally
+  valid field is blocked without sending raw protobuf to CRS. Bounded by
+  `waf.grpc.max_content_scan_bytes` (default 64 KiB) and controlled by
+  `waf.grpc.content_scan = "off" | "strings"` (default `strings`). Blocks
+  include the field path in the reason and honour
+  `server.grpc_aware_rejections`. New metrics
+  `waf_grpc_content_scans_total` and `waf_grpc_content_blocks_total`. See
+  `docs/grpc-inspection.md`.
+
 - Production observability for the Coraza, admission, gRPC and GraphQL
   subsystems. New Grafana dashboard
   `infrastructure/monitoring/dashboards/waf-overview.json`, expanded

@@ -87,6 +87,15 @@ impl std::fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
+/// A decoded string/bytes value collected for content inspection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectedField {
+    /// Fully-qualified field path (for example `pkg.Request.name`).
+    pub path: String,
+    /// UTF-8 value, truncated to the remaining content-scan budget.
+    pub value: Vec<u8>,
+}
+
 /// Decodes `payload` as `input_type` and enforces field policy.
 ///
 /// Callers must only invoke this when the descriptor contains `input_type`;
@@ -97,16 +106,56 @@ pub fn decode_message(
     messages: &HashMap<String, GrpcMessage>,
     limits: &DecodeLimits,
 ) -> Result<(), DecodeError> {
+    decode_message_inner(payload, input_type, messages, limits, false, 0).map(|_| ())
+}
+
+/// Decodes `payload` and collects UTF-8 string/bytes values for content
+/// scanning, up to `max_content_bytes` in total.
+///
+/// Structural validation always covers the whole message; only collection is
+/// bounded. Values are truncated deterministically at a UTF-8 boundary once
+/// the budget is exhausted. Binary `bytes` values that are not valid UTF-8
+/// are not collected.
+pub fn decode_message_collect(
+    payload: &[u8],
+    input_type: &str,
+    messages: &HashMap<String, GrpcMessage>,
+    limits: &DecodeLimits,
+    max_content_bytes: usize,
+) -> Result<Vec<CollectedField>, DecodeError> {
+    decode_message_inner(
+        payload,
+        input_type,
+        messages,
+        limits,
+        true,
+        max_content_bytes,
+    )
+}
+
+fn decode_message_inner(
+    payload: &[u8],
+    input_type: &str,
+    messages: &HashMap<String, GrpcMessage>,
+    limits: &DecodeLimits,
+    collect: bool,
+    max_content_bytes: usize,
+) -> Result<Vec<CollectedField>, DecodeError> {
     let Some(message) = messages.get(input_type) else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let mut decoder = Decoder {
         cursor: Cursor::new(payload),
         messages,
         limits,
         decoded_fields: 0,
+        collect,
+        content_limit: max_content_bytes,
+        content_bytes: 0,
+        content: Vec::new(),
     };
-    decoder.decode_at(message, input_type, 0)
+    decoder.decode_at(message, input_type, 0)?;
+    Ok(decoder.content)
 }
 
 struct Decoder<'a> {
@@ -114,6 +163,10 @@ struct Decoder<'a> {
     messages: &'a HashMap<String, GrpcMessage>,
     limits: &'a DecodeLimits,
     decoded_fields: usize,
+    collect: bool,
+    content_limit: usize,
+    content_bytes: usize,
+    content: Vec<CollectedField>,
 }
 
 impl<'a> Decoder<'a> {
@@ -260,6 +313,7 @@ impl<'a> Decoder<'a> {
                 if self.limits.validate_strings {
                     validate_string(value, path)?;
                 }
+                self.collect_value(path, value);
             }
             "bytes" => {
                 let value = self.length_delimited(path)?;
@@ -272,6 +326,10 @@ impl<'a> Decoder<'a> {
                             self.limits.max_bytes_len
                         ),
                     });
+                }
+                // Binary bytes are not text: only valid UTF-8 is collected.
+                if std::str::from_utf8(value).is_ok() {
+                    self.collect_value(path, value);
                 }
             }
             "message" => {
@@ -293,9 +351,15 @@ impl<'a> Decoder<'a> {
                             messages: self.messages,
                             limits: self.limits,
                             decoded_fields: self.decoded_fields,
+                            collect: self.collect,
+                            content_limit: self.content_limit.saturating_sub(self.content_bytes),
+                            content_bytes: 0,
+                            content: Vec::new(),
                         };
                         let result = child.decode_at(nested, &child_path, depth + 1);
                         self.decoded_fields = child.decoded_fields;
+                        self.content_bytes = self.content_bytes.saturating_add(child.content_bytes);
+                        self.content.extend(child.content);
                         return result;
                     }
                 }
@@ -327,6 +391,26 @@ impl<'a> Decoder<'a> {
             }
         }
         Ok(())
+    }
+
+    fn collect_value(&mut self, path: &str, value: &[u8]) {
+        if !self.collect || self.content_bytes >= self.content_limit {
+            return;
+        }
+        let remaining = self.content_limit - self.content_bytes;
+        let take = value.len().min(remaining);
+        let mut slice = &value[..take];
+        if let Err(error) = std::str::from_utf8(slice) {
+            slice = &slice[..error.valid_up_to()];
+        }
+        if slice.is_empty() {
+            return;
+        }
+        self.content_bytes += slice.len();
+        self.content.push(CollectedField {
+            path: path.to_string(),
+            value: slice.to_vec(),
+        });
     }
 
     fn length_delimited(&mut self, path: &str) -> Result<&'a [u8], DecodeError> {

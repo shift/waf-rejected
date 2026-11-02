@@ -831,6 +831,17 @@ pub struct WafGrpcConfig {
 
     /// Validate string values (UTF-8, NUL and control characters).
     pub validate_strings: bool,
+
+    /// Content scanning of decoded string/bytes fields: `off` or `strings`.
+    /// `strings` (the default) sends the decoded field values to the Coraza
+    /// backend as a synthetic form payload; `off` keeps the structural-only
+    /// behaviour.
+    pub content_scan: String,
+
+    /// Maximum number of decoded field bytes included in one synthetic
+    /// content-scan payload. Values beyond the cap are truncated
+    /// deterministically.
+    pub max_content_scan_bytes: usize,
 }
 
 impl Default for WafGrpcConfig {
@@ -849,11 +860,18 @@ impl Default for WafGrpcConfig {
             max_decoded_fields: 100_000,
             reject_unknown_fields: false,
             validate_strings: true,
+            content_scan: "strings".to_string(),
+            max_content_scan_bytes: 64 * 1024,
         }
     }
 }
 
 impl WafGrpcConfig {
+    /// Whether decoded field content is scanned by the Coraza backend.
+    pub fn content_scan_enabled(&self) -> bool {
+        self.content_scan == "strings"
+    }
+
     /// Resolved unknown-method policy. An empty allowlist is monitor-only.
     pub fn unknown_method_action(&self) -> &str {
         match self.unknown_method_action.as_deref() {
@@ -891,6 +909,15 @@ impl WafGrpcConfig {
         }
         if self.max_decoded_fields == 0 {
             anyhow::bail!("waf.grpc.max_decoded_fields must be greater than zero");
+        }
+        if self.content_scan != "off" && self.content_scan != "strings" {
+            anyhow::bail!(
+                "waf.grpc.content_scan must be 'off' or 'strings', got '{}'",
+                self.content_scan
+            );
+        }
+        if self.max_content_scan_bytes == 0 {
+            anyhow::bail!("waf.grpc.max_content_scan_bytes must be greater than zero");
         }
         if let Some(action) = self.unknown_method_action.as_deref() {
             if action != "allow" && action != "block" {
@@ -1994,8 +2021,22 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
         assert_eq!(config.waf.grpc.max_decoded_fields, 100_000);
         assert!(!config.waf.grpc.reject_unknown_fields);
         assert!(config.waf.grpc.validate_strings);
+        assert_eq!(config.waf.grpc.content_scan, "strings");
+        assert_eq!(config.waf.grpc.max_content_scan_bytes, 64 * 1024);
+        assert!(config.waf.grpc.content_scan_enabled());
         assert_eq!(config.waf.grpc.unknown_method_action(), "allow");
         assert!(config.validate().is_ok());
+
+        config.waf.grpc.content_scan = "off".to_string();
+        assert!(!config.waf.grpc.content_scan_enabled());
+        assert!(config.validate().is_ok());
+
+        config.waf.grpc.content_scan = "everything".to_string();
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.waf.grpc.max_content_scan_bytes = 0;
+        assert!(config.validate().is_err());
 
         config.waf.grpc.max_message_bytes = 0;
         assert!(config.validate().is_err());

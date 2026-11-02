@@ -1073,6 +1073,16 @@ impl WasmReactor {
     }
 }
 
+impl crate::waf::grpc::GrpcContentScanner for WasmReactor {
+    fn scan(&self, payload: &[u8]) -> Result<Decision, String> {
+        match self.evaluate(payload) {
+            Ok(ReactorDecision::Allow) => Ok(Decision::Allow),
+            Ok(ReactorDecision::Block { status, reason }) => Ok(Decision::Block { status, reason }),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+}
+
 /// Loads the configured Coraza module bytes. `module_path` selects a file;
 /// `None` uses the module embedded in the binary, mirroring engine start-up.
 fn load_coraza_module(module_path: Option<&str>) -> Result<Cow<'static, [u8]>, ReactorError> {
@@ -1151,6 +1161,12 @@ impl WasmReactorRule {
             fail_closed: true,
             body_policy: BodyInspectionPolicy::default(),
         }
+    }
+
+    /// Returns the shared reactor, for direct (non-recursive) evaluations
+    /// such as gRPC field-content scanning.
+    pub fn reactor(&self) -> Arc<WasmReactor> {
+        Arc::clone(&self.reactor)
     }
 
     /// Attaches the process metrics registry so reactor evaluations are

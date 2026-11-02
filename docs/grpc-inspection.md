@@ -85,11 +85,18 @@ max_depth = 32                  # nested message depth (request = 0)
 max_decoded_fields = 100000     # total wire fields per message tree
 reject_unknown_fields = false   # true = reject field numbers absent from descriptor
 validate_strings = true         # reject invalid UTF-8, NUL and control bytes
+
+# Content scanning of decoded string/bytes fields: "off" or "strings".
+# "strings" (default) sends decoded values to Coraza as a synthetic form body.
+content_scan = "strings"
+# Maximum decoded field bytes in one synthetic content-scan payload (64 KiB).
+max_content_scan_bytes = 65536
 ```
 
 Validation (`Config::validate`) rejects a zero `max_message_bytes`,
-`max_frames`, `max_string_bytes`, `max_bytes_len`, `max_repeated`, `max_depth`
-or `max_decoded_fields`, an unknown `unknown_method_action`, allowlist entries
+`max_frames`, `max_string_bytes`, `max_bytes_len`, `max_repeated`, `max_depth`,
+`max_decoded_fields` or `max_content_scan_bytes`, a `content_scan` value other
+than `off`/`strings`, an unknown `unknown_method_action`, allowlist entries
 that are not `/package.Service/Method` paths, and an `allowlist_file` that is
 empty or cannot be loaded and validated (the error names the file and the
 reason).
@@ -140,6 +147,57 @@ method added only to `method_allowlist`), inspection falls back cleanly to the
 envelope checks above. Unknown nested message types are treated as opaque
 length-delimited fields rather than decoded.
 
+### Field-content scanning
+
+Structural field checks do not detect SQLi/XSS text inside a valid string.
+With `content_scan = "strings"` (the default when descriptor metadata is
+present), the inspector collects decoded `string` values and UTF-8 `bytes`
+values after structural validation and sends them to the configured Coraza
+backend as a **synthetic** request:
+
+* body: `application/x-www-form-urlencoded`, keys `f0`, `f1`, ... in field
+  order, values percent-encoded;
+* URI: `/__grpc__/package.Service/Method`;
+* method: `POST`.
+
+The synthetic payload is evaluated directly against the same backend (WASM
+reactor or native sidecar) that inspects ordinary requests. It bypasses the
+gRPC pre-check, so a content scan cannot recurse. The raw protobuf body is
+never sent to CRS.
+
+A backend block becomes a gRPC-aware rejection: `403` by default, or a
+`grpc-status` response when `server.grpc_aware_rejections = true`. The reason
+names the scanned field paths, for example:
+
+```
+gRPC content inspection blocked field(s) [acme.billing.v1.Request.customer_name]: ...
+```
+
+Cost and limits:
+
+* one extra Coraza evaluation per gRPC request that has descriptor metadata
+  and at least one scannable field. The evaluation cost scales with the
+  decoded field bytes, like ordinary CRS body inspection;
+* at most `max_content_scan_bytes` decoded field bytes are included (default
+  64 KiB). Structural validation still covers the whole message; only
+  collection is capped. Values are truncated deterministically at a UTF-8
+  boundary once the budget is exhausted;
+* binary `bytes` values that are not valid UTF-8 are not scanned as text;
+* `content_scan = "off"` restores the previous structural-only behaviour and
+  performs no extra evaluation.
+
+`benches/grpc_content.rs` measures the full `GrpcInspector::inspect` path with
+content scanning on and off. On the reference benchmark host the p50 was
+approximately 39 ms / 165 ms / 705 ms for 1/4/16 KiB strings with scanning
+enabled, versus 2.5 µs / 6.6 µs / 22 µs with `content_scan = "off"`. The extra
+cost is the Coraza body evaluation, not protobuf decoding or payload
+construction. Deployments that cannot budget it should lower
+`max_content_scan_bytes` or set `content_scan = "off"`.
+
+Metrics: `waf_grpc_content_scans_total` counts synthetic evaluations and
+`waf_grpc_content_blocks_total` counts requests blocked by them. The existing
+`waf_grpc_decisions_total` still records the overall gRPC pre-check outcome.
+
 ### Generating the allowlist
 
 Do not hand-maintain `method_allowlist`. Generate it from the protobuf
@@ -149,9 +207,10 @@ Do not hand-maintain `method_allowlist`. Generate it from the protobuf
 ## Limitations
 
 * Field-level inspection checks type, size, structure, enum membership and
-  basic string sanity. It is **not** a content scanner: malicious text inside a
-  field is not matched by CRS rules because the protobuf body is deliberately
-  withheld from CRS.
+  basic string sanity. Content scanning (`content_scan = "strings"`) adds a
+  synthetic Coraza evaluation of decoded string/UTF-8 bytes values; it is not a
+  byte-for-byte scan of the raw protobuf and does not inspect non-UTF-8 binary
+  `bytes` fields. Set `content_scan = "off"` to skip the extra evaluation.
 * Metadata is emitted for messages reachable from request types to
   `MAX_MESSAGE_FIELD_DEPTH` (16) in the generator. Deeper messages are treated
   as opaque length-delimited fields at runtime. Methods without descriptor
@@ -173,7 +232,10 @@ scanner exclusion, and `grpc-web-text` decoding. Field tests cover a valid
 descriptor-backed message, oversized strings with the field path in the
 reason, unknown fields allowed/rejected by config, nested depth limits,
 malformed wire data (`400`), enum values, string control bytes, packed repeated
-counts, and the missing-metadata fallback. `src/waf/mod.rs` verifies that a
+counts, and the missing-metadata fallback. Content-scan tests cover SQLi/XSS
+blocking with the field path in the reason, benign values, non-UTF-8 `bytes`
+exclusion, the byte cap and deterministic truncation, `content_scan = "off"`,
+and single-increment metrics. `src/waf/mod.rs` verifies that a
 gRPC protobuf body is not delivered to downstream rules while a non-gRPC body
 still is. Artifact tests cover allow/block from a generated file, merging with
 `method_allowlist`, per-method limits smaller than the global value,

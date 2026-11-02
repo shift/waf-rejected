@@ -28,6 +28,7 @@
 //! protobuf body is still never handed to CRS.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use base64::Engine as _;
 use hyper::header::HeaderValue;
@@ -35,8 +36,10 @@ use hyper::HeaderMap;
 use tracing::debug;
 
 use crate::config::WafGrpcConfig;
+use crate::metrics::Metrics;
+use crate::waf::coraza_payload;
 use crate::waf::grpc_allowlist::{self, GrpcAllowlist, GrpcAllowlistError, GrpcMessage};
-use crate::waf::protobuf::{self, DecodeLimits};
+use crate::waf::protobuf::{self, CollectedField, DecodeLimits};
 use crate::waf::{Decision, RequestContext, WafRule};
 
 /// Bytes in a gRPC message prefix: 1 flag byte + 4 length bytes.
@@ -427,8 +430,17 @@ impl std::fmt::Display for GrpcInspectionError {
     }
 }
 
+/// Direct Coraza backend used for gRPC field-content scanning.
+///
+/// Implementations call the backend without going through the gRPC pre-check,
+/// so a content scan cannot recurse into another gRPC inspection.
+pub trait GrpcContentScanner: Send + Sync {
+    /// Evaluates a synthetic request payload and returns the backend decision.
+    fn scan(&self, payload: &[u8]) -> Result<Decision, String>;
+}
+
 /// Protocol-aware gRPC inspector built from `waf.grpc`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GrpcInspector {
     allowlist: HashSet<String>,
     /// Per-method limits from the generated artifact, keyed by method path.
@@ -441,6 +453,26 @@ pub struct GrpcInspector {
     max_frames: usize,
     unknown_method_blocked: bool,
     decode_limits: DecodeLimits,
+    content_scan: bool,
+    max_content_scan_bytes: usize,
+    content_scanner: Option<Arc<dyn GrpcContentScanner>>,
+    metrics: Option<Arc<Metrics>>,
+}
+
+impl std::fmt::Debug for GrpcInspector {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GrpcInspector")
+            .field("allowlist", &self.allowlist)
+            .field("max_message_bytes", &self.max_message_bytes)
+            .field("max_frames", &self.max_frames)
+            .field("unknown_method_blocked", &self.unknown_method_blocked)
+            .field("decode_limits", &self.decode_limits)
+            .field("content_scan", &self.content_scan)
+            .field("max_content_scan_bytes", &self.max_content_scan_bytes)
+            .field("content_scanner", &self.content_scanner.is_some())
+            .finish()
+    }
 }
 
 impl GrpcInspector {
@@ -516,7 +548,23 @@ impl GrpcInspector {
                 reject_unknown_fields: config.reject_unknown_fields,
                 validate_strings: config.validate_strings,
             },
+            content_scan: config.content_scan_enabled(),
+            max_content_scan_bytes: config.max_content_scan_bytes,
+            content_scanner: None,
+            metrics: None,
         }
+    }
+
+    /// Attaches the direct Coraza backend used for field-content scanning.
+    pub fn with_content_scanner(mut self, scanner: Arc<dyn GrpcContentScanner>) -> Self {
+        self.content_scanner = Some(scanner);
+        self
+    }
+
+    /// Attaches the process metrics registry for content-scan counters.
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Per-message limit for a method: the artifact's value when present,
@@ -634,17 +682,40 @@ impl GrpcInspector {
                 // the envelope-only behaviour.
                 if let Some(input_type) = self.method_input_types.get(&method.path) {
                     if self.messages.contains_key(input_type) {
+                        let mut collected: Vec<CollectedField> = Vec::new();
+                        let mut collected_bytes = 0usize;
                         for payload in frame_payloads(body) {
-                            if let Err(error) = protobuf::decode_message(
+                            let remaining =
+                                self.max_content_scan_bytes.saturating_sub(collected_bytes);
+                            match protobuf::decode_message_collect(
                                 payload,
                                 input_type,
                                 &self.messages,
                                 &self.decode_limits,
+                                remaining,
                             ) {
-                                return Ok(GrpcVerdict::Block {
-                                    status: error.status(),
-                                    reason: error.to_string(),
-                                });
+                                Ok(fields) => {
+                                    collected_bytes = collected_bytes.saturating_add(
+                                        fields.iter().map(|field| field.value.len()).sum::<usize>(),
+                                    );
+                                    collected.extend(fields);
+                                }
+                                Err(error) => {
+                                    return Ok(GrpcVerdict::Block {
+                                        status: error.status(),
+                                        reason: error.to_string(),
+                                    });
+                                }
+                            }
+                        }
+
+                        if self.content_scan && !collected.is_empty() {
+                            if let Some(scanner) = self.content_scanner.as_deref() {
+                                if let Some(decision) =
+                                    self.scan_content(scanner, ctx, &method.path, &collected)?
+                                {
+                                    return Ok(decision);
+                                }
                             }
                         }
                     }
@@ -657,6 +728,141 @@ impl GrpcInspector {
             monitored,
         })
     }
+
+    /// Evaluates collected field values through the direct Coraza backend.
+    ///
+    /// The synthetic payload is a form body (`f0`, `f1`, ...) with a
+    /// `/__grpc__/...` URI, so CRS parses it as ordinary request content. The
+    /// raw protobuf is never sent. Returns `None` when the backend allows.
+    fn scan_content(
+        &self,
+        scanner: &dyn GrpcContentScanner,
+        ctx: &RequestContext,
+        method_path: &str,
+        fields: &[CollectedField],
+    ) -> Result<Option<GrpcVerdict>, GrpcInspectionError> {
+        let mut body = String::new();
+        for (index, field) in fields.iter().enumerate() {
+            if index > 0 {
+                body.push('&');
+            }
+            body.push_str(&format!("f{index}="));
+            body.push_str(&form_encode(&field.value));
+        }
+
+        let uri = format!("/__grpc__{method_path}")
+            .parse::<hyper::Uri>()
+            .map_err(|error| GrpcInspectionError {
+                reason: format!("failed to build gRPC content-scan URI: {error}"),
+            })?;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            hyper::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+        // CRS expects a Host header; reuse the original so host-based rules
+        // see the same virtual host as the real request.
+        if let Some(host) = ctx
+            .headers
+            .get(hyper::header::HOST)
+            .or_else(|| ctx.headers.get(":authority"))
+        {
+            headers.insert(hyper::header::HOST, host.clone());
+        } else if let Some(authority) = ctx.uri.authority() {
+            if let Ok(value) = HeaderValue::from_str(authority.as_str()) {
+                headers.insert(hyper::header::HOST, value);
+            }
+        }
+        if !headers.contains_key(hyper::header::HOST) {
+            headers.insert(
+                hyper::header::HOST,
+                HeaderValue::from_static("grpc-content-scan.invalid"),
+            );
+        }
+        // CRS also expects User-Agent and Accept; reuse the originals when
+        // present so the synthetic request does not trip protocol warnings.
+        if let Some(user_agent) = ctx.headers.get(hyper::header::USER_AGENT) {
+            headers.insert(hyper::header::USER_AGENT, user_agent.clone());
+        } else {
+            headers.insert(
+                hyper::header::USER_AGENT,
+                HeaderValue::from_static("waf-grpc-content-scan/1.0"),
+            );
+        }
+        if let Some(accept) = ctx.headers.get(hyper::header::ACCEPT) {
+            headers.insert(hyper::header::ACCEPT, accept.clone());
+        } else {
+            headers.insert(hyper::header::ACCEPT, HeaderValue::from_static("*/*"));
+        }
+        // A POST without Content-Length trips CRS protocol rule 920180.
+        if let Ok(length) = HeaderValue::from_str(&body.len().to_string()) {
+            headers.insert(hyper::header::CONTENT_LENGTH, length);
+        }
+        let mut synthetic = RequestContext::new(
+            // Reuse the original client address so IP-based rules stay
+            // consistent with the real request.
+            ctx.client_ip,
+            hyper::Method::POST,
+            uri,
+            headers,
+            Some(body.len()),
+        );
+        synthetic.body = Some(bytes::Bytes::from(body));
+
+        let payload =
+            coraza_payload::build_payload(&synthetic).map_err(|error| GrpcInspectionError {
+                reason: format!("failed to encode gRPC content-scan payload: {error}"),
+            })?;
+
+        if let Some(metrics) = &self.metrics {
+            metrics.record_grpc_content_scan();
+        }
+
+        match scanner.scan(&payload) {
+            Ok(Decision::Allow) => Ok(None),
+            Ok(Decision::Block { status, reason }) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_grpc_content_block();
+                }
+                let paths = fields
+                    .iter()
+                    .map(|field| field.path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Ok(Some(GrpcVerdict::Block {
+                    status,
+                    reason: format!("gRPC content inspection blocked field(s) [{paths}]: {reason}"),
+                }))
+            }
+            Ok(Decision::RateLimit { reason }) => Ok(Some(GrpcVerdict::Block {
+                status: 429,
+                reason: format!("gRPC content inspection rate limited: {reason}"),
+            })),
+            Err(error) => Err(GrpcInspectionError {
+                reason: format!("gRPC content inspection failed: {error}"),
+            }),
+        }
+    }
+}
+
+/// Percent-encodes a field value for `application/x-www-form-urlencoded`.
+fn form_encode(value: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for &byte in value {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            b' ' => encoded.push('+'),
+            _ => {
+                encoded.push('%');
+                encoded.push(HEX[(byte >> 4) as usize] as char);
+                encoded.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+        }
+    }
+    encoded
 }
 
 fn decode_web_text(bytes: &[u8]) -> Result<Vec<u8>, GrpcInspectionError> {
@@ -1171,6 +1377,202 @@ mod tests {
                 strip_body: true,
                 monitored: false
             }
+        );
+    }
+
+    struct FakeScanner {
+        block: bool,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        last_payload: std::sync::Mutex<Vec<u8>>,
+    }
+
+    impl FakeScanner {
+        fn new(block: bool) -> Arc<Self> {
+            Arc::new(Self {
+                block,
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                last_payload: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl GrpcContentScanner for FakeScanner {
+        fn scan(&self, payload: &[u8]) -> Result<Decision, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.last_payload.lock().unwrap() = payload.to_vec();
+            if self.block {
+                Ok(Decision::Block {
+                    status: 403,
+                    reason: "CRS rule 942100".to_string(),
+                })
+            } else {
+                Ok(Decision::Allow)
+            }
+        }
+    }
+
+    fn put_bytes(number: u32, value: &[u8], out: &mut Vec<u8>) {
+        put_tag(number, 2, out);
+        put_varint(value.len() as u64, out);
+        out.extend_from_slice(value);
+    }
+
+    fn content_inspector(
+        config: &mut WafGrpcConfig,
+        fields: Vec<crate::waf::grpc_allowlist::GrpcMessageField>,
+        scanner: Arc<FakeScanner>,
+    ) -> (tempfile::TempDir, GrpcInspector) {
+        let (dir, inspector) = field_inspector(config, vec![request_message(fields)]);
+        (dir, inspector.with_content_scanner(scanner))
+    }
+
+    #[test]
+    fn content_scan_blocks_sqli_and_xss_with_field_path() {
+        for value in ["' OR '1'='1' --", "<script>alert(1)</script>"] {
+            let mut config = WafGrpcConfig::default();
+            let scanner = FakeScanner::new(true);
+            let (_dir, inspector) = content_inspector(
+                &mut config,
+                vec![request_field("name", 1, "string", false)],
+                Arc::clone(&scanner),
+            );
+            let mut payload = Vec::new();
+            put_string(1, value, &mut payload);
+            let verdict = inspector
+                .inspect(&grpc_context(
+                    "/acme.Service/Method",
+                    Some(frame(0, &payload)),
+                ))
+                .unwrap();
+            match verdict {
+                GrpcVerdict::Block { status, reason } => {
+                    assert_eq!(status, 403);
+                    assert!(reason.contains("acme.Request.name"), "{reason}");
+                    assert!(reason.contains("gRPC content inspection"), "{reason}");
+                }
+                other => panic!("expected content block, got {other:?}"),
+            }
+            assert_eq!(scanner.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn content_scan_allows_benign_strings() {
+        let mut config = WafGrpcConfig::default();
+        let scanner = FakeScanner::new(false);
+        let (_dir, inspector) = content_inspector(
+            &mut config,
+            vec![request_field("name", 1, "string", false)],
+            Arc::clone(&scanner),
+        );
+        let mut payload = Vec::new();
+        put_string(1, "alice", &mut payload);
+        let verdict = inspector
+            .inspect(&grpc_context(
+                "/acme.Service/Method",
+                Some(frame(0, &payload)),
+            ))
+            .unwrap();
+        assert!(matches!(verdict, GrpcVerdict::Allow { .. }));
+        assert_eq!(scanner.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn binary_bytes_are_not_scanned_as_text() {
+        let mut config = WafGrpcConfig::default();
+        let scanner = FakeScanner::new(true);
+        let (_dir, inspector) = content_inspector(
+            &mut config,
+            vec![request_field("blob", 1, "bytes", false)],
+            Arc::clone(&scanner),
+        );
+        let mut payload = Vec::new();
+        put_bytes(1, &[0xff, 0x00, 0xfe, 0x01], &mut payload);
+        let verdict = inspector
+            .inspect(&grpc_context(
+                "/acme.Service/Method",
+                Some(frame(0, &payload)),
+            ))
+            .unwrap();
+        assert!(matches!(verdict, GrpcVerdict::Allow { .. }));
+        assert_eq!(scanner.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn content_scan_respects_byte_cap() {
+        let mut config = WafGrpcConfig::default();
+        config.max_content_scan_bytes = 8;
+        let scanner = FakeScanner::new(false);
+        let (_dir, inspector) = content_inspector(
+            &mut config,
+            vec![request_field("name", 1, "string", false)],
+            Arc::clone(&scanner),
+        );
+        let mut payload = Vec::new();
+        put_string(1, "abcdefghijklmnop", &mut payload);
+        let verdict = inspector
+            .inspect(&grpc_context(
+                "/acme.Service/Method",
+                Some(frame(0, &payload)),
+            ))
+            .unwrap();
+        assert!(matches!(verdict, GrpcVerdict::Allow { .. }));
+        let sent = scanner.last_payload.lock().unwrap().clone();
+        let text = String::from_utf8(sent).unwrap();
+        assert!(text.contains("f0=abcdefgh"), "{text}");
+        assert!(!text.contains("ijklmnop"), "{text}");
+    }
+
+    #[test]
+    fn content_scan_off_preserves_allow_behaviour() {
+        let mut config = WafGrpcConfig::default();
+        config.content_scan = "off".to_string();
+        let scanner = FakeScanner::new(true);
+        let (_dir, inspector) = content_inspector(
+            &mut config,
+            vec![request_field("name", 1, "string", false)],
+            Arc::clone(&scanner),
+        );
+        let mut payload = Vec::new();
+        put_string(1, "' OR '1'='1' --", &mut payload);
+        let verdict = inspector
+            .inspect(&grpc_context(
+                "/acme.Service/Method",
+                Some(frame(0, &payload)),
+            ))
+            .unwrap();
+        assert!(matches!(verdict, GrpcVerdict::Allow { .. }));
+        assert_eq!(scanner.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn content_scan_metrics_increment_once() {
+        let metrics = Arc::new(crate::metrics::Metrics::new());
+        let mut config = WafGrpcConfig::default();
+        let scanner = FakeScanner::new(true);
+        let (_dir, inspector) = content_inspector(
+            &mut config,
+            vec![request_field("name", 1, "string", false)],
+            Arc::clone(&scanner),
+        );
+        let inspector = inspector.with_metrics(Arc::clone(&metrics));
+        let mut payload = Vec::new();
+        put_string(1, "<script>alert(1)</script>", &mut payload);
+        let _ = inspector
+            .inspect(&grpc_context(
+                "/acme.Service/Method",
+                Some(frame(0, &payload)),
+            ))
+            .unwrap();
+        assert_eq!(scanner.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered.contains("waf_grpc_content_scans_total 1"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("waf_grpc_content_blocks_total 1"),
+            "{rendered}"
         );
     }
 

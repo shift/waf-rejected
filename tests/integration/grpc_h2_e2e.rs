@@ -419,6 +419,27 @@ async fn spawn_proxy(
     allowlist_path: &Path,
     grpc_aware_rejections: bool,
 ) -> SocketAddr {
+    spawn_proxy_with_content_scan(
+        upstream,
+        ca_path,
+        cert_path,
+        key_path,
+        allowlist_path,
+        grpc_aware_rejections,
+        "strings",
+    )
+    .await
+}
+
+async fn spawn_proxy_with_content_scan(
+    upstream: SocketAddr,
+    ca_path: &Path,
+    cert_path: &Path,
+    key_path: &Path,
+    allowlist_path: &Path,
+    grpc_aware_rejections: bool,
+    content_scan: &str,
+) -> SocketAddr {
     let mut config = Config::default();
     config.upstream_uri = format!("https://127.0.0.1:{}", upstream.port());
     config.proxy.upstream_ca_path = Some(ca_path.to_string_lossy().into_owned());
@@ -436,6 +457,7 @@ async fn spawn_proxy(
     config.waf.grpc.allowlist_file = Some(allowlist_path.to_string_lossy().into_owned());
     config.waf.grpc.reject_unknown_fields = true;
     config.waf.grpc.unknown_method_action = Some("block".to_string());
+    config.waf.grpc.content_scan = content_scan.to_string();
 
     let service = Arc::new(WafProxyService::new(config).unwrap());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -691,7 +713,7 @@ async fn malformed_grpc_frame_is_rejected_before_upstream() {
 
 #[tokio::test]
 #[ignore = "requires TLS, local ports and the wasm-reactor feature"]
-async fn sqli_in_declared_protobuf_field_is_not_content_inspected() {
+async fn sqli_in_declared_protobuf_field_is_content_inspected() {
     let env = test_env().await;
     let proxy = spawn_proxy(
         env.upstream,
@@ -707,13 +729,74 @@ async fn sqli_in_declared_protobuf_field_is_not_content_inspected() {
     let payload = protobuf_string(1, "' OR '1'='1' -- <script>alert(1)</script>");
     let frame = grpc_frame(&payload);
     let response = sender
-        .send_request(grpc_request(proxy, SQLI, frame.clone()))
+        .send_request(grpc_request(proxy, SQLI, frame))
         .await
         .expect("sqli response");
     assert_eq!(
         response.status(),
+        StatusCode::FORBIDDEN,
+        "SQLi/XSS text in a declared string field must be content-inspected"
+    );
+    assert_eq!(
+        env.upstream_state.calls.load(Ordering::SeqCst),
+        0,
+        "blocked gRPC content must not reach the upstream"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires TLS, local ports and the wasm-reactor feature"]
+async fn benign_declared_protobuf_field_is_allowed() {
+    let env = test_env().await;
+    let proxy = spawn_proxy(
+        env.upstream,
+        &env.ca_path,
+        &env.cert_path,
+        &env.key_path,
+        &env.allowlist_path,
+        false,
+    )
+    .await;
+    let mut sender = h2_client::<Full<Bytes>>(proxy, &env.ca_path).await;
+
+    let payload = protobuf_string(1, "alice");
+    let frame = grpc_frame(&payload);
+    let response = sender
+        .send_request(grpc_request(proxy, SQLI, frame.clone()))
+        .await
+        .expect("benign response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let (data, trailers) = read_body(response.into_body()).await;
+    assert_eq!(data, frame);
+    assert_eq!(trailers.unwrap().get("grpc-status").unwrap(), "0");
+}
+
+#[tokio::test]
+#[ignore = "requires TLS, local ports and the wasm-reactor feature"]
+async fn content_scan_off_preserves_structural_allow() {
+    let env = test_env().await;
+    let proxy = spawn_proxy_with_content_scan(
+        env.upstream,
+        &env.ca_path,
+        &env.cert_path,
+        &env.key_path,
+        &env.allowlist_path,
+        false,
+        "off",
+    )
+    .await;
+    let mut sender = h2_client::<Full<Bytes>>(proxy, &env.ca_path).await;
+
+    let payload = protobuf_string(1, "' OR '1'='1' --");
+    let frame = grpc_frame(&payload);
+    let response = sender
+        .send_request(grpc_request(proxy, SQLI, frame.clone()))
+        .await
+        .expect("content-scan-off response");
+    assert_eq!(
+        response.status(),
         StatusCode::OK,
-        "descriptor field policy is structural: SQLi/XSS text in a declared string field is not content-inspected"
+        "content_scan = off must preserve the structural-only allow behaviour"
     );
     let (data, trailers) = read_body(response.into_body()).await;
     assert_eq!(data, frame);
