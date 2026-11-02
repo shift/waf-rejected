@@ -163,6 +163,13 @@ Results default to `/tmp/opencode/load-validation/`:
 Override ports with `WAF_PORT`, `HEALTH_PORT`, `UPSTREAM_PORT` when 39080/39081/
 39000 are occupied.
 
+For per-layer latency decomposition (raw reactor, engine, payload construction,
+proxy with and without the WAF) and the sub-millisecond gates, use
+`./scripts/bench-subms.sh`; see
+[`subms-budget.md`](subms-budget.md). The two harnesses answer different
+questions: this one proves end-to-end capacity and decision correctness, the
+sub-millisecond harness assigns the latency budget to a layer.
+
 ## Reference hardware and caveats
 
 - Host: Intel Core i5-8400T, 6 logical CPUs, 15 862 MiB RAM, kernel 6.18.

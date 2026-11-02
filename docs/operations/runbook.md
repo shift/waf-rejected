@@ -37,6 +37,10 @@ on-call:
   `forward-uninspected` + `max_inspect_bytes`, or `reject` +
   `max_inspect_bytes`). A smaller prefix or `reject` changes which rows of the
   capacity table are meaningful.
+- For per-layer latency (raw reactor, engine, payload, proxy with and without
+  the WAF) and the sub-millisecond gates, see
+  [`subms-budget.md`](subms-budget.md). Use it before attributing a latency
+  regression to the rule engine or to the proxy.
 - The native Coraza sidecar removes the ~5–6× Go-to-wasm body-inspection
   penalty (8 KiB p50 358 → 61 ms, 60 KiB 2779 → 457 ms on the research
   laptop). It is the first mitigation for sustained heavy-body latency.
