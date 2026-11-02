@@ -1,0 +1,183 @@
+{
+  "schema": 1,
+  "generated_at": "2026-11-02T23:19:13Z",
+  "commit": "efb56b5",
+  "dirty_files": 5,
+  "environment": {
+    "host": "Linux 6.18.36 x86_64",
+    "kernel": "6.18.36",
+    "cpu_model": "Intel(R) Core(TM) i5-8400T CPU @ 1.70GHz",
+    "cpu_count": "6",
+    "cpu_affinity": "2-5",
+    "scaling_governor": "powersave",
+    "turbo_disabled": "0",
+    "loadavg_at_start": "2.70 8.39 17.35",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "cargo": "cargo 1.99.1 (5f94df478 2026-08-27)",
+    "nix": "nix (Nix) 2.34.7"
+  },
+  "settings": {
+    "samples": 50,
+    "warmup": 5,
+    "alloc_reps": 50,
+    "cases": [
+      "bodyless",
+      "4k-allow",
+      "4k-sqli"
+    ],
+    "latency_metric": "process CPU time (CLOCK_PROCESS_CPUTIME_ID)",
+    "throughput_metric": "wall-clock samples per second",
+    "coraza_scope": "WasmReactor::evaluate on a prebuilt JSON payload; payload construction excluded"
+  },
+  "process": {
+    "coraza": {
+      "cpus_allowed": "2-5",
+      "rss_kb": 415128,
+      "rss_peak_kb": 434728,
+      "target_arch": "x86_64",
+      "target_os": "linux"
+    },
+    "rust": {
+      "cpus_allowed": "2-5",
+      "rss_kb": 20748,
+      "rss_peak_kb": 20804,
+      "target_arch": "x86_64",
+      "target_os": "linux"
+    },
+    "kernel": {
+      "cpus_allowed": "2-5",
+      "rss_kb": 11768,
+      "rss_peak_kb": 13948,
+      "target_arch": "x86_64",
+      "target_os": "linux"
+    }
+  },
+  "rows": [
+    {
+      "alloc_bytes_per_op": 6798.92,
+      "allocs_per_op": 4.02,
+      "backend": "coraza",
+      "case": "4k-allow",
+      "decision": "allow",
+      "max_ms": 486.690018,
+      "mean_ms": 217.17885672,
+      "p50_ms": 177.662226,
+      "p95_ms": 404.731923,
+      "p99_ms": 486.690018,
+      "samples": 50,
+      "throughput_rps": 4.534620202486801
+    },
+    {
+      "alloc_bytes_per_op": 6851.84,
+      "allocs_per_op": 5.04,
+      "backend": "coraza",
+      "case": "4k-sqli",
+      "decision": "block",
+      "max_ms": 717.984558,
+      "mean_ms": 302.20650872000004,
+      "p50_ms": 263.33234,
+      "p95_ms": 599.848369,
+      "p99_ms": 717.984558,
+      "samples": 50,
+      "throughput_rps": 1.807652138905807
+    },
+    {
+      "alloc_bytes_per_op": 2658.84,
+      "allocs_per_op": 4.04,
+      "backend": "coraza",
+      "case": "bodyless",
+      "decision": "allow",
+      "max_ms": 4.131752,
+      "mean_ms": 3.57680556,
+      "p50_ms": 3.652821,
+      "p95_ms": 4.082792,
+      "p99_ms": 4.131752,
+      "samples": 50,
+      "throughput_rps": 276.3238675110837
+    },
+    {
+      "alloc_bytes_per_op": 33.0,
+      "allocs_per_op": 1.0,
+      "backend": "kernel",
+      "case": "4k-allow",
+      "decision": "allow",
+      "max_ms": 0.637897,
+      "mean_ms": 0.58039758,
+      "p50_ms": 0.570196,
+      "p95_ms": 0.626266,
+      "p99_ms": 0.637897,
+      "samples": 50,
+      "throughput_rps": 1716.2435068072225
+    },
+    {
+      "alloc_bytes_per_op": 33.0,
+      "allocs_per_op": 1.0,
+      "backend": "kernel",
+      "case": "4k-sqli",
+      "decision": "block",
+      "max_ms": 0.465318,
+      "mean_ms": 0.32785828,
+      "p50_ms": 0.318049,
+      "p95_ms": 0.353825,
+      "p99_ms": 0.465318,
+      "samples": 50,
+      "throughput_rps": 3035.123726515199
+    },
+    {
+      "alloc_bytes_per_op": 0.0,
+      "allocs_per_op": 0.0,
+      "backend": "kernel",
+      "case": "bodyless",
+      "decision": "allow",
+      "max_ms": 0.010997,
+      "mean_ms": 0.00933016,
+      "p50_ms": 0.009295,
+      "p95_ms": 0.009477,
+      "p99_ms": 0.010997,
+      "samples": 50,
+      "throughput_rps": 97912.88886103811
+    },
+    {
+      "alloc_bytes_per_op": 2024667.0,
+      "allocs_per_op": 4789.0,
+      "backend": "rust",
+      "case": "4k-allow",
+      "decision": "allow",
+      "max_ms": 2.090262,
+      "mean_ms": 1.93523468,
+      "p50_ms": 1.919107,
+      "p95_ms": 2.047999,
+      "p99_ms": 2.090262,
+      "samples": 50,
+      "throughput_rps": 514.7337173356674
+    },
+    {
+      "alloc_bytes_per_op": 2029145.0,
+      "allocs_per_op": 4865.0,
+      "backend": "rust",
+      "case": "4k-sqli",
+      "decision": "block",
+      "max_ms": 2.275522,
+      "mean_ms": 1.89110456,
+      "p50_ms": 1.861728,
+      "p95_ms": 2.004566,
+      "p99_ms": 2.275522,
+      "samples": 50,
+      "throughput_rps": 526.8011230304197
+    },
+    {
+      "alloc_bytes_per_op": 125379.0,
+      "allocs_per_op": 2666.0,
+      "backend": "rust",
+      "case": "bodyless",
+      "decision": "allow",
+      "max_ms": 0.240775,
+      "mean_ms": 0.20619418,
+      "p50_ms": 0.201619,
+      "p95_ms": 0.238587,
+      "p99_ms": 0.240775,
+      "samples": 50,
+      "throughput_rps": 4807.444539396815
+    }
+  ]
+}

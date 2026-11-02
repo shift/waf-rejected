@@ -467,6 +467,16 @@ name = "engine-kernel-corpus"
 path = "src/bin/engine_kernel_corpus.rs"
 required-features = ["engine-kernel"]
 
+# Engine-level benchmark for the performance regression gate. Measures the
+# Coraza WASI reactor, the native Rust CRS engine and the experimental kernel
+# behind the same request set. See benchmarks/perf-gate/ and
+# docs/suggestions_from_agents/perf-gate.md.
+[[bin]]
+name = "perf-gate-bench"
+path = "src/bin/perf_gate_bench.rs"
+required-features = ["wasm-reactor", "rust-engine", "engine-kernel"]
+
+
 # Transform-pipeline latency and allocation harness (p50/p99, allocs/request).
 [[bin]]
 name = "transform-bench"

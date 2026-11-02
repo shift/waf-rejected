@@ -6,6 +6,17 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Added
 
+- Engine-level performance regression gate (`benchmarks/perf-gate/`). A
+  reproducible runner measures the Coraza WASI reactor, the native Rust CRS
+  engine and the experimental kernel behind the same bodyless, 4 KiB allow and
+  4 KiB SQLi requests; it records p50/p95/p99, throughput, RSS, allocations and
+  the hardware/kernel/toolchain environment, with CPU affinity pinned by
+  default. A checked-in JSON baseline and `compare.sh` report p50 regressions
+  beyond a configurable threshold; enforcement is opt-in (`--enforce`) so shared
+  CI runners stay green. Includes a synthetic self-test and a documented
+  comparison against ModSecurity/CRS and public cloud WAF latency claims. See
+  `docs/suggestions_from_agents/perf-gate.md`.
+
 - Experimental native Rust evaluation kernel (`engine-kernel`, non-default).
   Standalone prototype of a Coraza replacement: zero-copy request spans, a
   per-value transform-pipeline cache, a compiled DAG of cheap predicates,
