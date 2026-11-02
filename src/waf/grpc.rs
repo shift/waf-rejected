@@ -300,7 +300,7 @@ pub fn validate_frames(body: &[u8], limits: FrameLimits) -> Result<FrameReport, 
         }
 
         report.frames += 1;
-        report.decoded_bytes += declared;
+        report.decoded_bytes = report.decoded_bytes.saturating_add(declared);
         if flag == 1 {
             report.compressed_frames += 1;
         }
@@ -316,7 +316,8 @@ pub fn validate_frames(body: &[u8], limits: FrameLimits) -> Result<FrameReport, 
 fn frame_payloads(body: &[u8]) -> impl Iterator<Item = &[u8]> {
     let mut offset = 0usize;
     std::iter::from_fn(move || {
-        if offset + FRAME_PREFIX_LEN > body.len() {
+        let start = offset.checked_add(FRAME_PREFIX_LEN)?;
+        if start > body.len() {
             return None;
         }
         let length = u32::from_be_bytes([
@@ -325,8 +326,7 @@ fn frame_payloads(body: &[u8]) -> impl Iterator<Item = &[u8]> {
             body[offset + 3],
             body[offset + 4],
         ]) as usize;
-        let start = offset + FRAME_PREFIX_LEN;
-        let end = start + length;
+        let end = start.checked_add(length)?;
         offset = end;
         body.get(start..end)
     })
@@ -1583,5 +1583,93 @@ mod tests {
                 monitored: false
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn limits() -> FrameLimits {
+        FrameLimits {
+            max_message_bytes: usize::MAX,
+            max_frames: 16,
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn arbitrary_bytes_never_panic(body in proptest::collection::vec(any::<u8>(), 0..2048)) {
+            let _ = validate_frames(&body, limits());
+        }
+
+        #[test]
+        fn frame_prefix_is_total(
+            flag in any::<u8>(),
+            length in any::<u32>(),
+            payload in proptest::collection::vec(any::<u8>(), 0..256),
+        ) {
+            let mut body = Vec::with_capacity(FRAME_PREFIX_LEN + payload.len());
+            body.push(flag);
+            body.extend_from_slice(&length.to_be_bytes());
+            body.extend_from_slice(&payload);
+
+            let result = validate_frames(&body, limits());
+            if flag > 1 {
+                let is_flag_error = matches!(result, Err(FrameError::InvalidCompressedFlag { .. }));
+                prop_assert!(is_flag_error);
+            } else if length > i32::MAX as u32 {
+                let is_length_error = matches!(result, Err(FrameError::InvalidLength { .. }));
+                prop_assert!(is_length_error);
+            } else if length as usize > payload.len() {
+                let is_truncated = matches!(result, Err(FrameError::TruncatedMessage { .. }));
+                prop_assert!(is_truncated);
+            } else {
+                let report = result.expect("complete frame must validate");
+                prop_assert_eq!(report.frames, 1);
+                prop_assert_eq!(report.decoded_bytes, length as usize);
+                prop_assert_eq!(report.compressed_frames, usize::from(flag == 1));
+            }
+        }
+
+        #[test]
+        fn valid_frame_sequences_round_trip(
+            frames in proptest::collection::vec(
+                (any::<bool>(), proptest::collection::vec(any::<u8>(), 0..64)),
+                0..8,
+            ),
+        ) {
+            let mut body = Vec::new();
+            let mut decoded = 0usize;
+            let mut compressed = 0usize;
+            for (is_compressed, payload) in &frames {
+                body.push(u8::from(*is_compressed));
+                body.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+                body.extend_from_slice(payload);
+                decoded += payload.len();
+                compressed += usize::from(*is_compressed);
+            }
+            let report = validate_frames(&body, limits()).expect("generated frames must validate");
+            prop_assert_eq!(report.frames, frames.len());
+            prop_assert_eq!(report.decoded_bytes, decoded);
+            prop_assert_eq!(report.compressed_frames, compressed);
+        }
+
+        #[test]
+        fn method_path_parser_is_total(path in ".*") {
+            if let Ok(method) = parse_method_path(&path) {
+                prop_assert!(method.path.starts_with('/'));
+                prop_assert_eq!(method.path.matches('/').count(), 2);
+                prop_assert_eq!(method.path, format!("/{}/{}", method.service, method.method));
+            }
+        }
+
+        #[test]
+        fn content_type_parser_is_total(value in ".*") {
+            let _ = GrpcContentType::from_header(&value);
+        }
     }
 }

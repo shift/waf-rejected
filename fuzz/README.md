@@ -20,6 +20,10 @@ does not include `cargo-fuzz`; run fuzz targets outside the sandboxed build.
 | `content_inspection` | Arbitrary bytes as URI query and request body | `ContentInspectionRule::evaluate` must not panic, including percent-decoded and lossy-UTF-8 input. |
 | `websocket_frame` | Arbitrary bytes interpreted as a text frame when valid UTF-8, otherwise a binary frame | The WebSocket frame inspection path (`WafEngine::fast_evaluate` with the handler's request context) must not panic. |
 | `config_toml` | Arbitrary TOML | `Config` deserialization and `Config::validate` must not panic; invalid input may return an error. |
+| `protobuf` | Arbitrary protobuf wire bytes | `protobuf::decode_message` must not panic on truncated varints, huge lengths, unknown wire types or deeply nested messages; configured depth/length/count limits are enforced. |
+| `grpc_frames` | Arbitrary gRPC frame bytes | `grpc::validate_frames` must not panic or over-read; every 5-byte prefix either validates with its declared length or returns a typed `FrameError`. The same bytes are also fed to `parse_method_path`. |
+| `graphql_body` | Arbitrary GraphQL JSON body | `GraphqlInspector::inspect` must not panic on invalid UTF-8, malformed JSON, deeply nested values or hostile query text. |
+| `allowlist_json` | Arbitrary allowlist/descriptor bytes | `parse_allowlist`, `parse_descriptor_set` and `build_allowlist` must not panic; invalid input returns a typed error. |
 
 `WebSocketHandler::inspect_websocket_message` is private. The
 `websocket_frame` harness reproduces the context it builds and evaluates it
@@ -42,7 +46,14 @@ cargo +nightly fuzz build
 cargo +nightly fuzz run content_inspection -- -runs=10000 -max_total_time=60
 cargo +nightly fuzz run websocket_frame  -- -runs=10000 -max_total_time=60
 cargo +nightly fuzz run config_toml      -- -runs=10000 -max_total_time=60
+cargo +nightly fuzz run protobuf         -- -runs=10000 -max_total_time=60
+cargo +nightly fuzz run grpc_frames      -- -runs=10000 -max_total_time=60
+cargo +nightly fuzz run graphql_body     -- -runs=10000 -max_total_time=60
+cargo +nightly fuzz run allowlist_json   -- -runs=10000 -max_total_time=60
 ```
+
+`scripts/fuzz-smoke.sh` runs the four parser targets for a short bounded
+time (30 s each by default) and is safe to run locally.
 
 The seed corpus lives in `corpus/<target>/` and is picked up automatically.
 libFuzzer appends newly discovered inputs to the same directory; do not commit

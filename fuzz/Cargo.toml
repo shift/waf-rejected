@@ -12,6 +12,7 @@ libfuzzer-sys = "0.4"
 waf-ingress = { path = ".." }
 bytes = "1.0"
 http = "1.0"
+hyper = "1.0"
 tokio = { version = "1.0", features = ["rt"] }
 toml = "0.8"
 
@@ -32,6 +33,34 @@ bench = false
 [[bin]]
 name = "config_toml"
 path = "fuzz_targets/config_toml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protobuf"
+path = "fuzz_targets/protobuf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "grpc_frames"
+path = "fuzz_targets/grpc_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "graphql_body"
+path = "fuzz_targets/graphql_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "allowlist_json"
+path = "fuzz_targets/allowlist_json.rs"
 test = false
 doc = false
 bench = false

@@ -710,3 +710,150 @@ mod tests {
         assert_eq!(error.status(), 413);
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn field(name: &str, number: u32, field_type: &str, repeated: bool) -> GrpcMessageField {
+        GrpcMessageField {
+            name: name.to_string(),
+            number,
+            field_type: field_type.to_string(),
+            repeated,
+            required: false,
+            message_type: None,
+            enum_values: None,
+        }
+    }
+
+    fn sample_registry() -> HashMap<String, GrpcMessage> {
+        let mut child = field("child", 6, "message", false);
+        child.message_type = Some("pkg.Node".to_string());
+        let mut state = field("state", 2, "enum", false);
+        state.enum_values = Some(vec![0, 1, 2]);
+        let messages = vec![
+            GrpcMessage {
+                message: "pkg.Request".to_string(),
+                fields: vec![
+                    field("name", 1, "string", false),
+                    field("blob", 2, "bytes", false),
+                    field("count", 3, "int32", false),
+                    field("ids", 4, "int32", true),
+                    state,
+                    child.clone(),
+                ],
+            },
+            GrpcMessage {
+                message: "pkg.Node".to_string(),
+                fields: vec![field("value", 1, "string", false), child],
+            },
+        ];
+        messages
+            .into_iter()
+            .map(|message| (message.message.clone(), message))
+            .collect()
+    }
+
+    fn limits() -> DecodeLimits {
+        DecodeLimits {
+            max_string_bytes: 64,
+            max_bytes_len: 64,
+            max_repeated: 4,
+            max_depth: 4,
+            max_decoded_fields: 64,
+            reject_unknown_fields: false,
+            validate_strings: true,
+        }
+    }
+
+    fn put_varint(mut value: u64, out: &mut Vec<u8>) {
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                return;
+            }
+        }
+    }
+
+    fn put_tag(number: u32, wire: u8, out: &mut Vec<u8>) {
+        put_varint((u64::from(number) << 3) | u64::from(wire), out);
+    }
+
+    fn put_len(number: u32, value: &[u8], out: &mut Vec<u8>) {
+        put_tag(number, WIRE_LENGTH_DELIMITED, out);
+        put_varint(value.len() as u64, out);
+        out.extend_from_slice(value);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn arbitrary_bytes_never_panic(payload in proptest::collection::vec(any::<u8>(), 0..2048)) {
+            let messages = sample_registry();
+            let _ = decode_message(&payload, "pkg.Request", &messages, &limits());
+        }
+
+        #[test]
+        fn valid_string_round_trips(value in "[ -~]{0,64}") {
+            let messages = sample_registry();
+            let mut payload = Vec::new();
+            put_len(1, value.as_bytes(), &mut payload);
+            prop_assert!(decode_message(&payload, "pkg.Request", &messages, &limits()).is_ok());
+        }
+
+        #[test]
+        fn string_length_limit_is_enforced(value in proptest::collection::vec(any::<u8>(), 0..128)) {
+            let messages = sample_registry();
+            let mut payload = Vec::new();
+            put_len(1, &value, &mut payload);
+            let result = decode_message(&payload, "pkg.Request", &messages, &limits());
+            if value.len() > 64 {
+                let is_limit = matches!(result, Err(DecodeError::Limit { .. }));
+                prop_assert!(is_limit);
+            }
+        }
+
+        #[test]
+        fn nested_depth_is_bounded(depth in 0usize..20) {
+            let messages = sample_registry();
+            let mut payload = Vec::new();
+            for _ in 0..depth {
+                let mut wrapped = Vec::new();
+                put_len(6, &payload, &mut wrapped);
+                payload = wrapped;
+            }
+            let result = decode_message(&payload, "pkg.Request", &messages, &limits());
+            if depth > 4 {
+                let is_limit = matches!(result, Err(DecodeError::Limit { .. }));
+                prop_assert!(is_limit);
+            } else {
+                prop_assert!(result.is_ok());
+            }
+        }
+
+        #[test]
+        fn repeated_count_is_bounded(count in 0usize..16) {
+            let messages = sample_registry();
+            let mut payload = Vec::new();
+            for value in 0..count {
+                put_tag(4, WIRE_VARINT, &mut payload);
+                put_varint(value as u64, &mut payload);
+            }
+            let result = decode_message(&payload, "pkg.Request", &messages, &limits());
+            if count > 4 {
+                let is_limit = matches!(result, Err(DecodeError::Limit { .. }));
+                prop_assert!(is_limit);
+            } else {
+                prop_assert!(result.is_ok());
+            }
+        }
+    }
+}

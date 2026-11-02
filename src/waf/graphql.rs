@@ -944,6 +944,11 @@ impl<'a> QueryParser<'a> {
         depth: usize,
         division: Division,
     ) -> Result<(), GraphqlInspectionError> {
+        if depth > MAX_PARSE_DEPTH {
+            return Err(GraphqlInspectionError::malformed(format!(
+                "GraphQL query nesting exceeds the parser limit of {MAX_PARSE_DEPTH}"
+            )));
+        }
         if !matches!(self.tokens.get(self.index), Some(Token::LBrace)) {
             return Ok(());
         }
@@ -1055,6 +1060,11 @@ enum Division {
     Operation,
     Fragment,
 }
+
+/// Hard cap on parser recursion, independent of the configurable inspection
+/// depth. This keeps a hostile document from exhausting the stack before the
+/// configured `max_depth` policy is applied.
+const MAX_PARSE_DEPTH: usize = 512;
 
 fn negligible_depth() -> usize {
     0
@@ -1353,5 +1363,92 @@ mod tests {
         std::fs::write(&path, r#"[{"name":"x","sha256":"nope"}]"#).unwrap();
         assert!(load_operation_allowlist(&path).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use bytes::Bytes;
+    use hyper::{HeaderMap, Method, Uri};
+    use proptest::prelude::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn json_context(body: &[u8]) -> RequestContext {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            hyper::header::CONTENT_TYPE,
+            hyper::header::HeaderValue::from_static("application/json"),
+        );
+        RequestContext::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            Method::POST,
+            Uri::from_static("/graphql"),
+            headers,
+            Some(body.len()),
+        )
+        .with_body(Some(Bytes::copy_from_slice(body)))
+    }
+
+    fn nested_query(depth: usize) -> String {
+        let mut query = String::with_capacity(depth * 6 + 8);
+        for _ in 0..depth {
+            query.push_str("{ a ");
+        }
+        query.push_str("field");
+        for _ in 0..depth {
+            query.push_str(" }");
+        }
+        query
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn arbitrary_json_body_never_panics(body in proptest::collection::vec(any::<u8>(), 0..4096)) {
+            let inspector = GraphqlInspector::from_config(&WafGraphqlConfig::default());
+            let _ = inspector.inspect(&json_context(&body));
+        }
+
+        #[test]
+        fn arbitrary_query_text_never_panics(query in ".*") {
+            let _ = parse_query(&query);
+            let _ = normalize_query(&query);
+            let _ = query_hash(&query);
+        }
+
+        #[test]
+        fn depth_counter_is_monotonic_and_bounded(depth in 2usize..40) {
+            let doc = parse_query(&nested_query(depth)).expect("nested query parses");
+            prop_assert!(doc.depth <= depth);
+            prop_assert!(doc.depth + 1 >= depth);
+            let shallower = parse_query(&nested_query(depth - 1)).expect("nested query parses");
+            prop_assert!(doc.depth >= shallower.depth);
+        }
+
+        #[test]
+        fn alias_and_field_counters_are_bounded(count in 0usize..32) {
+            let mut query = String::from("{");
+            for index in 0..count {
+                query.push_str(&format!("a{index}: f{index} "));
+            }
+            query.push('}');
+            let doc = parse_query(&query).expect("aliased query parses");
+            prop_assert_eq!(doc.aliases, count);
+            prop_assert_eq!(doc.fields, count);
+        }
+
+        #[test]
+        fn deeply_nested_query_is_rejected_without_overflow(depth in 1000usize..2000) {
+            prop_assert!(parse_query(&nested_query(depth)).is_err());
+        }
+    }
+
+    #[test]
+    fn parser_depth_cap_is_a_deterministic_regression() {
+        let query = nested_query(MAX_PARSE_DEPTH + 10);
+        let error = parse_query(&query).expect_err("query beyond the parser cap must fail");
+        assert!(error.reason.contains("parser limit"), "{error}");
     }
 }

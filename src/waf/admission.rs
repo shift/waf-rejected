@@ -330,3 +330,37 @@ mod tests {
         assert!(controller.admit(InspectionCost::Heavy).await.is_ok());
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use bytes::Bytes;
+    use hyper::{HeaderMap, Method, Uri};
+    use proptest::prelude::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn context(body: Option<&[u8]>) -> RequestContext {
+        RequestContext::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            Method::POST,
+            Uri::from_static("/submit"),
+            HeaderMap::new(),
+            body.map(<[u8]>::len),
+        )
+        .with_body(body.map(|b| Bytes::copy_from_slice(b)))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn classification_matches_body_presence(body in proptest::option::of(proptest::collection::vec(any::<u8>(), 0..1024))) {
+            let ctx = context(body.as_deref());
+            let expected = match body.as_deref() {
+                Some(bytes) if !bytes.is_empty() => InspectionCost::Heavy,
+                _ => InspectionCost::Cheap,
+            };
+            prop_assert_eq!(classify(&ctx), expected);
+        }
+    }
+}

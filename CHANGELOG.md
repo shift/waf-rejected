@@ -6,6 +6,16 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Added
 
+- Property and fuzz hardening for the security-critical parsers. `proptest`
+  suites now cover the protobuf wire decoder, gRPC frame/path/content-type
+  parsing, GraphQL body/query parsing and counters, allowlist/descriptor
+  loading, and admission classification. New isolated `cargo-fuzz` targets
+  (`protobuf`, `grpc_frames`, `graphql_body`, `allowlist_json`) with seed
+  corpora and `scripts/fuzz-smoke.sh` provide bounded local smoke runs. Fixed
+  unbounded recursion in GraphQL selection-set parsing and binary descriptor
+  parsing, and hardened gRPC frame arithmetic. See
+  `docs/developer-guide/parser-hardening.md`.
+
 - Heavy-inspection admission control (`[waf.admission]`). Each evaluation is
   classified as cheap (no body, or a gRPC/GraphQL body withheld from CRS) or
   heavy (CRS body scan) from the context the protocol pre-checks already

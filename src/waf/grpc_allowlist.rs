@@ -1197,7 +1197,7 @@ fn parse_file_descriptor(bytes: &[u8]) -> Result<FileDescriptorProto, GrpcAllowl
             }
             (4, WIRE_LENGTH_DELIMITED) => {
                 file.messages
-                    .push(parse_descriptor_proto(reader.read_length_delimited()?)?);
+                    .push(parse_descriptor_proto(reader.read_length_delimited()?, 0)?);
             }
             (5, WIRE_LENGTH_DELIMITED) => {
                 file.enums
@@ -1213,7 +1213,15 @@ fn parse_file_descriptor(bytes: &[u8]) -> Result<FileDescriptorProto, GrpcAllowl
     Ok(file)
 }
 
-fn parse_descriptor_proto(bytes: &[u8]) -> Result<DescriptorProto, GrpcAllowlistError> {
+fn parse_descriptor_proto(
+    bytes: &[u8],
+    depth: usize,
+) -> Result<DescriptorProto, GrpcAllowlistError> {
+    if depth > MAX_MESSAGE_FIELD_DEPTH {
+        return Err(GrpcAllowlistError::Descriptor(format!(
+            "descriptor message nesting exceeds the limit of {MAX_MESSAGE_FIELD_DEPTH}"
+        )));
+    }
     let mut reader = WireReader::new(bytes);
     let mut message = DescriptorProto::default();
     while let Some((field, wire)) = reader.read_tag()? {
@@ -1227,9 +1235,10 @@ fn parse_descriptor_proto(bytes: &[u8]) -> Result<DescriptorProto, GrpcAllowlist
                     .push(parse_field_descriptor(reader.read_length_delimited()?)?);
             }
             (3, WIRE_LENGTH_DELIMITED) => {
-                message
-                    .nested
-                    .push(parse_descriptor_proto(reader.read_length_delimited()?)?);
+                message.nested.push(parse_descriptor_proto(
+                    reader.read_length_delimited()?,
+                    depth + 1,
+                )?);
             }
             (4, WIRE_LENGTH_DELIMITED) => {
                 message
@@ -2835,5 +2844,126 @@ max_message_bytes = 4096
             .expect("generate from file");
         assert_eq!(allowlist.methods, expected_methods());
         fs::remove_file(&path).expect("cleanup");
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn put_varint(mut value: u64, out: &mut Vec<u8>) {
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                return;
+            }
+        }
+    }
+
+    fn put_len(number: u32, value: &[u8], out: &mut Vec<u8>) {
+        put_varint(
+            (u64::from(number) << 3) | u64::from(WIRE_LENGTH_DELIMITED),
+            out,
+        );
+        put_varint(value.len() as u64, out);
+        out.extend_from_slice(value);
+    }
+
+    fn valid_allowlist() -> GrpcAllowlist {
+        GrpcAllowlist {
+            ir_version: ALLOWLIST_IR_VERSION,
+            source: AllowlistSource {
+                kind: "protobuf".to_string(),
+                sha256: "a".repeat(64),
+            },
+            methods: vec![GrpcAllowlistMethod {
+                path: "/pkg.Service/Method".to_string(),
+                client_streaming: false,
+                server_streaming: false,
+                input: "pkg.Request".to_string(),
+                output: "pkg.Response".to_string(),
+                max_message_bytes: 1024,
+            }],
+            messages: vec![GrpcMessage {
+                message: "pkg.Request".to_string(),
+                fields: vec![GrpcMessageField {
+                    name: "name".to_string(),
+                    number: 1,
+                    field_type: "string".to_string(),
+                    repeated: false,
+                    required: false,
+                    message_type: None,
+                    enum_values: None,
+                }],
+            }],
+            unknown_method_action: "block".to_string(),
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn arbitrary_allowlist_bytes_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..4096)) {
+            let _ = parse_allowlist(&bytes);
+        }
+
+        #[test]
+        fn arbitrary_descriptor_bytes_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..4096)) {
+            let _ = parse_descriptor_set(&bytes, DescriptorFormat::Auto);
+            let _ = parse_descriptor_set(&bytes, DescriptorFormat::Binary);
+            let _ = parse_descriptor_set(&bytes, DescriptorFormat::Json);
+        }
+
+        #[test]
+        fn arbitrary_json_text_never_panics(text in ".*") {
+            let _ = parse_allowlist(text.as_bytes());
+        }
+
+        #[test]
+        fn valid_allowlist_round_trips(_unused in 0u8..1) {
+            let allowlist = valid_allowlist();
+            let json = allowlist.to_canonical_json().expect("serialize");
+            let parsed = parse_allowlist(json.as_bytes()).expect("parse canonical JSON");
+            prop_assert_eq!(parsed, allowlist);
+        }
+
+        #[test]
+        fn deeply_nested_binary_descriptor_is_rejected(depth in 1000usize..2000) {
+            let mut message = Vec::new();
+            for _ in 0..depth {
+                let mut outer = Vec::new();
+                put_len(3, &message, &mut outer);
+                message = outer;
+            }
+            let mut file = Vec::new();
+            put_len(4, &message, &mut file);
+            let mut set = Vec::new();
+            put_len(1, &file, &mut set);
+            prop_assert!(parse_descriptor_set(&set, DescriptorFormat::Binary).is_err());
+        }
+    }
+
+    #[test]
+    fn descriptor_depth_cap_is_a_deterministic_regression() {
+        let mut message = Vec::new();
+        for _ in 0..(MAX_MESSAGE_FIELD_DEPTH + 10) {
+            let mut outer = Vec::new();
+            put_len(3, &message, &mut outer);
+            message = outer;
+        }
+        let mut file = Vec::new();
+        put_len(4, &message, &mut file);
+        let mut set = Vec::new();
+        put_len(1, &file, &mut set);
+        let error = parse_descriptor_set(&set, DescriptorFormat::Binary)
+            .expect_err("descriptor beyond the depth cap must fail");
+        assert!(error.to_string().contains("nesting"), "{error}");
     }
 }
