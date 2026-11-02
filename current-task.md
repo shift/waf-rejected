@@ -784,6 +784,23 @@ sidecar without changing detection rules or defaults.
 - Consequence: no perf win to ship; the branch keeps the benchmark harness,
   the backtrace hardening, the docs' measured findings and the Criterion rows.
 
+## research: native Rust fast path (worktree `.worktrees/fastpath`)
+
+Branch: `research/fastpath`. Task: prototype a compiled Rust prefilter that can
+prove requests clean and skip Coraza, without changing defaults.
+
+- Feature `fastpath` (`src/waf/fastpath/`): method/path matchers, header and
+  protocol checks, scanner/OS-file/PHP Aho-Corasick matchers, regex signature
+  prefilter, and a body literal prefilter derived from
+  `rules/crs/prefilter.json`.
+- Soundness mode (a): `Clean` only when every covered rule is provably unable
+  to match; otherwise `NeedsCoraza`. Body requests always fall back on stock
+  CRS because 51 body rules are ungated.
+- Corpus harness: `crs_corpus --engine fastpath`; 44/2,112 clean, 0 false
+  negatives vs the WASI Coraza baseline, 0 clean expected-block.
+- Benchmark: `fastpath_bench` (in-process, no proxy).
+- Docs: `docs/suggestions_from_agents/fastpath-engine.md`.
+
 ---
 
 # Research: content-addressed allow-verdict cache (worktree `.worktrees/allow-cache`)

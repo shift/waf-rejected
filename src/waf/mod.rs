@@ -27,11 +27,15 @@ pub mod allow_cache;
 
 /// Experimental required-literal prefilter for CRS request bodies. Non-default:
 /// it is an opt-in evaluation mode until the detection-parity corpus proves it.
-#[cfg(feature = "crs-prefilter")]
+#[cfg(any(feature = "crs-prefilter", feature = "fastpath"))]
 pub mod prefilter;
 /// Offline extractor that emits `rules/crs/prefilter.json`.
-#[cfg(feature = "crs-prefilter")]
+#[cfg(any(feature = "crs-prefilter", feature = "fastpath"))]
 pub mod prefilter_extract;
+
+/// Experimental compiled request fast path (non-default `fastpath` feature).
+#[cfg(feature = "fastpath")]
+pub mod fastpath;
 
 /// Shared JSON payload envelope for the wasm reactor and native sidecar.
 #[cfg(any(feature = "wasm-reactor", feature = "coraza-native"))]

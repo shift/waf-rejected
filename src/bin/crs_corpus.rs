@@ -30,6 +30,9 @@ use waf_ingress::waf::coraza_corpus::{
 #[cfg(feature = "wasm-reactor")]
 use waf_ingress::waf::wasm_reactor::{ReactorDecision, WasmReactor, EMBEDDED_CORAZA_REACTOR};
 
+#[cfg(feature = "fastpath")]
+use waf_ingress::waf::fastpath::{FastPath, FastPathDecision, FastPathRequest};
+
 #[cfg(all(feature = "coraza-native", unix))]
 use waf_ingress::waf::native_coraza::{ClientConfig, NativeCorazaClient};
 
@@ -42,6 +45,8 @@ enum EngineChoice {
     Native,
     /// Run both and compare their decisions.
     Both,
+    /// Run only the experimental compiled Rust fast path (requires `fastpath`).
+    Fastpath,
 }
 
 impl std::fmt::Display for EngineChoice {
@@ -50,6 +55,7 @@ impl std::fmt::Display for EngineChoice {
             Self::Wasm => f.write_str("wasm"),
             Self::Native => f.write_str("native"),
             Self::Both => f.write_str("both"),
+            Self::Fastpath => f.write_str("fastpath"),
         }
     }
 }
@@ -157,10 +163,12 @@ fn run(args: &Args) -> Result<ExitCode, FatalError> {
         },
         engines: BTreeMap::new(),
         parity: None,
+        fastpath: None,
     };
 
     let run_wasm = matches!(args.engine, EngineChoice::Wasm | EngineChoice::Both);
     let run_native = matches!(args.engine, EngineChoice::Native | EngineChoice::Both);
+    let run_fastpath = matches!(args.engine, EngineChoice::Fastpath);
 
     let mut wasm_report = None;
     if run_wasm {
@@ -190,6 +198,12 @@ fn run(args: &Args) -> Result<ExitCode, FatalError> {
         }
     }
 
+    if run_fastpath {
+        let fastpath_report = run_fastpath_engine(&cases)?;
+        print_fastpath_summary(&fastpath_report);
+        report.fastpath = Some(fastpath_report);
+    }
+
     if let Some(path) = &args.json {
         let json = serde_json::to_vec_pretty(&report)
             .map_err(|err| FatalError::Fatal(format!("failed to serialise report: {err}")))?;
@@ -213,7 +227,13 @@ fn run(args: &Args) -> Result<ExitCode, FatalError> {
         .engines
         .values()
         .any(|engine| engine.false_negatives + engine.false_positives + engine.errors > 0);
-    if args.fail_on_mismatch && failed {
+    let fastpath_failed = report.fastpath.as_ref().is_some_and(|fastpath| {
+        fastpath
+            .cases
+            .iter()
+            .any(|case| case.clean && case.expected == Expected::Block)
+    });
+    if args.fail_on_mismatch && (failed || fastpath_failed) {
         return Ok(ExitCode::from(3));
     }
     Ok(ExitCode::SUCCESS)
@@ -228,6 +248,24 @@ struct Report {
     corpus: ReportCorpus,
     engines: BTreeMap<String, EngineReport>,
     parity: Option<ParityReport>,
+    fastpath: Option<FastpathReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct FastpathReport {
+    total: usize,
+    clean: usize,
+    fallback: usize,
+    by_reason: BTreeMap<String, usize>,
+    cases: Vec<FastpathCaseReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct FastpathCaseReport {
+    id: String,
+    expected: Expected,
+    clean: bool,
+    reason: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -475,6 +513,75 @@ fn run_native_engine(_cases: &[&CorpusCase], _args: &Args) -> Result<EngineRepor
         "native",
         "built without the `coraza-native` feature (or not on Unix)",
     ))
+}
+
+#[cfg(feature = "fastpath")]
+fn run_fastpath_engine(cases: &[&CorpusCase]) -> Result<FastpathReport, FatalError> {
+    let fast_path = FastPath::embedded()
+        .map_err(|err| FatalError::Fatal(format!("failed to build fast path: {err}")))?;
+    let mut report = FastpathReport {
+        total: cases.len(),
+        clean: 0,
+        fallback: 0,
+        by_reason: BTreeMap::new(),
+        cases: Vec::with_capacity(cases.len()),
+    };
+
+    for case in cases {
+        let headers: Vec<(&str, &str)> = case
+            .request
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        let request = FastPathRequest {
+            method: &case.request.method,
+            uri: &case.request.uri,
+            http_version: &case.request.http_version,
+            headers: &headers,
+            body: case.request.body.as_deref().map(str::as_bytes),
+        };
+        match fast_path.evaluate(&request) {
+            FastPathDecision::Clean { .. } => {
+                report.clean += 1;
+                report.cases.push(FastpathCaseReport {
+                    id: case.id.clone(),
+                    expected: case.expected,
+                    clean: true,
+                    reason: None,
+                });
+            }
+            FastPathDecision::NeedsCoraza { reason } => {
+                report.fallback += 1;
+                *report.by_reason.entry(reason.to_string()).or_default() += 1;
+                report.cases.push(FastpathCaseReport {
+                    id: case.id.clone(),
+                    expected: case.expected,
+                    clean: false,
+                    reason: Some(reason.to_string()),
+                });
+            }
+        }
+    }
+
+    Ok(report)
+}
+
+#[cfg(not(feature = "fastpath"))]
+fn run_fastpath_engine(_cases: &[&CorpusCase]) -> Result<FastpathReport, FatalError> {
+    Err(FatalError::Usage(
+        "built without the `fastpath` feature".to_string(),
+    ))
+}
+
+fn print_fastpath_summary(report: &FastpathReport) {
+    println!(
+        "fastpath: clean {}/{} ({} fallback to Coraza)",
+        report.clean, report.total, report.fallback
+    );
+    for (reason, count) in &report.by_reason {
+        println!("  {reason}: {count}");
+    }
 }
 
 fn print_engine_summary(report: &EngineReport, verbose: bool) {
