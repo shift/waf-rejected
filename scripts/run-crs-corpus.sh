@@ -53,12 +53,20 @@ for arg in "$@"; do
 done
 
 case "$ENGINE" in
-  wasm|native|both) ;;
+  wasm|native|both|rust|fastpath) ;;
   *)
-    echo "error: --engine must be wasm, native, or both (got '$ENGINE')" >&2
+    echo "error: --engine must be wasm, native, both, rust, or fastpath (got '$ENGINE')" >&2
     exit 2
     ;;
 esac
+
+FEATURES="wasm-reactor,coraza-native"
+if [[ "$ENGINE" == "rust" || "${ENGINE_FEATURE:-0}" == "1" ]]; then
+  FEATURES="$FEATURES,native-engine"
+fi
+if [[ "$ENGINE" == "fastpath" ]]; then
+  FEATURES="$FEATURES,fastpath"
+fi
 
 SIDECAR_PID=""
 SOCKET_DIR=""
@@ -110,4 +118,4 @@ fi
 
 echo "running CRS detection corpus (engine=$ENGINE)"
 nix develop -c cargo run --quiet --bin crs_corpus \
-  --features wasm-reactor,coraza-native -- "${ARGS[@]}"
+  --features "$FEATURES" -- "${ARGS[@]}"

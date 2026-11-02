@@ -23,9 +23,30 @@ use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
+use waf_ingress::engine::determinism::DeterminismReport;
+use waf_ingress::engine::differential::{self, CounterexampleFile, DifferentialReport};
+use waf_ingress::engine::generated;
+use waf_ingress::engine::{EngineError, RuleEngine};
+
+#[cfg(any(
+    feature = "wasm-reactor",
+    all(feature = "coraza-native", unix),
+    feature = "native-engine"
+))]
+use waf_ingress::engine::determinism;
+
+#[cfg(any(
+    feature = "wasm-reactor",
+    all(feature = "coraza-native", unix),
+    feature = "native-engine"
+))]
+use waf_ingress::engine::EngineOutcome;
 use waf_ingress::waf::coraza_corpus::{
     judge, CaseResult, Corpus, CorpusCase, Expected, Observed, DEFAULT_CORPUS_PATH,
 };
+
+#[cfg(any(feature = "wasm-reactor", all(feature = "coraza-native", unix)))]
+use waf_ingress::waf::coraza_corpus::CorpusRequest;
 
 #[cfg(feature = "wasm-reactor")]
 use waf_ingress::waf::wasm_reactor::{ReactorDecision, WasmReactor, EMBEDDED_CORAZA_REACTOR};
@@ -36,6 +57,9 @@ use waf_ingress::waf::fastpath::{FastPath, FastPathDecision, FastPathRequest};
 #[cfg(all(feature = "coraza-native", unix))]
 use waf_ingress::waf::native_coraza::{ClientConfig, NativeCorazaClient};
 
+#[cfg(feature = "native-engine")]
+use waf_ingress::engine::NativeRustEngine;
+
 /// Engine selection for the harness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum EngineChoice {
@@ -43,7 +67,9 @@ enum EngineChoice {
     Wasm,
     /// Run only the native Go sidecar (requires `coraza-native` and a socket).
     Native,
-    /// Run both and compare their decisions.
+    /// Run only the native Rust engine (requires `native-engine`).
+    Rust,
+    /// Run both Coraza backends and compare their decisions.
     Both,
     /// Run only the experimental compiled Rust fast path (requires `fastpath`).
     Fastpath,
@@ -54,6 +80,7 @@ impl std::fmt::Display for EngineChoice {
         match self {
             Self::Wasm => f.write_str("wasm"),
             Self::Native => f.write_str("native"),
+            Self::Rust => f.write_str("rust"),
             Self::Both => f.write_str("both"),
             Self::Fastpath => f.write_str("fastpath"),
         }
@@ -102,6 +129,34 @@ struct Args {
     /// Print every case instead of only failures.
     #[arg(long)]
     verbose: bool,
+
+    /// Number of generated differential cases (0 disables).
+    #[arg(long, default_value_t = 0)]
+    generated: usize,
+
+    /// Seed for generated differential cases.
+    #[arg(long, default_value_t = 0x5eed_c0de)]
+    generated_seed: u64,
+
+    /// Persist minimal counterexamples here when a differential run fails.
+    #[arg(long, default_value = "tests/corpus/engine/counterexamples.json")]
+    counterexamples: PathBuf,
+
+    /// Determinism iterations per case (0 disables).
+    #[arg(long, default_value_t = 0)]
+    determinism: usize,
+
+    /// Worker threads for the determinism run.
+    #[arg(long, default_value_t = 4)]
+    determinism_threads: usize,
+
+    /// Cap the number of cases used by the determinism run (0 uses all).
+    #[arg(long, default_value_t = 128)]
+    determinism_limit: usize,
+
+    /// Fail instead of skipping when the requested Rust engine is unavailable.
+    #[arg(long)]
+    require_engine: bool,
 
     /// Return exit code 3 when any case fails or errors.
     #[arg(long)]
@@ -164,11 +219,22 @@ fn run(args: &Args) -> Result<ExitCode, FatalError> {
         engines: BTreeMap::new(),
         parity: None,
         fastpath: None,
+        determinism: BTreeMap::new(),
+        differential: None,
     };
 
     let run_wasm = matches!(args.engine, EngineChoice::Wasm | EngineChoice::Both);
     let run_native = matches!(args.engine, EngineChoice::Native | EngineChoice::Both);
     let run_fastpath = matches!(args.engine, EngineChoice::Fastpath);
+    let run_rust = matches!(args.engine, EngineChoice::Rust);
+
+    if run_rust && args.require_engine && !rust_engine_available() {
+        return Err(FatalError::Fatal(
+            "native Rust engine requested with --require-engine, but the \
+             `native-engine` backend is not available in this build"
+                .to_string(),
+        ));
+    }
 
     let mut wasm_report = None;
     if run_wasm {
@@ -190,6 +256,12 @@ fn run(args: &Args) -> Result<ExitCode, FatalError> {
         report.engines.insert("native".to_string(), engine_report);
     }
 
+    if run_rust {
+        let engine_report = run_rust_engine(&cases, args)?;
+        print_engine_summary(&engine_report, args.verbose);
+        report.engines.insert("rust".to_string(), engine_report);
+    }
+
     if let (Some(wasm), Some(native)) = (&wasm_report, &native_report) {
         if wasm.available && native.available {
             let parity = compare_engines(wasm, native);
@@ -203,6 +275,15 @@ fn run(args: &Args) -> Result<ExitCode, FatalError> {
         print_fastpath_summary(&fastpath_report);
         report.fastpath = Some(fastpath_report);
     }
+
+    for engine in selected_engines(args) {
+        if let Some(determinism) = run_determinism_for(engine, &cases, args)? {
+            print_determinism_summary(engine, &determinism);
+            report.determinism.insert(engine.to_string(), determinism);
+        }
+    }
+
+    report.differential = run_generated_differential(args)?;
 
     if let Some(path) = &args.json {
         let json = serde_json::to_vec_pretty(&report)
@@ -223,7 +304,7 @@ fn run(args: &Args) -> Result<ExitCode, FatalError> {
         println!("report written to {}", path.display());
     }
 
-    let failed = report
+    let engine_failed = report
         .engines
         .values()
         .any(|engine| engine.false_negatives + engine.false_positives + engine.errors > 0);
@@ -233,10 +314,30 @@ fn run(args: &Args) -> Result<ExitCode, FatalError> {
             .iter()
             .any(|case| case.clean && case.expected == Expected::Block)
     });
-    if args.fail_on_mismatch && (failed || fastpath_failed) {
+    let determinism_failed = report
+        .determinism
+        .values()
+        .any(|determinism| !determinism.is_clean());
+    let differential_failed = report
+        .differential
+        .as_ref()
+        .is_some_and(|differential| !differential.is_clean());
+    if args.fail_on_mismatch
+        && (engine_failed || fastpath_failed || determinism_failed || differential_failed)
+    {
         return Ok(ExitCode::from(3));
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn selected_engines(args: &Args) -> Vec<&'static str> {
+    match args.engine {
+        EngineChoice::Wasm => vec!["wasm"],
+        EngineChoice::Native => vec!["native"],
+        EngineChoice::Rust => vec!["rust"],
+        EngineChoice::Both => vec!["wasm", "native"],
+        EngineChoice::Fastpath => Vec::new(),
+    }
 }
 
 fn short_commit(commit: &str) -> &str {
@@ -249,6 +350,8 @@ struct Report {
     engines: BTreeMap<String, EngineReport>,
     parity: Option<ParityReport>,
     fastpath: Option<FastpathReport>,
+    determinism: BTreeMap<String, DeterminismReport>,
+    differential: Option<DifferentialReport>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -582,6 +685,378 @@ fn print_fastpath_summary(report: &FastpathReport) {
     for (reason, count) in &report.by_reason {
         println!("  {reason}: {count}");
     }
+}
+
+#[cfg(feature = "native-engine")]
+fn run_rust_engine(cases: &[&CorpusCase], _args: &Args) -> Result<EngineReport, FatalError> {
+    if !rust_engine_available() {
+        return Ok(EngineReport::skipped(
+            "rust",
+            "the `native-engine` backend is not linked into this build",
+        ));
+    }
+    let engine = NativeRustEngine::new();
+    let mut report = EngineReport::new("rust");
+    for case in cases {
+        match engine.evaluate(&case.request) {
+            Ok(EngineOutcome::Allow) => report.record(case, Some(Observed::Allow), None),
+            Ok(EngineOutcome::Block) => report.record(case, Some(Observed::Block), None),
+            Err(error) => report.record(case, None, Some(error.to_string())),
+        }
+    }
+    report.finish();
+    Ok(report)
+}
+
+#[cfg(not(feature = "native-engine"))]
+fn run_rust_engine(_cases: &[&CorpusCase], _args: &Args) -> Result<EngineReport, FatalError> {
+    Ok(EngineReport::skipped(
+        "rust",
+        "built without the `native-engine` feature",
+    ))
+}
+
+#[cfg(feature = "native-engine")]
+fn rust_engine_available() -> bool {
+    NativeRustEngine::available()
+}
+
+#[cfg(not(feature = "native-engine"))]
+fn rust_engine_available() -> bool {
+    false
+}
+
+#[cfg(feature = "native-engine")]
+fn rust_candidate() -> Option<Box<dyn RuleEngine>> {
+    if rust_engine_available() {
+        Some(Box::new(NativeRustEngine::new()))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(feature = "native-engine"))]
+fn rust_candidate() -> Option<Box<dyn RuleEngine>> {
+    None
+}
+
+#[cfg(feature = "wasm-reactor")]
+struct WasmAdapter {
+    reactor: WasmReactor,
+}
+
+#[cfg(feature = "wasm-reactor")]
+impl RuleEngine for WasmAdapter {
+    fn name(&self) -> &str {
+        "wasm"
+    }
+
+    fn evaluate(&self, request: &CorpusRequest) -> Result<EngineOutcome, EngineError> {
+        let payload = request
+            .to_payload()
+            .map_err(|error| EngineError::Internal(format!("payload encoding failed: {error}")))?;
+        match self.reactor.evaluate(&payload) {
+            Ok(ReactorDecision::Allow) => Ok(EngineOutcome::Allow),
+            Ok(ReactorDecision::Block { .. }) => Ok(EngineOutcome::Block),
+            Err(error) => Err(EngineError::Internal(error.to_string())),
+        }
+    }
+}
+
+#[cfg(all(feature = "coraza-native", unix))]
+struct NativeAdapter {
+    client: NativeCorazaClient,
+}
+
+#[cfg(all(feature = "coraza-native", unix))]
+impl RuleEngine for NativeAdapter {
+    fn name(&self) -> &str {
+        "native"
+    }
+
+    fn evaluate(&self, request: &CorpusRequest) -> Result<EngineOutcome, EngineError> {
+        let payload = request
+            .to_payload()
+            .map_err(|error| EngineError::Internal(format!("payload encoding failed: {error}")))?;
+        match self.client.evaluate(&payload) {
+            Ok(waf_ingress::waf::Decision::Allow) => Ok(EngineOutcome::Allow),
+            Ok(waf_ingress::waf::Decision::Block { .. })
+            | Ok(waf_ingress::waf::Decision::RateLimit { .. }) => Ok(EngineOutcome::Block),
+            Err(error) => Err(EngineError::Internal(error.to_string())),
+        }
+    }
+}
+
+#[cfg(feature = "wasm-reactor")]
+fn wasm_reference(args: &Args) -> Option<Box<dyn RuleEngine>> {
+    let reactor = match &args.module {
+        Some(path) => WasmReactor::from_coraza_file(path),
+        None => WasmReactor::from_coraza_bytes(EMBEDDED_CORAZA_REACTOR),
+    }
+    .ok()?;
+    Some(Box::new(WasmAdapter { reactor }))
+}
+
+#[cfg(not(feature = "wasm-reactor"))]
+fn wasm_reference(_args: &Args) -> Option<Box<dyn RuleEngine>> {
+    None
+}
+
+#[cfg(all(feature = "coraza-native", unix))]
+fn native_reference(args: &Args) -> Option<Box<dyn RuleEngine>> {
+    let config = ClientConfig {
+        socket_path: args.native_socket.clone(),
+        pool_size: 2,
+        timeout: Duration::from_millis(args.native_timeout_ms),
+        max_payload_bytes: 64 * 1024,
+    };
+    let client = NativeCorazaClient::new(&config).ok()?;
+    Some(Box::new(NativeAdapter { client }))
+}
+
+#[cfg(not(all(feature = "coraza-native", unix)))]
+fn native_reference(_args: &Args) -> Option<Box<dyn RuleEngine>> {
+    None
+}
+
+fn coraza_reference(args: &Args) -> Option<Box<dyn RuleEngine>> {
+    wasm_reference(args).or_else(|| native_reference(args))
+}
+
+#[cfg(feature = "wasm-reactor")]
+fn wasm_factory(args: &Args) -> impl Fn() -> Result<Box<dyn RuleEngine>, EngineError> + Sync + '_ {
+    move || {
+        let reactor = match &args.module {
+            Some(path) => WasmReactor::from_coraza_file(path),
+            None => WasmReactor::from_coraza_bytes(EMBEDDED_CORAZA_REACTOR),
+        }
+        .map_err(|error| EngineError::Internal(error.to_string()))?;
+        Ok(Box::new(WasmAdapter { reactor }) as Box<dyn RuleEngine>)
+    }
+}
+
+#[cfg(all(feature = "coraza-native", unix))]
+fn native_factory(
+    args: &Args,
+) -> impl Fn() -> Result<Box<dyn RuleEngine>, EngineError> + Sync + '_ {
+    let config = ClientConfig {
+        socket_path: args.native_socket.clone(),
+        pool_size: 2,
+        timeout: Duration::from_millis(args.native_timeout_ms),
+        max_payload_bytes: 64 * 1024,
+    };
+    move || {
+        let client = NativeCorazaClient::new(&config)
+            .map_err(|error| EngineError::Internal(error.to_string()))?;
+        Ok(Box::new(NativeAdapter { client }) as Box<dyn RuleEngine>)
+    }
+}
+
+#[cfg(feature = "wasm-reactor")]
+fn wasm_determinism(args: &Args, cases: &[CorpusCase]) -> Result<DeterminismReport, EngineError> {
+    determinism::run(
+        wasm_factory(args),
+        cases,
+        args.determinism,
+        args.determinism_threads,
+        args.generated_seed,
+    )
+}
+
+#[cfg(not(feature = "wasm-reactor"))]
+fn wasm_determinism(_args: &Args, _cases: &[CorpusCase]) -> Result<DeterminismReport, EngineError> {
+    Err(EngineError::Unavailable(
+        "built without the `wasm-reactor` feature".to_string(),
+    ))
+}
+
+#[cfg(all(feature = "coraza-native", unix))]
+fn native_determinism(args: &Args, cases: &[CorpusCase]) -> Result<DeterminismReport, EngineError> {
+    determinism::run(
+        native_factory(args),
+        cases,
+        args.determinism,
+        args.determinism_threads,
+        args.generated_seed,
+    )
+}
+
+#[cfg(not(all(feature = "coraza-native", unix)))]
+fn native_determinism(
+    _args: &Args,
+    _cases: &[CorpusCase],
+) -> Result<DeterminismReport, EngineError> {
+    Err(EngineError::Unavailable(
+        "built without the `coraza-native` feature (or not on Unix)".to_string(),
+    ))
+}
+
+#[cfg(feature = "native-engine")]
+fn rust_determinism(args: &Args, cases: &[CorpusCase]) -> Result<DeterminismReport, EngineError> {
+    if !rust_engine_available() {
+        return Err(EngineError::Unavailable(
+            "the `native-engine` backend is not linked into this build".to_string(),
+        ));
+    }
+    determinism::run(
+        || Ok(Box::new(NativeRustEngine::new()) as Box<dyn RuleEngine>),
+        cases,
+        args.determinism,
+        args.determinism_threads,
+        args.generated_seed,
+    )
+}
+
+#[cfg(not(feature = "native-engine"))]
+fn rust_determinism(_args: &Args, _cases: &[CorpusCase]) -> Result<DeterminismReport, EngineError> {
+    Err(EngineError::Unavailable(
+        "built without the `native-engine` feature".to_string(),
+    ))
+}
+
+fn run_determinism_for(
+    engine: &str,
+    cases: &[&CorpusCase],
+    args: &Args,
+) -> Result<Option<DeterminismReport>, FatalError> {
+    if args.determinism == 0 {
+        return Ok(None);
+    }
+    let mut selected: Vec<CorpusCase> = cases.iter().map(|case| (*case).clone()).collect();
+    if args.determinism_limit > 0 {
+        selected.truncate(args.determinism_limit);
+    }
+    if selected.is_empty() {
+        return Ok(None);
+    }
+
+    let result = match engine {
+        "wasm" => wasm_determinism(args, &selected),
+        "native" => native_determinism(args, &selected),
+        "rust" => rust_determinism(args, &selected),
+        _ => return Ok(None),
+    };
+    match result {
+        Ok(report) => Ok(Some(report)),
+        Err(EngineError::Unavailable(reason)) => {
+            println!("determinism {engine}: SKIPPED ({reason})");
+            Ok(None)
+        }
+        Err(error) => Err(FatalError::Fatal(format!(
+            "determinism {engine} failed: {error}"
+        ))),
+    }
+}
+
+fn print_determinism_summary(engine: &str, report: &DeterminismReport) {
+    println!(
+        "determinism {engine}: {} comparisons ({} cases x {} iterations, {} threads), mismatches={}, errors={}{}",
+        report.comparisons,
+        report.cases,
+        report.iterations,
+        report.threads,
+        report.mismatches.len(),
+        report.errors,
+        if report.truncated { " (truncated)" } else { "" }
+    );
+    for mismatch in report.mismatches.iter().take(20) {
+        println!(
+            "  MISMATCH {} iteration={} thread={} baseline={} observed={}",
+            mismatch.case_id,
+            mismatch.iteration,
+            mismatch.thread,
+            mismatch.baseline,
+            mismatch.observed
+        );
+    }
+    if report.mismatches.len() > 20 {
+        println!(
+            "  ... {} more (use --json for the full list)",
+            report.mismatches.len() - 20
+        );
+    }
+}
+
+fn run_generated_differential(args: &Args) -> Result<Option<DifferentialReport>, FatalError> {
+    if args.generated == 0 {
+        return Ok(None);
+    }
+    let mut cases = generated::generate(args.generated_seed, args.generated);
+    if let Ok(file) = CounterexampleFile::load(&args.counterexamples) {
+        for case in file.cases {
+            cases.push(waf_ingress::engine::generated::GeneratedRequest {
+                id: case.id,
+                tags: case.tags,
+                request: case.request,
+            });
+        }
+    }
+    let candidate = match rust_candidate() {
+        Some(candidate) => candidate,
+        None => {
+            let message = "the native Rust engine is unavailable";
+            if args.require_engine {
+                return Err(FatalError::Fatal(format!("differential: {message}")));
+            }
+            println!("differential: SKIPPED ({message})");
+            return Ok(None);
+        }
+    };
+    let reference = match coraza_reference(args) {
+        Some(reference) => reference,
+        None => {
+            let message = "no Coraza reference backend is available";
+            if args.require_engine {
+                return Err(FatalError::Fatal(format!("differential: {message}")));
+            }
+            println!("differential: SKIPPED ({message})");
+            return Ok(None);
+        }
+    };
+
+    let report = differential::compare(reference.as_ref(), candidate.as_ref(), &cases);
+    println!(
+        "differential rust vs {}: {}/{} agree, {} disagree, reference_errors={}, rust_errors={}",
+        reference.name(),
+        report.agree,
+        report.compared,
+        report.disagree,
+        report.reference_errors,
+        report.candidate_errors
+    );
+    for mismatch in report.mismatches.iter().take(20) {
+        println!(
+            "  MISMATCH {} reference={:?} rust={:?} reference_error={:?} rust_error={:?}",
+            mismatch.id,
+            mismatch.reference,
+            mismatch.candidate,
+            mismatch.reference_error,
+            mismatch.candidate_error
+        );
+    }
+    if report.mismatches.len() > 20 {
+        println!(
+            "  ... {} more (use --json for the full list)",
+            report.mismatches.len() - 20
+        );
+    }
+    if !report.is_clean() {
+        let added = differential::persist_counterexamples(
+            &args.counterexamples,
+            &report.mismatches,
+            &report.counterexamples,
+        )
+        .map_err(|error| {
+            FatalError::Fatal(format!("failed to persist counterexamples: {error}"))
+        })?;
+        println!(
+            "counterexamples: {} minimized case(s), {} new, written to {}",
+            report.counterexamples.len(),
+            added,
+            args.counterexamples.display()
+        );
+    }
+    Ok(Some(report))
 }
 
 fn print_engine_summary(report: &EngineReport, verbose: bool) {

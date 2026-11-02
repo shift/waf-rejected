@@ -12,10 +12,21 @@ on:
         description: "Run the optional CRS detection corpus (wasm + native parity)"
         type: boolean
         default: false
+      run_engine_guarantees:
+        description: "Run accounting + differential + determinism engine gates"
+        type: boolean
+        default: false
+      engine_feature:
+        description: "Require the native Rust engine (blocking differential target)"
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths:
       - "src/**"
+      - "src/engine/**"
+      - "rules/crs/rule-manifest.json"
+      - "tests/corpus/engine/**"
       - "tests/**"
       - "benches/**"
       - "Cargo.toml"
@@ -27,11 +38,15 @@ on:
       - "scripts/run-crs-corpus.sh"
       - "scripts/vendor-crs-corpus.sh"
       - "scripts/convert-crs-corpus.py"
+      - "scripts/check-engine-guarantees.sh"
       - ".github/workflows/feature-matrix.yml"
   pull_request:
     branches: [main]
     paths:
       - "src/**"
+      - "src/engine/**"
+      - "rules/crs/rule-manifest.json"
+      - "tests/corpus/engine/**"
       - "tests/**"
       - "benches/**"
       - "Cargo.toml"
@@ -43,6 +58,7 @@ on:
       - "scripts/run-crs-corpus.sh"
       - "scripts/vendor-crs-corpus.sh"
       - "scripts/convert-crs-corpus.py"
+      - "scripts/check-engine-guarantees.sh"
       - ".github/workflows/feature-matrix.yml"
 
 permissions:
@@ -137,4 +153,28 @@ jobs:
         with:
           name: crs-corpus-report
           path: target/crs-corpus.json
+          if-no-files-found: ignore
+
+  engine-guarantees:
+    name: Engine guarantees (optional)
+    # Opt-in only. Accounting and Coraza determinism are always enforced by the
+    # script; the native Rust differential becomes blocking when engine_feature
+    # is enabled.
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.run_engine_guarantees == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      ENGINE_FEATURE: ${{ github.event.inputs.engine_feature == 'true' && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Nix
+        uses: cachix/install-nix-action@v25
+      - name: Run engine guarantees
+        run: ./scripts/check-engine-guarantees.sh
+      - name: Upload guarantee reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-guarantees-report
+          path: target/engine-guarantees/
           if-no-files-found: ignore

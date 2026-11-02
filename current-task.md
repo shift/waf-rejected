@@ -827,3 +827,47 @@ verification done, not pushed.
   wasm-reactor,allow-cache -- --deny warnings`.
 - Gap: native sidecar replay not measured in this session; wasm measured, hit
   path is backend-independent. See the doc's Follow-ups.
+
+---
+
+# Test: enforceable engine guarantees (`test/engine-guarantees`)
+
+**Status:** implemented, local verification in progress.
+**Constraint:** no WAF default, detection rule, or version change.
+
+## Plan
+
+- [x] Add `src/engine/` guarantee layer (accounting, generated inputs,
+      differential, determinism, budget, fail-closed).
+- [x] Add `src/bin/rule_accounting.rs` and committed
+      `rules/crs/rule-manifest.json`.
+- [x] Expose `engine::accounting::verify_complete(manifest, support)`.
+- [x] Extend `crs_corpus` with `--engine rust`, `--generated`, determinism and
+      counterexample persistence.
+- [x] Add `scripts/check-engine-guarantees.sh` and the workflow-dispatch job.
+- [x] Document guarantees, enforcement and residual risks in
+      `docs/suggestions_from_agents/engine-guarantees.md`.
+- [x] Verify `cargo fmt -- --check`, `cargo test --lib`, tool builds and the
+      Coraza baseline harness run.
+- [x] Commit on `test/engine-guarantees` (no push, no merge, no version bump).
+
+## Notes
+
+- The native engine integration point is `src/engine/backend.rs` behind the
+  non-default `native-engine` feature. The scaffold reports unavailable, so the
+  Rust differential/determinism targets skip unless `--require-engine` is set.
+- The engine workstream branch uses `src/waf/rust_engine/` and a `rust-engine`
+  feature; this work does not depend on it. When it lands, the CI input
+  `engine_feature` should be enabled and `backend.rs` wired to it.
+
+## Verification results
+
+- `cargo fmt -- --check` — pass.
+- `cargo test --lib engine::` — 48 passed, 0 failed.
+- `cargo test --lib` — 381 passed, 9 ignored, 0 failed.
+- `cargo clippy --lib -- --deny warnings` — pass.
+- `cargo check --features wasm-reactor,coraza-native,native-engine --bin crs_corpus --bin rule_accounting` — pass.
+- `rule_accounting --check` — pass; manifest has 524 entries, 436 rule ids, 53 chains.
+- `rule_accounting --support` with the full-support template — pass.
+- `crs_corpus --engine wasm --limit 1` — 1/1 passed (baseline smoke; the shared host is heavily loaded, so the full 100-iteration Coraza determinism run was not executed locally).
+- `crs_corpus --engine rust --limit 1 --generated 10 --determinism 2` — reports skipped because the `native-engine` backend is the unimplemented scaffold; `--require-engine` fails as designed.

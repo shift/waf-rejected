@@ -72,6 +72,10 @@ name = "memory-soak"
 path = "src/bin/memory_soak.rs"
 required-features = ["wasm-reactor"]
 
+[[bin]]
+name = "rule_accounting"
+path = "src/bin/rule_accounting.rs"
+
 [dependencies]
 # Async runtime and HTTP
 tokio = { version = "1.0", features = ["full"] }
@@ -244,6 +248,11 @@ wasm-reactor = ["dep:wasmtime", "dep:wasmtime-wasi"]
 # in native/coraza-sidecar and is built separately. See
 # docs/coraza-native-sidecar.md.
 coraza-native = []
+# Native Rust engine replacement. Non-default until the engine workstream lands
+# and the guarantee gates (accounting, differential, determinism, bounds,
+# fail-closed) pass against it. Enabling this feature makes the engine
+# guarantees CI job blocking for the Rust differential target.
+native-engine = []
 # Experimental required-literal prefilter for CRS request bodies. Non-default:
 # it is an opt-in evaluation mode until the detection-parity corpus proves it
 # on the deployed rule set. See docs/suggestions_from_agents/crs-prefilter.md.

@@ -305,3 +305,18 @@ directly.
   the case.
 - Record engine gaps here. Suggestions for rule or engine changes belong in
   `docs/suggestions_from_agents/`.
+
+## Native engine differential
+
+The same harness supports the native Rust engine replacement:
+
+```bash
+nix develop -c cargo run --bin crs_corpus --features wasm-reactor,native-engine -- \
+  --engine rust --require-engine --generated 500 --fail-on-mismatch
+```
+
+`--generated` produces deterministic SQLi/XSS/LFI/RCE requests with encoding and
+placement permutations, compares the Rust decision with Coraza, and persists
+minimized counterexamples in `tests/corpus/engine/counterexamples.json`. The
+accounting, determinism, resource-bound and fail-closed guarantees are described
+in `docs/suggestions_from_agents/engine-guarantees.md`.
