@@ -59,6 +59,12 @@ pub struct Metrics {
     admission_wait_count: AtomicU64,
     admission_cheap_inflight: AtomicU64,
     admission_heavy_inflight: AtomicU64,
+    grpc_allow_total: AtomicU64,
+    grpc_block_total: AtomicU64,
+    grpc_error_total: AtomicU64,
+    graphql_allow_total: AtomicU64,
+    graphql_block_total: AtomicU64,
+    graphql_error_total: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -110,6 +116,12 @@ impl Metrics {
             admission_wait_count: AtomicU64::new(0),
             admission_cheap_inflight: AtomicU64::new(0),
             admission_heavy_inflight: AtomicU64::new(0),
+            grpc_allow_total: AtomicU64::new(0),
+            grpc_block_total: AtomicU64::new(0),
+            grpc_error_total: AtomicU64::new(0),
+            graphql_allow_total: AtomicU64::new(0),
+            graphql_block_total: AtomicU64::new(0),
+            graphql_error_total: AtomicU64::new(0),
         }
     }
 
@@ -299,6 +311,30 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_grpc_allow(&self) {
+        self.grpc_allow_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_grpc_block(&self) {
+        self.grpc_block_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_grpc_error(&self) {
+        self.grpc_error_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_graphql_allow(&self) {
+        self.graphql_allow_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_graphql_block(&self) {
+        self.graphql_block_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_graphql_error(&self) {
+        self.graphql_error_total.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn uptime_seconds(&self) -> u64 {
         self.start_time.elapsed().as_secs()
     }
@@ -433,6 +469,25 @@ impl Metrics {
             self.admission_rejected_timeout_total.load(Ordering::Relaxed),
             self.admission_cheap_inflight.load(Ordering::Relaxed),
             self.admission_heavy_inflight.load(Ordering::Relaxed),
+        ));
+
+        out.push_str(&format!(
+            "# HELP waf_grpc_decisions_total gRPC protocol pre-check decisions by outcome.\n\
+             # TYPE waf_grpc_decisions_total counter\n\
+             waf_grpc_decisions_total{{decision=\"allow\"}} {}\n\
+             waf_grpc_decisions_total{{decision=\"block\"}} {}\n\
+             waf_grpc_decisions_total{{decision=\"error\"}} {}\n\
+             # HELP waf_graphql_decisions_total GraphQL protocol pre-check decisions by outcome.\n\
+             # TYPE waf_graphql_decisions_total counter\n\
+             waf_graphql_decisions_total{{decision=\"allow\"}} {}\n\
+             waf_graphql_decisions_total{{decision=\"block\"}} {}\n\
+             waf_graphql_decisions_total{{decision=\"error\"}} {}\n",
+            self.grpc_allow_total.load(Ordering::Relaxed),
+            self.grpc_block_total.load(Ordering::Relaxed),
+            self.grpc_error_total.load(Ordering::Relaxed),
+            self.graphql_allow_total.load(Ordering::Relaxed),
+            self.graphql_block_total.load(Ordering::Relaxed),
+            self.graphql_error_total.load(Ordering::Relaxed),
         ));
 
         out.push_str(
@@ -595,6 +650,47 @@ mod tests {
             find_line(&rendered, "waf_coraza_errors_total "),
             "waf_coraza_errors_total 1"
         );
+    }
+
+    #[test]
+    fn render_includes_protocol_decision_counters() {
+        let metrics = Metrics::new();
+        metrics.record_grpc_allow();
+        metrics.record_grpc_block();
+        metrics.record_grpc_error();
+        metrics.record_graphql_allow();
+        metrics.record_graphql_block();
+        metrics.record_graphql_error();
+
+        let rendered = metrics.render_prometheus();
+        for (prefix, expected) in [
+            (
+                "waf_grpc_decisions_total{decision=\"allow\"} ",
+                "waf_grpc_decisions_total{decision=\"allow\"} 1",
+            ),
+            (
+                "waf_grpc_decisions_total{decision=\"block\"} ",
+                "waf_grpc_decisions_total{decision=\"block\"} 1",
+            ),
+            (
+                "waf_grpc_decisions_total{decision=\"error\"} ",
+                "waf_grpc_decisions_total{decision=\"error\"} 1",
+            ),
+            (
+                "waf_graphql_decisions_total{decision=\"allow\"} ",
+                "waf_graphql_decisions_total{decision=\"allow\"} 1",
+            ),
+            (
+                "waf_graphql_decisions_total{decision=\"block\"} ",
+                "waf_graphql_decisions_total{decision=\"block\"} 1",
+            ),
+            (
+                "waf_graphql_decisions_total{decision=\"error\"} ",
+                "waf_graphql_decisions_total{decision=\"error\"} 1",
+            ),
+        ] {
+            assert_eq!(find_line(&rendered, prefix), expected);
+        }
     }
 
     #[test]

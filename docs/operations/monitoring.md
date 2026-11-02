@@ -39,6 +39,16 @@ populated in normal deployments; they remain at zero only when
   histogram (buckets `le="0.001"` through `le="5"`, plus `+Inf`, with `_sum`
   and `_count`)
 
+### Protocol decision metrics
+
+The gRPC and GraphQL pre-checks emit one counter with a bounded `decision`
+label (`allow`, `block`, `error`). Cardinality is fixed at three series per
+protocol; no method, operation name, client or rule label is attached, so the
+series count does not grow with traffic.
+
+- `waf_grpc_decisions_total{decision}` - gRPC protocol pre-check outcomes
+- `waf_graphql_decisions_total{decision}` - GraphQL protocol pre-check outcomes
+
 The metrics above are emitted by the built-in `/metrics` endpoint. The
 following extended metrics are planned or emitted by optional integrations:
 
@@ -206,6 +216,55 @@ catches unexpected rule behaviour or an active attack.
 ```
 
 ## Grafana Dashboards
+
+### WAF Overview dashboard
+
+`infrastructure/monitoring/dashboards/waf-overview.json` is the production
+overview. It uses only series emitted by `src/metrics.rs`:
+
+| row | panels |
+| --- | --- |
+| Traffic | request rate, allow/block/rate-limit/auth-failure rate, upstream error rate, request latency p50/p95/p99 |
+| Coraza | evaluations/blocks/errors, evaluation-duration p95/p99 and heatmap |
+| Body policy | truncation/rejection rate, inspected-bytes heatmap and mean |
+| Admission | queue depth/enqueue rate, in-flight by class, admitted/rejected, wait p95/p99 |
+| Protocol | gRPC and GraphQL decisions, block ratio |
+| Coverage note | reactor pool/worker and RSS are not exported; see the metric gap below |
+
+Validate the dashboard and alert metric references with:
+
+```bash
+bash scripts/check-dashboards.sh
+```
+
+### Alert inventory
+
+`infrastructure/monitoring/alert_rules.yml` contains the following
+actionable rules. Each links to a triage section in
+[`runbook.md`](runbook.md).
+
+| alert | signal |
+| --- | --- |
+| `CorazaAdmissionHeavyRejections` | sustained admission rejection |
+| `CorazaAdmissionQueueSaturated` | admission queue depth > 0 |
+| `CorazaBodyTruncationSpike` | body-policy truncation rate |
+| `CorazaBodyRejectionSpike` | body-policy 413 rate |
+| `CorazaEvaluationErrorRate` | Coraza error ratio |
+| `CorazaEvaluationDurationSLOBurn` | Coraza p99 evaluation duration |
+| `CorazaBlockSpike` | Coraza block rate |
+| `GrpcBlockRateAnomaly` | gRPC block ratio |
+| `GraphqlBlockRateAnomaly` | GraphQL block ratio |
+| `ReactorPoolExhaustion` | heavy queue + heavy in-flight |
+| `HighRequestLatency` | request p95 |
+| `UpstreamErrorRate` | upstream error ratio |
+
+### Metric gaps
+
+Reactor pool size, idle/busy workers, worker restarts and process RSS are not
+exported by `/metrics`. The dashboard uses admission queue depth, heavy
+in-flight and Coraza errors as pool-pressure proxies, and the runbook points
+at cAdvisor/kubelet for RSS. Adding direct pool gauges would be a bounded
+follow-up (one series per pool, not per worker).
 
 ### Security Overview Dashboard
 

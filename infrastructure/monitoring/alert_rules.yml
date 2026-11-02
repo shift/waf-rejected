@@ -132,6 +132,7 @@ groups:
         annotations:
           summary: "Sustained heavy-inspection admission rejections"
           description: "{{ $value | humanizePercentage }} of Coraza evaluations are being rejected by admission control; heavy bodies are saturating the pool"
+          runbook_url: "https://github.com/waf-rejected/waf-rejected/blob/main/docs/operations/runbook.md#corazaadmissionheavyrejections"
 
       - alert: CorazaAdmissionQueueSaturated
         expr: waf_admission_queue_depth > 0
@@ -142,3 +143,85 @@ groups:
         annotations:
           summary: "Heavy-inspection admission queue saturated"
           description: "{{ $value }} heavy inspections have been waiting for a permit for 2 minutes; heavy bodies are saturating the pool"
+          runbook_url: "https://github.com/waf-rejected/waf-rejected/blob/main/docs/operations/runbook.md#corazaadmissionqueuesaturated"
+
+      - alert: CorazaBodyTruncationSpike
+        expr: rate(waf_coraza_body_truncated_total[5m]) > 1
+        for: 5m
+        labels:
+          severity: warning
+          category: security
+        annotations:
+          summary: "Coraza body-policy truncation spike"
+          description: "{{ $value | humanize }} bodies per second are being truncated to max_inspect_bytes; the configured inspection prefix may be too small for production traffic"
+          runbook_url: "https://github.com/waf-rejected/waf-rejected/blob/main/docs/operations/runbook.md#corazabodytruncationspike"
+
+      - alert: CorazaBodyRejectionSpike
+        expr: rate(waf_coraza_body_rejected_total[5m]) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+          category: security
+        annotations:
+          summary: "Coraza body-policy rejection spike"
+          description: "{{ $value | humanize }} bodies per second are being rejected with 413 by the oversize policy; clients may be sending bodies above max_inspect_bytes"
+          runbook_url: "https://github.com/waf-rejected/waf-rejected/blob/main/docs/operations/runbook.md#corazabodyrejectionspike"
+
+      - alert: CorazaEvaluationDurationSLOBurn
+        expr: histogram_quantile(0.99, sum by (le) (rate(waf_coraza_evaluation_duration_seconds_bucket[5m]))) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+          category: performance
+        annotations:
+          summary: "Coraza evaluation-duration SLO burn"
+          description: "Coraza p99 evaluation duration is {{ $value }}s, above the 0.5s SLO; heavy bodies or reactor contention are eroding the latency budget"
+          runbook_url: "https://github.com/waf-rejected/waf-rejected/blob/main/docs/operations/runbook.md#corazaevaluationdurationsloburn"
+
+      - alert: GrpcBlockRateAnomaly
+        expr: |
+          sum(rate(waf_grpc_decisions_total{decision="block"}[5m]))
+          /
+          clamp_min(sum(rate(waf_grpc_decisions_total[5m])), 0.001)
+          > 0.2
+          and
+          sum(rate(waf_grpc_decisions_total[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          category: security
+        annotations:
+          summary: "gRPC block-rate anomaly"
+          description: "{{ $value | humanizePercentage }} of gRPC protocol decisions are blocks; check the allowlist, descriptor limits and recent rule changes"
+          runbook_url: "https://github.com/waf-rejected/waf-rejected/blob/main/docs/operations/runbook.md#grpcblockrateanomaly"
+
+      - alert: GraphqlBlockRateAnomaly
+        expr: |
+          sum(rate(waf_graphql_decisions_total{decision="block"}[5m]))
+          /
+          clamp_min(sum(rate(waf_graphql_decisions_total[5m])), 0.001)
+          > 0.2
+          and
+          sum(rate(waf_graphql_decisions_total[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          category: security
+        annotations:
+          summary: "GraphQL block-rate anomaly"
+          description: "{{ $value | humanizePercentage }} of GraphQL protocol decisions are blocks; check the operation allowlist, depth/alias limits and recent rule changes"
+          runbook_url: "https://github.com/waf-rejected/waf-rejected/blob/main/docs/operations/runbook.md#graphqlblockrateanomaly"
+
+      - alert: ReactorPoolExhaustion
+        expr: |
+          sum(waf_admission_queue_depth) > 0
+          and
+          sum(waf_admission_inflight{class="heavy"}) > 0
+        for: 5m
+        labels:
+          severity: critical
+          category: performance
+        annotations:
+          summary: "Reactor pool exhaustion"
+          description: "Heavy inspections are queued while heavy in-flight work is non-zero for 5 minutes; the reactor pool is exhausted. Direct pool/worker gauges are not exported, so admission queue depth is the pool-pressure signal."
+          runbook_url: "https://github.com/waf-rejected/waf-rejected/blob/main/docs/operations/runbook.md#reactorpoolexhaustion"

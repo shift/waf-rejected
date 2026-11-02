@@ -1,0 +1,309 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "id": 1,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "expr": "sum(rate(waf_requests_total[5m]))",
+          "legendFormat": "requests/s",
+          "refId": "A"
+        }
+      ],
+      "title": "Request rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "id": 2,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "sum(rate(waf_allowed_total[5m]))", "legendFormat": "allowed", "refId": "A" },
+        { "expr": "sum(rate(waf_blocked_total[5m]))", "legendFormat": "blocked", "refId": "B" },
+        { "expr": "sum(rate(waf_rate_limited_total[5m]))", "legendFormat": "rate limited", "refId": "C" },
+        { "expr": "sum(rate(waf_auth_failures_total[5m]))", "legendFormat": "auth failures", "refId": "D" }
+      ],
+      "title": "Allow / block / rate-limit / auth-failure rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "id": 3,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "expr": "sum(rate(waf_upstream_errors_total[5m])) / clamp_min(sum(rate(waf_requests_total[5m])), 0.001)",
+          "legendFormat": "upstream error ratio",
+          "refId": "A"
+        }
+      ],
+      "title": "Upstream error rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "id": 4,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le) (rate(waf_request_duration_seconds_bucket[5m])))", "legendFormat": "p50", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(waf_request_duration_seconds_bucket[5m])))", "legendFormat": "p95", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(waf_request_duration_seconds_bucket[5m])))", "legendFormat": "p99", "refId": "C" }
+      ],
+      "title": "Request latency p50 / p95 / p99",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "id": 5,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "sum(rate(waf_coraza_evaluations_total[5m]))", "legendFormat": "evaluations/s", "refId": "A" },
+        { "expr": "sum(rate(waf_coraza_blocks_total[5m]))", "legendFormat": "blocks/s", "refId": "B" },
+        { "expr": "sum(rate(waf_coraza_errors_total[5m]))", "legendFormat": "errors/s", "refId": "C" }
+      ],
+      "title": "Coraza evaluations / blocks / errors",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "id": 6,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(waf_coraza_evaluation_duration_seconds_bucket[5m])))", "legendFormat": "p95", "refId": "A" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(waf_coraza_evaluation_duration_seconds_bucket[5m])))", "legendFormat": "p99", "refId": "B" }
+      ],
+      "title": "Coraza evaluation duration p95 / p99",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "id": 7,
+      "options": { "calculate": false, "cellGap": 1, "color": { "mode": "scheme", "scheme": "Spectral", "steps": 64 }, "yAxis": { "unit": "s" } },
+      "targets": [
+        {
+          "expr": "sum by (le) (rate(waf_coraza_evaluation_duration_seconds_bucket[5m]))",
+          "format": "heatmap",
+          "legendFormat": "{{le}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Coraza evaluation duration heatmap",
+      "type": "heatmap"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "id": 8,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "sum(rate(waf_coraza_body_truncated_total[5m]))", "legendFormat": "truncated/s", "refId": "A" },
+        { "expr": "sum(rate(waf_coraza_body_rejected_total[5m]))", "legendFormat": "rejected/s", "refId": "B" }
+      ],
+      "title": "Body policy: truncated / rejected rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "id": 9,
+      "options": { "calculate": false, "cellGap": 1, "color": { "mode": "scheme", "scheme": "Blues", "steps": 64 }, "yAxis": { "unit": "bytes" } },
+      "targets": [
+        {
+          "expr": "sum by (le) (rate(waf_coraza_body_inspected_bytes_bucket[5m]))",
+          "format": "heatmap",
+          "legendFormat": "{{le}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Body policy: inspected-bytes distribution",
+      "type": "heatmap"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "id": 10,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "expr": "sum(rate(waf_coraza_body_inspected_bytes_sum[5m])) / clamp_min(sum(rate(waf_coraza_body_inspected_bytes_count[5m])), 0.001)",
+          "legendFormat": "mean inspected bytes",
+          "refId": "A"
+        }
+      ],
+      "title": "Body policy: mean inspected bytes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "id": 11,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "sum(waf_admission_queue_depth)", "legendFormat": "queue depth", "refId": "A" },
+        { "expr": "sum(rate(waf_admission_queued_total[5m]))", "legendFormat": "queued/s", "refId": "B" }
+      ],
+      "title": "Admission: queue depth and enqueue rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "id": 12,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "sum(waf_admission_inflight{class=\"cheap\"})", "legendFormat": "cheap in-flight", "refId": "A" },
+        { "expr": "sum(waf_admission_inflight{class=\"heavy\"})", "legendFormat": "heavy in-flight", "refId": "B" }
+      ],
+      "title": "Admission: in-flight by class",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
+      "id": 13,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "sum(rate(waf_admission_admitted_total[5m]))", "legendFormat": "admitted/s", "refId": "A" },
+        { "expr": "sum by (reason) (rate(waf_admission_rejected_total[5m]))", "legendFormat": "rejected ({{reason}})/s", "refId": "B" }
+      ],
+      "title": "Admission: admitted / rejected",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
+      "id": 14,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(waf_admission_wait_duration_seconds_bucket[5m])))", "legendFormat": "p95 wait", "refId": "A" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(waf_admission_wait_duration_seconds_bucket[5m])))", "legendFormat": "p99 wait", "refId": "B" }
+      ],
+      "title": "Admission: wait duration p95 / p99",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 56 },
+      "id": 15,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "sum by (decision) (rate(waf_grpc_decisions_total[5m]))", "legendFormat": "gRPC {{decision}}/s", "refId": "A" }
+      ],
+      "title": "gRPC protocol decisions",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 56 },
+      "id": 16,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "sum by (decision) (rate(waf_graphql_decisions_total[5m]))", "legendFormat": "GraphQL {{decision}}/s", "refId": "A" }
+      ],
+      "title": "GraphQL protocol decisions",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 64 },
+      "id": 17,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "expr": "sum(rate(waf_grpc_decisions_total{decision=\"block\"}[5m])) / clamp_min(sum(rate(waf_grpc_decisions_total[5m])), 0.001)",
+          "legendFormat": "gRPC block ratio",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(waf_graphql_decisions_total{decision=\"block\"}[5m])) / clamp_min(sum(rate(waf_graphql_decisions_total[5m])), 0.001)",
+          "legendFormat": "GraphQL block ratio",
+          "refId": "B"
+        }
+      ],
+      "title": "gRPC / GraphQL block ratio",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 72 },
+      "id": 18,
+      "options": {
+        "content": "Reactor pool/worker health and process RSS are not exported by the WAF `/metrics` endpoint. Use the admission queue depth, heavy in-flight and Coraza error panels as the available pool-pressure signals, and scrape container RSS from cAdvisor/kubelet (`container_memory_working_set_bytes`). See `docs/operations/monitoring.md` for the metric gap.",
+        "mode": "markdown"
+      },
+      "title": "Reactor pool / RSS coverage note",
+      "type": "text"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["waf", "security", "coraza", "admission"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Prometheus",
+        "multi": false,
+        "name": "DS_PROMETHEUS",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "WAF-Rejected Overview",
+  "uid": "waf-rejected-overview",
+  "version": 1,
+  "weekStart": ""
+}

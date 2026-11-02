@@ -658,6 +658,9 @@ impl WafEngine {
                 strip_body,
                 monitored,
             }) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_grpc_allow();
+                }
                 if monitored {
                     debug!(
                         uri = %request.uri,
@@ -671,6 +674,9 @@ impl WafEngine {
                 }
             }
             Ok(grpc::GrpcVerdict::Block { status, reason }) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_grpc_block();
+                }
                 let decision = Decision::Block { status, reason };
                 self.event_logger
                     .log_event(
@@ -682,6 +688,9 @@ impl WafEngine {
                 Some(GrpcPrecheck::Reject(decision))
             }
             Err(err) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_grpc_error();
+                }
                 if self.fail_closed {
                     let decision = Decision::Block {
                         status: 503,
@@ -724,6 +733,9 @@ impl WafEngine {
                 operation_name,
                 query_hash,
             }) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_graphql_allow();
+                }
                 debug!(
                     operation_type = operation_type.as_str(),
                     operation = operation_name.as_deref().unwrap_or("<anonymous>"),
@@ -741,6 +753,9 @@ impl WafEngine {
                 }
             }
             Ok(graphql::GraphqlVerdict::Block { status, reason }) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_graphql_block();
+                }
                 let decision = Decision::Block { status, reason };
                 self.event_logger
                     .log_event(request, &decision, vec![graphql::RULE_NAME.to_string()])
@@ -748,6 +763,9 @@ impl WafEngine {
                 Some(GraphqlPrecheck::Reject(decision))
             }
             Err(err) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_graphql_error();
+                }
                 if self.fail_closed {
                     let decision = Decision::Block {
                         status: 503,

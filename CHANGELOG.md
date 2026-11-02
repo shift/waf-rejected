@@ -6,6 +6,18 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Added
 
+- Production observability for the Coraza, admission, gRPC and GraphQL
+  subsystems. New Grafana dashboard
+  `infrastructure/monitoring/dashboards/waf-overview.json`, expanded
+  `infrastructure/monitoring/alert_rules.yml` with runbook links, per-alert
+  triage in `docs/operations/runbook.md`, and
+  `scripts/check-dashboards.sh` to validate dashboard JSON and metric
+  references against the Rust source. Adds bounded-cardinality
+  `waf_grpc_decisions_total{decision}` and
+  `waf_graphql_decisions_total{decision}` counters (three series each).
+  Reactor pool/worker and RSS metrics remain unexported and are documented as
+  a gap.
+
 - Opt-in Coraza body-inspection size policy (`[waf.coraza]`).
   `max_inspect_bytes` (default `0` = inspect the whole body) and
   `oversize_action` (`"inspect-all"` default, `"forward-uninspected"`,
