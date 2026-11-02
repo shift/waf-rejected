@@ -506,6 +506,7 @@ pub fn socket_available(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::waf::coraza_payload::build_payload;
     use bytes::Bytes;
     use hyper::{HeaderMap, Method, Uri};
     use std::io::{Read as _, Write as _};
