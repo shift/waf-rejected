@@ -33,6 +33,12 @@ pub mod prefilter;
 #[cfg(any(feature = "crs-prefilter", feature = "fastpath"))]
 pub mod prefilter_extract;
 
+/// Experimental Vectorscan/Hyperscan multi-pattern scanner (non-default).
+/// Requires the system `libhs` (nixpkgs `vectorscan`); see
+/// `docs/suggestions_from_agents/hyperscan-evaluation.md`.
+#[cfg(feature = "hyperscan-eval")]
+pub mod hyperscan;
+
 /// Experimental compiled request fast path (non-default `fastpath` feature).
 #[cfg(feature = "fastpath")]
 pub mod fastpath;

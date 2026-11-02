@@ -465,7 +465,7 @@ struct GroupKey {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Extract {
+pub(crate) enum Extract {
     Identity,
     UrlDecode,
     JsonUnescape,
@@ -474,14 +474,14 @@ enum Extract {
 
 impl Extract {
     /// The extraction variants a CRS body processor can apply to a value.
-    const ALL: [Extract; 4] = [
+    pub(crate) const ALL: [Extract; 4] = [
         Extract::Identity,
         Extract::UrlDecode,
         Extract::JsonUnescape,
         Extract::HtmlEntityDecode,
     ];
 
-    fn apply(self, input: &[u8]) -> Cow<'_, [u8]> {
+    pub(crate) fn apply(self, input: &[u8]) -> Cow<'_, [u8]> {
         match self {
             Extract::Identity => Cow::Borrowed(input),
             Extract::UrlDecode => Cow::Owned(url_decode(input, false)),
@@ -492,7 +492,7 @@ impl Extract {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Transform {
+pub(crate) enum Transform {
     Lowercase,
     Uppercase,
     UrlDecode,
@@ -514,7 +514,7 @@ enum Transform {
     CmdLine,
 }
 
-fn parse_transforms(names: &[String]) -> Result<Vec<Transform>, PrefilterError> {
+pub(crate) fn parse_transforms(names: &[String]) -> Result<Vec<Transform>, PrefilterError> {
     let mut out = Vec::new();
     for name in names {
         match name.as_str() {
@@ -546,7 +546,7 @@ fn parse_transforms(names: &[String]) -> Result<Vec<Transform>, PrefilterError> 
     Ok(out)
 }
 
-fn apply_pipeline(input: &[u8], extract: Extract, transforms: &[Transform]) -> Vec<u8> {
+pub(crate) fn apply_pipeline(input: &[u8], extract: Extract, transforms: &[Transform]) -> Vec<u8> {
     let mut current = extract.apply(input);
     for transform in transforms {
         current = Cow::Owned(transform.apply(&current));
@@ -554,7 +554,139 @@ fn apply_pipeline(input: &[u8], extract: Extract, transforms: &[Transform]) -> V
     current.into_owned()
 }
 
+/// Number of body extraction variants a CRS body processor can produce.
+#[doc(hidden)]
+pub const EXTRACTION_VARIANTS: usize = Extract::ALL.len();
+
+/// Experimental helper for the Vectorscan/Hyperscan evaluation target.
+///
+/// A parsed transform chain that can be applied to a body for one extraction
+/// variant without re-parsing the artifact's transform names on every scan.
+/// Not part of the stable API; gated behind `crs-prefilter`.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct TransformChain {
+    transforms: Vec<Transform>,
+}
+
+impl TransformChain {
+    #[doc(hidden)]
+    pub fn parse(names: &[String]) -> Result<Self, PrefilterError> {
+        Ok(Self {
+            transforms: parse_transforms(names)?,
+        })
+    }
+
+    /// Apply the chain to a body for one extraction variant.
+    ///
+    /// This is the naive path: extraction and every transform run for every
+    /// group, matching the existing Aho-Corasick prefilter's structure.
+    #[doc(hidden)]
+    pub fn apply(&self, body: &[u8], extraction: usize) -> Vec<u8> {
+        self.apply_view(&extract_view(body, extraction))
+            .into_owned()
+    }
+
+    /// Apply the chain to an already-extracted view, skipping transforms that
+    /// are provably the identity on this input.
+    ///
+    /// The skip predicate is conservative: a `false` result only means the
+    /// transform runs. Reusing the input buffer when every transform is a
+    /// no-op is what lets one extracted view feed every group's database.
+    #[doc(hidden)]
+    pub fn apply_view<'a>(&self, input: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+        let mut current = std::borrow::Cow::Borrowed(input);
+        for transform in &self.transforms {
+            if transform.is_identity_for(&current) {
+                continue;
+            }
+            current = std::borrow::Cow::Owned(transform.apply(&current));
+        }
+        current
+    }
+
+    /// Apply the chain without the no-op skip, for an apples-to-apples
+    /// comparison with the existing per-group prefilter.
+    #[doc(hidden)]
+    pub fn apply_view_naive(&self, input: &[u8]) -> Vec<u8> {
+        let mut current = std::borrow::Cow::Borrowed(input);
+        for transform in &self.transforms {
+            current = std::borrow::Cow::Owned(transform.apply(&current));
+        }
+        current.into_owned()
+    }
+
+    #[doc(hidden)]
+    pub fn is_identity(&self) -> bool {
+        self.transforms.is_empty()
+    }
+}
+
+/// Apply one body extraction variant without any rule transform.
+#[doc(hidden)]
+pub fn extract_view(body: &[u8], extraction: usize) -> std::borrow::Cow<'_, [u8]> {
+    Extract::ALL
+        .get(extraction)
+        .copied()
+        .unwrap_or(Extract::Identity)
+        .apply(body)
+}
+
 impl Transform {
+    /// Conservative identity test: true only when [`Self::apply`] would
+    /// return the input unchanged.
+    fn is_identity_for(self, input: &[u8]) -> bool {
+        match self {
+            Transform::Lowercase => {
+                input.iter().all(u8::is_ascii) && !input.iter().any(u8::is_ascii_uppercase)
+            }
+            Transform::Uppercase => {
+                input.iter().all(u8::is_ascii) && !input.iter().any(u8::is_ascii_lowercase)
+            }
+            Transform::UrlDecode | Transform::UrlDecodeUni => {
+                !input.iter().any(|b| *b == b'%' || *b == b'+')
+            }
+            Transform::RemoveNulls | Transform::ReplaceNulls => !input.contains(&0),
+            Transform::CompressWhitespace => !input
+                .windows(2)
+                .any(|pair| is_latin_space(pair[0]) && is_latin_space(pair[1])),
+            Transform::RemoveWhitespace => !input.iter().any(|b| is_latin_space(*b)),
+            Transform::Trim => {
+                !input.first().is_some_and(|b| is_latin_space(*b))
+                    && !input.last().is_some_and(|b| is_latin_space(*b))
+            }
+            Transform::TrimLeft => !input.first().is_some_and(|b| is_latin_space(*b)),
+            Transform::TrimRight => !input.last().is_some_and(|b| is_latin_space(*b)),
+            Transform::NormalizePath => !input.is_empty() && !input.contains(&b'/'),
+            Transform::NormalizePathWin => {
+                !input.is_empty() && !input.contains(&b'/') && !input.contains(&b'\\')
+            }
+            Transform::EscapeSeqDecode => !input.contains(&b'\\'),
+            Transform::ReplaceComments => !input.windows(2).any(|pair| pair == b"/*"),
+            Transform::JsDecode | Transform::CssDecode => !input.contains(&b'\\'),
+            Transform::HtmlEntityDecode => !input.contains(&b'&'),
+            Transform::CmdLine => {
+                input.iter().all(u8::is_ascii)
+                    && !input.iter().any(|b| {
+                        matches!(
+                            b,
+                            b'"' | b'\''
+                                | b'\\'
+                                | b'^'
+                                | b' '
+                                | b','
+                                | b';'
+                                | b'\t'
+                                | b'\r'
+                                | b'\n'
+                                | b'/'
+                                | b'('
+                        ) || b.is_ascii_uppercase()
+                    })
+            }
+        }
+    }
+
     fn apply(self, input: &[u8]) -> Vec<u8> {
         match self {
             Transform::Lowercase => map_case(input, true),
@@ -1442,6 +1574,7 @@ mod tests {
         assert_eq!(first.gated_rule_ids(), second.gated_rule_ids());
     }
 
+    #[cfg(all(feature = "coraza-native", unix))]
     #[test]
     fn removal_bound_matches_the_wire_abi() {
         assert_eq!(
@@ -1516,5 +1649,106 @@ mod tests {
         let sanitized = prefilter.sanitize_remove_rule_ids(&noisy);
         assert_eq!(sanitized, ids);
         assert!(sanitized.len() <= MAX_REMOVE_RULE_IDS);
+    }
+
+    #[test]
+    fn transform_identity_predicate_is_conservative() {
+        let samples: &[&[u8]] = &[
+            b"",
+            b"plain",
+            b"MixedCase",
+            b"%41",
+            b"a+b",
+            b"a&b",
+            b"a\\b",
+            b"a/*b",
+            b"a  b",
+            b" a ",
+            b"a/b",
+            b"a\\b",
+            b"a,b;c",
+            b"\x00",
+            b"\"'^",
+            b"caf\xc3\xa9",
+            b"..",
+            b".",
+            b"/a/../b",
+        ];
+        let transforms = [
+            Transform::Lowercase,
+            Transform::Uppercase,
+            Transform::UrlDecode,
+            Transform::UrlDecodeUni,
+            Transform::RemoveNulls,
+            Transform::ReplaceNulls,
+            Transform::CompressWhitespace,
+            Transform::RemoveWhitespace,
+            Transform::Trim,
+            Transform::TrimLeft,
+            Transform::TrimRight,
+            Transform::NormalizePath,
+            Transform::NormalizePathWin,
+            Transform::EscapeSeqDecode,
+            Transform::ReplaceComments,
+            Transform::JsDecode,
+            Transform::CssDecode,
+            Transform::HtmlEntityDecode,
+            Transform::CmdLine,
+        ];
+        for transform in transforms {
+            for sample in samples {
+                if transform.is_identity_for(sample) {
+                    assert_eq!(
+                        transform.apply(sample),
+                        *sample,
+                        "{transform:?} claimed identity on {sample:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transform_chain_skip_matches_naive() {
+        let chains: &[&[&str]] = &[
+            &[],
+            &["lowercase"],
+            &["urldecodeuni"],
+            &["urldecodeuni", "lowercase"],
+            &["htmlentitydecode", "lowercase"],
+            &[
+                "urldecodeuni",
+                "htmlentitydecode",
+                "jsdecode",
+                "cssdecode",
+                "removenulls",
+            ],
+            &["normalizepathwin"],
+            &["cmdline", "normalizepath"],
+            &["compresswhitespace", "removewhitespace"],
+        ];
+        let samples: &[&[u8]] = &[
+            b"plain",
+            b"MixedCase",
+            b"%41%2f%2e%2e+",
+            b"a&ltscript&gt",
+            b"a\\u0041\\x41\\101",
+            b"a/*comment*/b",
+            b"a  b\t\nc",
+            b" /a/../b//c/ ",
+            b"cmd /c dir",
+            b"\x00a\x00",
+        ];
+        for names in chains {
+            let names: Vec<String> = names.iter().map(|name| (*name).to_string()).collect();
+            let chain = TransformChain::parse(&names).expect("known transforms");
+            for sample in samples {
+                assert_eq!(
+                    chain.apply_view(sample).as_ref(),
+                    chain.apply_view_naive(sample),
+                    "chain {names:?} disagreed on {sample:?}"
+                );
+            }
+        }
     }
 }

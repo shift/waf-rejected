@@ -47,7 +47,8 @@
           filter =
             path: type:
             (craneLib.filterCargoSources path type)
-            || (builtins.match ".*/wasm/.*" path != null);
+            || (builtins.match ".*/wasm/.*" path != null)
+            || (builtins.match ".*/rules/.*" path != null);
         };
 
         # Common arguments for all derivations
@@ -244,6 +245,25 @@
             mainProgram = "coraza-sidecar";
           };
         };
+
+        # Experimental Vectorscan/Hyperscan prefilter benchmark. Non-default:
+        # the feature links the system libhs provided by nixpkgs#vectorscan.
+        hyperscan-bench = craneLib.buildPackage (commonArgs // {
+          inherit cargoArtifacts;
+          pname = "waf-hyperscan-bench";
+          buildInputs = commonArgs.buildInputs ++ [ pkgs.vectorscan ];
+          cargoBuildCommand =
+            "cargo build --release --no-default-features --bin hyperscan-bench --features hyperscan-eval";
+          cargoCheckCommand =
+            "cargo check --release --no-default-features --bin hyperscan-bench --features hyperscan-eval";
+          doCheck = false;
+          meta = with pkgs.lib; {
+            description = "Vectorscan/Hyperscan CRS body prefilter evaluation harness";
+            homepage = "https://github.com/shift/waf-rejected";
+            license = with licenses; [ mit asl20 bsd3 ];
+            mainProgram = "hyperscan-bench";
+          };
+        });
       in
       {
         packages = {
@@ -272,6 +292,9 @@
 
           # Experimental native Go Coraza sidecar (not part of default builds)
           coraza-native-sidecar = coraza-native-sidecar;
+
+          # Experimental Vectorscan/Hyperscan prefilter benchmark
+          hyperscan-bench = hyperscan-bench;
         };
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
@@ -297,6 +320,7 @@
             openssl
             zlib
             zstd
+            vectorscan  # libhs for the experimental hyperscan-eval target
 
             # Development tools
             git
