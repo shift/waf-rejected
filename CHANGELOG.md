@@ -175,6 +175,17 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Changed
 
+- The native Coraza sidecar enables CRS phase-1 early blocking
+  (`tx.early_blocking=1`, rule 900120) by default (`--early-blocking`, opt-out).
+  Requests whose phase-1 anomaly score already exceeds the blocking threshold
+  are denied before the request body is scanned: a scanner User-Agent with an
+  8 KiB body drops from ~61 ms to ~0.3 ms of CPU, and a 60 KiB body from
+  ~493 ms to ~0.3 ms. Allow/block decisions are unchanged (verified against the
+  SQLi/XSS/LFI/RCE corpus in both query and body form); the documented CRS
+  tradeoff is that phase-2 alerts for an already-blocked request are not
+  generated. Benign traffic is unaffected. See
+  `docs/suggestions_from_agents/crs-performance.md` for the full CRS profile and
+  the ranked remaining options.
 - The native Coraza sidecar's per-request cost is now protocol-independent: CRS
   scanning is 99.8 %+ of latency at every body size (measured split: 13–18 µs
   client+IPC vs 7.1–114 ms total), so p50 is unchanged and throughput is

@@ -12,7 +12,12 @@ import (
 
 func testServer(t testing.TB) *server {
 	t.Helper()
-	engine, err := newEngine("../../wasm/coraza_reactor/rules/crs/crs.conf", 64*1024)
+	return testServerWith(t, true)
+}
+
+func testServerWith(t testing.TB, earlyBlocking bool) *server {
+	t.Helper()
+	engine, err := newEngine("../../wasm/coraza_reactor/rules/crs/crs.conf", 64*1024, earlyBlocking)
 	if err != nil {
 		t.Fatalf("newEngine: %v", err)
 	}

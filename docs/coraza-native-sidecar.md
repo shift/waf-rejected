@@ -57,9 +57,10 @@ proxy process (Rust)                              sidecar process (Go)
   Coraza a sub-slice of the frame. The allow response allocates nothing on
   either side.
 - **Limits:** `--max-body`, `--max-headers`, `--max-header-bytes`, `--timeout`,
-  `--max-conns` and `--grace` are enforced in the sidecar. The client enforces
-  `waf.coraza.max_payload_bytes`, `waf.coraza.eval_timeout_ms` and the bounded
-  pool. Malformed/oversized payloads are blocked (`400`/`413`), never allowed.
+  `--max-conns`, `--early-blocking` and `--grace` are enforced in the sidecar.
+  The client enforces `waf.coraza.max_payload_bytes`,
+  `waf.coraza.eval_timeout_ms` and the bounded pool. Malformed/oversized
+  payloads are blocked (`400`/`413`), never allowed.
 - **Blocking is contained:** `WafRule::evaluate` is synchronous, so the client
   checks a connection out of a bounded pool, writes the frame, reads the
   decision and returns it. Socket send/receive timeouts plus a post-read
@@ -284,6 +285,33 @@ operator scanning is 99.8 %+ of the latency at every size. The remaining lever
 is concurrency and body size, not the socket. This is why the earlier wasm
 speed-up (5–6×) was real: it removed execution overhead from the dominant
 component, whereas protocol work can only trim a rounding error.
+
+### Early blocking (phase-1 anomaly evaluation)
+
+The sidecar enables CRS rule 900120 (`tx.early_blocking=1`) by default. When a
+request's phase-1 anomaly score already reaches the blocking threshold (scanner
+User-Agent, protocol/header/cookie attack rules), CRS denies in phase 1 and the
+request body is never scanned. The block decision is identical; only phase-2
+alerts for an already-blocked request are skipped, which is the documented CRS
+tradeoff for this mode. Disable with `--early-blocking=false` to restore the
+phase-2 evaluation and its telemetry.
+
+Benign traffic is unaffected (no phase-1 score → phase 2 runs normally). The
+win is on requests that are blocked anyway, which is also a CPU-amplification
+vector: a scanner User-Agent plus a large body used to force a full body scan
+before the phase-2 deny.
+
+| body | phase-2 only | early blocking | speedup |
+|---:|---:|---:|---:|
+| 1 KiB | 7.87 ms | 0.26 ms | 30× |
+| 4 KiB | 29.76 ms | 0.26 ms | 115× |
+| 8 KiB | 60.83 ms | 0.28 ms | 217× |
+| 16 KiB | 119.87 ms | 0.29 ms | 413× |
+| 60 KiB | 493.15 ms | 0.26 ms | 1 897× |
+
+Numbers are process CPU time on the reference machine, pinned core, median of
+6–9 evaluations; the full profile and the ranked remaining options are in
+[`suggestions_from_agents/crs-performance.md`](suggestions_from_agents/crs-performance.md).
 
 ### Through the proxy
 

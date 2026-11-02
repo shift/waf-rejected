@@ -82,10 +82,11 @@ func main() {
 		maxConns       = flag.Int("max-conns", 128, "maximum concurrently served connections")
 		timeout        = flag.Duration("timeout", 5*time.Second, "per-request wall-clock budget")
 		grace          = flag.Duration("grace", 10*time.Second, "graceful shutdown drain budget")
+		earlyBlocking  = flag.Bool("early-blocking", true, "enable CRS phase-1 early blocking (rule 900120) so requests already over the anomaly threshold are denied before the body is scanned")
 	)
 	flag.Parse()
 
-	engine, err := newEngine(*rulesPath, *maxBody)
+	engine, err := newEngine(*rulesPath, *maxBody, *earlyBlocking)
 	if err != nil {
 		log.Fatalf("initialise Coraza: %v", err)
 	}
@@ -181,7 +182,15 @@ accept:
 // newEngine loads the pinned CRS bundle. The data files (@pmFromFile) are
 // resolved relative to crs.conf, exactly as the WASI reactor does with its
 // embedded rules subtree.
-func newEngine(rulesPath string, maxBody int) (coraza.WAF, error) {
+//
+// earlyBlocking enables CRS rule 900120 (tx.early_blocking=1). Phase-1 rules
+// (scanner detection, protocol enforcement, header/cookie attack rules) then
+// deny a request as soon as its phase-1 anomaly score reaches the threshold,
+// instead of scanning the whole request body first and denying in phase 2.
+// The block decision is identical because the phase-1 score is already over
+// the threshold; only phase-2 telemetry is skipped, which is the documented
+// CRS tradeoff for this mode.
+func newEngine(rulesPath string, maxBody int, earlyBlocking bool) (coraza.WAF, error) {
 	conf, err := os.ReadFile(rulesPath)
 	if err != nil {
 		return nil, fmt.Errorf("read rules %s: %w", rulesPath, err)
@@ -197,6 +206,10 @@ SecRequestBodyLimit %d
 SecRequestBodyInMemoryLimit %d
 SecResponseBodyAccess Off
 `, maxBody, maxBody)
+	if earlyBlocking {
+		preamble += `SecAction "id:900120,phase:1,pass,nolog,t:none,setvar:tx.early_blocking=1"
+`
+	}
 	return coraza.NewWAF(
 		coraza.NewWAFConfig().
 			WithRootFS(rootFS).

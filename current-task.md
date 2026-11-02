@@ -662,3 +662,32 @@ removes the fail-fast `QueueFull` path and stabilises tails under contention.
   `nix build .#coraza-native-sidecar`.
 - Note: the measurement machine is shared with other agents, so the docs
   compare interleaved ratios rather than single absolute runs.
+
+## perf: OWASP CRS evaluation cost (worktree `.worktrees/crs-perf`)
+
+Branch: `perf/crs-cost`. Task: profile the dominant CRS cost, find safe
+reductions, implement the safe ones without weakening rules or changing WAF
+defaults, and rank the rest with security tradeoffs.
+
+Findings: CRS is 99.8 % of native sidecar request cost and byte-linear at
+~7.4 µs per inspected byte (1 KiB 7.9 ms, 8 KiB 61 ms, 60 KiB 479 ms CPU).
+Family split (8 KiB benign form): 932 28.7 %, 942 26.1 %, 934 10.5 %,
+941 9.0 %, 921 7.9 %, 933 6.4 %, 944 5.6 %, rest <3 %. Targets: ARGS 91.4 %,
+REQUEST_BODY 7.6 %; headers/URI/XML/cookies <0.5 % combined. Transform time
+2.7 %, operators 96.8 %; top rule 934100 10.9 %, top four 932 rules 34 %.
+`SecArgumentsLimit` is bypassed for POST bodies by Coraza 3.3.3 (body
+processors write ARGS_POST directly), so it cannot cap the many-argument
+vector. Body caps are linear (`ProcessPartial` 4/2/1 KiB = −50/−75/−87 %;
+`Reject` = −99.6 % but 413). GOGC/GOMAXPROCS/audit/debug have no steady-state
+effect. No response-only or safely-removable request rules exist.
+
+Implemented: native sidecar `--early-blocking` (CRS rule 900120) default on.
+Phase-1-blocked requests skip the body scan: 8 KiB 61 ms → 0.28 ms, 60 KiB
+493 ms → 0.26 ms; benign unchanged; decisions unchanged on the
+SQLi/XSS/LFI/RCE corpus (query + body). Documented in
+`docs/suggestions_from_agents/crs-performance.md` and
+`docs/coraza-native-sidecar.md`.
+
+Not implemented (product decisions): reactor (wasm) parity requires a module
+rebuild; inspected-body caps; literal prefilter; Hyperscan via cgo; upstream
+`SecArgumentsLimit` fix.

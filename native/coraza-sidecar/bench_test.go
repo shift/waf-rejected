@@ -185,3 +185,31 @@ func writeResponseBuf(buf []byte, binaryProto bool, resp Response) []byte {
 	body, _ := json.Marshal(resp)
 	return append(buf, body...)
 }
+
+// BenchmarkEvaluateEarlyBlocking measures a request that phase-1 rules already
+// block (scanner User-Agent) while it carries an 8 KiB body. With CRS early
+// blocking the body is never scanned; without it the full CRS body phase runs
+// before the phase-2 anomaly check denies the request.
+func BenchmarkEvaluateEarlyBlocking(b *testing.B) {
+	req := benchWireRequest(8 << 10)
+	req.Headers = append(req.Headers,
+		[2]string{"user-agent", "sqlmap/1.7.2#stable (https://sqlmap.org)"})
+
+	for _, tc := range []struct {
+		name string
+		srv  *server
+	}{
+		{"early-blocking", testServerWith(b, true)},
+		{"phase-2-only", testServerWith(b, false)},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			b.SetBytes(int64(len(req.Body)))
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				if resp := tc.srv.evaluateParsed(req); resp.Decision != "block" {
+					b.Fatalf("unexpected decision: %+v", resp)
+				}
+			}
+		})
+	}
+}
