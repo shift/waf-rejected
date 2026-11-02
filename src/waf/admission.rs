@@ -7,6 +7,10 @@
 //! bounds concurrent heavy evaluations so at least one reactor worker stays
 //! available for cheap traffic.
 //!
+//! Classification runs before the protocol pre-checks, on signals available on
+//! the original request. A gRPC field-content scan withholds the protobuf body
+//! from CRS but performs its own Coraza evaluation, so it is heavy.
+//!
 //! Waiting is asynchronous (`tokio::sync::Semaphore` + `tokio::time::timeout`)
 //! so a queued request does not block a Tokio worker. Saturation and timeout
 //! both fail closed: the engine maps them to `503` with `Retry-After`.
@@ -19,14 +23,14 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::config::WafAdmissionConfig;
 use crate::metrics::Metrics;
-use crate::waf::RequestContext;
 
 /// Cost class of a request's WAF inspection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InspectionCost {
     /// No body, or a body withheld from CRS by a protocol pre-check.
     Cheap,
-    /// A body that CRS body rules will scan.
+    /// A body that CRS body rules will scan, or a protocol pre-check that runs
+    /// its own Coraza evaluation (gRPC field-content scanning).
     Heavy,
 }
 
@@ -62,15 +66,36 @@ impl std::fmt::Display for AdmissionRejection {
     }
 }
 
-/// Classify an evaluation from the context the pre-checks produced.
+/// Inputs to classification that are known before any pre-check runs.
 ///
-/// The gRPC and GraphQL pre-checks already remove the body when it is withheld
-/// from CRS (`strip_body`), so looking at the post-precheck body is enough:
-/// a non-empty body means CRS will scan it.
-pub fn classify(ctx: &RequestContext) -> InspectionCost {
-    match ctx.body.as_ref() {
-        Some(body) if !body.is_empty() => InspectionCost::Heavy,
-        _ => InspectionCost::Cheap,
+/// Classification must not look at the post-pre-check context: the gRPC
+/// pre-check withholds the protobuf body from CRS *and* may run its own Coraza
+/// evaluation of decoded field values. A stripped body therefore does not
+/// imply a cheap evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InspectionSignals {
+    /// The request carries a non-empty body.
+    pub body_present: bool,
+    /// A protocol pre-check will run a Coraza evaluation of decoded content.
+    pub protocol_content_scan: bool,
+    /// A protocol pre-check withholds the body from CRS body rules.
+    pub body_withheld: bool,
+}
+
+/// Classify an evaluation from signals available on the original request.
+///
+/// A protocol content scan is heavy even though the raw body is withheld: it
+/// triggers a full Coraza evaluation of the decoded payload. Otherwise a body
+/// that reaches CRS body rules is heavy, and a body withheld by a pre-check is
+/// cheap.
+pub fn classify(signals: InspectionSignals) -> InspectionCost {
+    if signals.protocol_content_scan {
+        return InspectionCost::Heavy;
+    }
+    if !signals.body_present || signals.body_withheld {
+        InspectionCost::Cheap
+    } else {
+        InspectionCost::Heavy
     }
 }
 
@@ -255,26 +280,33 @@ impl AdmissionController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
-    use hyper::{HeaderMap, Method, Uri};
-    use std::net::{IpAddr, Ipv4Addr};
 
-    fn context(body: Option<&[u8]>) -> RequestContext {
-        RequestContext::new(
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            Method::POST,
-            Uri::from_static("/submit"),
-            HeaderMap::new(),
-            body.map(<[u8]>::len),
-        )
-        .with_body(body.map(|b| Bytes::copy_from_slice(b)))
+    fn signals(
+        body_present: bool,
+        protocol_content_scan: bool,
+        body_withheld: bool,
+    ) -> InspectionSignals {
+        InspectionSignals {
+            body_present,
+            protocol_content_scan,
+            body_withheld,
+        }
     }
 
     #[test]
     fn classifies_bodies_as_heavy_and_empty_or_absent_as_cheap() {
-        assert_eq!(classify(&context(None)), InspectionCost::Cheap);
-        assert_eq!(classify(&context(Some(b""))), InspectionCost::Cheap);
-        assert_eq!(classify(&context(Some(b"a=1"))), InspectionCost::Heavy);
+        assert_eq!(
+            classify(signals(false, false, false)),
+            InspectionCost::Cheap
+        );
+        assert_eq!(classify(signals(true, false, false)), InspectionCost::Heavy);
+        assert_eq!(classify(signals(true, false, true)), InspectionCost::Cheap);
+    }
+
+    #[test]
+    fn protocol_content_scans_are_heavy_even_when_the_body_is_withheld() {
+        assert_eq!(classify(signals(true, true, true)), InspectionCost::Heavy);
+        assert_eq!(classify(signals(false, true, true)), InspectionCost::Heavy);
     }
 
     #[test]
@@ -334,33 +366,28 @@ mod tests {
 #[cfg(test)]
 mod proptests {
     use super::*;
-    use bytes::Bytes;
-    use hyper::{HeaderMap, Method, Uri};
     use proptest::prelude::*;
-    use std::net::{IpAddr, Ipv4Addr};
-
-    fn context(body: Option<&[u8]>) -> RequestContext {
-        RequestContext::new(
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            Method::POST,
-            Uri::from_static("/submit"),
-            HeaderMap::new(),
-            body.map(<[u8]>::len),
-        )
-        .with_body(body.map(|b| Bytes::copy_from_slice(b)))
-    }
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(128))]
 
         #[test]
-        fn classification_matches_body_presence(body in proptest::option::of(proptest::collection::vec(any::<u8>(), 0..1024))) {
-            let ctx = context(body.as_deref());
-            let expected = match body.as_deref() {
-                Some(bytes) if !bytes.is_empty() => InspectionCost::Heavy,
-                _ => InspectionCost::Cheap,
+        fn classification_follows_body_and_protocol_signals(
+            body_present in any::<bool>(),
+            protocol_content_scan in any::<bool>(),
+            body_withheld in any::<bool>(),
+        ) {
+            let cost = classify(InspectionSignals {
+                body_present,
+                protocol_content_scan,
+                body_withheld,
+            });
+            let expected = if protocol_content_scan || (body_present && !body_withheld) {
+                InspectionCost::Heavy
+            } else {
+                InspectionCost::Cheap
             };
-            prop_assert_eq!(classify(&ctx), expected);
+            prop_assert_eq!(cost, expected);
         }
     }
 }

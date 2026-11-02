@@ -17,6 +17,8 @@
 #   HEALTH_PORT    health port (default 39081)
 #   UPSTREAM_PORT  mock upstream port (default 39000)
 #   CARGO_TARGET_DIR  optional shared target directory
+#   ADMISSION_ENABLED  heavy-inspection admission control (default true; false
+#                      reproduces the pre-fix bypass for A/B validation)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -24,10 +26,34 @@ OUT_DIR="${OUT_DIR:-/tmp/opencode/load-validation}"
 WAF_PORT="${WAF_PORT:-39080}"
 HEALTH_PORT="${HEALTH_PORT:-39081}"
 UPSTREAM_PORT="${UPSTREAM_PORT:-39000}"
+# A/B switch for validation: `false` reproduces the pre-fix behaviour where
+# protocol content scans bypassed the heavy pool.
+ADMISSION_ENABLED="${ADMISSION_ENABLED:-true}"
 
 mkdir -p "$OUT_DIR"
 rm -f "$OUT_DIR"/results.json "$OUT_DIR"/fixture.json "$OUT_DIR"/summary.md \
-      "$OUT_DIR"/waf-ingress.log "$OUT_DIR"/config.toml
+      "$OUT_DIR"/waf-ingress.log "$OUT_DIR"/config.toml \
+      "$OUT_DIR"/grpc-allowlist.json
+
+# Minimal IR v2 artifact: only `/acme.Content/Scan` has descriptor metadata,
+# so only that load profile triggers the Coraza gRPC content scan. Unknown
+# methods keep the envelope-only path used by the other gRPC profiles.
+cat >"$OUT_DIR/grpc-allowlist.json" <<'EOF'
+{
+  "ir_version": 2,
+  "source": {"kind": "protobuf", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"},
+  "methods": [
+    {"path": "/acme.Content/Scan", "client_streaming": false, "server_streaming": false,
+     "input": "acme.Request", "output": "acme.Response", "max_message_bytes": 4194304}
+  ],
+  "messages": [
+    {"message": "acme.Request", "fields": [
+      {"name": "name", "number": 1, "type": "string"}
+    ]}
+  ],
+  "unknown_method_action": "allow"
+}
+EOF
 
 cat >"$OUT_DIR/config.toml" <<EOF
 # Throwaway load-validation config. Not a production configuration.
@@ -99,8 +125,13 @@ pool_size = 0
 [waf.grpc]
 enabled = true
 method_allowlist = []
+allowlist_file = "${OUT_DIR}/grpc-allowlist.json"
+content_scan = "strings"
 max_message_bytes = 4194304
 max_frames = 64
+
+[waf.admission]
+enabled = ${ADMISSION_ENABLED}
 
 [security.auth]
 enabled = false

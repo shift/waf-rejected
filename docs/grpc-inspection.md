@@ -178,6 +178,13 @@ Cost and limits:
 * one extra Coraza evaluation per gRPC request that has descriptor metadata
   and at least one scannable field. The evaluation cost scales with the
   decoded field bytes, like ordinary CRS body inspection;
+* the scan runs under heavy-inspection admission control (`[waf.admission]`).
+  The request is classified **before** the gRPC pre-check, from the original
+  `application/grpc*` content type, body presence and descriptor metadata, so
+  a content scan occupies one heavy permit for the whole evaluation. Saturated
+  admission rejects with `503 + Retry-After` before the scan runs; it never
+  allows the request uninspected. `content_scan = "off"` stays cheap and
+  bypasses the heavy queue because it performs no Coraza evaluation;
 * at most `max_content_scan_bytes` decoded field bytes are included (default
   64 KiB). Structural validation still covers the whole message; only
   collection is capped. Values are truncated deterministically at a UTF-8
@@ -192,7 +199,11 @@ approximately 39 ms / 165 ms / 705 ms for 1/4/16 KiB strings with scanning
 enabled, versus 2.5 µs / 6.6 µs / 22 µs with `content_scan = "off"`. The extra
 cost is the Coraza body evaluation, not protobuf decoding or payload
 construction. Deployments that cannot budget it should lower
-`max_content_scan_bytes` or set `content_scan = "off"`.
+`max_content_scan_bytes` or set `content_scan = "off"`. With admission enabled
+these costs are bounded: in the load-validation A/B a 4 KiB scan at
+concurrency 64 kept p95 at ~0.40 s with excess requests rejected `503`,
+instead of queueing to a 2.8 s p95 with admission bypassed. See
+[performance-validation.md](operations/performance-validation.md#grpc-content-scan-admission-ab).
 
 Metrics: `waf_grpc_content_scans_total` counts synthetic evaluations and
 `waf_grpc_content_blocks_total` counts requests blocked by them. The existing
@@ -237,7 +248,10 @@ blocking with the field path in the reason, benign values, non-UTF-8 `bytes`
 exclusion, the byte cap and deterministic truncation, `content_scan = "off"`,
 and single-increment metrics. `src/waf/mod.rs` verifies that a
 gRPC protobuf body is not delivered to downstream rules while a non-gRPC body
-still is. Artifact tests cover allow/block from a generated file, merging with
+still is, that a content-scanning request is classified heavy while
+`content_scan = "off"` stays cheap, that saturated admission rejects before the
+scan or rule chain runs, and that a content scan holds exactly one permit.
+Artifact tests cover allow/block from a generated file, merging with
 `method_allowlist`, per-method limits smaller than the global value,
 unknown-method action precedence, an unreadable file, and deterministic
 generation of field metadata. `src/config.rs` rejects a missing or invalid

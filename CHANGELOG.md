@@ -140,6 +140,19 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Fixed
 
+- gRPC field-content scans no longer bypass heavy-inspection admission control.
+  Classification now runs **before** the gRPC pre-check on the original request:
+  `application/grpc*` with content scanning enabled and decodable descriptor
+  metadata is heavy, `content_scan = "off"` and `graphql-only` stay cheap, and
+  plain bodies stay heavy. Previously `admission::classify` saw the
+  body-stripped context, so every gRPC request was cheap and a 39–705 ms Coraza
+  evaluation could occupy reactor workers outside the semaphore. The permit now
+  covers the pre-check and the main evaluation, one permit per request, and a
+  saturated pool rejects with `503 + Retry-After` before any reactor
+  evaluation. Load validation: 4 KiB scans at c=64 went from 2.78 s to 0.40 s
+  p95 with excess work rejected, and bodyless p95 under 10% gRPC-scan load
+  improved from 491 ms to 52 ms. See
+  `docs/operations/performance-validation.md`.
 - HTTP/2 ingress with keep-alive enabled now installs a `TokioTimer`; without
   it hyper panicked with "You must supply a timer" on the first HTTP/2
   connection.

@@ -825,12 +825,79 @@ impl WafEngine {
             .is_some_and(|inspector| inspector.strips_body())
     }
 
+    /// Admission signals for the request as received, before any pre-check.
+    ///
+    /// Classification must not use the post-pre-check context: the gRPC
+    /// pre-check withholds the protobuf body from CRS but may still run its own
+    /// Coraza evaluation of decoded field values, which is as expensive as a
+    /// CRS body scan.
+    fn inspection_signals(&self, request: &RequestContext) -> admission::InspectionSignals {
+        let body_present = request.body.as_ref().is_some_and(|body| !body.is_empty());
+        #[cfg(feature = "wasm-reactor")]
+        {
+            let grpc = self.grpc_inspector.as_ref();
+            let graphql = self.graphql_inspector.as_ref();
+            admission::InspectionSignals {
+                body_present,
+                protocol_content_scan: grpc
+                    .is_some_and(|inspector| inspector.scans_content(request)),
+                body_withheld: grpc.is_some_and(|inspector| inspector.matches(request))
+                    || graphql.is_some_and(|inspector| {
+                        inspector.matches(request) && inspector.strips_body()
+                    }),
+            }
+        }
+        #[cfg(not(feature = "wasm-reactor"))]
+        {
+            admission::InspectionSignals {
+                body_present,
+                protocol_content_scan: false,
+                body_withheld: false,
+            }
+        }
+    }
+
+    fn inspection_cost(&self, request: &RequestContext) -> admission::InspectionCost {
+        admission::classify(self.inspection_signals(request))
+    }
+
+    /// Fail-closed response for a request rejected by admission control.
+    async fn admission_rejected(
+        &self,
+        request: &RequestContext,
+        rejection: admission::AdmissionRejection,
+    ) -> Decision {
+        let decision = Decision::Block {
+            status: 503,
+            reason: format!(
+                "WAF admission control rejected heavy inspection: {rejection}; retry later"
+            ),
+        };
+        warn!(
+            client_ip = %request.client_ip,
+            reason = %rejection,
+            "heavy inspection rejected by admission control"
+        );
+        self.event_logger
+            .log_event(request, &decision, vec!["admission-control".to_string()])
+            .await;
+        decision
+    }
+
     /// Fast evaluation for performance-critical paths (headers/URI only)
     /// Skips expensive operations like body inspection
     pub async fn fast_evaluate(&self, request: &RequestContext) -> Decision {
         if !self.enabled {
             return Decision::Allow;
         }
+
+        // Admission control covers the protocol pre-checks too: a gRPC
+        // field-content scan is a full Coraza evaluation even though the raw
+        // body is withheld from the rule chain.
+        let _admission_guard = match self.admission.admit(self.inspection_cost(request)).await {
+            Ok(guard) => guard,
+            Err(rejection) => return self.admission_rejected(request, rejection).await,
+        };
 
         #[cfg(feature = "wasm-reactor")]
         let graphql_context;
@@ -864,28 +931,6 @@ impl WafEngine {
         if let Some(_wasm_engine) = &self.wasm_engine {
             debug!("Skipping WASM evaluation for fast path (performance optimization)");
         }
-
-        // Admission control wraps the rule chain that contains the reactor.
-        let _admission_guard = match self.admission.admit(admission::classify(request)).await {
-            Ok(guard) => guard,
-            Err(rejection) => {
-                let decision = Decision::Block {
-                    status: 503,
-                    reason: format!(
-                        "WAF admission control rejected heavy inspection: {rejection}; retry later"
-                    ),
-                };
-                warn!(
-                    client_ip = %request.client_ip,
-                    reason = %rejection,
-                    "heavy inspection rejected by admission control"
-                );
-                self.event_logger
-                    .log_event(request, &decision, vec!["admission-control".to_string()])
-                    .await;
-                return decision;
-            }
-        };
 
         // PHASE 2: Optimized traditional rule evaluation
         {
@@ -965,6 +1010,15 @@ impl WafEngine {
         if !self.enabled {
             return Decision::Allow;
         }
+
+        // Admission control covers the protocol pre-checks as well as the rule
+        // chain: a gRPC field-content scan runs a Coraza evaluation before the
+        // main evaluation. Classification uses the original request, because
+        // the pre-checks strip the body that made the scan expensive.
+        let _admission_guard = match self.admission.admit(self.inspection_cost(request)).await {
+            Ok(guard) => guard,
+            Err(rejection) => return self.admission_rejected(request, rejection).await,
+        };
 
         #[cfg(feature = "wasm-reactor")]
         let graphql_context;
@@ -1099,30 +1153,6 @@ impl WafEngine {
                 }
             }
         }
-
-        // Admission control wraps the rule chain that contains the reactor.
-        // Classification uses the post-precheck context, so a body withheld
-        // by gRPC/GraphQL is cheap and never waits behind CRS body scans.
-        let _admission_guard = match self.admission.admit(admission::classify(request)).await {
-            Ok(guard) => guard,
-            Err(rejection) => {
-                let decision = Decision::Block {
-                    status: 503,
-                    reason: format!(
-                        "WAF admission control rejected heavy inspection: {rejection}; retry later"
-                    ),
-                };
-                warn!(
-                    client_ip = %request.client_ip,
-                    reason = %rejection,
-                    "heavy inspection rejected by admission control"
-                );
-                self.event_logger
-                    .log_event(request, &decision, vec!["admission-control".to_string()])
-                    .await;
-                return decision;
-            }
-        };
 
         // PHASE 3: Traditional rule evaluation
         {
@@ -1935,6 +1965,322 @@ mod tests {
         assert!(rendered.contains("waf_admission_queued_total 0"));
         assert!(rendered.contains("waf_admission_rejected_total{reason=\"timeout\"} 0"));
         assert!(rendered.contains("waf_admission_rejected_total{reason=\"queue_full\"} 0"));
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    struct ContentScanProbe {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    impl crate::waf::grpc::GrpcContentScanner for ContentScanProbe {
+        fn scan(&self, _payload: &[u8]) -> Result<Decision, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Decision::Allow)
+        }
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    struct CountingRule {
+        seen: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    impl WafRule for CountingRule {
+        fn name(&self) -> &str {
+            "counting-rule"
+        }
+
+        fn evaluate(&self, _ctx: &RequestContext) -> Decision {
+            self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Decision::Allow
+        }
+    }
+
+    /// Builds an engine whose gRPC artifact gives `/acme.Content/Scan` a
+    /// descriptor-backed `string` field, so content scanning is possible.
+    #[cfg(feature = "wasm-reactor")]
+    fn grpc_content_scan_engine(
+        content_scan: &str,
+        scanner: Arc<ContentScanProbe>,
+        admission: AdmissionController,
+    ) -> WafEngine {
+        use crate::waf::grpc_allowlist::{
+            AllowlistSource, GrpcAllowlist, GrpcAllowlistMethod, GrpcMessage, GrpcMessageField,
+            ALLOWLIST_IR_VERSION,
+        };
+
+        let allowlist = GrpcAllowlist {
+            ir_version: ALLOWLIST_IR_VERSION,
+            source: AllowlistSource {
+                kind: "protobuf".to_string(),
+                sha256: "d".repeat(64),
+            },
+            methods: vec![GrpcAllowlistMethod {
+                path: "/acme.Content/Scan".to_string(),
+                client_streaming: false,
+                server_streaming: false,
+                input: "acme.Request".to_string(),
+                output: "acme.Response".to_string(),
+                max_message_bytes: 64 * 1024,
+            }],
+            messages: vec![GrpcMessage {
+                message: "acme.Request".to_string(),
+                fields: vec![GrpcMessageField {
+                    name: "name".to_string(),
+                    number: 1,
+                    field_type: "string".to_string(),
+                    repeated: false,
+                    required: false,
+                    message_type: None,
+                    enum_values: None,
+                }],
+            }],
+            // Unknown methods keep the envelope-only behaviour used by the
+            // existing gRPC tests and the load harness.
+            unknown_method_action: "allow".to_string(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("allowlist.json");
+        std::fs::write(&path, allowlist.to_canonical_json().unwrap()).unwrap();
+
+        let mut config = crate::config::WafGrpcConfig::default();
+        config.allowlist_file = Some(path.display().to_string());
+        config.content_scan = content_scan.to_string();
+        let inspector = crate::waf::grpc::GrpcInspector::try_from_config(&config)
+            .unwrap()
+            .with_content_scanner(scanner);
+
+        let mut engine = WafEngine::new().with_admission(admission);
+        engine.grpc_inspector = Some(inspector);
+        engine
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    fn grpc_content_request() -> RequestContext {
+        let value = "x".repeat(64);
+        let mut payload = Vec::with_capacity(value.len() + 2);
+        payload.push(0x0a); // field 1, length-delimited
+        payload.push(value.len() as u8);
+        payload.extend_from_slice(value.as_bytes());
+        let mut body = Vec::with_capacity(5 + payload.len());
+        body.push(0);
+        body.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        body.extend_from_slice(&payload);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            hyper::header::CONTENT_TYPE,
+            hyper::header::HeaderValue::from_static("application/grpc+proto"),
+        );
+        headers.insert(
+            "grpc-encoding",
+            hyper::header::HeaderValue::from_static("identity"),
+        );
+        RequestContext::new(
+            IpAddr::from_str("192.168.1.100").unwrap(),
+            Method::POST,
+            Uri::from_str("/acme.Content/Scan").unwrap(),
+            headers,
+            Some(body.len()),
+        )
+        .with_body(Some(Bytes::from(body)))
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    #[test]
+    fn admission_classification_uses_the_original_request() {
+        let disabled = AdmissionController::disabled();
+        let engine = grpc_content_scan_engine(
+            "strings",
+            Arc::new(ContentScanProbe {
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+            disabled.clone(),
+        );
+        assert_eq!(
+            engine.inspection_cost(&grpc_content_request()),
+            admission::InspectionCost::Heavy,
+            "gRPC content scanning triggers a Coraza evaluation"
+        );
+
+        let scan_off = grpc_content_scan_engine(
+            "off",
+            Arc::new(ContentScanProbe {
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+            disabled.clone(),
+        );
+        assert_eq!(
+            scan_off.inspection_cost(&grpc_content_request()),
+            admission::InspectionCost::Cheap,
+            "content_scan = off withholds the body without a Coraza evaluation"
+        );
+
+        assert_eq!(
+            engine.inspection_cost(&admission_context("a=1")),
+            admission::InspectionCost::Heavy,
+            "plain bodies still reach CRS body rules"
+        );
+        assert_eq!(
+            engine.inspection_cost(&create_test_context()),
+            admission::InspectionCost::Cheap,
+            "bodyless requests stay cheap"
+        );
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    #[test]
+    fn graphql_only_stays_cheap_and_graphql_crs_stays_heavy() {
+        let body = r#"{"query":"query GetUser { user { id } }","operationName":"GetUser"}"#;
+
+        let mut only_engine = WafEngine::new();
+        only_engine.graphql_inspector = Some(crate::waf::graphql::GraphqlInspector::from_config(
+            &graphql_config(crate::config::WafGraphqlScanMode::GraphqlOnly),
+        ));
+        assert_eq!(
+            only_engine.inspection_cost(&graphql_context(body)),
+            admission::InspectionCost::Cheap,
+            "graphql-only withholds the body and runs only cheap checks"
+        );
+
+        let mut crs_engine = WafEngine::new();
+        crs_engine.graphql_inspector = Some(crate::waf::graphql::GraphqlInspector::from_config(
+            &graphql_config(crate::config::WafGraphqlScanMode::Crs),
+        ));
+        assert_eq!(
+            crs_engine.inspection_cost(&graphql_context(body)),
+            admission::InspectionCost::Heavy,
+            "graphql crs mode still scans the body"
+        );
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    #[tokio::test]
+    async fn saturated_heavy_pool_rejects_grpc_content_scan_before_evaluation() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let admission = AdmissionController::with_permits(
+            true,
+            1,
+            std::time::Duration::from_millis(50),
+            0,
+            None,
+        );
+        let _held = admission
+            .admit(admission::InspectionCost::Heavy)
+            .await
+            .unwrap();
+
+        let mut engine = grpc_content_scan_engine(
+            "strings",
+            Arc::new(ContentScanProbe {
+                calls: Arc::clone(&calls),
+            }),
+            admission.clone(),
+        );
+        let rule_runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        engine.add_rule(CountingRule {
+            seen: Arc::clone(&rule_runs),
+        });
+
+        for decision in [
+            engine.evaluate(&grpc_content_request()).await,
+            engine.fast_evaluate(&grpc_content_request()).await,
+        ] {
+            match decision {
+                Decision::Block { status, reason } => {
+                    assert_eq!(status, 503);
+                    assert!(
+                        reason.contains("admission control"),
+                        "reason must name admission control: {reason}"
+                    );
+                }
+                other => panic!("gRPC content scan must not bypass admission: {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the content-scan Coraza evaluation must not run"
+        );
+        assert_eq!(
+            rule_runs.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the rule chain must not run"
+        );
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn grpc_content_scan_off_stays_cheap_under_a_saturated_heavy_pool() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let admission = AdmissionController::with_permits(
+            true,
+            1,
+            std::time::Duration::from_millis(200),
+            0,
+            None,
+        );
+        let _held = admission
+            .admit(admission::InspectionCost::Heavy)
+            .await
+            .unwrap();
+
+        let engine = grpc_content_scan_engine(
+            "off",
+            Arc::new(ContentScanProbe {
+                calls: Arc::clone(&calls),
+            }),
+            admission,
+        );
+
+        let started = std::time::Instant::now();
+        assert_eq!(
+            engine.evaluate(&grpc_content_request()).await,
+            Decision::Allow
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "cheap gRPC request waited behind heavy inspection: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[cfg(feature = "wasm-reactor")]
+    #[tokio::test]
+    async fn grpc_content_scan_holds_exactly_one_permit() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let admission = AdmissionController::with_permits(
+            true,
+            1,
+            std::time::Duration::from_millis(20),
+            1,
+            None,
+        );
+        let engine = grpc_content_scan_engine(
+            "strings",
+            Arc::new(ContentScanProbe {
+                calls: Arc::clone(&calls),
+            }),
+            admission.clone(),
+        );
+
+        // With a single permit, a double acquire would time out and return 503.
+        assert_eq!(
+            engine.evaluate(&grpc_content_request()).await,
+            Decision::Allow
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(admission.available_permits(), 1);
+
+        assert_eq!(
+            engine.evaluate(&grpc_content_request()).await,
+            Decision::Allow
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(admission.available_permits(), 1);
     }
 
     #[cfg(feature = "wasm-reactor")]

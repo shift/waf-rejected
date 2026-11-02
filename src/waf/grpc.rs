@@ -581,6 +581,33 @@ impl GrpcInspector {
         request_content_type(&ctx.headers).is_some()
     }
 
+    /// Whether [`Self::inspect`] will run a Coraza field-content scan.
+    ///
+    /// Cheap and side-effect free: it reads the content type, the method path
+    /// and the descriptor metadata, but never decodes the body. A malformed
+    /// body that the pre-check later rejects with `400` is therefore still
+    /// classified heavy. That over-approximation is the safe direction for
+    /// admission control: a scan is never under-counted.
+    pub fn scans_content(&self, ctx: &RequestContext) -> bool {
+        if !self.content_scan || self.content_scanner.is_none() || !self.matches(ctx) {
+            return false;
+        }
+        if !ctx.body.as_ref().is_some_and(|body| !body.is_empty()) {
+            return false;
+        }
+        let path = ctx
+            .headers
+            .get(":path")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_else(|| ctx.uri.path());
+        let Ok(method) = parse_method_path(path) else {
+            return false;
+        };
+        self.method_input_types
+            .get(&method.path)
+            .is_some_and(|input| self.messages.contains_key(input))
+    }
+
     /// Runs all protocol-aware checks for a gRPC request.
     pub fn inspect(&self, ctx: &RequestContext) -> Result<GrpcVerdict, GrpcInspectionError> {
         let content_type = match request_content_type(&ctx.headers) {
@@ -934,6 +961,22 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
             Method::POST,
             Uri::from_str(path).unwrap(),
+            headers,
+            body.as_ref().map(|b| b.len()),
+        );
+        if let Some(body) = body {
+            ctx = ctx.with_body(Some(Bytes::from(body)));
+        }
+        ctx
+    }
+
+    fn grpc_context_with_content_type(content_type: &str, body: Option<Vec<u8>>) -> RequestContext {
+        let mut headers = headers_with(content_type);
+        headers.insert("grpc-encoding", HeaderValue::from_static("identity"));
+        let mut ctx = RequestContext::new(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+            Method::POST,
+            Uri::from_str("/acme.Service/Method").unwrap(),
             headers,
             body.as_ref().map(|b| b.len()),
         );
@@ -1543,6 +1586,69 @@ mod tests {
             .unwrap();
         assert!(matches!(verdict, GrpcVerdict::Allow { .. }));
         assert_eq!(scanner.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn scans_content_reports_when_a_coraza_evaluation_will_run() {
+        let mut config = WafGrpcConfig::default();
+        let scanner = FakeScanner::new(false);
+        let (_dir, inspector) = content_inspector(
+            &mut config,
+            vec![request_field("name", 1, "string", false)],
+            Arc::clone(&scanner),
+        );
+        let mut payload = Vec::new();
+        put_string(1, "hello", &mut payload);
+        let request = grpc_context("/acme.Service/Method", Some(frame(0, &payload)));
+        assert!(inspector.scans_content(&request));
+
+        // No body means the pre-check performs envelope checks only.
+        assert!(!inspector.scans_content(&grpc_context("/acme.Service/Method", None)));
+        assert!(!inspector.scans_content(&grpc_context("/acme.Service/Method", Some(Vec::new()))));
+
+        // Methods without descriptor metadata stay envelope-only.
+        assert!(!inspector.scans_content(&grpc_context(
+            "/acme.Service/Other",
+            Some(frame(0, &payload))
+        )));
+
+        // A non-gRPC content type never runs the gRPC pre-check.
+        assert!(!inspector.scans_content(&grpc_context_with_content_type(
+            "application/json",
+            Some(frame(0, &payload))
+        )));
+    }
+
+    #[test]
+    fn scans_content_is_false_when_content_scan_or_scanner_is_absent() {
+        let mut config = WafGrpcConfig::default();
+        let scanner = FakeScanner::new(false);
+        let (_dir, inspector) = content_inspector(
+            &mut config,
+            vec![request_field("name", 1, "string", false)],
+            Arc::clone(&scanner),
+        );
+        let mut payload = Vec::new();
+        put_string(1, "hello", &mut payload);
+        let request = grpc_context("/acme.Service/Method", Some(frame(0, &payload)));
+
+        let mut off_config = WafGrpcConfig::default();
+        off_config.content_scan = "off".to_string();
+        let (_off_dir, off_inspector) = content_inspector(
+            &mut off_config,
+            vec![request_field("name", 1, "string", false)],
+            Arc::clone(&scanner),
+        );
+        assert!(!off_inspector.scans_content(&request));
+
+        let mut no_scanner_config = WafGrpcConfig::default();
+        let (_no_scanner_dir, no_scanner_inspector) = field_inspector(
+            &mut no_scanner_config,
+            vec![request_message(vec![request_field(
+                "name", 1, "string", false,
+            )])],
+        );
+        assert!(!no_scanner_inspector.scans_content(&request));
     }
 
     #[test]

@@ -35,18 +35,25 @@ selection are reproducible. Timings are obviously not bit-reproducible.
 | `form-60k` | 60 000-byte form POST (CRS scan; DoS probe) |
 | `grpc-1k` | valid unary gRPC frame, 1 KiB message, no content-length (stream path) |
 | `grpc-256k` | valid unary gRPC frame, 256 KiB message |
+| `grpc-content-4k` | descriptor-backed gRPC string field, 4 KiB (Coraza content scan) |
+| `grpc-content-16k` | descriptor-backed gRPC string field, 16 KiB (Coraza content scan) |
 | `graphql-2k` | 2 KiB GraphQL JSON POST |
 | `graphql-8k` | 8 KiB GraphQL JSON POST |
 | `sqli` | SQL-injection form probe; must be 403 |
 | `xss` | XSS query probe; must be 403 |
 | `mixed` | 60% bodyless, 20% form-1k, 10% SQLi, 10% XSS |
 | `mixed-dos` | 90% bodyless, 10% 60 KiB form (pool starvation probe) |
+| `mixed-grpc-dos` | 90% bodyless, 10% gRPC 4 KiB content scan (admission isolation probe) |
 
 gRPC uses HTTP/1.1 because plaintext ingress only speaks HTTP/1.1. The frame
 envelope is valid and the request deliberately omits `Content-Length`, matching
 real gRPC over HTTP/2; the WAF classifies it as a stream, forwards the body
 incrementally and withholds it from CRS. `TE: trailers` is sent as gRPC-over-
-HTTP/1.1 requires.
+HTTP/1.1 requires. The `grpc-content-*` profiles are the exception: they send
+`Content-Length` so the body is buffered and the descriptor-backed gRPC
+pre-check runs its Coraza content scan. The throwaway config points
+`waf.grpc.allowlist_file` at a minimal IR v2 artifact that declares only
+`/acme.Content/Scan`, so the other gRPC profiles keep the envelope-only path.
 
 The throwaway config disables per-IP/global rate limiting and security-event
 export so the matrix measures inspection capacity rather than the default
@@ -87,7 +94,8 @@ weakened after a run; a failure is a release finding.
 | `form-16k-p95-c16` | 16 KiB form p95 < 2000 ms at c=16, zero errors |
 | `form-60k-admitted-c1` | 60 KiB form inspected at c=1: no 503/error, p95 < 5 s |
 | `form-60k-p95-c1` | 60 KiB form p95 < 5000 ms at c=1 |
-| `zero-503-above-20rps` | every cell offered >= 20 RPS has zero 503s |
+| `grpc-content-4k-admission-bounded` | gRPC 4 KiB content scan p95 < 1000 ms at c=64, no non-503 errors |
+| `zero-503-above-20rps` | every non-admission-bounded cell offered >= 20 RPS has zero 503s |
 | `light-availability-c16` | light profiles have zero errors/503s at c <= 16 |
 | `attack-block-rate` | SQLi/XSS: 100% 403, zero false allows |
 | `mixed-decision-correctness` | mixed traffic: zero attack false allows and zero clean false blocks |
@@ -141,8 +149,11 @@ Override ports with `WAF_PORT`, `HEALTH_PORT`, `UPSTREAM_PORT` when 39080/39081/
   6 pre-warmed reactor workers. Memory therefore scales with pool size plus
   per-request buffers.
 - Plaintext ingress is HTTP/1.1 only; HTTP/2 requires TLS ALPN. gRPC numbers
-  are the HTTP/1.1 stream path, which is the same Coraza withholding path used
-  by HTTP/2 gRPC.
+  are the HTTP/1.1 path, which uses the same Coraza withholding path as HTTP/2
+  gRPC. `grpc-content-*` buffers the body (Content-Length) so the
+  descriptor-backed content scan runs; real HTTP/2 unary gRPC with a
+  `Content-Length` equivalent behaves the same, while streaming RPCs remain
+  uninspected by design.
 - 60 KiB cells at high concurrency complete few requests, so their p95 has a
   small sample. Treat it as directional evidence of saturation, not a precise
   percentile.
@@ -259,11 +270,14 @@ mitigations; changing defaults or security policy is out of scope.
 
 ### Admission control: 60 KiB isolation after the fix
 
-`[waf.admission]` classifies evaluations as cheap (no body, or a gRPC/GraphQL
-body withheld from CRS) or heavy (CRS body scan). Heavy evaluations are capped
-at `heavy_permits`; auto reserves about half the reactor pool, capped at
-`pool_size - 1`. Cheap requests bypass the heavy queue. A saturated heavy queue
-rejects with `503 + Retry-After`, never `Allow`.
+`[waf.admission]` classifies evaluations as cheap (no body, a gRPC body
+withheld from CRS without a content scan, or a `graphql-only` body) or heavy
+(CRS body scan, or a gRPC field-content scan). Classification runs before the
+protocol pre-checks on the original request, so a gRPC content scan cannot
+bypass the heavy pool. Heavy evaluations are capped at `heavy_permits`; auto
+reserves about half the reactor pool, capped at `pool_size - 1`. Cheap requests
+bypass the heavy queue. A saturated heavy queue rejects with
+`503 + Retry-After`, never `Allow`.
 
 Measured on 2026-11-01 from the `feat/coraza-admission` working tree, release
 build, warm-up 1 s + measurement 5 s for the heavy matrix and 1 s + 3 s for the
@@ -288,6 +302,35 @@ cheap capacity is finite; it is no longer a multi-second starvation. Heavy
 requests above the permit count are deliberately rejected rather than queued
 indefinitely, which is why heavy-only cells now show 503s. Operators who value
 heavy throughput over cheap latency can raise `heavy_permits` explicitly.
+
+### gRPC content-scan admission A/B
+
+gRPC field-content scanning (`waf.grpc.content_scan = "strings"`) runs an extra
+Coraza evaluation of decoded field values, costing ~39 ms / ~165 ms / ~705 ms
+for 1/4/16 KiB on the benchmark host. Before this fix that evaluation ran
+before admission classification, so it bypassed the heavy semaphore entirely.
+`scripts/load-validate.sh` now accepts `ADMISSION_ENABLED=false` to reproduce
+the pre-fix behaviour on the same binary for a controlled A/B.
+
+Measured on 2026-11-02 from `fix/admission-grpc-content`, release build,
+warm-up 1 s + measurement 3 s, seed 42, pool auto = 6 (heavy permits = 3),
+`grpc-content-4k` (4 KiB decoded string, one content scan per request):
+
+| case | admission bypassed (`false`) | admission enabled (`true`) |
+|---|---|---|
+| gRPC content scan only, c=64: p95 | 2 778 ms (max 4 006 ms) | **398 ms (max 450 ms)** |
+| gRPC content scan only, c=64: 503s | 0 | 696 of 744 (excess rejected) |
+| gRPC content scan only, c=64: RPS | 28 | **232** |
+| 90% bodyless + 10% content scan, c=64: bodyless p95 | 491 ms | **52 ms** |
+| 90% bodyless + 10% content scan, c=64: overall RPS | 218 | **969** |
+| 90% bodyless + 10% content scan, c=8: bodyless p95 | 48 ms | **5.7 ms** |
+
+Content scans are now bounded by `heavy_permits` plus the 250 ms queue timeout;
+excess scans are rejected with `503 + Retry-After` instead of queueing for
+seconds. Cheap bodyless traffic under gRPC-heavy load improves by ~9x at c=64
+and ~8x at c=8. The `grpc-content-4k-admission-bounded` gate enforces p95 <
+1 s with no non-503 errors. Absolute values are host- and load-dependent; the
+before/after ratio is the signal.
 
 ### Memory
 

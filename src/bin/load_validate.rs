@@ -258,6 +258,36 @@ fn grpc_frame(seed: u64, message_len: usize) -> Bytes {
     Bytes::from(body)
 }
 
+/// A frame whose field 1 is a valid UTF-8 `string` of `value_len` bytes.
+///
+/// This is the shape a descriptor-backed artifact declares, so the gRPC
+/// pre-check runs its Coraza field-content scan (unless `content_scan` is
+/// off).
+fn grpc_string_frame(seed: u64, value_len: usize) -> Bytes {
+    let value = fill(seed, value_len);
+    let mut payload = Vec::with_capacity(value_len + 10);
+    payload.push(0x0a); // field 1, wire type 2
+    let mut remaining = value_len as u64;
+    loop {
+        let mut byte = (remaining & 0x7f) as u8;
+        remaining >>= 7;
+        if remaining != 0 {
+            byte |= 0x80;
+        }
+        payload.push(byte);
+        if remaining == 0 {
+            break;
+        }
+    }
+    payload.extend_from_slice(&value);
+
+    let mut body = Vec::with_capacity(payload.len() + 5);
+    body.push(0);
+    body.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    body.extend_from_slice(&payload);
+    Bytes::from(body)
+}
+
 fn post_headers(content_type: &str, body_len: usize) -> Vec<(String, String)> {
     vec![
         ("content-type".into(), content_type.into()),
@@ -321,6 +351,28 @@ fn build_templates(seed: u64) -> Vec<RequestTemplate> {
             body,
             expected: Expected::Allow,
             chunked: true,
+        });
+    }
+
+    // Descriptor-backed gRPC method: the allowlist artifact declares field 1
+    // as a string, so this request triggers the Coraza content scan. The body
+    // is buffered (content-length, not chunked) so the pre-check can see it;
+    // the streaming path never inspects frames.
+    for (class, len) in [
+        ("grpc-content-4k", 4 * 1024usize),
+        ("grpc-content-16k", 16 * 1024),
+    ] {
+        let body = grpc_string_frame(seed.wrapping_add(len as u64), len);
+        let mut headers = grpc_headers();
+        headers.push(("content-length".into(), body.len().to_string()));
+        templates.push(RequestTemplate {
+            class,
+            method: "POST",
+            path: "/acme.Content/Scan".into(),
+            headers,
+            body,
+            expected: Expected::Allow,
+            chunked: false,
         });
     }
 
@@ -406,6 +458,18 @@ fn profiles() -> Vec<Profile> {
             description: "256 KiB valid gRPC frame, body withheld from CRS",
         },
         Profile {
+            name: "grpc-content-4k",
+            mix: vec![("grpc-content-4k", 100)],
+            p95_target_ms: Some(1000.0),
+            description: "4 KiB gRPC string field, Coraza content scan (admission-bounded)",
+        },
+        Profile {
+            name: "grpc-content-16k",
+            mix: vec![("grpc-content-16k", 100)],
+            p95_target_ms: Some(2000.0),
+            description: "16 KiB gRPC string field, Coraza content scan (admission-bounded)",
+        },
+        Profile {
             name: "graphql-2k",
             mix: vec![("graphql-2k", 100)],
             p95_target_ms: Some(500.0),
@@ -445,6 +509,12 @@ fn profiles() -> Vec<Profile> {
             mix: vec![("bodyless-get", 90), ("form-60k", 10)],
             p95_target_ms: Some(200.0),
             description: "90% bodyless GET + 10% 60 KiB bodies (pool starvation)",
+        },
+        Profile {
+            name: "mixed-grpc-dos",
+            mix: vec![("bodyless-get", 90), ("grpc-content-4k", 10)],
+            p95_target_ms: Some(200.0),
+            description: "90% bodyless GET + 10% gRPC content scans (admission isolation)",
         },
     ]
 }
@@ -1361,14 +1431,39 @@ fn build_gates(cells: &[CellResult], rss: &RssSummary) -> Vec<Gate> {
         "60 KiB form p95 < 5000 ms (eval_timeout) at concurrency 1",
         |s, _| (s.p95_ms < 5000.0, format!("p95={:.2} ms", s.p95_ms)),
     ));
+    gates.push(gate_from_cell(
+        cells,
+        "grpc-content-4k-admission-bounded",
+        "grpc-content-4k",
+        64,
+        "gRPC content scans are admission-bounded at c=64 (p95 < 1000 ms, no non-503 errors)",
+        |s, _| {
+            (
+                s.p95_ms < 1000.0 && s.errors.saturating_sub(s.s503) == 0,
+                format!(
+                    "p95={:.2} ms, 503={}, non-503 errors={}",
+                    s.p95_ms,
+                    s.s503,
+                    s.errors.saturating_sub(s.s503)
+                ),
+            )
+        },
+    ));
 
     // No 503s once the offered rate is material (>= 20 RPS), including mixed
     // profiles. Heavy-body-only cells below that rate are covered separately.
+    // Admission-bounded profiles (`form-60k`, `grpc-content-*`) and mixes that
+    // include them (`mixed-dos`, `mixed-grpc-dos`) are expected to reject
+    // excess heavy work with 503 by design and are excluded.
     {
         let mut failing = Vec::new();
         let mut evaluated = 0usize;
         for cell in cells {
-            if cell.stats.rps >= 20.0 {
+            let admission_bounded = matches!(
+                cell.profile.as_str(),
+                "form-60k" | "mixed-dos" | "mixed-grpc-dos"
+            ) || cell.profile.starts_with("grpc-content-");
+            if cell.stats.rps >= 20.0 && !admission_bounded {
                 evaluated += 1;
                 if cell.stats.s503 > 0 {
                     failing.push(format!(
@@ -1974,7 +2069,7 @@ fn write_markdown(path: &Path, results: &Results) -> Result<()> {
 
     out.push_str("\n## Caveats\n\n");
     out.push_str("- Closed-loop clients on the same host as the WAF and upstream compete for CPU; these are capacity floors, not ceilings.\n");
-    out.push_str("- Plaintext ingress speaks HTTP/1.1 only. The gRPC profiles use valid unary frames with `application/grpc` over HTTP/1.1; body bytes are withheld from CRS by design.\n");
+    out.push_str("- Plaintext ingress speaks HTTP/1.1 only. The gRPC profiles use valid unary frames with `application/grpc` over HTTP/1.1; `grpc-1k`/`grpc-256k` withhold the body from CRS, while `grpc-content-4k`/`grpc-content-16k` use the descriptor-backed `/acme.Content/Scan` method and therefore run the Coraza field-content scan under admission control.\n");
     out.push_str("- Rate limiting is disabled in the throwaway config so the matrix measures inspection capacity, not the default 100 req/min per-IP limiter.\n");
     out.push_str("- A p95 is only meaningful with enough samples; heavy 60 KiB cells at high concurrency complete few requests.\n");
 
