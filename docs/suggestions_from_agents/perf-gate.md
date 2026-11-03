@@ -221,8 +221,13 @@ same-host, same-corpus, same-boundary measurement.
 
 ## Gate behaviour and CI
 
-* `selftest.sh` proves three cases: baseline copy passes, a +50% p50 row fails
-  under `--enforce`, and the same row does not fail without `--enforce`.
+* `selftest.sh` proves four cases: baseline copy passes, a +50% p50 row fails
+  under `--enforce`, the same row does not fail without `--enforce`, and a
+  doubled `4k-sqli / 4k-allow` ratio fails even when absolute p50 rows pass.
+* The gate also compares the same-run `4k-sqli / 4k-allow` ratio per backend.
+  A CPU-frequency, host-load or guest-GC-mode shift scales both rows together
+  and cancels in the ratio, while a real attack-path regression raises it. Keep
+  the ratio threshold aligned with the p50 threshold.
 * The comparison uses exact `(backend, case)` keys. A new case with no baseline
   row is reported as `NO-BASELINE` and does not fail the gate; add it to the
   baseline in the same change that adds it to the harness.

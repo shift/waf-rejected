@@ -6,6 +6,17 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Performance
 
+- Harden the engine performance gate against shared-host clock/GC drift. The
+  reported 4 KiB SQLi regression is not reproducible on a quiet pinned host:
+  swapping the baseline (`efb56b5`) and current (`06c38ec`) Coraza guest modules
+  under the same binary gives the same p50/p95 (164/373 ms) and allocation
+  counts (6 852 B / 5.04 per op). `compare.sh` now also enforces the same-run
+  `4k-sqli / 4k-allow` ratio (baseline 1.48) alongside absolute p50, so a real
+  attack-path regression is still caught when every row scales together; the
+  self-test covers a doubled ratio with unchanged absolute rows. No rule,
+  inspection or WAF default changes. See
+  `docs/operations/performance-verification.md` §3.4.1.
+
 - Native Rust CRS engine hot-loop optimisation (`rust-engine`, non-default):
   zero-allocation transform pipelines and cache, per-rule mandatory-literal
   gates from `rules/crs/prefilter.json` (50 gated rules, 55 % of regex

@@ -14,3 +14,8 @@ nix develop -c ./benchmarks/perf-gate/selftest.sh
 `run.sh` writes timestamped reports to `results/`. `baseline.json` is the
 committed reference; update it only with a reviewed, intentional change and the
 old/new numbers in the PR.
+
+`compare.sh` checks two things: the absolute p50 of every row, and the same-run
+`4k-sqli / 4k-allow` ratio per backend. The ratio cancels CPU-frequency, load
+and guest-GC-mode shifts that scale every row together, so it still catches an
+attack-path regression when a slow host makes all absolute rows look worse.

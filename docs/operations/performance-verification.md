@@ -204,7 +204,7 @@ before the proxy does; the absolute numbers need a dedicated host.
 |---|---|---:|---:|---:|---|
 | coraza | bodyless | 3.653 | 3.373 | −7.7 % | ok |
 | coraza | 4k-allow | 177.662 | 179.347 | +0.9 % | ok |
-| coraza | 4k-sqli | 263.332 | 401.725 | **+52.5 %** | **REGRESSION** |
+| coraza | 4k-sqli | 263.332 | 401.725 | +52.5 % | not reproduced (§3.4.1) |
 | rust | bodyless | 0.202 | 0.158 | −21.5 % | ok |
 | rust | 4k-allow | 1.919 | 1.231 | −35.9 % | ok |
 | rust | 4k-sqli | 1.862 | 1.256 | −32.5 % | ok |
@@ -215,9 +215,10 @@ before the proxy does; the absolute numbers need a dedicated host.
 Allocation side of the same rows: the Rust engine dropped from 2.02 MB /
 4 789 allocs to 646 KB / 1 772 allocs at 4 KiB allow, which explains most of
 its 36 % p50 improvement. Coraza and kernel allocations are unchanged. The
-4k-sqli regression is therefore not allocation growth (6 852 → 6 842 B/op,
-5.04 → 5.03 allocs/op) and not envelope growth; it is in the rule evaluation
-or anomaly-scoring path for the attack body.
+4k-sqli delta is therefore not allocation growth (6 852 → 6 842 B/op,
+5.04 → 5.03 allocs/op) and not envelope growth. A follow-up bisect (§3.4.1)
+showed it is not a rule-path change either: the row reflects a guest GC/clock
+bimodality.
 
 The regression was re-measured twice more in separate processes on the same
 host (`coraza-recheck-1.json`, `coraza-recheck-2.json`):
@@ -229,8 +230,46 @@ host (`coraza-recheck-1.json`, `coraza-recheck-2.json`):
 | recheck 1 | 3.218 | 170.726 | 377.479 |
 | recheck 2 | 3.034 | 170.048 | 388.516 |
 
-Allow and bodyless track the baseline; SQLi is consistently 43–53 % slower.
-This is a reproducible regression, not a one-off scheduler artefact.
+Allow and bodyless track the baseline; SQLi is reported 43–53 % slower in
+those runs.
+
+### 3.4.1 Follow-up: the 4 KiB SQLi row was not reproducible
+
+A later bisect on the same host, with the sibling builds stopped and the
+process pinned first to CPU 5 and then to CPUs 2–5, could not reproduce the
+regression in either direction. The Coraza row is **bimodal**: a request either
+finishes in ~164 ms or pays a Go guest GC cycle and finishes in ~373 ms. The p50
+therefore lands on whichever side of 50 % the GC hits fall in a particular run.
+The report above caught a run where most samples were in the slow mode; a
+quiet run puts the p50 in the fast mode.
+
+| run (pinned, quiet) | bodyless p50 | 4k-allow p50/p95 | 4k-sqli p50/p95 | sqli/allow |
+|---|---:|---:|---:|---:|
+| current module (`06c38ec`) | 3.25 | 164.73 / 373.00 | 164.06 / 375.93 | 1.00 |
+| baseline module (`efb56b5`) | 3.28 | 164.78 / 371.78 | 164.49 / 374.29 | 1.00 |
+| pre-`3a86896` 192 MiB guest | 2.39 | 164.03 / 168.07 | 163.61 / 167.73 | 1.00 |
+
+Evidence that this is not a rule-path commit in `efb56b5..ddc8547`:
+
+* Only `06c38ec` changes the committed guest module. Swapping the `efb56b5`
+  and `06c38ec` modules under the same host binary leaves p50/p95 and the
+  block decision identical (table above).
+* `perf-gate` builds the legacy JSON envelope, so the binary-ABI branch added
+  by `06c38ec` is not exercised by this row. The host-side reactor diff adds
+  only the optional `decision_base` read; allocations stay at 6 851.84 B /
+  5.04 per op, matching the baseline.
+* The 164/373 ms split tracks the guest `GOMEMLIMIT`/GC state, not the rules.
+  Raising the guest soft limit to 192 MiB removes the GC hit from these short
+  runs, but that limit was deliberately lowered to 64 MiB by `3a86896` to bound
+  a six-worker pool's RSS, so it is not a free fix.
+
+The actionable defect is therefore the gate, not the engine: an absolute p50
+comparison cannot distinguish a slower CPU/GC phase from an attack-path
+regression when every row scales together. `compare.sh` now also checks the
+same-run `4k-sqli / 4k-allow` ratio, which cancels clock and GC-mode changes.
+The committed baseline ratio is 1.48; the quiet runs above are 1.00, and the
+ratio gate fails a doubled ratio even when absolute p50 rows are unchanged
+(`selftest.sh` covers this case).
 
 PERF-GATE RSS: coraza peak 422 716 KiB, Rust engine 21 732 KiB, kernel
 14 700 KiB. `bench-subms` peak RSS (wasm pools + proxy + client + upstream) was
@@ -326,11 +365,14 @@ Ranked by share of the measured budget:
    7.6 µs at 4 KiB, i.e. 0.004 % of the request. No proxy or serialisation
    optimisation can move this.
 
-2. **The 4 KiB SQLi path regressed 52 % against the committed gate**
-   (263 → 402 ms p50) while 4 KiB allow is unchanged (+0.9 %) and bodyless
-   improved (−7.7 %). Allocation counters are identical. This is the only
-   gate failure and is specific to the attack body, which points at rule
-   evaluation / anomaly scoring rather than the envelope or frequency alone.
+2. **The reported 4 KiB SQLi regression was a measurement artefact.**
+   The row is bimodal at ~164 ms (no guest GC) and ~373 ms (GC cycle); a run
+   whose samples are mostly in the slow mode reports p50 ≈ 400 ms. Swapping the
+   baseline and current guest modules under the same binary gives identical
+   p50/p95 and allocation counts, and no commit in `efb56b5..ddc8547` changes
+   the JSON rule path. The gate now compares the same-run
+   `4k-sqli / 4k-allow` ratio in addition to absolute p50 so clock and GC-mode
+   shifts cannot masquerade as an attack-path regression (§3.4.1).
 
 3. **The native sidecar is still CRS-bound.** Reactor 1.18 / 8.08 / 28.75 /
    58.25 ms and engine 1.10 / 7.46 / 28.46 / 58.54 ms: the socket round trip
@@ -364,7 +406,7 @@ Ranked by expected gain / effort / risk. None is implemented by this report.
 
 | # | change | expected gain | effort | risk |
 |---|---|---|---|---|
-| 1 | **Bisect and fix the 4 KiB SQLi regression** (`perf-gate` coraza 4k-sqli +52 %). Start from the merged commits `#132`–`#136`; the unchanged allow row and allocation counters narrow it to the attack/scoring path. | 139 ms p50 back on attack requests (402 → 263 ms); no detection change if it is pure overhead | M | L |
+| 1 | **Stabilise the Coraza guest GC tail** (the 164/373 ms bimodality, §3.4.1). The rule path and binary ABI are not the cause; the guest `GOMEMLIMIT`/GC phase is. | p95 373 → ~168 ms and p50 no longer crosses into the slow mode; needs an RSS/soak tradeoff | M | M |
 | 2 | **Use the binary v1 frame on the proxy → wasm path.** L1 measures 0.26 µs / 193 B / 1 alloc at 4 KiB versus 7.6 µs / 22.4 KB / 46 allocs for JSON. L3 wasm still shows JSON-sized allocations. | ~7.6 ms and ~22 KB / 46 allocs per 4 KiB request (≈4 % of p50); larger relative gain at 8 KiB | M | L–M (versioned ABI) |
 | 3 | **Remove Rust-engine allocations.** 646 KB / 1 772 allocs at 4 KiB versus kernel 33 B / 1. Reuse an arena/scratch across evaluation and borrow request strings. | 20–40 % of the 1.24 ms 4 KiB row; brings Rust engine near the kernel's 0.68 ms | M–H | M (aliasing/lifetime correctness, differential corpus required) |
 | 4 | **Prove a body prefilter and skip Coraza for clean bodies.** Hyperscan/literal prefilter or the compiled fast path currently covers only a small clean subset (44/2,112 in the prototype). | 2–3× on allow paths if parity holds; enables sub-ms at 1–4 KiB without changing the rule engine | H | H (false negatives, corpus proof, fallback correctness) |
@@ -452,6 +494,10 @@ the source of truth. Compare only runs with the same `environment.json`
 - `crs_corpus --engine rust` cannot run because `engine::NativeRustEngine` is
   an unavailable scaffold; the real Rust engine is measured by
   `rust-engine-parity`.
-- The 4 KiB SQLi regression is reproducible in this run (one gate failure) but
-  needs a second confirmation and a bisect before it is attributed to a merged
-  commit.
+- The 4 KiB SQLi "regression" is not reproducible on a quiet pinned host; it is
+  a GC/clock bimodality (§3.4.1). The absolute p50 gate is now complemented by a
+  same-run `4k-sqli / 4k-allow` ratio check so a real attack-path regression is
+  still caught.
+- The underlying guest GC tail (p95 ~373 ms versus p50 ~164 ms on a 4 KiB
+  attack body) remains. Fixing it needs a GC/memory-limit tradeoff and a soak
+  measurement; it is listed in §7 rather than changed in this report.

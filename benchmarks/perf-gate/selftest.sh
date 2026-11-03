@@ -14,6 +14,10 @@ trap 'rm -rf "$TMP"' EXIT
 
 cp "$BASELINE" "$TMP/pass.json"
 jq '(.rows[0].p50_ms) *= 1.5' "$BASELINE" >"$TMP/fail.json"
+# Keep the 4k-sqli p50 unchanged but halve 4k-allow: the absolute rows do not
+# regress, but the attack/allow ratio doubles and must trip the ratio gate.
+jq '(.rows[] | select(.case == "4k-allow") | .p50_ms) *= 0.5' \
+  "$BASELINE" >"$TMP/ratio-fail.json"
 
 failures=0
 
@@ -36,6 +40,13 @@ if "$COMPARE" "$TMP/fail.json" >/dev/null; then
 else
   echo "FAIL: +50% p50 row failed without --enforce" >&2
   failures=$((failures + 1))
+fi
+
+if "$COMPARE" --enforce "$TMP/ratio-fail.json" >/dev/null; then
+  echo "FAIL: doubled 4k-sqli/4k-allow ratio passed under --enforce" >&2
+  failures=$((failures + 1))
+else
+  echo "PASS: doubled 4k-sqli/4k-allow ratio fails under --enforce"
 fi
 
 if [[ "$failures" -ne 0 ]]; then
