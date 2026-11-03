@@ -28,12 +28,26 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 /// Artifact schema version. Bumped whenever the JSON contract changes.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// v2 adds the non-body gates (the engine applies every gate per candidate
+/// value, so a rule on headers/URI can be gated exactly like a body rule), the
+/// generic coverage counters, and per-representation literal groups.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Literals shorter than this are not useful for a prefilter: they hit benign
 /// text constantly. A rule whose only derivable literals are shorter is
 /// `ungated`.
-pub const MIN_LITERAL_LEN: usize = 3;
+///
+/// Two characters is the floor: constructs such as `..` (path traversal),
+/// `/*` (comment open) and `="` (XSS attribute terminator) are two-character
+/// mandatory literals that still let the engine skip the whole rule. Short
+/// literals only cost a false hit (the regex runs anyway); they can never
+/// cause a false negative.
+pub const MIN_LITERAL_LEN: usize = 2;
+
+/// Largest explicit bracket expression that is expanded into an alternation.
+/// `[aA]`, `[Tt]`, `[0-4]` are cheap; `[a-z]`/`\d` stay opaque.
+const MAX_CLASS_EXPANSION: usize = 8;
 
 /// Upper bound on the disjunctive literal set for one rule. Large sets are
 /// still sound but inflate the artifact and the Aho-Corasick automaton.
@@ -101,6 +115,18 @@ pub struct UngatedRule {
 pub struct Coverage {
     /// Rules and chain members that were parsed.
     pub parsed_entries: usize,
+    /// Entries with a sound literal gate, over every target class.
+    #[serde(default)]
+    pub gated_entries: usize,
+    /// Entries without a sound literal gate, over every target class.
+    #[serde(default)]
+    pub ungated_entries: usize,
+    /// Gated entries that read body-derived data.
+    #[serde(default)]
+    pub gated_body_relevant: usize,
+    /// Ungated entries that read body-derived data.
+    #[serde(default)]
+    pub ungated_body_relevant: usize,
     /// Entries whose targets can read body-derived data.
     pub body_relevant_entries: usize,
     /// Body-relevant entries with a sound literal gate.
@@ -111,6 +137,12 @@ pub struct Coverage {
     pub distinct_literals: usize,
     /// Total literal members across gated groups (with duplicates).
     pub total_literals: usize,
+    /// Ungated entries grouped by operator.
+    #[serde(default)]
+    pub ungated_entries_by_operator: BTreeMap<String, usize>,
+    /// Ungated entries grouped by CRS family.
+    #[serde(default)]
+    pub ungated_entries_by_family: BTreeMap<String, usize>,
     /// Ungated body-relevant entries grouped by operator.
     pub ungated_by_operator: BTreeMap<String, usize>,
     /// Ungated body-relevant entries grouped by CRS family.
@@ -222,7 +254,11 @@ pub fn extract_from_str(
                 operator: operator.clone(),
                 targets: targets.clone(),
                 body_relevant,
-                gated: gated && body_relevant,
+                // The native engine evaluates the gate per candidate value, so
+                // the proof is target-independent: headers, URI and cookies are
+                // gated exactly like body values. The standalone body prefilter
+                // still filters on `body_relevant` when it loads the artifact.
+                gated,
                 transforms,
                 literals: flatten(&groups),
                 literal_groups: groups,
@@ -266,24 +302,32 @@ pub fn extract_from_str(
 fn summarise(rules: &[Gate], ungated: &[UngatedRule]) -> Coverage {
     let mut cov = Coverage {
         parsed_entries: rules.len() + ungated.len(),
+        gated_entries: rules.len(),
+        ungated_entries: ungated.len(),
         ..Coverage::default()
     };
     let mut distinct = BTreeSet::new();
     for gate in rules {
-        if !gate.body_relevant || !gate.gated {
-            continue;
-        }
-        cov.body_relevant_gated += 1;
         for group in &gate.literal_groups {
             cov.total_literals += group.literals.len();
             distinct.extend(group.literals.iter().cloned());
         }
+        if !gate.body_relevant {
+            continue;
+        }
+        cov.gated_body_relevant += 1;
     }
     for rule in ungated {
+        *cov.ungated_entries_by_operator
+            .entry(rule.operator.clone())
+            .or_default() += 1;
+        *cov.ungated_entries_by_family
+            .entry(rule.family.clone())
+            .or_default() += 1;
         if !rule.body_relevant {
             continue;
         }
-        cov.body_relevant_ungated += 1;
+        cov.ungated_body_relevant += 1;
         *cov.ungated_by_operator
             .entry(rule.operator.clone())
             .or_default() += 1;
@@ -292,6 +336,8 @@ fn summarise(rules: &[Gate], ungated: &[UngatedRule]) -> Coverage {
             .or_default() += 1;
         cov.ungated_rule_ids.push(rule.id);
     }
+    cov.body_relevant_gated = cov.gated_body_relevant;
+    cov.body_relevant_ungated = cov.ungated_body_relevant;
     cov.body_relevant_entries = cov.body_relevant_gated + cov.body_relevant_ungated;
     cov.distinct_literals = distinct.len();
     cov.ungated_rule_ids.sort_unstable();
@@ -333,6 +379,9 @@ struct RawRule {
     operator: Operator,
     transforms: Vec<String>,
     chain: bool,
+    /// `multiMatch`: the operator runs on every intermediate transform
+    /// representation, so a single-representation literal gate is unsound.
+    multi_match: bool,
     /// `tag:'paranoia-level/N'`, when present.
     paranoia: Option<u32>,
     line: usize,
@@ -421,7 +470,7 @@ fn parse_rule(text: &str, line: usize, source: &str) -> Result<RawRule, ExtractE
 
     let targets = parse_targets(target_text);
     let operator = parse_operator(&operator_text);
-    let (id, transforms, chain, paranoia) = parse_actions(&actions_text);
+    let (id, transforms, chain, multi_match, paranoia) = parse_actions(&actions_text);
 
     Ok(RawRule {
         id,
@@ -429,6 +478,7 @@ fn parse_rule(text: &str, line: usize, source: &str) -> Result<RawRule, ExtractE
         operator,
         transforms,
         chain,
+        multi_match,
         paranoia,
         line,
     })
@@ -578,10 +628,11 @@ fn parse_operator(text: &str) -> Operator {
     }
 }
 
-fn parse_actions(text: &str) -> (Option<u32>, Vec<String>, bool, Option<u32>) {
+fn parse_actions(text: &str) -> (Option<u32>, Vec<String>, bool, bool, Option<u32>) {
     let mut id = None;
     let mut transforms = Vec::new();
     let mut chain = false;
+    let mut multi_match = false;
     let mut paranoia = None;
     for action in split_actions(text) {
         let action = action.trim();
@@ -590,6 +641,10 @@ fn parse_actions(text: &str) -> (Option<u32>, Vec<String>, bool, Option<u32>) {
         }
         if action == "chain" {
             chain = true;
+            continue;
+        }
+        if action.eq_ignore_ascii_case("multimatch") {
+            multi_match = true;
             continue;
         }
         if let Some(value) = action.strip_prefix("id:") {
@@ -615,7 +670,7 @@ fn parse_actions(text: &str) -> (Option<u32>, Vec<String>, bool, Option<u32>) {
             }
         }
     }
-    (id, transforms, chain, paranoia)
+    (id, transforms, chain, multi_match, paranoia)
 }
 
 /// Splits an action list on commas that are not inside single quotes.
@@ -681,6 +736,17 @@ fn gate_member(
     data_cache: &mut BTreeMap<String, Vec<String>>,
 ) -> (bool, Vec<String>, Vec<LiteralGroup>, Option<String>) {
     let transforms = canonical_transforms(&member.transforms);
+    if member.multi_match {
+        return (
+            false,
+            transforms,
+            Vec::new(),
+            Some(
+                "multiMatch evaluates every transform prefix; a single-representation gate is unsound"
+                    .to_string(),
+            ),
+        );
+    }
     if member.operator.negated {
         return (
             false,
@@ -716,22 +782,9 @@ fn gate_member(
         return (true, transforms, vec![group], None);
     }
 
-    let (literals, case_insensitive) = match op.as_str() {
+    let literals: Vec<Literal> = match op.as_str() {
         "rx" => match extract_regex_literals(&member.operator.argument) {
-            Ok(set) => {
-                let mut all = BTreeSet::new();
-                let mut has_ci = false;
-                let mut has_cs = false;
-                for literal in set {
-                    if literal.ci {
-                        has_ci = true;
-                    } else {
-                        has_cs = true;
-                    }
-                    all.insert(literal.text);
-                }
-                (all.into_iter().collect::<Vec<_>>(), (has_ci, has_cs))
-            }
+            Ok(set) => set,
             Err(reason) => return (false, transforms, Vec::new(), Some(reason)),
         },
         "pmfromfile" => {
@@ -756,15 +809,21 @@ fn gate_member(
                     Some(format!("@pmFromFile {file} contains no phrases")),
                 );
             }
-            (phrases, (true, false))
+            phrases
+                .into_iter()
+                .map(|text| Literal { text, ci: true })
+                .collect()
         }
         "pm" => {
-            let phrases: Vec<String> = member
+            let phrases: Vec<Literal> = member
                 .operator
                 .argument
                 .split_whitespace()
                 .filter(|p| !p.is_empty())
-                .map(|p| p.to_lowercase())
+                .map(|p| Literal {
+                    text: p.to_lowercase(),
+                    ci: true,
+                })
                 .collect();
             if phrases.is_empty() {
                 return (
@@ -774,7 +833,7 @@ fn gate_member(
                     Some("@pm without phrases".to_string()),
                 );
             }
-            (phrases, (true, false))
+            phrases
         }
         "contains" | "streq" | "beginswith" | "endswith" | "within" => {
             let literal = member
@@ -791,7 +850,10 @@ fn gate_member(
                     Some(format!("@{} without a literal", member.operator.name)),
                 );
             }
-            (vec![literal], (false, true))
+            vec![Literal {
+                text: literal,
+                ci: false,
+            }]
         }
         // `@detectSQLi`/`@detectXSS` expose no required literal, so they can
         // never be gated. They *are* evaluable natively (feature
@@ -830,19 +892,33 @@ fn gate_member(
             Some("no required literal could be derived".to_string()),
         );
     }
-    if literals.len() > MAX_LITERALS_PER_RULE {
+    // Group by case sensitivity. A single any-of set may mix `(?i)` and
+    // case-sensitive members; each member is attributed to the representation
+    // that matches it, which is still one-sided (the value must contain the
+    // member under that member's own case rules).
+    let mut by_case: BTreeMap<bool, BTreeSet<String>> = BTreeMap::new();
+    for literal in &literals {
+        by_case
+            .entry(literal.ci)
+            .or_default()
+            .insert(literal.text.clone());
+    }
+    let unique: usize = by_case.values().map(BTreeSet::len).sum();
+    if unique > MAX_LITERALS_PER_RULE {
         return (
             false,
             transforms,
             Vec::new(),
             Some(format!(
-                "literal set of {} exceeds the {} member cap",
-                literals.len(),
-                MAX_LITERALS_PER_RULE
+                "literal set of {unique} exceeds the {MAX_LITERALS_PER_RULE} member cap"
             )),
         );
     }
-    let too_short = literals
+    let all_texts: Vec<String> = by_case
+        .values()
+        .flat_map(|set| set.iter().cloned())
+        .collect();
+    let too_short = all_texts
         .iter()
         .filter(|l| l.chars().count() < MIN_LITERAL_LEN)
         .count();
@@ -856,7 +932,7 @@ fn gate_member(
             )),
         );
     }
-    if !transforms_supported(&transforms, &literals) {
+    if !transforms_supported(&transforms, &all_texts) {
         let chain = transforms.join(",");
         return (
             false,
@@ -868,20 +944,12 @@ fn gate_member(
         );
     }
 
-    let (has_ci, has_cs) = case_insensitive;
-    let mut groups = Vec::new();
-    if has_ci {
+    let mut groups: Vec<LiteralGroup> = Vec::with_capacity(by_case.len());
+    for (case_insensitive, literals) in by_case {
         groups.push(LiteralGroup {
             transforms: transforms.clone(),
-            case_insensitive: true,
-            literals: literals.clone(),
-        });
-    }
-    if has_cs || !has_ci {
-        groups.push(LiteralGroup {
-            transforms: transforms.clone(),
-            case_insensitive: false,
-            literals: literals.clone(),
+            case_insensitive,
+            literals: literals.into_iter().collect(),
         });
     }
     (true, transforms, groups, None)
@@ -903,7 +971,7 @@ fn transforms_supported(transforms: &[String], literals: &[String]) -> bool {
         | "replacenulls" | "compresswhitespace" | "removewhitespace" | "trim" | "trimleft"
         | "trimright" | "normalizepath" | "normalizepathwin" | "normalisepath"
         | "normalisepathwin" | "escapeseqdecode" | "replacecomments" | "jsdecode" | "cssdecode"
-        | "cmdline" => true,
+        | "cmdline" | "base64decode" => true,
         "utf8tounicode" => ascii_only,
         // The runtime decodes numeric references exactly and the ASCII
         // punctuation named entities listed in `prefilter::decode_entity`.
@@ -999,6 +1067,10 @@ enum Node {
     /// Literal text plus the case-insensitive flag in effect for that atom.
     Literal(String, bool),
     Class,
+    /// A consuming construct with no derivable literal (backreference,
+    /// conditional, unknown escape). It must break literal adjacency: text on
+    /// either side is not guaranteed to be contiguous in a match.
+    Opaque,
     Anchor,
     Concat(Vec<Node>),
     Alt(Vec<Node>),
@@ -1122,10 +1194,7 @@ impl RegexParser {
         let c = self.bump().ok_or("unexpected end of pattern")?;
         match c {
             '(' => self.parse_group(),
-            '[' => {
-                self.parse_class()?;
-                Ok(Node::Class)
-            }
+            '[' => self.parse_class(),
             '.' => Ok(Node::Class),
             '^' | '$' => Ok(Node::Anchor),
             '\\' => self.parse_escape(),
@@ -1295,11 +1364,13 @@ impl RegexParser {
                     Err("unterminated comment group".to_string())
                 }
                 Some('(') => {
-                    // Conditional group: parse conservatively.
+                    // Conditional group: it consumes text but its branches are
+                    // not modelled. Treat it as opaque so a literal is never
+                    // bridged across it.
                     self.skip_balanced()?;
                     self.ci = saved_ci;
                     self.extended = saved_x;
-                    Ok(Node::Empty)
+                    Ok(Node::Opaque)
                 }
                 Some('i') | Some('m') | Some('s') | Some('x') | Some('U') | Some('J')
                 | Some('-') => {
@@ -1350,15 +1421,18 @@ impl RegexParser {
     }
 
     fn skip_balanced(&mut self) -> Result<(), String> {
-        let mut depth = 1usize;
+        // Used after `(?(`: the condition's closing `)` returns to depth zero
+        // and does not close the conditional group, so only a `)` seen at
+        // depth zero terminates the scan.
+        let mut depth = 0usize;
         while let Some(c) = self.bump() {
             match c {
                 '(' => depth += 1,
                 ')' => {
-                    depth -= 1;
                     if depth == 0 {
                         return Ok(());
                     }
+                    depth -= 1;
                 }
                 '\\' => {
                     self.bump();
@@ -1369,19 +1443,108 @@ impl RegexParser {
         Err("unterminated conditional group".to_string())
     }
 
-    fn parse_class(&mut self) -> Result<(), String> {
+    fn parse_class(&mut self) -> Result<Node, String> {
+        let negated = self.eat('^');
+        let mut bail = negated;
+        let mut items: Vec<String> = Vec::new();
         let mut first = true;
-        while let Some(c) = self.bump() {
-            match c {
-                ']' if !first => return Ok(()),
-                '\\' => {
-                    self.bump();
+        loop {
+            match self.peek() {
+                Some(']') if !first => {
+                    self.pos += 1;
+                    break;
                 }
+                None => return Err("unterminated character class".to_string()),
                 _ => {}
             }
             first = false;
+            let Some(start) = self.read_class_atom(&mut bail)? else {
+                continue;
+            };
+            // A `-` is a range operator only when it has a right-hand atom.
+            if self.peek() == Some('-') && !matches!(self.peek_at(1), Some(']') | None) {
+                self.pos += 1;
+                let Some(end) = self.read_class_atom(&mut bail)? else {
+                    continue;
+                };
+                if end < start || !start.is_ascii() || !end.is_ascii() {
+                    bail = true;
+                    continue;
+                }
+                let count = end as u32 - start as u32 + 1;
+                if count as usize > MAX_CLASS_EXPANSION {
+                    bail = true;
+                    continue;
+                }
+                for code in start as u32..=end as u32 {
+                    if let Some(ch) = char::from_u32(code) {
+                        items.push(ch.to_string());
+                    }
+                }
+            } else {
+                items.push(start.to_string());
+            }
         }
-        Err("unterminated character class".to_string())
+        if bail || items.is_empty() || items.len() > MAX_CLASS_EXPANSION {
+            return Ok(Node::Class);
+        }
+        items.sort();
+        items.dedup();
+        if items.len() == 1 {
+            return Ok(Node::Literal(items.pop().expect("one item"), self.ci));
+        }
+        Ok(Node::Alt(
+            items
+                .into_iter()
+                .map(|text| Node::Literal(text, self.ci))
+                .collect(),
+        ))
+    }
+
+    /// Reads one bracket-expression atom. Returns `None` when the atom cannot
+    /// be enumerated as a single character (class escape, POSIX class, ...).
+    fn read_class_atom(&mut self, bail: &mut bool) -> Result<Option<char>, String> {
+        let c = match self.bump() {
+            Some(c) => c,
+            None => return Err("unterminated character class".to_string()),
+        };
+        if c != '\\' {
+            // POSIX/collating/equivalence classes have no finite enumeration.
+            if c == '[' && matches!(self.peek(), Some(':') | Some('.') | Some('=')) {
+                let close = self.bump().expect("checked above");
+                while let Some(inner) = self.bump() {
+                    if inner == close && self.peek() == Some(']') {
+                        self.pos += 1;
+                        break;
+                    }
+                }
+                *bail = true;
+                return Ok(None);
+            }
+            return Ok(Some(c));
+        }
+        let esc = self.bump().ok_or("trailing backslash in class")?;
+        match esc {
+            'n' => Ok(Some('\n')),
+            'r' => Ok(Some('\r')),
+            't' => Ok(Some('\t')),
+            'f' => Ok(Some('\x0c')),
+            'a' => Ok(Some('\x07')),
+            'e' => Ok(Some('\x1b')),
+            'x' => match self.parse_hex_char()? {
+                Some(ch) if ch.is_ascii() => Ok(Some(ch)),
+                _ => {
+                    *bail = true;
+                    Ok(None)
+                }
+            },
+            other if other.is_ascii_alphanumeric() => {
+                // \d, \p{...}, \b, octal escapes, ...: not a finite set.
+                *bail = true;
+                Ok(None)
+            }
+            other => Ok(Some(other)),
+        }
     }
 
     fn parse_escape(&mut self) -> Result<Node, String> {
@@ -1406,7 +1569,12 @@ impl RegexParser {
             'f' => Ok(Node::Literal("\x0c".to_string(), self.ci)),
             'a' => Ok(Node::Literal("\x07".to_string(), self.ci)),
             'e' => Ok(Node::Literal("\x1b".to_string(), self.ci)),
-            'x' => self.parse_hex_escape(),
+            'x' => match self.parse_hex_char()? {
+                Some(ch) => Ok(Node::Literal(ch.to_string(), self.ci)),
+                // A raw non-ASCII byte in PCRE byte mode cannot be represented
+                // unambiguously as a UTF-8 `str`.
+                None => Ok(Node::Class),
+            },
             'u' => {
                 // PCRE uses \x{...}; `\u` is not standard but be conservative.
                 Ok(Node::Class)
@@ -1430,7 +1598,7 @@ impl RegexParser {
                     Ok(Node::Class)
                 }
             }
-            '1'..='9' => Ok(Node::Class),
+            '1'..='9' => Ok(Node::Opaque),
             'Q' => {
                 let mut text = String::new();
                 while let Some(c) = self.bump() {
@@ -1454,7 +1622,7 @@ impl RegexParser {
         }
     }
 
-    fn parse_hex_escape(&mut self) -> Result<Node, String> {
+    fn parse_hex_char(&mut self) -> Result<Option<char>, String> {
         if self.eat('{') {
             let mut value = String::new();
             while let Some(c) = self.bump() {
@@ -1466,7 +1634,9 @@ impl RegexParser {
             let code = u32::from_str_radix(&value, 16)
                 .map_err(|_| format!("invalid \\x{{{value}}} escape"))?;
             let ch = char::from_u32(code).ok_or("invalid code point in \\x{} escape")?;
-            Ok(Node::Literal(ch.to_string(), self.ci))
+            // A raw non-ASCII code point has byte-mode ambiguity; only ASCII
+            // is used as a literal.
+            Ok((code <= 0x7f).then_some(ch))
         } else {
             let mut value = String::new();
             for _ in 0..2 {
@@ -1485,9 +1655,9 @@ impl RegexParser {
             if code > 0x7f {
                 // Byte-mode regexes can match a raw non-UTF-8 byte here; a
                 // Rust string cannot represent that unambiguously.
-                return Ok(Node::Class);
+                return Ok(None);
             }
-            Ok(Node::Literal((code as u8 as char).to_string(), self.ci))
+            Ok(Some(code as u8 as char))
         }
     }
 }
@@ -1522,7 +1692,7 @@ fn required_set(node: &Node) -> Option<Vec<Literal>> {
                 }])
             }
         }
-        Node::Class | Node::Anchor | Node::Empty => None,
+        Node::Class | Node::Opaque | Node::Anchor | Node::Empty => None,
         Node::Repeat(inner, min, _) => {
             if *min >= 1 {
                 required_set(inner)
@@ -1548,7 +1718,7 @@ fn literal_expansion(node: &Node) -> Option<Vec<Literal>> {
             text: String::new(),
             ci: false,
         }]),
-        Node::Class => None,
+        Node::Class | Node::Opaque => None,
         Node::Repeat(inner, min, max) => {
             let max = (*max)?;
             if max > 8 || max < *min {
@@ -1659,19 +1829,66 @@ fn required_concat(children: &[Node]) -> Option<Vec<Literal>> {
 
     let mut best: Option<Vec<Literal>> = None;
     let mut best_score = 0usize;
+
+    let consider = |set: Vec<Literal>, best: &mut Option<Vec<Literal>>, best_score: &mut usize| {
+        let score = set
+            .iter()
+            .map(|l| l.text.chars().count())
+            .min()
+            .unwrap_or(0);
+        if score > *best_score
+            || (score == *best_score
+                && best
+                    .as_ref()
+                    .map_or(true, |current| set.len() < current.len()))
+        {
+            *best_score = score;
+            *best = Some(set);
+        }
+    };
+
+    // Each child on its own (an alternation's any-of set, a repeated literal,
+    // ...).
     for child in &merged {
         if let Some(set) = required_set(child) {
-            let score = set
-                .iter()
-                .map(|l| l.text.chars().count())
-                .min()
-                .unwrap_or(0);
-            if score > best_score || best.is_none() {
-                best_score = score;
-                best = Some(set);
+            consider(set, &mut best, &mut best_score);
+        }
+    }
+
+    // Adjacent finitely-expandable children form a longer mandatory run.
+    // `~` followed by `[\+\-]` becomes `~+`/`~-`, and a literal suffix after a
+    // bounded class (`=[aA]`) keeps the whole suffix. Classes with more than
+    // `MAX_CLASS_EXPANSION` members and consuming opaque nodes break the run.
+    let mut index = 0usize;
+    while index < merged.len() {
+        if literal_expansion(&merged[index]).is_none() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let mut run: Option<Vec<Literal>> = Some(vec![Literal {
+            text: String::new(),
+            ci: false,
+        }]);
+        while index < merged.len() {
+            let Some(expanded) = literal_expansion(&merged[index]) else {
+                break;
+            };
+            run = cross_product(run.as_deref()?, &expanded);
+            index += 1;
+        }
+        if index > start + 1 {
+            if let Some(run) = run {
+                let mut run = run;
+                run.sort();
+                run.dedup();
+                if run.len() <= MAX_LITERALS_PER_RULE {
+                    consider(run, &mut best, &mut best_score);
+                }
             }
         }
     }
+
     best
 }
 
@@ -1685,19 +1902,15 @@ fn required_alt(branches: &[Node]) -> Option<Vec<Literal>> {
     union.dedup();
 
     // A branch whose only required literal is shorter than the minimum makes
-    // the whole alternation ungated: a match could use just that branch.
-    if union
+    // the whole alternation ungated: a match could use just that branch. Try a
+    // literal that every candidate in every branch contains before rejecting.
+    let too_short = union
         .iter()
-        .any(|l| l.text.chars().count() < MIN_LITERAL_LEN)
-    {
-        return None;
-    }
-
-    if union.len() <= MAX_LITERALS_PER_RULE {
+        .any(|l| l.text.chars().count() < MIN_LITERAL_LEN);
+    if !too_short && union.len() <= MAX_LITERALS_PER_RULE {
         return Some(union);
     }
 
-    // Too many members: fall back to a literal common to every candidate.
     let texts: Vec<&str> = union.iter().map(|l| l.text.as_str()).collect();
     if let Some(common) = longest_common_substring(&texts, MIN_LITERAL_LEN) {
         let ci = union.iter().all(|l| l.ci);
@@ -1754,6 +1967,11 @@ pub fn render_summary(artifact: &PrefilterArtifact) -> String {
         cov.body_relevant_gated, cov.body_relevant_ungated, cov.body_relevant_entries
     ));
     out.push_str(&format!(
+        "- All entries: {} gated, {} ungated (of {} total); the native engine \
+         gates headers, URI and cookies as well\n",
+        cov.gated_entries, cov.ungated_entries, cov.parsed_entries
+    ));
+    out.push_str(&format!(
         "- Fast path available for the whole rule set: **{}**\n",
         if cov.all_body_rules_gated {
             "yes"
@@ -1784,6 +2002,12 @@ pub fn render_summary(artifact: &PrefilterArtifact) -> String {
             "| {} | {} | @{} | {} |\n",
             rule.id, rule.family, rule.operator, rule.reason
         ));
+    }
+
+    out.push_str("\n## Ungated entries by operator (all targets)\n\n");
+    out.push_str("| operator | entries |\n|---|---:|\n");
+    for (operator, count) in &cov.ungated_entries_by_operator {
+        out.push_str(&format!("| @{operator} | {count} |\n"));
     }
 
     out.push_str("\n## Gated rules by family\n\n");
@@ -1887,9 +2111,51 @@ mod tests {
 
     #[test]
     fn alternation_with_short_branch_is_ungated() {
-        // A match could use the two-character branch, so no literal from the
+        // A match could use the one-character branch, so no literal from the
         // other branch is required.
-        assert!(extract_regex_literals(r"(?:select|se)").is_err());
+        assert!(extract_regex_literals(r"(?:select|s)").is_err());
+    }
+
+    #[test]
+    fn two_character_literal_is_usable() {
+        // Two-character mandatory literals are accepted.
+        assert_eq!(set(r"(?:foo|\.\.)"), vec!["..", "foo"]);
+    }
+
+    #[test]
+    fn bounded_class_is_expanded() {
+        // `[aA]bc` matches exactly two strings; both are required literals.
+        assert_eq!(set(r"[aA]bc"), vec!["Abc", "abc"]);
+        // A class in the middle of a run is expanded the same way.
+        assert_eq!(
+            set(r"x[Tt]rue"),
+            vec!["xTrue".to_string(), "xtrue".to_string()]
+        );
+    }
+
+    #[test]
+    fn large_or_negated_class_is_not_expanded() {
+        // 26 members is above the expansion bound, and negated/POSIX classes
+        // have no finite enumeration.
+        assert!(extract_regex_literals(r"[a-z]").is_err());
+        assert!(extract_regex_literals(r"[^x]").is_err());
+        assert!(extract_regex_literals(r"[[:alpha:]]").is_err());
+    }
+
+    #[test]
+    fn consuming_conditional_does_not_bridge_literals() {
+        // `ab(?(1)c|d)e` matches `abce` or `abde`; `abe` is not a substring of
+        // either, so it must never be emitted as a mandatory literal.
+        let literals = set(r"ab(?(1)c|d)e");
+        assert!(!literals.iter().any(|l| l == "abe"), "{literals:?}");
+        assert!(literals.iter().all(|l| l == "ab" || l == "e"));
+    }
+
+    #[test]
+    fn backreference_does_not_bridge_literals() {
+        let literals = set(r"(ab)\1cd");
+        assert!(!literals.iter().any(|l| l.contains("abcd")));
+        assert!(literals.iter().any(|l| l == "cd" || l == "ab"));
     }
 
     #[test]
@@ -1910,6 +2176,15 @@ mod tests {
         // The lookahead must not be treated as a required literal.
         let literals = set(r"(?=foo)bar");
         assert_eq!(literals, vec!["bar"]);
+    }
+
+    #[test]
+    fn missing_literal_cannot_be_a_gate() {
+        // The `secret` literal is only in one branch; a match can use `.`, so
+        // emitting `secret` as mandatory would be a false negative.
+        assert!(extract_regex_literals(r"(?:secret|.)").is_err());
+        // Likewise a literal behind a consuming conditional must not bridge.
+        assert!(!set(r"ab(?(1)c|d)e").iter().any(|l| l == "abcde"));
     }
 
     #[test]

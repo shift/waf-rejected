@@ -41,6 +41,18 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Changed
 
+- **CRS mandatory-literal gating coverage (rust-engine).** The offline
+  extractor now expands bounded character classes (`[aA]`), combines adjacent
+  literals into infix/suffix runs (`~[\+\-]` → `~+`/`~-`), keeps per-case
+  literal groups, accepts two-character mandatory literals, and treats
+  consuming conditionals/backreferences as opaque so a literal is never
+  bridged across them. The artifact is schema v2 and regenerated for the host
+  and Go-reactor copies. Gated entries rise 62→95 (body-relevant 62→76) and the
+  4 KiB gate skips 137 regex evaluations instead of 99 (283 µs regex share);
+  4 KiB p50 falls 615→566 µs. `multiMatch` rules are explicitly left ungated
+  (the engine kernel consumes the same artifact). The 4 KiB <480 µs target is
+  still missed because the RCE command-list rules have no ≥2-character
+  mandatory literal; see `docs/developer-guide/literal-gating.md`.
 - Native Rust CRS engine (`rust-engine`, non-default) rule-loop work: an
   empty-target gate skips rules whose positive collections are absent,
   `multiMatch`/`capture`/`MATCHED_VARS` flags are precomputed, `skipAfter`

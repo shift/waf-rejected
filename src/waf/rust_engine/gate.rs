@@ -30,9 +30,40 @@ use super::transforms::Transform;
 /// Embedded CRS literal artifact produced by `crs-prefilter-extract`.
 pub const EMBEDDED_PREFILTER: &str = include_str!("../../../rules/crs/prefilter.json");
 
-/// Maximum number of gated rules. A single `u64` hit mask keeps the per-value
-/// cache compact; rules beyond the cap stay ungated (sound, just slower).
-const MAX_GATED_RULES: usize = 64;
+/// Maximum number of gated rules. A multi-word hit mask scales with this; rules
+/// beyond the cap stay ungated (sound, just slower).
+const MAX_GATED_RULES: usize = 256;
+
+/// Bits in one [`GateMask`] word.
+const MASK_BITS: usize = 64;
+
+/// Words in a [`GateMask`]: enough for [`MAX_GATED_RULES`] gates.
+pub(crate) const GATE_MASK_WORDS: usize = MAX_GATED_RULES / MASK_BITS;
+
+/// Bitset of gate ids hit by one transformed candidate value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GateMask([u64; GATE_MASK_WORDS]);
+
+impl GateMask {
+    #[inline]
+    pub(crate) fn set(&mut self, gate: u16) {
+        let index = usize::from(gate);
+        self.0[index / MASK_BITS] |= 1u64 << (index % MASK_BITS);
+    }
+
+    #[inline]
+    pub(crate) fn insert(&mut self, gate: GateMask) {
+        for (word, extra) in self.0.iter_mut().zip(gate.0) {
+            *word |= extra;
+        }
+    }
+
+    #[inline]
+    pub(crate) fn contains(&self, gate: u16) -> bool {
+        let index = usize::from(gate);
+        index < MAX_GATED_RULES && self.0[index / MASK_BITS] & (1u64 << (index % MASK_BITS)) != 0
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct Artifact {
@@ -44,6 +75,8 @@ struct ArtifactRule {
     id: u32,
     #[serde(default)]
     gated: bool,
+    #[serde(default)]
+    body_relevant: bool,
     #[serde(default)]
     literal_groups: Vec<ArtifactGroup>,
 }
@@ -60,24 +93,26 @@ struct ArtifactGroup {
 
 /// One `(transform pipeline, case sensitivity)` scan group.
 pub(crate) struct GateGroup {
-    /// Pipeline id into [`Program::pipelines`].
-    pub(crate) pipeline: u16,
+    /// Prefix ids to resolve for the value before scanning. A full rule
+    /// pipeline uses its whole plan; a multi-match prefix uses a one-element
+    /// plan that resolves just that intermediate representation.
+    pub(crate) plan: Vec<u32>,
     pub(crate) automaton: AhoCorasick,
-    /// Pattern index -> bitmask of gate ids.
-    pub(crate) pattern_rules: Vec<u64>,
+    /// Pattern index -> mask of gate ids.
+    pub(crate) pattern_rules: Vec<GateMask>,
 }
 
 /// Compiled per-rule gates shared by every request on an engine.
 pub struct GateSet {
     groups: Vec<GateGroup>,
-    /// Gate id -> rule bit in a value hit mask.
-    rule_masks: Vec<u64>,
+    /// Number of compiled gates; gate ids are dense indexes below this.
+    gated_rules: usize,
 }
 
 impl std::fmt::Debug for GateSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GateSet")
-            .field("gated_rules", &self.rule_masks.len())
+            .field("gated_rules", &self.gated_rules)
             .field("groups", &self.groups.len())
             .finish()
     }
@@ -86,20 +121,18 @@ impl std::fmt::Debug for GateSet {
 impl GateSet {
     /// Number of rules with a compiled gate.
     pub fn len(&self) -> usize {
-        self.rule_masks.len()
+        self.gated_rules
     }
 
     /// True when no rule is gated.
     pub fn is_empty(&self) -> bool {
-        self.rule_masks.is_empty()
+        self.gated_rules == 0
     }
 
     /// True when `mask` contains a required literal for `gate`.
     #[inline]
-    pub fn allows(&self, gate: u16, mask: u64) -> bool {
-        self.rule_masks
-            .get(usize::from(gate))
-            .is_some_and(|rule| mask & rule != 0)
+    pub fn allows(&self, gate: u16, mask: GateMask) -> bool {
+        mask.contains(gate)
     }
 
     pub(crate) fn groups(&self) -> &[GateGroup] {
@@ -140,11 +173,48 @@ pub fn attach(program: &mut Program) -> Result<Option<Arc<GateSet>>, String> {
         }
     }
 
+    // Rules that evaluate every intermediate transform representation. Their
+    // gate must scan every prefix of the pipeline, not just the final value.
+    let mut multi_match = BTreeSet::new();
+    for items in [
+        &program.phase1,
+        &program.phase2,
+        &program.phase3,
+        &program.phase4,
+        &program.phase5,
+    ] {
+        for item in items {
+            let ProgramItem::Rule(group) = item else {
+                continue;
+            };
+            for rule in &group.rules {
+                if let Some(id) = rule.id {
+                    if rule.multi_match() {
+                        multi_match.insert(id);
+                    }
+                }
+            }
+        }
+    }
+
     // gate id -> (pipeline, case insensitive) -> literals
     type Pending = BTreeMap<u32, BTreeMap<(Vec<Transform>, bool), BTreeSet<Vec<u8>>>>;
     let mut pending: Pending = BTreeMap::new();
     for rule in artifact.rules {
         if !rule.gated || !eligible.contains(&rule.id) {
+            continue;
+        }
+        // Header/URI gating is supported by the artifact, but the per-value
+        // gate scan costs more than the small regexes it avoids on typical
+        // header values. Body values are the ones large enough to amortise it.
+        if !rule.body_relevant {
+            continue;
+        }
+        // A multi-match rule evaluates every intermediate transform
+        // representation; a single-representation gate would be unsound, and
+        // scanning every prefix costs more than the regex it avoids. Keep
+        // these rules ungated (they run).
+        if multi_match.contains(&rule.id) {
             continue;
         }
         for group in rule.literal_groups {
@@ -166,29 +236,29 @@ pub fn attach(program: &mut Program) -> Result<Option<Arc<GateSet>>, String> {
     pending.retain(|_, groups| !groups.is_empty());
 
     // Merge literals by representation, attributing every literal to the rule
-    // ids that need it. Rules whose pipeline is not in the program are dropped
-    // first so an uncompiled gate can never suppress a rule.
-    type Merged = BTreeMap<(u16, bool), BTreeMap<Vec<u8>, BTreeSet<u32>>>;
+    // ids that need it. A rule is gated only when *every* one of its
+    // representations is resolvable: dropping one group would lose a literal
+    // that can legitimately match, which would be a false negative.
+    type Merged = BTreeMap<(Vec<u32>, bool), BTreeMap<Vec<u8>, BTreeSet<u32>>>;
     let mut merged: Merged = BTreeMap::new();
     let mut covered_rules = BTreeSet::new();
+    let mut failed_rules = BTreeSet::new();
     for (id, groups) in &pending {
-        for ((pipeline, case_insensitive), literals) in groups {
-            let Some(pipeline_id) = program
-                .pipelines
-                .iter()
-                .position(|candidate| candidate == pipeline)
-            else {
-                continue;
-            };
-            let Ok(pipeline_id) = u16::try_from(pipeline_id) else {
+        for ((chain, case_insensitive), literals) in groups {
+            let plan = resolve_plan(program, chain);
+            let Some(plan) = plan else {
+                failed_rules.insert(*id);
                 continue;
             };
             covered_rules.insert(*id);
-            let entry = merged.entry((pipeline_id, *case_insensitive)).or_default();
+            let entry = merged.entry((plan, *case_insensitive)).or_default();
             for literal in literals {
                 entry.entry(literal.clone()).or_default().insert(*id);
             }
         }
+    }
+    for id in failed_rules {
+        covered_rules.remove(&id);
     }
 
     let mut gate_for_rule: BTreeMap<u32, u16> = BTreeMap::new();
@@ -201,20 +271,19 @@ pub fn attach(program: &mut Program) -> Result<Option<Arc<GateSet>>, String> {
     if gate_for_rule.is_empty() {
         return Ok(None);
     }
-    let rule_masks: Vec<u64> = gate_for_rule.values().map(|gate| 1u64 << gate).collect();
 
     let mut groups = Vec::with_capacity(merged.len());
-    for ((pipeline, case_insensitive), patterns) in merged {
+    for ((plan, case_insensitive), patterns) in merged {
         let mut literals = Vec::with_capacity(patterns.len());
         let mut masks = Vec::with_capacity(patterns.len());
         for (literal, ids) in patterns {
-            let mut mask = 0u64;
+            let mut mask = GateMask::default();
             for id in ids {
                 if let Some(gate) = gate_for_rule.get(&id) {
-                    mask |= 1u64 << gate;
+                    mask.set(*gate);
                 }
             }
-            if mask != 0 {
+            if mask != GateMask::default() {
                 literals.push(literal);
                 masks.push(mask);
             }
@@ -228,7 +297,7 @@ pub fn attach(program: &mut Program) -> Result<Option<Arc<GateSet>>, String> {
             .build(&literals)
             .map_err(|error| format!("prefilter automaton: {error}"))?;
         groups.push(GateGroup {
-            pipeline,
+            plan,
             automaton,
             pattern_rules: masks,
         });
@@ -264,7 +333,32 @@ pub fn attach(program: &mut Program) -> Result<Option<Arc<GateSet>>, String> {
     if attached == 0 {
         return Ok(None);
     }
-    Ok(Some(Arc::new(GateSet { groups, rule_masks })))
+    Ok(Some(Arc::new(GateSet {
+        groups,
+        gated_rules: gate_for_rule.len(),
+    })))
+}
+
+/// Resolves a transform chain to the prefix ids the cache understands.
+///
+/// Full rule pipelines are plan entries of [`Program::transform_prefixes`].
+/// Multi-match intermediates are only prefix table entries, so they resolve to
+/// a one-element plan.
+fn resolve_plan(program: &Program, chain: &[Transform]) -> Option<Vec<u32>> {
+    if let Some(index) = program
+        .pipelines
+        .iter()
+        .position(|candidate| candidate == chain)
+    {
+        return Some(program.transform_prefixes.plan(index).to_vec());
+    }
+    program
+        .transform_prefixes
+        .prefixes()
+        .iter()
+        .position(|candidate| candidate == chain)
+        .and_then(|index| u32::try_from(index).ok())
+        .map(|index| vec![index])
 }
 
 fn parse_pipeline(names: &[String]) -> Option<Vec<Transform>> {
@@ -280,6 +374,7 @@ fn parse_pipeline(names: &[String]) -> Option<Vec<Transform>> {
 
 #[cfg(test)]
 mod tests {
+    use super::{GateMask, GateSet};
     use crate::waf::rust_engine::{CompilePolicy, RustEngine};
 
     #[test]
@@ -293,6 +388,28 @@ mod tests {
         let gates = engine.gate_set().expect("gates compiled");
         assert!(gates.len() > 30, "expected a useful gate set");
         assert_eq!(engine.gated_rule_count(), gates.len());
+    }
+
+    #[test]
+    fn gate_skips_only_when_its_own_literal_is_present() {
+        // Adversarial: rule 0 requires literal 0; a value that matched some
+        // other rule's literal (bit 1) must still run rule 0. This is the
+        // property that makes a missing literal impossible to skip.
+        let gates = GateSet {
+            groups: Vec::new(),
+            gated_rules: 2,
+        };
+        let mut mask = GateMask::default();
+        assert!(!gates.allows(0, mask));
+        mask.set(1);
+        assert!(!gates.allows(0, mask), "another rule's hit must not allow");
+        assert!(gates.allows(1, mask));
+        mask.set(0);
+        assert!(gates.allows(0, mask));
+        // Bit 2 was never assigned a rule: it can never allow an out-of-range
+        // gate id.
+        mask.set(200);
+        assert!(!gates.allows(255, mask));
     }
 
     #[test]

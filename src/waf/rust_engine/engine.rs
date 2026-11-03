@@ -21,7 +21,7 @@ use std::path::Path;
 
 use super::budget::{Budget, Limits};
 use super::error::{EngineError, LoadError};
-use super::gate::GateSet;
+use super::gate::{GateMask, GateSet};
 use super::ir::{
     Action, Collection, CompiledRule, CtlAction, Disruptive, Phase, Program, ProgramItem,
     RuleGroup, Selector,
@@ -948,7 +948,9 @@ impl RustEngine {
                             &mut scratch.cache,
                             &mut scratch.value_ids,
                             &self.program.transform_prefixes,
-                            usize::from(rule.pipeline),
+                            self.program
+                                .transform_prefixes
+                                .plan(usize::from(rule.pipeline)),
                             id,
                             &candidate.value,
                             &mut scratch.charged_transform_bytes,
@@ -1161,7 +1163,9 @@ impl RustEngine {
                             &mut worker_scratch.cache,
                             &mut worker_scratch.value_ids,
                             &self.program.transform_prefixes,
-                            usize::from(rule.pipeline),
+                            self.program
+                                .transform_prefixes
+                                .plan(usize::from(rule.pipeline)),
                             id,
                             &candidate.value,
                             &mut worker_scratch.charged_transform_bytes,
@@ -1265,7 +1269,7 @@ impl RustEngine {
         candidate: &Candidate<'_>,
         scratch: &mut Scratch,
         budget: &mut Budget,
-    ) -> Result<Option<u64>, EngineError> {
+    ) -> Result<Option<GateMask>, EngineError> {
         let Some(value_id) = candidate.cache_id else {
             return Ok(None);
         };
@@ -1275,13 +1279,13 @@ impl RustEngine {
         if let Some(mask) = scratch.gate_masks.get(value_id) {
             return Ok(Some(mask));
         }
-        let mut mask = 0u64;
+        let mut mask = GateMask::default();
         for group in gates.groups() {
             let range = resolve_cached(
                 &mut scratch.cache,
                 &mut scratch.value_ids,
                 &self.program.transform_prefixes,
-                usize::from(group.pipeline),
+                &group.plan,
                 value_id,
                 &candidate.value,
                 &mut scratch.charged_transform_bytes,
@@ -1293,7 +1297,7 @@ impl RustEngine {
             }
             for found in group.automaton.find_overlapping_iter(bytes) {
                 if let Some(bits) = group.pattern_rules.get(found.pattern().as_usize()) {
-                    mask |= *bits;
+                    mask.insert(*bits);
                 }
             }
         }
@@ -1911,7 +1915,7 @@ fn resolve_cached(
     cache: &mut TransformCache<Transform>,
     value_ids: &mut Vec<Option<ValueId>>,
     prefixes: &crate::waf::transforms::PrefixTable<Transform>,
-    plan_index: usize,
+    plan: &[u32],
     value_id: u32,
     input: &[u8],
     charged: &mut u64,
@@ -1929,7 +1933,7 @@ fn resolve_cached(
             id
         }
     };
-    let range = cache.resolve(id, input, prefixes.plan(plan_index), prefixes.prefixes())?;
+    let range = cache.resolve(id, input, plan, prefixes.prefixes())?;
     let total = cache.transform_bytes();
     let delta = total.saturating_sub(*charged);
     if delta > 0 {
@@ -1972,7 +1976,7 @@ thread_local! {
 
 /// Per-phase cache of mandatory-literal hit masks keyed by value id.
 struct GateMaskCache {
-    masks: Vec<u64>,
+    masks: Vec<GateMask>,
     generations: Vec<u32>,
     generation: u32,
 }
@@ -1995,12 +1999,12 @@ impl GateMaskCache {
             self.generation = 1;
         }
         if self.masks.is_empty() {
-            self.masks = vec![0; 8192];
+            self.masks = vec![GateMask::default(); 8192];
             self.generations = vec![0; 8192];
         }
     }
 
-    fn get(&self, value_id: u32) -> Option<u64> {
+    fn get(&self, value_id: u32) -> Option<GateMask> {
         let index = value_id as usize;
         if index >= self.masks.len() || self.generations[index] != self.generation {
             return None;
@@ -2008,7 +2012,7 @@ impl GateMaskCache {
         Some(self.masks[index])
     }
 
-    fn set(&mut self, value_id: u32, mask: u64) {
+    fn set(&mut self, value_id: u32, mask: GateMask) {
         let index = value_id as usize;
         if index < self.masks.len() {
             self.masks[index] = mask;

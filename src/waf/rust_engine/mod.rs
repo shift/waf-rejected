@@ -43,7 +43,7 @@ pub mod transforms;
 pub use budget::{Budget, Limits};
 pub use engine::{Outcome, RustEngine};
 pub use error::{EngineError, LoadError, UnsupportedConstruct};
-pub use gate::GateSet;
+pub use gate::{GateMask, GateSet};
 pub use ir::{CompiledRule, Phase, Program, ProgramItem, RuleGroup};
 pub use parser::{parse_conf_path, parse_conf_str, CompilePolicy, ConstructUse, SupportReport};
 pub use request::{
