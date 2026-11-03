@@ -581,7 +581,7 @@ impl RustEngine {
                         index += 1;
                         continue;
                     }
-                    match self.eval_group(
+                    let group_result = self.eval_group(
                         group,
                         data,
                         tx_state,
@@ -591,7 +591,8 @@ impl RustEngine {
                         &mut exceptions,
                         captures,
                         scratch,
-                    )? {
+                    )?;
+                    match group_result {
                         GroupResult::NoMatch => {
                             index += 1;
                         }
@@ -626,11 +627,8 @@ impl RustEngine {
                                     Disruptive::Pass => {}
                                 }
                             }
-                            if let Some(marker) = flow.skip_after {
-                                match marker_index(items, &marker) {
-                                    Some(target) => index = target + 1,
-                                    None => index += 1,
-                                }
+                            if let Some(target) = group.rules[0].skip_after {
+                                index = target as usize + 1;
                             } else {
                                 index += 1;
                             }
@@ -643,6 +641,9 @@ impl RustEngine {
     }
 
     fn group_removed(&self, group: &RuleGroup, state: &EvalState) -> bool {
+        if state.removed_rules.is_empty() && state.removed_tags.is_empty() {
+            return false;
+        }
         if let Some(id) = group.id() {
             if state.removed_rules.contains(&id) {
                 return true;
@@ -669,8 +670,10 @@ impl RustEngine {
         captures: &mut Captures,
         scratch: &mut Scratch,
     ) -> Result<GroupResult, EngineError> {
-        tx_state.clear_matches();
-        let record_matches = group_records_matches(group);
+        let record_matches = group.records_matches;
+        if record_matches {
+            tx_state.clear_matches();
+        }
         let mut all_matched = true;
         for rule in &group.rules {
             let matched = self.eval_rule(
@@ -699,7 +702,6 @@ impl RustEngine {
         for action in &parent.actions {
             match action {
                 Action::Disruptive(disruptive) => flow.disruptive = Some(*disruptive),
-                Action::SkipAfter(marker) => flow.skip_after = Some(marker.clone()),
                 Action::Status(status) => flow.status = Some(*status),
                 _ => {}
             }
@@ -721,7 +723,9 @@ impl RustEngine {
         scratch: &mut Scratch,
         record_matches: bool,
     ) -> Result<bool, EngineError> {
-        tx_state.clear_captures();
+        if rule.captures {
+            tx_state.clear_captures();
+        }
         if rule.operator.is_none() {
             self.apply_nondisruptive(
                 rule,
@@ -734,6 +738,21 @@ impl RustEngine {
             return Ok(true);
         }
 
+        // Empty-collection gate: a rule whose positive targets are all absent
+        // dynamic collections cannot match. This skips candidate resolution and
+        // the regex scan for whole families of ARGS/body/XML rules on requests
+        // that do not carry them, and is a no-op for static targets and counts.
+        if rule.has_positive
+            && rule.presence != 0
+            && !rule.has_static_positive
+            && !rule.may_count
+            && rule.presence & data.dynamic_present(tx_state) == 0
+        {
+            return Ok(false);
+        }
+
+        #[cfg(feature = "engine-profile")]
+        let tx_sample = super::profile::sample();
         if let Some(matched) = self.eval_tx_rule(
             rule,
             data,
@@ -744,9 +763,15 @@ impl RustEngine {
             scratch,
             record_matches,
         )? {
+            #[cfg(feature = "engine-profile")]
+            super::profile::record(super::profile::Category::Tx, tx_sample.0, tx_sample.1);
             return Ok(matched);
         }
+        #[cfg(feature = "engine-profile")]
+        super::profile::record(super::profile::Category::Tx, tx_sample.0, tx_sample.1);
 
+        #[cfg(feature = "engine-profile")]
+        let matched_sample = super::profile::sample();
         if let Some(matched) = self.eval_matched_rule(
             rule,
             data,
@@ -759,6 +784,12 @@ impl RustEngine {
         )? {
             return Ok(matched);
         }
+        #[cfg(feature = "engine-profile")]
+        super::profile::record(
+            super::profile::Category::MatchedVars,
+            matched_sample.0,
+            matched_sample.1,
+        );
 
         #[cfg(feature = "engine-profile")]
         let candidates_sample = super::profile::sample();
@@ -892,7 +923,11 @@ impl RustEngine {
                             copy_captures(tx_state, captures);
                         }
                         if record_matches {
-                            tx_state.record_match(candidate.matched_name(), value);
+                            tx_state.record_match(
+                                candidate.collection,
+                                candidate.key.as_deref(),
+                                value,
+                            );
                         }
                         self.apply_nondisruptive(
                             rule,
@@ -974,7 +1009,11 @@ impl RustEngine {
                         copy_captures(tx_state, captures);
                     }
                     if record_matches {
-                        tx_state.record_match(candidate.matched_name(), value);
+                        tx_state.record_match(
+                            candidate.collection,
+                            candidate.key.as_deref(),
+                            value,
+                        );
                     }
                     // Coraza executes non-disruptive actions for every match,
                     // not once per rule. This matters for rules that build a
@@ -1192,7 +1231,11 @@ impl RustEngine {
                             copy_captures(tx_state, &candidate_captures);
                         }
                         if let Some(value) = recorded {
-                            tx_state.record_match(candidate.matched_name(), &value);
+                            tx_state.record_match(
+                                candidate.collection,
+                                candidate.key.as_deref(),
+                                &value,
+                            );
                         }
                         self.apply_nondisruptive(
                             rule,
@@ -1388,18 +1431,15 @@ impl RustEngine {
                 budget.matched()?;
                 budget.bytes(value.len())?;
                 let matched_name = if record_matches {
-                    Some(match matched_key {
-                        Some(key) => format!("{}:{key}", Collection::Tx.name()),
-                        None => Collection::Tx.name().to_string(),
-                    })
+                    Some(matched_key)
                 } else {
                     None
                 };
                 if capture {
                     copy_captures(tx_state, captures);
                 }
-                if let Some(matched_name) = matched_name {
-                    tx_state.record_match(matched_name, value);
+                if let Some(matched_key) = matched_name {
+                    tx_state.record_match(Collection::Tx, matched_key, value);
                 }
                 self.apply_nondisruptive(
                     rule,
@@ -1455,7 +1495,13 @@ impl RustEngine {
             let Some((name, stored)) = tx_state.matched_at(index) else {
                 break;
             };
-            let raw = if names_only { name.as_bytes() } else { stored };
+            scratch.match_name.clear();
+            scratch.match_name.extend_from_slice(name.as_bytes());
+            let raw = if names_only {
+                scratch.match_name.as_slice()
+            } else {
+                stored
+            };
             budget.value()?;
             budget.bytes(raw.len())?;
             transform_into(
@@ -1484,7 +1530,7 @@ impl RustEngine {
             budget.matched()?;
             budget.bytes(value.len())?;
             let matched_name = if record_matches {
-                Some(format!("{}:{name}", collection.name()))
+                Some(scratch.match_name.as_slice())
             } else {
                 None
             };
@@ -1492,7 +1538,8 @@ impl RustEngine {
                 copy_captures(tx_state, captures);
             }
             if let Some(matched_name) = matched_name {
-                tx_state.record_match(matched_name, value);
+                let name = std::str::from_utf8(matched_name).unwrap_or("");
+                tx_state.record_match(collection, Some(name), value);
             }
             self.apply_nondisruptive(
                 rule,
@@ -1654,24 +1701,6 @@ fn apply_ctl(ctl: &CtlAction, state: &mut TxState, eval: &mut EvalState) {
     }
 }
 
-/// True when a group reads `MATCHED_VARS` or expands a matched-variable macro.
-/// Groups that do neither skip the per-match bookkeeping entirely.
-fn group_records_matches(group: &RuleGroup) -> bool {
-    group.rules.iter().any(|rule| {
-        rule.variables.iter().any(|spec| {
-            matches!(
-                spec.collection,
-                Collection::MatchedVars | Collection::MatchedVarsNames
-            )
-        }) || rule.actions.iter().any(|action| match action {
-            Action::SetVar { name, value, .. } => {
-                name.contains("matched_var") || value.0.contains("matched_var")
-            }
-            _ => false,
-        })
-    })
-}
-
 fn is_exception(candidate: &Candidate<'_>, exceptions: &[Candidate<'_>]) -> bool {
     exceptions.iter().any(|exception| {
         if !same_collection(candidate.collection, exception.collection) {
@@ -1818,13 +1847,6 @@ fn transform_multi_into(
     Ok(())
 }
 
-fn marker_index(items: &[ProgramItem], marker: &str) -> Option<usize> {
-    items.iter().position(|item| match item {
-        ProgramItem::Marker(name) => name == marker,
-        ProgramItem::Rule(_) => false,
-    })
-}
-
 fn tx_i64(tx: &Collections<'_>, name: &str) -> i64 {
     tx.tx_get(name)
         .and_then(|value| std::str::from_utf8(value).ok())
@@ -1875,6 +1897,7 @@ struct Scratch {
     macro_name: Vec<u8>,
     macro_value: Vec<u8>,
     op_macro: Vec<u8>,
+    match_name: Vec<u8>,
     capture_locations: Option<regex::bytes::CaptureLocations>,
     tx_state: Option<TxState>,
     gate_masks: GateMaskCache,
@@ -1943,6 +1966,10 @@ impl MultiBuffer {
     }
 }
 
+thread_local! {
+    static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch::default());
+}
+
 /// Per-phase cache of mandatory-literal hit masks keyed by value id.
 struct GateMaskCache {
     masks: Vec<u64>,
@@ -1990,10 +2017,6 @@ impl GateMaskCache {
     }
 }
 
-thread_local! {
-    static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch::default());
-}
-
 #[derive(Default)]
 struct EvalState {
     removed_rules: HashSet<u32>,
@@ -2015,7 +2038,6 @@ struct RemovedTarget {
 #[derive(Default)]
 struct GroupFlow {
     disruptive: Option<Disruptive>,
-    skip_after: Option<String>,
     status: Option<u16>,
 }
 

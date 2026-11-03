@@ -29,6 +29,15 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Changed
 
+- Native Rust CRS engine (`rust-engine`, non-default) rule-loop work: an
+  empty-target gate skips rules whose positive collections are absent,
+  `multiMatch`/`capture`/`MATCHED_VARS` flags are precomputed, `skipAfter`
+  targets are resolved at load time, `MATCHED_VARS` uses recycled byte arenas,
+  and macro/capture/selector paths no longer allocate per match. Corpus parity
+  is unchanged (2,110/2,112, 0 native-only FNs); allocations fall from ~143 to
+  33-42/request. Latency improves (bodyless 158→110 µs, 1 KiB 316→271 µs,
+  4 KiB 636→596 µs, 8 KiB 1.05→1.02 ms); the 4/8 KiB targets are still missed.
+  See `docs/suggestions_from_agents/engine-ruleloop.md`.
 - io_uring ring thread now batches submissions, keeps multiple operations in
   flight, recycles read buffers, and slices a single `Bytes` copy for partial
   writes. SQPOLL remains opt-in (`WAF_IO_URING_SQPOLL=1`).

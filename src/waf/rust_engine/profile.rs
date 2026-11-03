@@ -25,9 +25,11 @@ pub enum Category {
     Operators,
     Scoring,
     Captures,
+    Tx,
+    MatchedVars,
 }
 
-const CATEGORIES: usize = 7;
+const CATEGORIES: usize = 9;
 
 /// Per-request profile, normalised to one request by the caller.
 #[derive(Debug, Clone, Copy, Default)]
@@ -39,6 +41,8 @@ pub struct Report {
     pub operators_ns: u64,
     pub scoring_ns: u64,
     pub captures_ns: u64,
+    pub tx_ns: u64,
+    pub matched_ns: u64,
     pub parse_allocs: u64,
     pub transforms_allocs: u64,
     pub candidates_allocs: u64,
@@ -46,13 +50,19 @@ pub struct Report {
     pub operators_allocs: u64,
     pub scoring_allocs: u64,
     pub captures_allocs: u64,
+    pub tx_allocs: u64,
+    pub matched_allocs: u64,
     pub regex_evaluations: u64,
     pub regex_skipped: u64,
+    /// All allocation events between `begin` and `finish`, including work not
+    /// attributed to a category (rule scaffolding, match bookkeeping).
+    pub total_allocs: u64,
 }
 
 #[derive(Default)]
 struct State {
     active: bool,
+    start_allocs: usize,
     ns: [u64; CATEGORIES],
     allocs: [u64; CATEGORIES],
     regex_evaluations: u64,
@@ -75,6 +85,7 @@ pub fn begin() {
         let mut state = state.borrow_mut();
         *state = State {
             active: true,
+            start_allocs: allocations(),
             ..State::default()
         };
     });
@@ -93,6 +104,8 @@ pub fn finish() -> Report {
             operators_ns: state.ns[Category::Operators as usize],
             scoring_ns: state.ns[Category::Scoring as usize],
             captures_ns: state.ns[Category::Captures as usize],
+            tx_ns: state.ns[Category::Tx as usize],
+            matched_ns: state.ns[Category::MatchedVars as usize],
             parse_allocs: state.allocs[Category::Parse as usize],
             transforms_allocs: state.allocs[Category::Transforms as usize],
             candidates_allocs: state.allocs[Category::Candidates as usize],
@@ -100,8 +113,11 @@ pub fn finish() -> Report {
             operators_allocs: state.allocs[Category::Operators as usize],
             scoring_allocs: state.allocs[Category::Scoring as usize],
             captures_allocs: state.allocs[Category::Captures as usize],
+            tx_allocs: state.allocs[Category::Tx as usize],
+            matched_allocs: state.allocs[Category::MatchedVars as usize],
             regex_evaluations: state.regex_evaluations,
             regex_skipped: state.regex_skipped,
+            total_allocs: allocations().saturating_sub(state.start_allocs) as u64,
         }
     })
 }

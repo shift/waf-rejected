@@ -524,8 +524,19 @@ fn profile(args: &Args, engine: &RustEngine) -> Result<(), String> {
          operator time; per-category allocation deltas are in the engine-profile report"
     );
     println!(
-        "{:<10} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
-        "body", "parse", "xform", "cand", "gate", "regex", "score", "capture", "total"
+        "{:<10} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "body",
+        "parse",
+        "xform",
+        "cand",
+        "gate",
+        "regex",
+        "score",
+        "capture",
+        "tx",
+        "matched",
+        "total",
+        "unacct"
     );
     for (label, size) in rows {
         let (headers, body) = bench_request(size);
@@ -546,6 +557,9 @@ fn profile(args: &Args, engine: &RustEngine) -> Result<(), String> {
             all.operators_allocs += report.operators_allocs;
             all.scoring_allocs += report.scoring_allocs;
             all.captures_allocs += report.captures_allocs;
+            all.tx_allocs += report.tx_allocs;
+            all.matched_allocs += report.matched_allocs;
+            all.total_allocs += report.total_allocs;
         }
         let reps = args.reps.max(1) as f64;
         let total = all.parse_allocs
@@ -554,9 +568,12 @@ fn profile(args: &Args, engine: &RustEngine) -> Result<(), String> {
             + all.gate_allocs
             + all.operators_allocs
             + all.scoring_allocs
-            + all.captures_allocs;
+            + all.captures_allocs
+            + all.tx_allocs
+            + all.matched_allocs;
+        let unaccounted = all.total_allocs.saturating_sub(total);
         println!(
-            "{:<10} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1}",
+            "{:<10} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1}",
             label,
             all.parse_allocs as f64 / reps,
             all.transforms_allocs as f64 / reps,
@@ -565,7 +582,10 @@ fn profile(args: &Args, engine: &RustEngine) -> Result<(), String> {
             all.operators_allocs as f64 / reps,
             all.scoring_allocs as f64 / reps,
             all.captures_allocs as f64 / reps,
+            all.tx_allocs as f64 / reps,
+            all.matched_allocs as f64 / reps,
             total as f64 / reps,
+            unaccounted as f64 / reps,
         );
     }
     Ok(())

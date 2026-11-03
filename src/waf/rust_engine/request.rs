@@ -114,7 +114,11 @@ pub struct TxState {
     captures: [Vec<u8>; super::operators::MAX_CAPTURES],
     matched_var: Vec<u8>,
     matched_var_name: Vec<u8>,
-    matched_vars: Vec<(String, Vec<u8>)>,
+    /// Arena-backed match records for `MATCHED_VARS`: `(name start, name end,
+    /// value start, value end)` into `matched_names` / `matched_values`.
+    matched_vars: Vec<(usize, usize, usize, usize)>,
+    matched_names: Vec<u8>,
+    matched_values: Vec<u8>,
 }
 
 impl Default for TxState {
@@ -129,6 +133,8 @@ impl Default for TxState {
             matched_var: Vec::new(),
             matched_var_name: Vec::new(),
             matched_vars: Vec::new(),
+            matched_names: Vec::new(),
+            matched_values: Vec::new(),
         }
     }
 }
@@ -473,8 +479,8 @@ impl<'a> Collections<'a> {
     }
 
     /// Records a matched variable for `MATCHED_VAR*`.
-    pub fn record_match(&mut self, name: String, value: &[u8]) {
-        self.state.record_match(name, value);
+    pub fn record_match(&mut self, collection: Collection, key: Option<&str>, value: &[u8]) {
+        self.state.record_match(collection, key, value);
     }
 
     /// Clears the per-rule matched-variable state.
@@ -574,6 +580,65 @@ impl<'a> Collections<'a> {
 }
 
 impl<'a> RequestData<'a> {
+    /// Dynamic collection presence bits for the current phase.
+    ///
+    /// `CompiledRule::presence` is an OR of these bits; when it does not
+    /// intersect this mask (and the rule has no static target or count target)
+    /// the rule cannot match, so candidate resolution and regex work are
+    /// skipped entirely.
+    pub(crate) fn dynamic_present(&self, state: &TxState) -> u64 {
+        let mut mask = 0u64;
+        let mut bit = |collection: Collection| mask |= 1u64 << (collection as u32);
+        if !self.args_get.is_empty() || !self.args_post.is_empty() {
+            bit(Collection::Args);
+        }
+        if !self.args_get.is_empty() {
+            bit(Collection::ArgsGet);
+            bit(Collection::ArgsGetNames);
+            bit(Collection::ArgsNames);
+        }
+        if !self.args_post.is_empty() {
+            bit(Collection::ArgsPost);
+            bit(Collection::ArgsPostNames);
+            bit(Collection::ArgsNames);
+        }
+        if !self.headers.is_empty() {
+            bit(Collection::RequestHeaders);
+            bit(Collection::RequestHeadersNames);
+        }
+        if !self.cookies.is_empty() {
+            bit(Collection::RequestCookies);
+            bit(Collection::RequestCookiesNames);
+        }
+        if self
+            .request_body
+            .as_ref()
+            .is_some_and(|body| !body.is_empty())
+        {
+            bit(Collection::RequestBody);
+        }
+        if !self.files.is_empty() {
+            bit(Collection::Files);
+        }
+        if !self.files_names.is_empty() {
+            bit(Collection::FilesNames);
+        }
+        if !self.files_sizes.is_empty() {
+            bit(Collection::FilesSizes);
+        }
+        if !self.multipart_part_headers.is_empty() {
+            bit(Collection::MultipartPartHeaders);
+        }
+        if !state.tx_is_empty() {
+            bit(Collection::Tx);
+        }
+        if state.matched_len() > 0 {
+            bit(Collection::MatchedVars);
+            bit(Collection::MatchedVarsNames);
+        }
+        mask
+    }
+
     pub(crate) fn resolve_into<'r>(
         &'r self,
         spec: &VariableSpec,
@@ -965,6 +1030,11 @@ impl<'a> RequestData<'a> {
 }
 
 impl TxState {
+    /// True when no TX variable is currently defined.
+    pub(crate) fn tx_is_empty(&self) -> bool {
+        self.tx.is_empty()
+    }
+
     /// Returns the TX value, case-insensitive.
     pub fn tx_get(&self, name: &str) -> Option<&[u8]> {
         if let Some((_, value)) = self.tx.get(name) {
@@ -1095,12 +1165,29 @@ impl TxState {
     }
 
     /// Records a matched variable for `MATCHED_VAR*`.
-    pub fn record_match(&mut self, name: String, value: &[u8]) {
+    ///
+    /// The collection/key/value are appended to reused byte arenas, so a match
+    /// does not allocate after the first request that needs the same capacity.
+    pub fn record_match(&mut self, collection: Collection, key: Option<&str>, value: &[u8]) {
+        let name_start = self.matched_names.len();
+        self.matched_names
+            .extend_from_slice(collection.name().as_bytes());
+        if let Some(key) = key {
+            self.matched_names.push(b':');
+            self.matched_names.extend_from_slice(key.as_bytes());
+        }
+        let name_end = self.matched_names.len();
+        let value_start = self.matched_values.len();
+        self.matched_values.extend_from_slice(value);
+        let value_end = self.matched_values.len();
+
         self.matched_var.clear();
         self.matched_var.extend_from_slice(value);
         self.matched_var_name.clear();
-        self.matched_var_name.extend_from_slice(name.as_bytes());
-        self.matched_vars.push((name, value.to_vec()));
+        self.matched_var_name
+            .extend_from_slice(&self.matched_names[name_start..name_end]);
+        self.matched_vars
+            .push((name_start, name_end, value_start, value_end));
     }
 
     /// Clears the per-rule matched-variable state.
@@ -1108,6 +1195,8 @@ impl TxState {
         self.matched_var.clear();
         self.matched_var_name.clear();
         self.matched_vars.clear();
+        self.matched_names.clear();
+        self.matched_values.clear();
     }
 
     /// Number of values in `MATCHED_VARS` for the current rule group.
@@ -1117,9 +1206,9 @@ impl TxState {
 
     /// One `MATCHED_VARS` entry as `(name, value)`.
     pub fn matched_at(&self, index: usize) -> Option<(&str, &[u8])> {
-        self.matched_vars
-            .get(index)
-            .map(|(name, value)| (name.as_str(), value.as_slice()))
+        let (name_start, name_end, value_start, value_end) = *self.matched_vars.get(index)?;
+        let name = std::str::from_utf8(&self.matched_names[name_start..name_end]).ok()?;
+        Some((name, &self.matched_values[value_start..value_end]))
     }
 
     /// Borrowed `(name, value)` iterator over active TX entries matching
@@ -1166,17 +1255,20 @@ impl TxState {
         } else {
             Collection::MatchedVars
         };
-        for (name, value) in &self.matched_vars {
+        for index in 0..self.matched_vars.len() {
+            let Some((name, value)) = self.matched_at(index) else {
+                continue;
+            };
             let value = if names_only {
                 name.as_bytes().to_vec()
             } else {
-                value.clone()
+                value.to_vec()
             };
             budget.value()?;
             budget.bytes(value.len())?;
             out.push(Candidate {
                 collection,
-                key: Some(Cow::Owned(name.clone())),
+                key: Some(Cow::Owned(name.to_string())),
                 value: Cow::Owned(value),
                 cache_id: None,
             });
@@ -1262,7 +1354,7 @@ fn expand_macro_name<'r, 'a>(
     state: &'r TxState,
     name: &str,
 ) -> Cow<'r, [u8]> {
-    let lower = name.to_ascii_lowercase();
+    let lower = lower_name(name);
     if let Some(key) = lower.strip_prefix("tx.") {
         return state.tx_get(key).map(Cow::Borrowed).unwrap_or_default();
     }
@@ -1273,43 +1365,40 @@ fn expand_macro_name<'r, 'a>(
         return Cow::Borrowed(state.matched_var_name.as_slice());
     }
     if let Some((collection, key)) = name.split_once('.') {
-        match collection.to_ascii_lowercase().as_str() {
-            "args" => {
-                return find_entry(&data.args_get, key)
-                    .or_else(|| find_entry(&data.args_post, key))
-                    .map(|entry| Cow::Borrowed(entry.value.as_ref()))
-                    .unwrap_or_default();
-            }
-            "args_get" => {
-                return find_entry(&data.args_get, key)
-                    .map(|entry| Cow::Borrowed(entry.value.as_ref()))
-                    .unwrap_or_default();
-            }
-            "args_post" => {
-                return find_entry(&data.args_post, key)
-                    .map(|entry| Cow::Borrowed(entry.value.as_ref()))
-                    .unwrap_or_default();
-            }
-            "request_headers" => {
-                return data
-                    .headers
-                    .iter()
-                    .find(|header| header.key.eq_ignore_ascii_case(key))
-                    .map(|header| Cow::Borrowed(header.value.as_ref()))
-                    .unwrap_or_default();
-            }
-            "request_cookies" => {
-                return find_entry(&data.cookies, key)
-                    .map(|entry| Cow::Borrowed(entry.value.as_ref()))
-                    .unwrap_or_default();
-            }
-            "rule" => {
-                return Cow::Borrowed(&[]);
-            }
-            _ => {}
+        if collection.eq_ignore_ascii_case("args") {
+            return find_entry(&data.args_get, key)
+                .or_else(|| find_entry(&data.args_post, key))
+                .map(|entry| Cow::Borrowed(entry.value.as_ref()))
+                .unwrap_or_default();
+        }
+        if collection.eq_ignore_ascii_case("args_get") {
+            return find_entry(&data.args_get, key)
+                .map(|entry| Cow::Borrowed(entry.value.as_ref()))
+                .unwrap_or_default();
+        }
+        if collection.eq_ignore_ascii_case("args_post") {
+            return find_entry(&data.args_post, key)
+                .map(|entry| Cow::Borrowed(entry.value.as_ref()))
+                .unwrap_or_default();
+        }
+        if collection.eq_ignore_ascii_case("request_headers") {
+            return data
+                .headers
+                .iter()
+                .find(|header| header.key.eq_ignore_ascii_case(key))
+                .map(|header| Cow::Borrowed(header.value.as_ref()))
+                .unwrap_or_default();
+        }
+        if collection.eq_ignore_ascii_case("request_cookies") {
+            return find_entry(&data.cookies, key)
+                .map(|entry| Cow::Borrowed(entry.value.as_ref()))
+                .unwrap_or_default();
+        }
+        if collection.eq_ignore_ascii_case("rule") {
+            return Cow::Borrowed(&[]);
         }
     }
-    match lower.as_str() {
+    match lower.as_ref() {
         "request_uri" => Cow::Borrowed(data.request_uri.as_ref()),
         "request_uri_raw" => Cow::Borrowed(data.request_uri_raw.as_ref()),
         "request_method" => Cow::Borrowed(data.request_method.as_ref()),
@@ -1343,7 +1432,7 @@ fn selector_matches(selector: &Selector, key: &str) -> bool {
     match selector {
         Selector::All => true,
         Selector::Key(expected) => key.eq_ignore_ascii_case(expected),
-        Selector::Regex(regex) => regex.is_match(&key.to_ascii_lowercase()),
+        Selector::Regex(regex) => regex.is_match(lower_name(key).as_ref()),
     }
 }
 
@@ -1929,7 +2018,7 @@ mod tests {
         let mut budget = Budget::new(super::super::budget::Limits::default());
         let mut collections = Collections::new(&request, &mut budget).expect("collections");
         collections.tx_set("foo", b"bar".to_vec());
-        collections.record_match("ARGS:x".to_string(), b"value");
+        collections.record_match(Collection::Args, Some("x"), b"value");
         let mut out = Vec::new();
         collections.expand_into("%{tx.foo}", &mut out);
         assert_eq!(out.as_slice(), b"bar");

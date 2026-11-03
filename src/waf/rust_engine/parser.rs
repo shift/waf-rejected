@@ -375,7 +375,11 @@ impl Compiler {
         }
         self.report.rules_compiled += rules.len();
         let line = raws[0].line;
-        let group = RuleGroup { rules, line };
+        let group = RuleGroup {
+            rules,
+            line,
+            records_matches: false,
+        };
         match parent_phase {
             Phase::RequestHeaders => self.program.phase1.push(ProgramItem::Rule(Box::new(group))),
             Phase::RequestBody => self.program.phase2.push(ProgramItem::Rule(Box::new(group))),
@@ -452,6 +456,31 @@ impl Compiler {
             actions.push(Action::Disruptive(disruptive));
         }
 
+        let multi_match = actions
+            .iter()
+            .any(|action| matches!(action, Action::MultiMatch));
+        let captures = actions
+            .iter()
+            .any(|action| matches!(action, Action::Capture));
+        let mut presence = 0u64;
+        let mut has_static_positive = false;
+        let mut may_count = false;
+        let mut has_positive = false;
+        for spec in &variables {
+            if spec.count {
+                may_count = true;
+            }
+            if spec.negated {
+                continue;
+            }
+            has_positive = true;
+            if spec.collection.is_dynamic() {
+                presence |= 1u64 << (spec.collection as u32);
+            } else {
+                has_static_positive = true;
+            }
+        }
+
         Ok(Some(CompiledRule {
             id: parsed.id.or(raw.id),
             phase,
@@ -464,6 +493,13 @@ impl Compiler {
             file: raw.file.clone(),
             line: raw.line,
             gate: None,
+            multi_match,
+            captures,
+            presence,
+            has_static_positive,
+            may_count,
+            has_positive,
+            skip_after: None,
         }))
     }
 
@@ -1075,21 +1111,24 @@ impl Compiler {
                 markers.insert(name.clone(), index);
             }
         }
-        for item in items.iter() {
+        for item in items.iter_mut() {
             let ProgramItem::Rule(group) = item else {
                 continue;
             };
-            for rule in &group.rules {
-                for action in &rule.actions {
-                    if let Action::SkipAfter(marker) = action {
-                        if !markers.contains_key(marker) {
-                            return Err(LoadError::UnknownMarker {
-                                rule_id: rule.id,
-                                line: rule.line,
-                                marker: marker.clone(),
-                            });
-                        }
-                    }
+            for rule in &mut group.rules {
+                let marker = rule.actions.iter().find_map(|action| match action {
+                    Action::SkipAfter(marker) => Some(marker.clone()),
+                    _ => None,
+                });
+                if let Some(marker) = marker {
+                    let Some(index) = markers.get(&marker) else {
+                        return Err(LoadError::UnknownMarker {
+                            rule_id: rule.id,
+                            line: rule.line,
+                            marker,
+                        });
+                    };
+                    rule.skip_after = Some(*index as u32);
                 }
             }
         }

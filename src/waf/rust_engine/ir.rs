@@ -107,6 +107,34 @@ pub enum Collection {
 }
 
 impl Collection {
+    /// True when the collection can be empty for a request (keyed values,
+    /// bodies, TX and matched-variable state). Single request fields such as
+    /// URI/method always resolve to one value, even when it is empty.
+    pub fn is_dynamic(self) -> bool {
+        matches!(
+            self,
+            Self::Args
+                | Self::ArgsGet
+                | Self::ArgsPost
+                | Self::ArgsNames
+                | Self::ArgsGetNames
+                | Self::ArgsPostNames
+                | Self::RequestHeaders
+                | Self::RequestHeadersNames
+                | Self::RequestCookies
+                | Self::RequestCookiesNames
+                | Self::RequestBody
+                | Self::Files
+                | Self::FilesNames
+                | Self::FilesSizes
+                | Self::MultipartPartHeaders
+                | Self::Tx
+                | Self::MatchedVars
+                | Self::MatchedVarsNames
+                | Self::Xml
+        )
+    }
+
     /// Canonical upper-case name used in `MATCHED_VAR_NAME` and reports.
     pub fn name(self) -> &'static str {
         match self {
@@ -415,21 +443,33 @@ pub struct CompiledRule {
     /// load time only for positive regex rules the prefilter artifact proves
     /// gated; `None` means the rule always runs.
     pub gate: Option<u16>,
+    /// Precomputed `multiMatch` flag (avoids rescanning actions per request).
+    pub multi_match: bool,
+    /// Precomputed `capture` flag (avoids rescanning actions per request).
+    pub captures: bool,
+    /// Dynamic collections (keyed values, body, TX, matched vars) this rule
+    /// needs at least one value from. Static targets are not represented.
+    pub presence: u64,
+    /// True when the rule has a positive target that always has a value
+    /// (URI, method, protocol, sizes, ...), so it must never be skipped.
+    pub has_static_positive: bool,
+    /// True when a `&COLLECTION` count target can match an absent collection.
+    pub may_count: bool,
+    /// True when the rule has at least one positive target.
+    pub has_positive: bool,
+    /// Pre-resolved `skipAfter` marker index in the phase program.
+    pub skip_after: Option<u32>,
 }
 
 impl CompiledRule {
     /// True when the rule uses `multiMatch`.
     pub fn multi_match(&self) -> bool {
-        self.actions
-            .iter()
-            .any(|action| matches!(action, Action::MultiMatch))
+        self.multi_match
     }
 
     /// True when the rule captures regex groups into `TX:0..9`.
     pub fn captures(&self) -> bool {
-        self.actions
-            .iter()
-            .any(|action| matches!(action, Action::Capture))
+        self.captures
     }
 }
 
@@ -438,6 +478,10 @@ impl CompiledRule {
 pub struct RuleGroup {
     pub rules: Vec<CompiledRule>,
     pub line: usize,
+    /// True when any rule in the group reads `MATCHED_VARS` or expands a
+    /// matched-variable macro. Precomputed so `MATCHED_VARS` bookkeeping can
+    /// be skipped for every other group.
+    pub records_matches: bool,
 }
 
 impl RuleGroup {
@@ -521,5 +565,25 @@ impl Program {
         }
         self.pipelines = pipelines;
         self.transform_prefixes = crate::waf::transforms::PrefixTable::from_chains(&self.pipelines);
+        for items in [&mut self.phase1, &mut self.phase2] {
+            for item in items.iter_mut() {
+                let ProgramItem::Rule(group) = item else {
+                    continue;
+                };
+                group.records_matches = group.rules.iter().any(|rule| {
+                    rule.variables.iter().any(|spec| {
+                        matches!(
+                            spec.collection,
+                            Collection::MatchedVars | Collection::MatchedVarsNames
+                        )
+                    }) || rule.actions.iter().any(|action| match action {
+                        Action::SetVar { name, value, .. } => {
+                            name.contains("matched_var") || value.0.contains("matched_var")
+                        }
+                        _ => false,
+                    })
+                });
+            }
+        }
     }
 }

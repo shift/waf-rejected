@@ -63,10 +63,10 @@ impl CompiledOperator {
                     };
                     if regex.captures_read(locations, value).is_some() {
                         for (index, slot) in captures.iter_mut().enumerate().take(MAX_CAPTURES) {
-                            *slot = locations
-                                .get(index)
-                                .map(|(start, end)| value[start..end].to_vec())
-                                .unwrap_or_default();
+                            slot.clear();
+                            if let Some((start, end)) = locations.get(index) {
+                                slot.extend_from_slice(&value[start..end]);
+                            }
                         }
                         true
                     } else {
@@ -79,8 +79,11 @@ impl CompiledOperator {
             OperatorKind::Pm(automaton) | OperatorKind::PmFromFile(automaton) => {
                 if capture {
                     let mut count = 0;
+                    for slot in captures.iter_mut().take(MAX_CAPTURES) {
+                        slot.clear();
+                    }
                     for found in automaton.find_iter(value).take(MAX_CAPTURES) {
-                        captures[count] = value[found.start()..found.end()].to_vec();
+                        captures[count].extend_from_slice(&value[found.start()..found.end()]);
                         count += 1;
                     }
                     count > 0

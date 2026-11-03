@@ -1033,3 +1033,18 @@ Task: delete the engine's private transform cache and use the shared
 - xform 373.5 → 89.9 µs and gate 338.5 → 102.0 µs at 4 KiB (−76 % / −70 %).
 - 141–145 allocations/request (transform category 0), unchanged.
 - Bodyless < 150 µs missed (158 µs); only ~34 µs of it is transform work.
+
+## perf: native engine rule loop (`perf/engine-ruleloop`)
+
+Baseline `ad7e7ea`. Profiled the native rule loop, added an empty-target rule
+gate, precomputed rule/group flags, pre-resolved `skipAfter`, macro/selector
+allocation fixes, recycled capture buffers and arena-backed `MATCHED_VARS`.
+Allocations fell from ~143 to 33-42/request. Corpus parity unchanged
+(2,110/2,112, 0 native-only FNs), transform fixture 7,320/7,320.
+
+Could not meet the latency targets on this host: bodyless 110 µs (<100 target),
+1 KiB 271 µs (<200), 4 KiB 596 µs (<450), 8 KiB 1.02 ms (<800). A union-DFA
+experiment (RegexSet, dense DFA, lazy meta) was implemented and measured but
+regressed 4 KiB latency to 725-958 µs, so it was removed. Details and profile
+breakdown in `docs/suggestions_from_agents/engine-ruleloop.md`; CHANGELOG
+updated. No defaults, versions, transforms, prefilter, proxy or Coraza changes.
