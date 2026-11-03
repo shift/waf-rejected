@@ -25,6 +25,9 @@
 //! [`crate::waf::Decision::Block`] rather than allowing the request.
 
 pub mod budget;
+/// Multi-pattern Vectorscan candidate gate (non-default `hyperscan-eval`).
+#[cfg(feature = "hyperscan-eval")]
+pub mod candidates;
 pub mod engine;
 pub mod error;
 pub mod gate;

@@ -34,6 +34,10 @@ const HS_SCAN_TERMINATED: c_int = -3;
 const HS_MODE_BLOCK: c_uint = 1;
 /// `HS_FLAG_CASELESS`.
 const HS_FLAG_CASELESS: c_uint = 1;
+/// `HS_FLAG_DOTALL` (`.` matches newline, mirroring `(?s)`).
+const HS_FLAG_DOTALL: c_uint = 2;
+/// `HS_FLAG_MULTILINE` (anchors match at line boundaries, mirroring `(?m)`).
+const HS_FLAG_MULTILINE: c_uint = 4;
 /// `HS_FLAG_SINGLEMATCH`.
 const HS_FLAG_SINGLEMATCH: c_uint = 8;
 
@@ -105,6 +109,29 @@ pub struct LiteralPattern {
     /// Match ASCII case-insensitively (`HS_FLAG_CASELESS`).
     pub caseless: bool,
     /// Rule ids that share this literal.
+    pub rule_ids: Vec<u32>,
+}
+
+/// One regular expression and the rules that share it.
+///
+/// Unlike [`LiteralPattern`] the expression is passed to the compiler
+/// verbatim. Callers must only supply patterns that are exactly representable
+/// for the intended match direction; compilation failures are reported per
+/// expression so a caller can drop the pattern and keep the rule on the
+/// existing path. Expressions are compiled in exact (non-prefilter) mode;
+/// callers are responsible for excluding constructs whose byte semantics could
+/// differ from the reference engine.
+#[derive(Debug, Clone)]
+pub struct RegexPattern {
+    /// PCRE-syntax expression (no delimiters).
+    pub expression: String,
+    /// Match ASCII case-insensitively (`HS_FLAG_CASELESS`).
+    pub caseless: bool,
+    /// Mirror `(?s)`: `.` also matches a newline.
+    pub dotall: bool,
+    /// Mirror `(?m)`: `^`/`$` also match at line boundaries.
+    pub multiline: bool,
+    /// Rule ids that share this expression.
     pub rule_ids: Vec<u32>,
 }
 
@@ -233,15 +260,55 @@ impl SharedHsDatabase {
     /// `Arc` and safe to scan from multiple threads.
     pub fn compile(patterns: &[LiteralPattern]) -> Result<Self, HsError> {
         let raw = compile_raw(patterns)?;
+        Ok(Self::from_raw(
+            raw,
+            patterns.iter().map(|p| p.rule_ids.clone()),
+        ))
+    }
+
+    /// Compiles a regex database in over-approximate (`HS_FLAG_PREFILTER`)
+    /// mode. Every expression is compiled exactly as supplied; on failure the
+    /// error carries the offending index so the caller can drop that pattern
+    /// and retry without losing the rest of the group.
+    pub fn compile_regex(patterns: &[RegexPattern]) -> Result<Self, HsError> {
+        let expressions: Vec<(String, c_uint)> = patterns
+            .iter()
+            .map(|pattern| {
+                let mut flags = HS_FLAG_SINGLEMATCH;
+                if pattern.caseless {
+                    flags |= HS_FLAG_CASELESS;
+                }
+                if pattern.dotall {
+                    flags |= HS_FLAG_DOTALL;
+                }
+                if pattern.multiline {
+                    flags |= HS_FLAG_MULTILINE;
+                }
+                (pattern.expression.clone(), flags)
+            })
+            .collect();
+        let refs: Vec<(&str, c_uint)> = expressions
+            .iter()
+            .map(|(expression, flags)| (expression.as_str(), *flags))
+            .collect();
+        let raw = compile_expressions(&refs)?;
+        Ok(Self::from_raw(
+            raw,
+            patterns.iter().map(|p| p.rule_ids.clone()),
+        ))
+    }
+
+    fn from_raw(raw: RawCompiled, pattern_rules: impl IntoIterator<Item = Vec<u32>>) -> Self {
         let db = Arc::new(DatabaseHandle { db: raw.db });
         let pool = Mutex::new(vec![ScratchHandle {
             scratch: raw.scratch,
         }]);
-        Ok(Self {
+        let pattern_rules: Vec<Vec<u32>> = pattern_rules.into_iter().collect();
+        Self {
             pool,
-            pattern_rules: patterns.iter().map(|p| p.rule_ids.clone()).collect(),
+            pattern_rules,
             db,
-        })
+        }
     }
 
     fn take_scratch(&self) -> Result<ScratchHandle, HsError> {
@@ -307,6 +374,42 @@ impl SharedHsDatabase {
         })
     }
 
+    /// Scans one body and visits every rule id reached by a matching pattern.
+    ///
+    /// Allocation-free: the caller accumulates into its own bitset. Returns
+    /// `true` when at least one pattern matched. Any runtime error must be
+    /// treated by the caller as "unknown" and must not suppress a rule.
+    pub fn scan_visit<F>(&self, body: &[u8], visit: F) -> Result<bool, HsError>
+    where
+        F: FnMut(u32),
+    {
+        if body.len() > c_uint::MAX as usize {
+            return Err(HsError::BodyTooLarge(body.len()));
+        }
+        let scratch = self.take_scratch()?;
+        let mut context = VisitContext {
+            pattern_rules: &self.pattern_rules,
+            hit: false,
+            visit,
+        };
+        let rc = unsafe {
+            hs_scan(
+                self.db.db,
+                body.as_ptr() as *const c_char,
+                body.len() as c_uint,
+                0,
+                scratch.scratch,
+                Some(on_visit::<F>),
+                &mut context as *mut VisitContext<'_, F> as *mut c_void,
+            )
+        };
+        self.return_scratch(scratch);
+        if rc != HS_SUCCESS && rc != HS_SCAN_TERMINATED {
+            return Err(HsError::Runtime(rc));
+        }
+        Ok(context.hit)
+    }
+
     /// Number of compiled patterns.
     pub fn pattern_count(&self) -> usize {
         self.pattern_rules.len()
@@ -320,35 +423,76 @@ impl SharedHsDatabase {
     }
 }
 
+struct VisitContext<'a, F> {
+    pattern_rules: &'a [Vec<u32>],
+    hit: bool,
+    visit: F,
+}
+
+unsafe extern "C" fn on_visit<F>(
+    id: c_uint,
+    _from: u64,
+    _to: u64,
+    _flags: c_uint,
+    context: *mut c_void,
+) -> c_int
+where
+    F: FnMut(u32),
+{
+    let context = &mut *(context as *mut VisitContext<'_, F>);
+    context.hit = true;
+    if let Some(rules) = context.pattern_rules.get(id as usize) {
+        for rule in rules {
+            (context.visit)(*rule);
+        }
+    }
+    0
+}
+
 struct RawCompiled {
     db: *mut HsDatabase,
     scratch: *mut HsScratch,
 }
 
-/// Compiles a block-mode database and allocates one scratch region.
+/// Compiles a block-mode database from literal patterns.
 fn compile_raw(patterns: &[LiteralPattern]) -> Result<RawCompiled, HsError> {
-    if patterns.is_empty() {
+    let escaped: Vec<String> = patterns
+        .iter()
+        .map(|pattern| escape_literal(&pattern.literal))
+        .collect();
+    let expressions: Vec<(&str, c_uint)> = patterns
+        .iter()
+        .zip(escaped.iter())
+        .map(|(pattern, expression)| {
+            let mut flags = HS_FLAG_SINGLEMATCH;
+            if pattern.caseless {
+                flags |= HS_FLAG_CASELESS;
+            }
+            (expression.as_str(), flags)
+        })
+        .collect();
+    compile_expressions(&expressions)
+}
+
+/// Compiles a block-mode database and allocates one scratch region.
+fn compile_expressions(expressions: &[(&str, c_uint)]) -> Result<RawCompiled, HsError> {
+    if expressions.is_empty() {
         return Err(HsError::CompileGeneral("empty pattern set".to_string()));
     }
     if unsafe { hs_valid_platform() } != HS_SUCCESS {
         return Err(HsError::UnsupportedPlatform);
     }
 
-    let mut expressions = Vec::with_capacity(patterns.len());
-    let mut cstrings = Vec::with_capacity(patterns.len());
-    let mut flags = Vec::with_capacity(patterns.len());
-    let mut ids = Vec::with_capacity(patterns.len());
-    for (index, pattern) in patterns.iter().enumerate() {
-        let escaped = escape_literal(&pattern.literal);
-        let cstring = CString::new(escaped.clone())
-            .map_err(|_| HsError::InteriorNul(pattern.literal.clone()))?;
-        expressions.push(cstring.as_ptr());
+    let mut pointers = Vec::with_capacity(expressions.len());
+    let mut cstrings = Vec::with_capacity(expressions.len());
+    let mut flags = Vec::with_capacity(expressions.len());
+    let mut ids = Vec::with_capacity(expressions.len());
+    for (index, (expression, flag)) in expressions.iter().enumerate() {
+        let cstring = CString::new(*expression)
+            .map_err(|_| HsError::InteriorNul((*expression).to_string()))?;
+        pointers.push(cstring.as_ptr());
         cstrings.push(cstring);
-        let mut flag = HS_FLAG_SINGLEMATCH;
-        if pattern.caseless {
-            flag |= HS_FLAG_CASELESS;
-        }
-        flags.push(flag);
+        flags.push(*flag);
         ids.push(index as c_uint);
     }
 
@@ -356,10 +500,10 @@ fn compile_raw(patterns: &[LiteralPattern]) -> Result<RawCompiled, HsError> {
     let mut error: *mut HsCompileError = ptr::null_mut();
     let rc = unsafe {
         hs_compile_multi(
-            expressions.as_ptr(),
+            pointers.as_ptr(),
             flags.as_ptr(),
             ids.as_ptr(),
-            patterns.len() as c_uint,
+            expressions.len() as c_uint,
             HS_MODE_BLOCK,
             ptr::null(),
             &mut db,
@@ -612,5 +756,60 @@ mod tests {
     #[test]
     fn empty_pattern_set_is_rejected() {
         assert!(SharedHsDatabase::compile(&[]).is_err());
+    }
+
+    #[test]
+    fn regex_database_scan_visits_every_hit() {
+        let patterns = vec![
+            RegexPattern {
+                expression: r"union\s+select".to_string(),
+                caseless: true,
+                dotall: true,
+                multiline: true,
+                rule_ids: vec![1],
+            },
+            RegexPattern {
+                expression: r"<script".to_string(),
+                caseless: true,
+                dotall: true,
+                multiline: true,
+                rule_ids: vec![2],
+            },
+        ];
+        let db = SharedHsDatabase::compile_regex(&patterns).expect("compile");
+        let mut hits = Vec::new();
+        assert!(db
+            .scan_visit(b"id=1 UNION SELECT x", |rule| hits.push(rule))
+            .expect("scan"));
+        assert_eq!(hits, vec![1]);
+        let mut hits = Vec::new();
+        db.scan_visit(b"<SCRIPT>alert(1)</SCRIPT>", |rule| hits.push(rule))
+            .expect("scan");
+        assert_eq!(hits, vec![2]);
+        assert!(!db.scan_visit(b"benign", |_| {}).expect("scan"));
+    }
+
+    #[test]
+    fn regex_database_reports_the_unsupported_expression_index() {
+        let patterns = vec![
+            RegexPattern {
+                expression: "a(?=b)".to_string(),
+                caseless: false,
+                dotall: true,
+                multiline: true,
+                rule_ids: vec![1],
+            },
+            RegexPattern {
+                expression: "select".to_string(),
+                caseless: false,
+                dotall: true,
+                multiline: true,
+                rule_ids: vec![2],
+            },
+        ];
+        match SharedHsDatabase::compile_regex(&patterns) {
+            Err(HsError::Compile { index, .. }) => assert_eq!(index, 0),
+            other => panic!("expected a compile error, got {:?}", other.err()),
+        }
     }
 }

@@ -172,6 +172,13 @@ impl Compiler {
         let gates = crate::waf::rust_engine::gate::attach(&mut self.program)
             .map_err(|detail| LoadError::Parse { line: 0, detail })?;
         self.program.gates = gates;
+        #[cfg(feature = "hyperscan-eval")]
+        {
+            // Load-time only. Any failure leaves every rule ungated; it never
+            // fails the bundle load.
+            self.program.hs_candidates =
+                crate::waf::rust_engine::candidates::attach(&mut self.program);
+        }
         Ok((self.program, self.report))
     }
 
@@ -493,6 +500,7 @@ impl Compiler {
             file: raw.file.clone(),
             line: raw.line,
             gate: None,
+            hs_gate: None,
             multi_match,
             captures,
             presence,
@@ -1177,7 +1185,7 @@ fn merge_metadata(target: &mut RuleMetadata, source: &RuleMetadata) {
 /// * `\x{XX}` (byte escapes) become `\xXX`;
 /// * literal braces such as `{.*}` become `\{.\*\}`;
 /// * escapes of non-metacharacters such as `\!` or `\<` lose the backslash.
-fn normalize_pattern(pattern: &str) -> String {
+pub(crate) fn normalize_pattern(pattern: &str) -> String {
     let converted = convert_hex_braces(pattern);
     let braces = escape_literal_braces(&converted);
     strip_unsupported_escapes(&braces)

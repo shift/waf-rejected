@@ -69,6 +69,13 @@ pub struct Outcome {
     pub operator_evaluations: u64,
     /// Number of regex evaluations skipped by mandatory-literal gates.
     pub regex_evaluations_skipped: u64,
+    /// Vectorscan database scans performed for the candidate pass.
+    #[cfg(feature = "hyperscan-eval")]
+    pub hs_candidate_scans: u64,
+    /// Regex evaluations skipped by the multi-pattern candidate pass (also
+    /// included in `regex_evaluations_skipped`).
+    #[cfg(feature = "hyperscan-eval")]
+    pub hs_candidate_skips: u64,
     /// Fail-closed error, if any.
     pub error: Option<String>,
 }
@@ -160,6 +167,12 @@ impl RustEngine {
     /// rules.
     pub fn gate_set(&self) -> Option<&GateSet> {
         self.program.gates.as_deref()
+    }
+
+    /// Compiled multi-pattern candidate gate (`hyperscan-eval` only).
+    #[cfg(feature = "hyperscan-eval")]
+    pub fn hs_candidate_set(&self) -> Option<&super::candidates::HsCandidateSet> {
+        self.program.hs_candidates.as_deref()
     }
 
     /// Number of compiled rules that carry a mandatory-literal gate.
@@ -505,6 +518,10 @@ impl RustEngine {
             early_blocking: tx_i64(&tx, "early_blocking") == 1,
             operator_evaluations: state.operator_evaluations,
             regex_evaluations_skipped: state.regex_evaluations_skipped,
+            #[cfg(feature = "hyperscan-eval")]
+            hs_candidate_scans: state.hs_candidate_scans,
+            #[cfg(feature = "hyperscan-eval")]
+            hs_candidate_skips: state.hs_candidate_skips,
             error,
         };
         scratch.tx_state = Some(tx.into_state());
@@ -566,6 +583,16 @@ impl RustEngine {
         scratch.value_ids.clear();
         scratch.charged_transform_bytes = scratch.cache.transform_bytes();
         scratch.gate_masks.begin();
+        #[cfg(feature = "hyperscan-eval")]
+        {
+            let words = self
+                .program
+                .hs_candidates
+                .as_deref()
+                .map(super::candidates::HsCandidateSet::words)
+                .unwrap_or(0);
+            scratch.hs_masks.begin(words);
+        }
         let (data, tx_state) = tx.split();
         let mut candidates: Vec<Candidate<'_>> = Vec::new();
         let mut exceptions: Vec<Candidate<'_>> = Vec::new();
@@ -871,6 +898,23 @@ impl RustEngine {
                             #[cfg(feature = "engine-profile")]
                             super::profile::regex_skip();
                             state.regex_evaluations_skipped += 1;
+                            continue;
+                        }
+                    }
+                }
+                #[cfg(feature = "hyperscan-eval")]
+                if let Some(gate) = rule.hs_gate {
+                    // `None` means the candidate pass could not produce a
+                    // trustworthy hit set (no cache id, unsupported CPU or a
+                    // runtime error); run the real regex.
+                    if let Some(hit) =
+                        self.hs_gate_hit(gate, rule.pipeline, candidate, scratch, budget, state)?
+                    {
+                        if !hit {
+                            #[cfg(feature = "engine-profile")]
+                            super::profile::regex_skip();
+                            state.regex_evaluations_skipped += 1;
+                            state.hs_candidate_skips += 1;
                             continue;
                         }
                     }
@@ -1303,6 +1347,75 @@ impl RustEngine {
         }
         scratch.gate_masks.set(value_id, mask);
         Ok(Some(mask))
+    }
+
+    /// Returns whether the multi-pattern candidate pass saw a hit for `gate`
+    /// on this candidate value.
+    ///
+    /// The hit mask is cached per `(value id, pipeline)`, so all rules that
+    /// share a value and transform chain reuse one database scan. A `None`
+    /// result means the gate cannot be trusted for this value (no cache id,
+    /// small value, no candidate set, or a Vectorscan runtime error) and the
+    /// caller must run the per-rule regex. It is never interpreted as a miss.
+    #[cfg(feature = "hyperscan-eval")]
+    fn hs_gate_hit(
+        &self,
+        gate: u16,
+        pipeline: u16,
+        candidate: &Candidate<'_>,
+        scratch: &mut Scratch,
+        budget: &mut Budget,
+        state: &mut EvalState,
+    ) -> Result<Option<bool>, EngineError> {
+        let Some(set) = self.program.hs_candidates.as_deref() else {
+            return Ok(None);
+        };
+        let Some(value_id) = candidate.cache_id else {
+            return Ok(None);
+        };
+        if candidate.value.len() < super::candidates::MIN_VALUE_BYTES {
+            return Ok(None);
+        }
+        // Only the rule's own pipeline representation is scanned. One
+        // database scan therefore serves every residual rule that targets this
+        // value with the same transform chain.
+        if let Some(hit) = scratch.hs_masks.get(value_id, pipeline, gate) {
+            return Ok(Some(hit));
+        }
+        let Some(group) = set.group(pipeline) else {
+            return Ok(None);
+        };
+        let plan = self
+            .program
+            .transform_prefixes
+            .plan(usize::from(group.pipeline));
+        let range = resolve_cached(
+            &mut scratch.cache,
+            &mut scratch.value_ids,
+            &self.program.transform_prefixes,
+            plan,
+            value_id,
+            &candidate.value,
+            &mut scratch.charged_transform_bytes,
+            budget,
+        )?;
+        let bytes = scratch.cache.bytes(range);
+        scratch.hs_masks.prepare(set.words());
+        let scanned = {
+            let mask = &mut scratch.hs_masks.pending;
+            group.database.scan_visit(bytes, |rule_id| {
+                set.set_rule(mask, rule_id);
+            })
+        };
+        if scanned.is_err() {
+            // A runtime error means "unknown", never "no match".
+            return Ok(None);
+        }
+        state.hs_candidate_scans += 1;
+        if !scratch.hs_masks.commit(value_id, pipeline) {
+            return Ok(None);
+        }
+        Ok(scratch.hs_masks.get(value_id, pipeline, gate))
     }
 
     /// Fast path for the common `SecRule TX:name ...` shape: a single keyed TX
@@ -1905,6 +2018,8 @@ struct Scratch {
     capture_locations: Option<regex::bytes::CaptureLocations>,
     tx_state: Option<TxState>,
     gate_masks: GateMaskCache,
+    #[cfg(feature = "hyperscan-eval")]
+    hs_masks: HsMaskCache,
 }
 
 /// Resolves `plan` for one value through the shared prefix cache and returns
@@ -2021,6 +2136,104 @@ impl GateMaskCache {
     }
 }
 
+/// Per-phase cache of multi-pattern candidate hit masks keyed by
+/// `(value id, transform pipeline)`.
+///
+/// The mask is a bitset because the residual regex subset is larger than the
+/// 64-rule literal gate. A value may be scanned for several pipelines; each
+/// scan ORs its pattern hits into the value's mask and records that pipeline,
+/// so a rule can only consult a mask after its own pipeline has been scanned.
+/// Capacity grows on demand; only values that reach a candidate-gated rule take
+/// a slot.
+#[cfg(feature = "hyperscan-eval")]
+#[derive(Default)]
+struct HsMaskCache {
+    words: usize,
+    masks: Vec<u64>,
+    /// Bit `p` is set when pipeline `p` has contributed to the value mask.
+    /// Supports pipelines 0..64; higher pipelines stay on the per-rule path.
+    pipelines: Vec<u64>,
+    generations: Vec<u32>,
+    generation: u32,
+    pending: Vec<u64>,
+}
+
+#[cfg(feature = "hyperscan-eval")]
+impl HsMaskCache {
+    fn begin(&mut self, words: usize) {
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.generations.fill(0);
+            self.generation = 1;
+        }
+        if self.words != words {
+            self.words = words;
+            self.masks.clear();
+            self.pipelines.clear();
+            self.generations.clear();
+        }
+        self.pending.clear();
+        self.pending.resize(words, 0);
+    }
+
+    fn prepare(&mut self, words: usize) {
+        if self.pending.len() != words {
+            self.pending.clear();
+            self.pending.resize(words, 0);
+        } else {
+            self.pending.fill(0);
+        }
+    }
+
+    /// Returns the cached bit for `gate` only when `pipeline` was already
+    /// scanned for this value.
+    fn get(&self, value_id: u32, pipeline: u16, gate: u16) -> Option<bool> {
+        if pipeline >= 64 {
+            return None;
+        }
+        let index = value_id as usize;
+        if index >= self.generations.len() || self.generations[index] != self.generation {
+            return None;
+        }
+        if self.pipelines[index] & (1u64 << pipeline) == 0 {
+            return None;
+        }
+        let gate = usize::from(gate);
+        let offset = index.checked_mul(self.words)? + gate / 64;
+        let value = *self.masks.get(offset)?;
+        Some(value & (1u64 << (gate % 64)) != 0)
+    }
+
+    /// Merges the pending scan into the value slot and marks `pipeline` as
+    /// scanned. Returns `false` for a pipeline the cache cannot represent.
+    fn commit(&mut self, value_id: u32, pipeline: u16) -> bool {
+        if pipeline >= 64 {
+            return false;
+        }
+        let index = value_id as usize;
+        if index >= self.generations.len() {
+            let capacity = (index + 1).max(64);
+            self.generations.resize(capacity, 0);
+            self.pipelines.resize(capacity, 0);
+            self.masks.resize(capacity * self.words, 0);
+        }
+        let start = index * self.words;
+        if self.generations[index] != self.generation {
+            self.masks[start..start + self.words].fill(0);
+            self.pipelines[index] = 0;
+            self.generations[index] = self.generation;
+        }
+        for (slot, value) in self.masks[start..start + self.words]
+            .iter_mut()
+            .zip(self.pending.iter())
+        {
+            *slot |= *value;
+        }
+        self.pipelines[index] |= 1u64 << pipeline;
+        true
+    }
+}
+
 #[derive(Default)]
 struct EvalState {
     removed_rules: HashSet<u32>,
@@ -2030,6 +2243,13 @@ struct EvalState {
     allow: bool,
     operator_evaluations: u64,
     regex_evaluations_skipped: u64,
+    /// Vectorscan database scans performed for the candidate pass.
+    #[cfg(feature = "hyperscan-eval")]
+    hs_candidate_scans: u64,
+    /// Regex evaluations skipped by the candidate pass (subset of
+    /// `regex_evaluations_skipped`).
+    #[cfg(feature = "hyperscan-eval")]
+    hs_candidate_skips: u64,
 }
 
 struct RemovedTarget {

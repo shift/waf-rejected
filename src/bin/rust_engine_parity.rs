@@ -643,7 +643,37 @@ fn bench(args: &Args, engine: &RustEngine) -> Result<(), String> {
             rust_allocs
         );
     }
+    #[cfg(feature = "hyperscan-eval")]
+    print_hs_diagnostics(engine);
     Ok(())
+}
+
+#[cfg(feature = "hyperscan-eval")]
+fn print_hs_diagnostics(engine: &RustEngine) {
+    let Some(set) = engine.hs_candidate_set() else {
+        println!("hs candidates: unavailable (fallback to per-rule regex)");
+        return;
+    };
+    let (headers, body) = bench_request(4096);
+    let request = EngineRequest {
+        method: "POST",
+        uri: "/post",
+        http_version: "HTTP/1.1",
+        headers: &headers,
+        body: Some(&body),
+    };
+    let outcome = engine.evaluate_detailed(&request).expect("evaluate");
+    println!(
+        "hs candidates: {} rules, {} groups, {} patterns, {} KiB, compile {:.1} ms | 4KiB request: {} scans, {} regex skips ({} total skips)",
+        set.rule_count(),
+        set.group_count(),
+        set.pattern_count(),
+        set.database_bytes() / 1024,
+        set.compile_micros() as f64 / 1e3,
+        outcome.hs_candidate_scans,
+        outcome.hs_candidate_skips,
+        outcome.regex_evaluations_skipped,
+    );
 }
 
 #[cfg(not(feature = "wasm-reactor"))]
@@ -682,6 +712,8 @@ fn bench(args: &Args, engine: &RustEngine) -> Result<(), String> {
         );
     }
     println!("coraza: rebuild with the `wasm-reactor` feature for the A/B table");
+    #[cfg(feature = "hyperscan-eval")]
+    print_hs_diagnostics(engine);
     Ok(())
 }
 

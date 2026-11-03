@@ -6,6 +6,18 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Added
 
+- **Vectorscan multi-pattern candidate pass for the residual engine regex
+  subset** (non-default `hyperscan-eval`). Positive `@rx` rules without a
+  mandatory-literal gate are compiled into one block-mode Vectorscan database
+  per transform pipeline. At request time one scan per `(value, pipeline)`
+  produces a rule-hit mask; rules whose pattern did not hit skip the per-rule
+  regex, while hits still run full operator confirmation, captures,
+  `MATCHED_VARS` and anomaly scoring. Databases are bounded (256 rules, 16 MiB
+  per group, 64 MiB total, 5 s compile ceiling), cached process-wide, and any
+  unsupported construct, compile failure or scan error leaves the rule on the
+  existing path. x86-64/AVX2 only; see
+  `docs/suggestions_from_agents/hyperscan-candidates.md`. Defaults, rules and
+  the Coraza path are unchanged.
 - **Native Rust engine is the default request-inspection backend.** `rust-engine`
   is now part of the default feature set and a plain configuration selects
   `waf.coraza.backend = "rust"`; builds without the feature keep `"wasm"`. The

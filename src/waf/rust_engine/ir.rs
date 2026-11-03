@@ -443,6 +443,11 @@ pub struct CompiledRule {
     /// load time only for positive regex rules the prefilter artifact proves
     /// gated; `None` means the rule always runs.
     pub gate: Option<u16>,
+    /// Optional multi-pattern candidate gate id (see
+    /// [`super::candidates`], `hyperscan-eval` only). Assigned at load time
+    /// only when the rule's exact regex compiled into a Vectorscan database;
+    /// `None` keeps the rule on the per-rule regex path.
+    pub hs_gate: Option<u16>,
     /// Precomputed `multiMatch` flag (avoids rescanning actions per request).
     pub multi_match: bool,
     /// Precomputed `capture` flag (avoids rescanning actions per request).
@@ -517,6 +522,10 @@ pub struct Program {
     /// Per-rule mandatory-literal gates, compiled once at load time and shared
     /// through an `Arc` when the engine is cloned across worker threads.
     pub gates: Option<std::sync::Arc<super::gate::GateSet>>,
+    /// Multi-pattern Vectorscan candidate gate (`hyperscan-eval` only). `None`
+    /// when the feature is off, the CPU is unsupported, or compilation failed.
+    #[cfg(feature = "hyperscan-eval")]
+    pub hs_candidates: Option<std::sync::Arc<super::candidates::HsCandidateSet>>,
 }
 
 impl Program {

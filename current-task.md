@@ -1,5 +1,26 @@
 # P0-09: Beta Release (current: 0.1.0-beta.9) (NORTH STAR)
 
+## Perf: Vectorscan multi-pattern candidate pass (`perf/hyperscan-candidates`)
+
+- [x] Compile residual positive `@rx` rules (no literal gate, no multiMatch)
+  into one block-mode Vectorscan database per transform pipeline; pattern ids
+  map back to rule gate bits.
+- [x] Scan once per `(value, pipeline)` (2 KiB floor), cache the hit mask for
+  the phase, skip only confirmed pattern misses; hits still run the full
+  operator.
+- [x] Bound compile/DB size (256 rules, 16 MiB/group, 64 MiB total, 5 s),
+  process-wide cache; any unsupported construct/compile/runtime error falls
+  back to the per-rule path.
+- [x] x86-64/AVX2 only; `hs_valid_platform()` checked before compile.
+- [x] 2,112-case corpus decisions identical to `main` (0 diffs); tests cover
+  miss-gating and hit-confirmation.
+- [x] Docs (`docs/suggestions_from_agents/hyperscan-candidates.md`) and
+  CHANGELOG. Performance: 4 KiB 632.7 → 570.2 µs p50, 8 KiB 1046.1 → 955.5 µs;
+  sub-400 µs target not reached (documented).
+- Pre-existing failure under the verify feature set:
+  `xml_body_processor_populates_both_xpath_collections` also fails with
+  `hyperscan-eval` disabled; not caused by this change.
+
 **Target**: ship a usable Beta that can be deployed behind a TLS-terminating
 load balancer and will enforce the documented WAF controls.
 
