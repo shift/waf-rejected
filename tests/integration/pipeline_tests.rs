@@ -14,6 +14,7 @@ use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+use waf_ingress::config::ListenerIoBackend;
 use waf_ingress::proxy::WafProxyService;
 use waf_ingress::Config;
 
@@ -63,9 +64,17 @@ async fn spawn_upstream() -> std::net::SocketAddr {
 }
 
 async fn spawn_proxy(upstream: std::net::SocketAddr) -> String {
+    spawn_proxy_with_backend(upstream, ListenerIoBackend::Tokio).await
+}
+
+async fn spawn_proxy_with_backend(
+    upstream: std::net::SocketAddr,
+    backend: ListenerIoBackend,
+) -> String {
     let mut config = Config::default();
     config.upstream_uri = format!("http://{}", upstream);
     config.server.max_body_size = 512;
+    config.server.io_backend = backend;
     config.waf.rate_limit.per_ip_enabled = false;
     config.waf.rate_limit.global_enabled = false;
     config.waf.coraza.enabled = false;
@@ -79,6 +88,20 @@ async fn spawn_proxy(upstream: std::net::SocketAddr) -> String {
     });
 
     format!("http://{}", addr)
+}
+
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+#[tokio::test]
+async fn pipeline_works_with_io_uring_listener() {
+    let upstream = spawn_upstream().await;
+    let proxy = spawn_proxy_with_backend(upstream, ListenerIoBackend::IoUring).await;
+    let client = reqwest::Client::new();
+
+    for _ in 0..3 {
+        let response = client.get(format!("{}/hello", proxy)).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "upstream-ok");
+    }
 }
 
 #[tokio::test]

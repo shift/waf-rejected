@@ -33,6 +33,10 @@ mod https_upstream_tests;
 #[path = "integration/http2_tuning_tests.rs"]
 mod http2_tuning_tests;
 
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+#[path = "integration/io_uring_proxy_bench.rs"]
+mod io_uring_proxy_bench;
+
 #[path = "integration/pipeline_tests.rs"]
 mod pipeline_tests;
 

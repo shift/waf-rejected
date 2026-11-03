@@ -13,10 +13,20 @@ All notable changes to WAF-Rejected are documented here.
   performance gate (best 8 KiB gain ~2.6%, 4 KiB ~1.3%, multi-argument bodies
   regress); see `docs/suggestions_from_agents/parallel-args.md`. Defaults,
   rules and the Coraza path are unchanged.
+- Config-gated io_uring listener (`server.io_backend = "tokio" | "io_uring"`,
+  default `tokio`) with automatic fallback to the tokio accept path when the
+  ring cannot be created. See `docs/developer-guide/io-uring-listener.md`.
+- End-to-end TLS/HTTP2/WAF proxy benchmark for the listener backends.
 
 ### Changed
 
-- Nothing yet.
+- io_uring ring thread now batches submissions, keeps multiple operations in
+  flight, recycles read buffers, and slices a single `Bytes` copy for partial
+  writes. SQPOLL remains opt-in (`WAF_IO_URING_SQPOLL=1`).
+- Multishot accept uses a pollable CQ ring with bounded shutdown instead of
+  blocking indefinitely in `io_uring_enter`.
+- Accept errors no longer tear down the proxy listener; they are logged and
+  retried.
 
 ## [0.1.0-beta.12] - 2026-11-03
 

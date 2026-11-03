@@ -11,7 +11,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 use super::uring::{
-    Uring, IORING_ACCEPT_MULTISHOT, IORING_OP_ACCEPT, IORING_OP_READ, IORING_OP_WRITE,
+    Uring, IORING_ACCEPT_MULTISHOT, IORING_CQE_F_MORE, IORING_OP_ACCEPT, IORING_OP_READ,
+    IORING_OP_WRITE,
 };
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 use std::os::unix::io::RawFd;
@@ -388,7 +389,7 @@ enum UringCommand {
     },
     Write {
         fd: RawFd,
-        buf: Vec<u8>,
+        buf: Bytes,
         reply: oneshot::Sender<Result<usize>>,
     },
     Accept {
@@ -401,97 +402,245 @@ enum UringCommand {
 }
 
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
-fn uring_submit_wait<F>(ring: &Uring, mut fill: F) -> Result<i32>
-where
-    F: FnMut(&mut super::uring::io_uring_sqe),
-{
-    if !ring.push(&mut fill) {
-        // Queue is bounded; drain one completion then retry once.
-        let _ = ring.submit(1)?;
-        if !ring.push(&mut fill) {
-            anyhow::bail!("io_uring submission queue is full");
+enum PendingOp {
+    Read {
+        buf: Vec<u8>,
+        reply: oneshot::Sender<Result<(Vec<u8>, usize)>>,
+    },
+    Write {
+        // Keeps the payload alive until the kernel reports completion.
+        _buf: Bytes,
+        reply: oneshot::Sender<Result<usize>>,
+    },
+    Accept {
+        reply: oneshot::Sender<Result<RawFd>>,
+    },
+}
+
+/// Fixed-size read buffer pool. Buffers are handed back after the completion
+/// is copied out, so the hot path stops allocating (and zeroing) a fresh
+/// `Vec` for every read.
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+struct ReadPool {
+    buf_size: usize,
+    max_free: usize,
+    free: Vec<Vec<u8>>,
+}
+
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+impl ReadPool {
+    fn new(buf_size: usize, max_free: usize) -> Self {
+        Self {
+            buf_size: buf_size.max(1),
+            max_free,
+            free: Vec::new(),
         }
     }
-    ring.submit(1)?;
-    loop {
-        if let Some(cqe) = ring.peek_cqe() {
-            ring.cqe_seen();
-            if cqe.res < 0 {
-                return Err(std::io::Error::from_raw_os_error(-cqe.res).into());
-            }
-            return Ok(cqe.res);
+
+    fn take(&mut self, len: usize) -> Vec<u8> {
+        if len <= self.buf_size {
+            self.free.pop().unwrap_or_else(|| vec![0u8; self.buf_size])
+        } else {
+            // Oversized read: fall back to a one-off allocation and let it
+            // drop rather than caching an unbounded buffer.
+            vec![0u8; len]
         }
-        ring.submit(1)?;
+    }
+
+    fn give(&mut self, buf: Vec<u8>) {
+        if buf.len() == self.buf_size && self.free.len() < self.max_free {
+            self.free.push(buf);
+        }
     }
 }
 
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
-fn run_uring_loop(ring: Uring, mut rx: mpsc::Receiver<UringCommand>) {
-    while let Some(cmd) = rx.blocking_recv() {
-        match cmd {
-            UringCommand::Read { fd, len, reply } => {
-                let mut buf = vec![0u8; len];
-                let ptr = buf.as_mut_ptr() as u64;
-                let res = uring_submit_wait(&ring, |sqe| {
-                    sqe.opcode = IORING_OP_READ;
-                    sqe.fd = fd;
-                    sqe.addr = ptr;
-                    sqe.len = len as u32;
-                });
-                match res {
-                    Ok(n) => {
-                        let n = n as usize;
-                        buf.truncate(n);
-                        let _ = reply.send(Ok((buf, n)));
+fn io_error(res: i32) -> anyhow::Error {
+    std::io::Error::from_raw_os_error(-res).into()
+}
+
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+fn complete_op(op: PendingOp, res: i32, pool: &mut ReadPool) {
+    match op {
+        PendingOp::Read { buf, reply } => {
+            if res < 0 {
+                pool.give(buf);
+                let _ = reply.send(Err(io_error(res)));
+            } else {
+                let n = (res as usize).min(buf.len());
+                let out = buf[..n].to_vec();
+                pool.give(buf);
+                let _ = reply.send(Ok((out, n)));
+            }
+        }
+        PendingOp::Write { reply, .. } => {
+            if res < 0 {
+                let _ = reply.send(Err(io_error(res)));
+            } else {
+                let _ = reply.send(Ok(res as usize));
+            }
+        }
+        PendingOp::Accept { reply } => {
+            if res < 0 {
+                let _ = reply.send(Err(io_error(res)));
+            } else {
+                let _ = reply.send(Ok(res as RawFd));
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+fn fail_pending(op: PendingOp, pool: &mut ReadPool) {
+    match op {
+        PendingOp::Read { buf, reply } => {
+            pool.give(buf);
+            let _ = reply.send(Err(anyhow::anyhow!("io_uring loop stopped")));
+        }
+        PendingOp::Write { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!("io_uring loop stopped")));
+        }
+        PendingOp::Accept { reply } => {
+            let _ = reply.send(Err(anyhow::anyhow!("io_uring loop stopped")));
+        }
+    }
+}
+
+/// Ring thread: accepts commands from many async callers, keeps up to half the
+/// ring depth in flight, submits them with one `io_uring_enter`, and dispatches
+/// completions as they arrive (which may be out of order).
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+fn run_uring_loop(ring: Uring, mut rx: mpsc::Receiver<UringCommand>, buf_size: usize) {
+    use std::collections::HashMap;
+
+    let max_inflight = (ring.entries() as usize).max(2) / 2;
+    let mut pending: HashMap<u64, PendingOp> = HashMap::with_capacity(max_inflight);
+    let mut pool = ReadPool::new(buf_size, max_inflight.max(8));
+    let mut next_id: u64 = 1;
+    let mut shutting_down = false;
+    let mut deferred: Option<UringCommand> = None;
+
+    loop {
+        // Fill the in-flight window without blocking. Every command becomes
+        // one SQE; the whole batch is submitted by the single enter below.
+        while !shutting_down && pending.len() < max_inflight {
+            let cmd = match deferred.take() {
+                Some(cmd) => cmd,
+                None => match rx.try_recv() {
+                    Ok(cmd) => cmd,
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        shutting_down = true;
+                        break;
                     }
-                    Err(e) => {
-                        let _ = reply.send(Err(e));
+                },
+            };
+
+            match cmd {
+                UringCommand::Read { fd, len, reply } => {
+                    if len == 0 {
+                        let _ = reply.send(Ok((Vec::new(), 0)));
+                        continue;
                     }
+                    let mut buf = pool.take(len);
+                    let id = next_id;
+                    next_id = next_id.wrapping_add(1);
+                    let ptr = buf.as_mut_ptr() as u64;
+                    let pushed = ring.push(|sqe| {
+                        sqe.opcode = IORING_OP_READ;
+                        sqe.fd = fd;
+                        sqe.addr = ptr;
+                        sqe.len = len as u32;
+                        sqe.user_data = id;
+                    });
+                    if !pushed {
+                        pool.give(buf);
+                        let _ =
+                            reply.send(Err(anyhow::anyhow!("io_uring submission queue is full")));
+                        break;
+                    }
+                    pending.insert(id, PendingOp::Read { buf, reply });
+                }
+                UringCommand::Write { fd, buf, reply } => {
+                    if buf.is_empty() {
+                        let _ = reply.send(Ok(0));
+                        continue;
+                    }
+                    let id = next_id;
+                    next_id = next_id.wrapping_add(1);
+                    let ptr = buf.as_ptr() as u64;
+                    let len = buf.len() as u32;
+                    let pushed = ring.push(|sqe| {
+                        sqe.opcode = IORING_OP_WRITE;
+                        sqe.fd = fd;
+                        sqe.addr = ptr;
+                        sqe.len = len;
+                        sqe.user_data = id;
+                    });
+                    if !pushed {
+                        let _ =
+                            reply.send(Err(anyhow::anyhow!("io_uring submission queue is full")));
+                        break;
+                    }
+                    pending.insert(id, PendingOp::Write { _buf: buf, reply });
+                }
+                UringCommand::Accept { fd, reply } => {
+                    let id = next_id;
+                    next_id = next_id.wrapping_add(1);
+                    let pushed = ring.push(|sqe| {
+                        sqe.opcode = IORING_OP_ACCEPT;
+                        sqe.fd = fd;
+                        // NULL sockaddr is allowed; the caller resolves the
+                        // peer address from the accepted fd.
+                        sqe.addr = 0;
+                        sqe.off = 0;
+                        sqe.user_data = id;
+                    });
+                    if !pushed {
+                        let _ =
+                            reply.send(Err(anyhow::anyhow!("io_uring submission queue is full")));
+                        break;
+                    }
+                    pending.insert(id, PendingOp::Accept { reply });
+                }
+                UringCommand::Shutdown { reply } => {
+                    let _ = reply.send(());
+                    shutting_down = true;
                 }
             }
-            UringCommand::Write { fd, buf, reply } => {
-                let ptr = buf.as_ptr() as u64;
-                let len = buf.len() as u32;
-                let res = uring_submit_wait(&ring, |sqe| {
-                    sqe.opcode = IORING_OP_WRITE;
-                    sqe.fd = fd;
-                    sqe.addr = ptr;
-                    sqe.len = len;
-                });
-                match res {
-                    Ok(n) => {
-                        let _ = reply.send(Ok(n as usize));
-                    }
-                    Err(e) => {
-                        let _ = reply.send(Err(e));
-                    }
-                }
+        }
+
+        // Reap everything already posted before deciding to wait.
+        while let Some(cqe) = ring.peek_cqe() {
+            ring.cqe_seen();
+            if let Some(op) = pending.remove(&cqe.user_data) {
+                complete_op(op, cqe.res, &mut pool);
             }
-            UringCommand::Accept { fd, reply } => {
-                let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-                let mut addr_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-                let addr_ptr = &mut addr as *mut _ as u64;
-                let len_ptr = &mut addr_len as *mut _ as u64;
-                let res = uring_submit_wait(&ring, |sqe| {
-                    sqe.opcode = IORING_OP_ACCEPT;
-                    sqe.fd = fd;
-                    sqe.addr = addr_ptr;
-                    // `off`/`addr2` share storage; accept uses it as socklen ptr.
-                    sqe.off = len_ptr;
-                });
-                match res {
-                    Ok(n) => {
-                        let _ = reply.send(Ok(n as RawFd));
-                    }
-                    Err(e) => {
-                        let _ = reply.send(Err(e));
-                    }
-                }
+        }
+
+        if shutting_down {
+            for (_, op) in pending.drain() {
+                fail_pending(op, &mut pool);
             }
-            UringCommand::Shutdown { reply } => {
-                let _ = reply.send(());
-                break;
+            break;
+        }
+
+        if pending.is_empty() {
+            match rx.blocking_recv() {
+                Some(cmd) => deferred = Some(cmd),
+                None => break,
             }
+            continue;
+        }
+
+        // One enter submits the whole batch and waits for at least one
+        // completion; already-submitted ops just wait.
+        if let Err(e) = ring.submit(1) {
+            eprintln!("io_uring submit failed: {e}");
+            for (_, op) in pending.drain() {
+                fail_pending(op, &mut pool);
+            }
+            break;
         }
     }
 }
@@ -512,16 +661,28 @@ impl IoUringNetworkHandler {
     /// use `NetworkIoHandler`.
     pub fn new(config: IoConfig) -> Result<Self> {
         let entries = (config.concurrency.max(64) * 2) as u32;
-        let ring =
-            Uring::new(entries).map_err(|e| anyhow::anyhow!("io_uring setup failed: {e}"))?;
+        // SQPOLL needs extra privileges and was not beneficial on this host, so
+        // it stays opt-in for measurement instead of being the default.
+        let sqpoll = std::env::var_os("WAF_IO_URING_SQPOLL").is_some();
+        let ring = if sqpoll {
+            Uring::new_sqpoll(entries).or_else(|e| {
+                tracing::warn!(error = %e, "io_uring SQPOLL unavailable; using normal ring");
+                Uring::new(entries)
+            })
+        } else {
+            Uring::new(entries)
+        }
+        .map_err(|e| anyhow::anyhow!("io_uring setup failed: {e}"))?;
         let (tx, rx) = mpsc::channel((config.concurrency.max(64) * 4).max(256));
+        let buf_size = config.buffer_size;
         std::thread::Builder::new()
             .name("io-uring-loop".into())
-            .spawn(move || run_uring_loop(ring, rx))
+            .spawn(move || run_uring_loop(ring, rx, buf_size))
             .map_err(|e| anyhow::anyhow!("failed to spawn io_uring loop: {e}"))?;
         tracing::info!(
             entries,
             concurrency = config.concurrency,
+            sqpoll,
             "io_uring network backend initialised"
         );
         Ok(Self {
@@ -562,9 +723,15 @@ impl IoUringNetworkHandler {
     /// Write the whole buffer to `fd`, handling partial writes.
     pub async fn write_fd(&self, fd: RawFd, buf: &[u8]) -> Result<()> {
         let start = Instant::now();
+        if buf.is_empty() {
+            return Ok(());
+        }
+        // Copy once into a ref-counted buffer; retries for partial writes then
+        // slice it instead of allocating a new Vec per chunk.
+        let data = Bytes::copy_from_slice(buf);
         let mut written = 0usize;
-        while written < buf.len() {
-            let chunk = buf[written..].to_vec();
+        while written < data.len() {
+            let chunk = data.slice(written..);
             let (reply, rx) = oneshot::channel();
             self.tx
                 .send(UringCommand::Write {
@@ -605,63 +772,12 @@ impl IoUringNetworkHandler {
     }
 
     /// Spawn a dedicated multishot-accept thread. Each accepted fd is sent on
-    /// the returned channel until the handler is dropped.
+    /// the returned channel until the acceptor is shut down or dropped.
     pub fn start_multishot_accept(
         &self,
         listener_fd: RawFd,
-    ) -> Result<(mpsc::Receiver<RawFd>, std::thread::JoinHandle<()>)> {
-        let ring = Uring::new(64)?;
-        let (tx, rx) = mpsc::channel(256);
-        let handle = std::thread::Builder::new()
-            .name("io-uring-accept".into())
-            .spawn(move || {
-                // Multishot accept does not fill sockaddr; addr/addr2 must be
-                // NULL. Submit one SQE; the kernel keeps it alive and posts a
-                // CQE per connection. We only reap completions after.
-                let ok = ring.push(|sqe| {
-                    sqe.opcode = IORING_OP_ACCEPT;
-                    sqe.fd = listener_fd;
-                    sqe.addr = 0;
-                    sqe.off = 0;
-                    // Kernel 6.18 stores accept flags in sqe->ioprio.
-                    sqe.ioprio = IORING_ACCEPT_MULTISHOT as u16;
-                });
-                if !ok {
-                    eprintln!("multishot accept: submission queue push failed");
-                    return;
-                }
-                if let Err(e) = ring.submit(1) {
-                    eprintln!("multishot accept: submit failed: {e}");
-                    return;
-                }
-                loop {
-                    let mut stop = false;
-                    while let Some(cqe) = ring.peek_cqe() {
-                        ring.cqe_seen();
-                        if cqe.res < 0 {
-                            let err = std::io::Error::from_raw_os_error(-cqe.res);
-                            if err.kind() == std::io::ErrorKind::WouldBlock {
-                                continue;
-                            }
-                            eprintln!("multishot accept: completion error: {err}");
-                            stop = true;
-                            break;
-                        }
-                        if tx.blocking_send(cqe.res).is_err() {
-                            stop = true;
-                            break;
-                        }
-                    }
-                    if stop {
-                        break;
-                    }
-                    if ring.submit(1).is_err() {
-                        break;
-                    }
-                }
-            })
-            .map_err(|e| anyhow::anyhow!("failed to spawn accept loop: {e}"))?;
-        Ok((rx, handle))
+    ) -> Result<(mpsc::Receiver<RawFd>, MultishotAcceptor)> {
+        start_multishot_accept(listener_fd)
     }
 
     /// Ask the background ring thread to stop. Dropping the handler also stops
@@ -670,6 +786,162 @@ impl IoUringNetworkHandler {
         let (reply, rx) = oneshot::channel();
         if self.tx.send(UringCommand::Shutdown { reply }).await.is_ok() {
             let _ = rx.await;
+        }
+    }
+}
+
+/// Spawn a multishot-accept thread without constructing the read/write handler.
+/// Used by the proxy listener, which only needs the accept fast path.
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+pub fn start_multishot_accept(
+    listener_fd: RawFd,
+) -> Result<(mpsc::Receiver<RawFd>, MultishotAcceptor)> {
+    let ring = Uring::new(64)?;
+    let (tx, rx) = mpsc::channel(256);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread_stop = std::sync::Arc::clone(&stop);
+    let handle = std::thread::Builder::new()
+        .name("io-uring-accept".into())
+        .spawn(move || run_multishot_accept(ring, listener_fd, tx, thread_stop))
+        .map_err(|e| anyhow::anyhow!("failed to spawn accept loop: {e}"))?;
+    Ok((
+        rx,
+        MultishotAcceptor {
+            stop,
+            handle: Some(handle),
+        },
+    ))
+}
+
+/// Handle to the multishot-accept thread. Dropping it stops the thread (within
+/// one poll interval) so listener shutdown is deterministic.
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+pub struct MultishotAcceptor {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+impl MultishotAcceptor {
+    /// Stop the accept loop and wait for the thread to exit.
+    pub fn shutdown(mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+impl Drop for MultishotAcceptor {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+fn arm_multishot_accept(ring: &Uring, listener_fd: RawFd) -> std::io::Result<()> {
+    let pushed = ring.push(|sqe| {
+        sqe.opcode = IORING_OP_ACCEPT;
+        sqe.fd = listener_fd;
+        // Multishot accept does not fill a sockaddr; addr/addr2 must be NULL.
+        sqe.addr = 0;
+        sqe.off = 0;
+        // liburing also stores the multishot flag in sqe->ioprio.
+        sqe.ioprio = IORING_ACCEPT_MULTISHOT as u16;
+    });
+    if !pushed {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "io_uring submission queue is full",
+        ));
+    }
+    ring.submit(0)?;
+    Ok(())
+}
+
+/// Multishot accept loop. The CQ ring fd is pollable, so the thread sleeps in
+/// `poll(2)` instead of busy-spinning and still notices the stop flag promptly.
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+fn run_multishot_accept(
+    ring: Uring,
+    listener_fd: RawFd,
+    tx: mpsc::Sender<RawFd>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+
+    if let Err(e) = arm_multishot_accept(&ring, listener_fd) {
+        eprintln!("multishot accept: arm failed: {e}");
+        return;
+    }
+    let mut armed = true;
+
+    loop {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+
+        let mut pfd = libc::pollfd {
+            fd: ring.fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // Bounded poll so shutdown never waits indefinitely.
+        let ready = unsafe { libc::poll(&mut pfd, 1, 25) };
+        if ready < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if ready == 0 {
+            continue;
+        }
+
+        while let Some(cqe) = ring.peek_cqe() {
+            ring.cqe_seen();
+            if cqe.res < 0 {
+                let err = std::io::Error::from_raw_os_error(-cqe.res);
+                match err.kind() {
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted => {}
+                    _ => {
+                        eprintln!("multishot accept: completion error: {err}");
+                        // EMFILE/ENFILE and friends: back off before re-arming
+                        // so the thread does not spin on a persistent error.
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                        armed = false;
+                    }
+                }
+                if cqe.flags & IORING_CQE_F_MORE == 0 {
+                    armed = false;
+                }
+                continue;
+            }
+
+            let fd = cqe.res as RawFd;
+            if tx.blocking_send(fd).is_err() {
+                // Receiver gone: close the accepted fd and stop.
+                unsafe { libc::close(fd) };
+                return;
+            }
+            if cqe.flags & IORING_CQE_F_MORE == 0 {
+                armed = false;
+            }
+        }
+
+        if !armed {
+            match arm_multishot_accept(&ring, listener_fd) {
+                Ok(()) => armed = true,
+                Err(e) => {
+                    eprintln!("multishot accept: re-arm failed: {e}");
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+            }
         }
     }
 }
@@ -789,6 +1061,78 @@ mod uring_tests {
             Err(e) => panic!("single accept failed: {e}"),
         }
         let _ = client.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_reads_and_writes_stay_correct() {
+        use std::sync::Arc;
+
+        const CLIENTS: usize = 16;
+        const ROUNDS: usize = 64;
+
+        let config = IoConfig {
+            backend: IoBackend::IoUring,
+            enable_zero_copy: true,
+            buffer_size: 8192,
+            concurrency: 32,
+        };
+        let Ok(handler) = IoUringNetworkHandler::new(config) else {
+            eprintln!("skipping: io_uring unavailable");
+            return;
+        };
+        let handler = Arc::new(handler);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut clients = Vec::new();
+        for i in 0..CLIENTS {
+            clients.push(tokio::spawn(async move {
+                let mut stream = TcpStream::connect(addr).await.unwrap();
+                let payload = vec![i as u8 + 1; 256];
+                for _ in 0..ROUNDS {
+                    stream.write_all(&payload).await.unwrap();
+                    let mut echoed = vec![0u8; payload.len()];
+                    stream.read_exact(&mut echoed).await.unwrap();
+                    assert_eq!(echoed, payload, "client {i} echo mismatch");
+                }
+            }));
+        }
+
+        let mut servers = Vec::new();
+        for _ in 0..CLIENTS {
+            let (stream, _) = listener.accept().await.unwrap();
+            let handler = Arc::clone(&handler);
+            servers.push(tokio::spawn(async move {
+                use std::os::unix::io::AsRawFd;
+                let fd = stream.as_raw_fd();
+                // Keep the tokio stream alive while the ring owns the fd ops.
+                let _stream = stream;
+                for _ in 0..ROUNDS {
+                    let mut got = Vec::new();
+                    // Read with deliberately small chunks to exercise partial
+                    // reads through the pipelined ring.
+                    while got.len() < 256 {
+                        let (chunk, n) = handler.read_fd(fd, 64).await.unwrap();
+                        if n == 0 {
+                            return;
+                        }
+                        got.extend_from_slice(&chunk);
+                        if got.len() >= 256 {
+                            break;
+                        }
+                    }
+                    handler.write_fd(fd, &got).await.unwrap();
+                }
+            }));
+        }
+
+        for client in clients {
+            client.await.unwrap();
+        }
+        for server in servers {
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]

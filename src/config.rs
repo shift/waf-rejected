@@ -347,6 +347,25 @@ pub struct ServerConfig {
 
     /// WebTransport over HTTP/3 configuration
     pub webtransport: WebTransportConfig,
+
+    /// Listener I/O backend.
+    ///
+    /// `"tokio"` (default) uses the portable epoll/tokio accept path.
+    /// `"io_uring"` uses the Linux io_uring multishot-accept path when the
+    /// binary was built with the `io-uring` feature; setup failure falls back
+    /// to the tokio path with a warning.
+    pub io_backend: ListenerIoBackend,
+}
+
+/// Listener I/O backend selection (`server.io_backend`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListenerIoBackend {
+    /// Portable epoll/tokio listener (default).
+    #[default]
+    Tokio,
+    /// Linux io_uring multishot-accept listener (requires `io-uring` feature).
+    IoUring,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1800,6 +1819,7 @@ impl Default for ServerConfig {
             tls: TlsConfig::default(),
             http2: Http2TuningConfig::default(),
             webtransport: WebTransportConfig::default(),
+            io_backend: ListenerIoBackend::default(),
         }
     }
 }
@@ -2214,6 +2234,18 @@ mod tests {
         assert_eq!(config.upstream_uri, "http://127.0.0.1:3000");
         assert_eq!(config.server.max_connections, 10000);
         assert_eq!(config.logging.level, "info");
+    }
+
+    #[test]
+    fn listener_io_backend_defaults_to_tokio_and_parses_io_uring() {
+        let default: Config = toml::from_str("").expect("empty config parses");
+        assert_eq!(default.server.io_backend, ListenerIoBackend::Tokio);
+
+        let uring: Config =
+            toml::from_str("[server]\nio_backend = \"io_uring\"\n").expect("io_uring parses");
+        assert_eq!(uring.server.io_backend, ListenerIoBackend::IoUring);
+
+        assert!(toml::from_str::<Config>("[server]\nio_backend = \"epoll\"\n").is_err());
     }
 
     #[test]

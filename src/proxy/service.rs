@@ -797,9 +797,23 @@ impl WafProxyService {
 
     /// Serve on an already-bound listener (useful for tests and socket activation).
     pub async fn start_with_listener(&self, listener: TcpListener) -> Result<(), WafError> {
+        let listener = crate::proxy::listener::ConnectionListener::from_tokio(
+            listener,
+            self.config.server.io_backend,
+        );
+        self.start_with_connection_listener(listener).await
+    }
+
+    /// Serve on a listener whose backend has already been selected (used by
+    /// benchmarks and tests that need to observe the post-fallback backend).
+    pub async fn start_with_connection_listener(
+        &self,
+        mut listener: crate::proxy::listener::ConnectionListener,
+    ) -> Result<(), WafError> {
         let bind_addr = listener
             .local_addr()
             .map_err(|e| WafError::internal(format!("Failed to read listener address: {}", e)))?;
+        info!("Listener backend: {:?}", listener.backend());
 
         info!("🚀 WAF Proxy Server started successfully on {}", bind_addr);
         info!("📊 Performance optimizations: connection pooling, async processing, rule caching");
@@ -911,10 +925,17 @@ impl WafProxyService {
         }
 
         loop {
-            let (tcp_stream, remote_addr) = listener
-                .accept()
-                .await
-                .map_err(|e| WafError::internal(format!("Failed to accept connection: {}", e)))?;
+            let (tcp_stream, remote_addr) = match listener.accept().await {
+                Ok(connection) => connection,
+                Err(e) => {
+                    // Accept errors are usually transient (EMFILE, aborted
+                    // handshake). Log and keep serving instead of tearing down
+                    // the listener.
+                    warn!("Failed to accept connection: {}", e);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                }
+            };
 
             let tls_manager = self.tls_manager.clone();
             let state = state.clone();

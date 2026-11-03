@@ -105,6 +105,7 @@ pub const IORING_REGISTER_BUFFERS: u32 = 0;
 pub const IORING_ACCEPT_MULTISHOT: u32 = 1;
 pub const IORING_SETUP_CQSIZE: u32 = 1 << 3;
 pub const IORING_SETUP_SQPOLL: u32 = 1 << 1;
+pub const IORING_CQE_F_MORE: u32 = 1 << 1;
 
 const IORING_OFF_SQ_RING: u64 = 0;
 const IORING_OFF_CQ_RING: u64 = 0x8000000;
@@ -139,9 +140,23 @@ impl Uring {
     /// Try to create an io_uring. Returns an error (never panics) when the
     /// kernel lacks support or seccomp blocks the syscalls.
     pub fn new(entries: u32) -> io::Result<Self> {
+        Self::new_with_flags(entries, 0)
+    }
+
+    /// Try to create a ring with `IORING_SETUP_SQPOLL`. Needs CAP_SYS_ADMIN (or
+    /// a sufficiently high `kernel.io_uring_disabled` allowance), so callers
+    /// must treat failure as "use the normal ring".
+    pub fn new_sqpoll(entries: u32) -> io::Result<Self> {
+        Self::new_with_flags(entries, IORING_SETUP_SQPOLL)
+    }
+
+    fn new_with_flags(entries: u32, extra_flags: u32) -> io::Result<Self> {
         let mut params: io_uring_params = unsafe { mem::zeroed() };
-        params.flags = IORING_SETUP_CQSIZE;
+        params.flags = IORING_SETUP_CQSIZE | extra_flags;
         params.cq_entries = entries.saturating_mul(2).max(entries);
+        // Keep the SQPOLL thread alive briefly so short idle gaps do not
+        // repeatedly spin the thread up.
+        params.sq_thread_idle = 2_000;
 
         let fd = unsafe {
             libc::syscall(
