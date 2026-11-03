@@ -66,6 +66,9 @@ pub mod native_detect;
 #[cfg(feature = "rust-engine")]
 pub mod rust_engine;
 
+/// Borrowed request view shared by the proxy and the WAF encoders.
+pub mod request_view;
+
 /// Shared JSON payload envelope for the wasm reactor and native sidecar.
 #[cfg(any(feature = "wasm-reactor", feature = "coraza-native"))]
 pub mod coraza_payload;

@@ -1092,11 +1092,11 @@ impl WafProxyService {
             Duration::from_secs(state.config.server.request_timeout_secs.max(1)),
             state
                 .buffer_pool
-                .read_incoming_body(body, size_hint, Some(max_body_size)),
+                .read_incoming_body_bytes(body, size_hint, Some(max_body_size)),
         )
         .await
         {
-            Ok(Ok((buffer, trailers))) => (buffer.to_bytes(), trailers),
+            Ok(Ok((bytes, trailers))) => (bytes, trailers),
             Ok(Err(BodyReadError::TooLarge { .. })) => {
                 warn!(
                     "Request body from {} exceeds limit {}",
@@ -1168,17 +1168,28 @@ impl WafProxyService {
 
         // Full evaluation includes body inspection, WASM/AI stages and audit
         // logging. The previous fast path silently skipped all of these.
+        //
+        // Move the request head into the context instead of cloning it, then
+        // move it back for the upstream forward. This removes a `HeaderMap`
+        // clone (and its per-header allocations) from every request.
+        let method = std::mem::replace(&mut parts.method, hyper::Method::GET);
+        let uri = std::mem::replace(&mut parts.uri, Uri::from_static("/"));
+        let headers = std::mem::take(&mut parts.headers);
         let request_context = RequestContext::with_http_version(
             client_ip,
-            parts.method.clone(),
-            parts.uri.clone(),
-            parts.headers.clone(),
+            method,
+            uri,
+            headers,
             Some(body_bytes.len()),
             http_version.to_string(),
         )
         .with_body(Some(body_bytes.clone()));
 
         let decision = state.waf_engine.evaluate_shared(&request_context).await;
+
+        parts.method = request_context.method;
+        parts.uri = request_context.uri;
+        parts.headers = request_context.headers;
 
         match decision {
             Decision::Allow => {

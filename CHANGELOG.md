@@ -330,6 +330,16 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Performance
 
+- Zero-copy request path between the proxy and the WAF. The proxy now returns
+  a single-frame hyper body as its own refcounted `Bytes` instead of copying it
+  into a pooled buffer and then copying it again with `to_bytes`; multi-frame
+  bodies are coalesced once. The parsed method, URI and header map are moved
+  into `RequestContext` and back instead of cloned. A borrowed `RequestView`
+  is shared by the encoders, and the native binary v1 encoder writes the URI
+  directly into the frame (no `uri.to_string()`) and slices the body from the
+  request `Bytes`. The WASI reactor still uses the JSON guest ABI, which is the
+  remaining copy on that backend. See `docs/developer-guide/zero-copy-http.md`.
+
 - Coraza WASI reactor tuning pass, with a reusable A/B harness. The
   `coraza_backend_bench` example now reports p95, accepts `CORAZA_MODULE` and
   `CORAZA_POOL_SIZE`, prints compile/warm time and can run a pool-size

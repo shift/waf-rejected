@@ -81,8 +81,19 @@ pub fn select_body<'a>(
     ctx: &'a RequestContext,
     policy: &BodyInspectionPolicy,
 ) -> BodySelection<'a> {
-    let full_body = ctx.body.as_deref();
-    let original_size = full_body.map(<[u8]>::len).or(ctx.body_size);
+    select_body_parts(ctx.body.as_deref(), ctx.body_size, policy)
+}
+
+/// Applies the body-size policy to borrowed body parts.
+///
+/// This is the shared implementation used by both the owned context and the
+/// borrowed [`crate::waf::request_view::RequestView`].
+pub fn select_body_parts<'a>(
+    full_body: Option<&'a [u8]>,
+    body_size: Option<usize>,
+    policy: &BodyInspectionPolicy,
+) -> BodySelection<'a> {
+    let original_size = full_body.map(<[u8]>::len).or(body_size);
 
     let mut inspected = full_body;
     let mut truncated = false;

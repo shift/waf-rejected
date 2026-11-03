@@ -287,6 +287,69 @@ impl BufferPool {
         Full::new(data)
     }
 
+    /// Read an incoming HTTP body into `Bytes` with the fewest copies possible.
+    ///
+    /// A body delivered as a single hyper frame (the common case for small
+    /// requests) is returned as the frame's own refcounted `Bytes`, so the
+    /// proxy and the WAF engine share the same allocation. Multi-frame bodies
+    /// are coalesced once into a `BytesMut` and frozen; there is no second
+    /// copy into a pooled buffer.
+    ///
+    /// `max_size` is enforced while streaming, including for chunked bodies
+    /// that do not advertise a `Content-Length`. Any trailing header block
+    /// (gRPC `grpc-status` / `grpc-message`) is returned alongside the data so
+    /// the caller can re-emit it unchanged.
+    pub async fn read_incoming_body_bytes<B>(
+        self: &Arc<Self>,
+        body: B,
+        _size_hint: Option<usize>,
+        max_size: Option<usize>,
+    ) -> Result<(Bytes, Option<hyper::HeaderMap>), BodyReadError>
+    where
+        B: hyper::body::Body<Data = Bytes>,
+        B::Error: std::fmt::Display,
+    {
+        let mut body = std::pin::pin!(body);
+        let mut chunks: Vec<Bytes> = Vec::new();
+        let mut total = 0usize;
+        let mut trailers = None;
+
+        loop {
+            let frame = http_body_util::BodyExt::frame(&mut body).await;
+            let Some(frame) = frame else { break };
+            let chunk = frame.map_err(|e| BodyReadError::Read(e.to_string()))?;
+            match chunk.into_data() {
+                Ok(data) => {
+                    if let Some(limit) = max_size {
+                        if total.saturating_add(data.len()) > limit {
+                            return Err(BodyReadError::TooLarge { limit });
+                        }
+                    }
+                    total += data.len();
+                    chunks.push(data);
+                }
+                Err(frame) => {
+                    if let Ok(block) = frame.into_trailers() {
+                        trailers = Some(block);
+                    }
+                }
+            }
+        }
+
+        let bytes = match chunks.len() {
+            0 => Bytes::new(),
+            1 => chunks.pop().expect("one chunk"),
+            _ => {
+                let mut buffer = BytesMut::with_capacity(total);
+                for chunk in chunks {
+                    buffer.extend_from_slice(&chunk);
+                }
+                buffer.freeze()
+            }
+        };
+        Ok((bytes, trailers))
+    }
+
     /// Efficiently read an incoming HTTP body into a pooled buffer.
     ///
     /// `max_size` is enforced while streaming, including for chunked bodies
@@ -333,6 +396,54 @@ impl BufferPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::{Full, StreamBody};
+    use hyper::body::Frame;
+    use std::convert::Infallible;
+
+    #[tokio::test]
+    async fn single_frame_body_is_returned_without_copy() {
+        let pool = BufferPool::new();
+        let bytes = Bytes::from_static(b"hello");
+        let body = Full::new(bytes.clone());
+        let (out, trailers) = pool
+            .read_incoming_body_bytes(body, Some(bytes.len()), Some(10))
+            .await
+            .unwrap();
+        assert_eq!(out, bytes);
+        assert_eq!(out.as_ptr(), bytes.as_ptr(), "single frame must be shared");
+        assert!(trailers.is_none());
+    }
+
+    #[tokio::test]
+    async fn multi_frame_body_is_coalesced_once() {
+        let pool = BufferPool::new();
+        let frames: Vec<Result<Frame<Bytes>, Infallible>> = vec![
+            Ok(Frame::data(Bytes::from_static(b"abc"))),
+            Ok(Frame::data(Bytes::from_static(b"def"))),
+        ];
+        let body = StreamBody::new(futures_util::stream::iter(frames));
+        let (out, trailers) = pool
+            .read_incoming_body_bytes(body, None, Some(10))
+            .await
+            .unwrap();
+        assert_eq!(&out[..], b"abcdef");
+        assert!(trailers.is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_body_is_rejected_while_streaming() {
+        let pool = BufferPool::new();
+        let frames: Vec<Result<Frame<Bytes>, Infallible>> = vec![
+            Ok(Frame::data(Bytes::from_static(b"abc"))),
+            Ok(Frame::data(Bytes::from_static(b"def"))),
+        ];
+        let body = StreamBody::new(futures_util::stream::iter(frames));
+        let error = pool
+            .read_incoming_body_bytes(body, None, Some(5))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, BodyReadError::TooLarge { limit: 5 }));
+    }
 
     #[test]
     fn test_buffer_pool_basic() {

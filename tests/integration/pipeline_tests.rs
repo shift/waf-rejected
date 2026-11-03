@@ -5,11 +5,14 @@ use std::io::Write;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use futures_util::stream;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::Frame;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 use waf_ingress::proxy::WafProxyService;
 use waf_ingress::Config;
@@ -225,4 +228,87 @@ async fn pipeline_rejects_oversized_body() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn pipeline_accepts_chunked_body() {
+    let upstream = spawn_upstream().await;
+    let proxy = spawn_proxy(upstream).await;
+
+    let chunks: Vec<Result<Frame<Bytes>, std::io::Error>> = vec![
+        Ok(Frame::data(Bytes::from_static(b"chunk-one|"))),
+        Ok(Frame::data(Bytes::from_static(b"chunk-two|"))),
+        Ok(Frame::data(Bytes::from_static(b"chunk-three"))),
+    ];
+    let body = reqwest::Body::wrap(StreamBody::new(stream::iter(chunks)));
+    let response = reqwest::Client::new()
+        .post(format!("{}/echo", proxy))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.text().await.unwrap(),
+        "chunk-one|chunk-two|chunk-three"
+    );
+}
+
+#[tokio::test]
+async fn pipeline_rejects_content_length_mismatch() {
+    let upstream = spawn_upstream().await;
+    let proxy = spawn_proxy(upstream).await;
+    let proxy_addr = proxy.strip_prefix("http://").unwrap();
+
+    let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+    // Advertise 16 bytes but send only 5, then close the write side.
+    stream
+        .write_all(b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 16\r\n\r\nshort")
+        .await
+        .unwrap();
+    stream.shutdown().await.unwrap();
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.contains("400 Bad Request") || response.contains("431"),
+        "unexpected response: {response}"
+    );
+}
+
+#[tokio::test]
+async fn pipeline_rejects_truncated_body() {
+    let upstream = spawn_upstream().await;
+    let proxy = spawn_proxy(upstream).await;
+    let proxy_addr = proxy.strip_prefix("http://").unwrap();
+
+    let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+    stream
+        .write_all(b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1024\r\n\r\npartial")
+        .await
+        .unwrap();
+    // Close without completing the advertised body.
+    stream.shutdown().await.unwrap();
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.contains("400 Bad Request") || response.contains("408"),
+        "unexpected response: {response}"
+    );
+}
+
+#[tokio::test]
+async fn pipeline_keeps_connection_alive_for_reuse() {
+    let upstream = spawn_upstream().await;
+    let proxy = spawn_proxy(upstream).await;
+    let client = reqwest::Client::new();
+
+    for _ in 0..3 {
+        let response = client.get(format!("{}/hello", proxy)).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "upstream-ok");
+    }
 }

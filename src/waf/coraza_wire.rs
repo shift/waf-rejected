@@ -22,7 +22,8 @@ use std::fmt;
 
 use bytes::Bytes;
 
-use crate::waf::coraza_payload::{select_body, BodyInspectionPolicy, BodySelection};
+use crate::waf::coraza_payload::{select_body_parts, BodyInspectionPolicy, BodySelection};
+use crate::waf::request_view::RequestView;
 use crate::waf::RequestContext;
 
 /// Payload discriminator for a legacy JSON envelope.
@@ -158,28 +159,43 @@ pub fn encode_request_with_rules(
     policy: &BodyInspectionPolicy,
     remove_rule_ids: &[u32],
 ) -> Result<WireBuild, WireError> {
-    let (body, inspected_bytes, original_size, truncated) = match select_body(ctx, policy) {
-        BodySelection::Inspect {
-            body,
-            inspected_bytes,
-            original_size,
-            truncated,
-        } => (body, inspected_bytes, original_size, truncated),
-        BodySelection::Reject { size, limit } => {
-            return Ok(WireBuild::Reject { size, limit });
-        }
-    };
+    encode_request_view(&ctx.view(), policy, remove_rule_ids)
+}
+
+/// Encodes a borrowed request view into a binary v1 frame.
+///
+/// The URI is written directly into the frame head instead of being formatted
+/// into a temporary `String`, and the body is sliced from the caller's
+/// refcounted `Bytes` when one is available. This is the zero-copy path used
+/// by the proxy hot path.
+pub fn encode_request_view(
+    view: &RequestView<'_>,
+    policy: &BodyInspectionPolicy,
+    remove_rule_ids: &[u32],
+) -> Result<WireBuild, WireError> {
+    let (body, inspected_bytes, original_size, truncated) =
+        match select_body_parts(view.body, view.body_size, policy) {
+            BodySelection::Inspect {
+                body,
+                inspected_bytes,
+                original_size,
+                truncated,
+            } => (body, inspected_bytes, original_size, truncated),
+            BodySelection::Reject { size, limit } => {
+                return Ok(WireBuild::Reject { size, limit });
+            }
+        };
 
     let remove_rule_ids = &remove_rule_ids[..remove_rule_ids.len().min(MAX_REMOVE_RULE_IDS)];
 
-    let method = ctx.method.as_str();
-    let uri = ctx.uri.to_string();
-    let version = ctx.http_version.as_str();
+    let method = view.method.as_str();
+    let uri_len = uri_wire_len(view.uri);
+    let version = view.http_version;
     let body_len = body.map(<[u8]>::len).unwrap_or(0);
-    let body_size = body.map(<[u8]>::len).or(ctx.body_size).unwrap_or(0);
+    let body_size = body.map(<[u8]>::len).or(view.body_size).unwrap_or(0);
 
     let mut header_blob_len = 0usize;
-    for (name, value) in ctx.headers.iter() {
+    for (name, value) in view.headers.iter() {
         header_blob_len += 4 + name.as_str().len() + value.as_bytes().len();
     }
     let remove_len = if remove_rule_ids.is_empty() {
@@ -191,7 +207,7 @@ pub fn encode_request_with_rules(
     let capacity = 4
         + REQUEST_HEADER_LEN
         + method.len()
-        + uri.len()
+        + uri_len
         + version.len()
         + header_blob_len
         + remove_len;
@@ -217,19 +233,19 @@ pub fn encode_request_with_rules(
     h[1] = WIRE_VERSION;
     h[2] = flags;
     put_u16(h, 4, method.len(), "method")?;
-    put_u16(h, 6, uri.len(), "uri")?;
+    put_u16(h, 6, uri_len, "uri")?;
     put_u16(h, 8, version.len(), "http_version")?;
-    put_u16(h, 10, ctx.headers.len(), "header count")?;
+    put_u16(h, 10, view.headers.len(), "header count")?;
     h[12..16].copy_from_slice(&(body_len as u32).to_be_bytes());
     h[16..20].copy_from_slice(&(body_size as u32).to_be_bytes());
     h[20..24].copy_from_slice(&(original_size.unwrap_or(0) as u32).to_be_bytes());
     h[24..28].copy_from_slice(&(header_blob_len as u32).to_be_bytes());
 
     head.extend_from_slice(method.as_bytes());
-    head.extend_from_slice(uri.as_bytes());
+    write_uri(&mut head, view.uri);
     head.extend_from_slice(version.as_bytes());
 
-    for (name, value) in ctx.headers.iter() {
+    for (name, value) in view.headers.iter() {
         let name = name.as_str();
         // Mirrors the JSON builder: header values are lossy UTF-8, because the
         // Coraza ABI is string-based.
@@ -258,7 +274,7 @@ pub fn encode_request_with_rules(
     let body_bytes = if body_len == 0 {
         None
     } else {
-        match (body, ctx.body.as_ref()) {
+        match (body, view.body_bytes) {
             (Some(selected), Some(full)) => Some(full.slice_ref(selected)),
             (Some(selected), None) => Some(Bytes::copy_from_slice(selected)),
             (None, _) => None,
@@ -274,6 +290,35 @@ pub fn encode_request_with_rules(
         inspected_bytes,
         truncated,
     })
+}
+
+/// Length of the URI as written by `Uri`'s `Display` implementation.
+fn uri_wire_len(uri: &hyper::Uri) -> usize {
+    let mut len = 0;
+    if let Some(scheme) = uri.scheme_str() {
+        len += scheme.len() + 3;
+    }
+    if let Some(authority) = uri.authority() {
+        len += authority.as_str().len();
+    }
+    if let Some(path_and_query) = uri.path_and_query() {
+        len += path_and_query.as_str().len();
+    }
+    len
+}
+
+/// Writes the URI in the same form as `Uri`'s `Display` implementation.
+fn write_uri(head: &mut Vec<u8>, uri: &hyper::Uri) {
+    if let Some(scheme) = uri.scheme_str() {
+        head.extend_from_slice(scheme.as_bytes());
+        head.extend_from_slice(b"://");
+    }
+    if let Some(authority) = uri.authority() {
+        head.extend_from_slice(authority.as_str().as_bytes());
+    }
+    if let Some(path_and_query) = uri.path_and_query() {
+        head.extend_from_slice(path_and_query.as_str().as_bytes());
+    }
 }
 
 fn put_u16(
@@ -601,6 +646,42 @@ mod tests {
                 Err(WireError::FieldTooLong { field, .. }) => assert_eq!(field, "header value"),
                 other => panic!("expected a field-too-long error, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn view_encoder_matches_context_encoder() {
+        let ctx = context("/submit?q=1", Some(b"a=1&b=2"));
+        let view = ctx.view();
+        let from_ctx =
+            match encode_request_with_rules(&ctx, &BodyInspectionPolicy::default(), &[941100])
+                .unwrap()
+            {
+                WireBuild::Built { request, .. } => request,
+                WireBuild::Reject { .. } => panic!("default policy must not reject"),
+            };
+        let from_view = match encode_request_view(
+            &view,
+            &BodyInspectionPolicy::default(),
+            &[941100],
+        )
+        .unwrap()
+        {
+            WireBuild::Built { request, .. } => request,
+            WireBuild::Reject { .. } => panic!("default policy must not reject"),
+        };
+        assert_eq!(from_ctx.head(), from_view.head());
+        assert_eq!(from_ctx.body(), from_view.body());
+    }
+
+    #[test]
+    fn uri_wire_len_matches_display() {
+        for raw in ["/", "/a?b=c", "http://example.test/x?y=1"] {
+            let uri: hyper::Uri = raw.parse().unwrap();
+            assert_eq!(uri_wire_len(&uri), uri.to_string().len());
+            let mut buf = Vec::new();
+            write_uri(&mut buf, &uri);
+            assert_eq!(buf, uri.to_string().as_bytes());
         }
     }
 
