@@ -4,6 +4,81 @@ All notable changes to WAF-Rejected are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- Nothing yet.
+
+## [0.1.0-beta.12] - 2026-11-03
+
+### Release summary
+
+Beta 12 packages the work merged since beta 11. Coraza 3.3.3 with OWASP CRS
+4.14.0 remains the default request engine (WASI reactor, wasmtime 49, Rust
+1.99.1). The native Go Coraza sidecar and the native Rust CRS engine remain
+**opt-in** and are not selected by a plain `config.toml`.
+
+Highlights:
+
+- **gRPC:** HTTP/2/HTTP/1.1 transport, frame and header validation,
+  descriptor-driven protobuf field decoding, and optional Coraza content scan.
+  Raw protobuf is never sent to CRS body rules; streaming RPCs stay
+  envelope-only by design.
+- **GraphQL:** operation parsing, allowlists, persisted-query hashes, limits
+  and mutation/subscription policy, with `crs` (default), `graphql-only` and
+  `off` body-scan modes.
+- **Native Coraza sidecar:** opt-in native Go Coraza/CRS backend over a Unix
+  socket, corpus-verified against the wasm reactor, plus admission control,
+  body-size policy and parser hardening.
+- **Detection corpus:** 2,112 corpus cases, with 7,320/7,320 transform parity
+  and 2,110/2,112 rule parity for the opt-in Rust engine.
+- **Performance:** early blocking, sound gating, sub-microsecond allow cache,
+  bodyless fast-allow, zero-allocation transforms, Hyperscan/prefilter,
+  Coraza binary ABI, start-up pre-warm, HTTP/2 tuning, and optional
+  allocator/TLS/io_uring paths.
+- **Observability:** admission, Coraza, early-block and cache metrics, plus a
+  documented feature matrix.
+
+### Support matrix
+
+This table summarises what the release actually guarantees. The full detail,
+including measured numbers and sizing guidance, is in
+[`docs/operations/support-matrix.md`](docs/operations/support-matrix.md).
+
+| Workload / path | Default | Status | Latency and coverage notes |
+| --- | --- | --- | --- |
+| Bodyless, no query | yes | Supported | Early blocking and optional fast-allow/allow-cache can reach sub-millisecond. Without those opt-ins the measured wasm p50 is ~4.5 ms and native ~0.9 ms. |
+| Small bodies (≤ 4 KiB) | yes | Supported | Full CRS body inspection. CRS-dominated: ~42 ms at 1 KiB and ~173 ms at 4 KiB on wasm; ~8 ms and ~29 ms on native. **Not sub-millisecond.** |
+| gRPC | yes | Supported | Protocol-aware envelope, frame and optional descriptor/field checks. Bodies are withheld from CRS by default; `content_scan = "strings"` adds a bounded content scan. |
+| GraphQL | yes | Supported | `body_scan = "crs"` keeps the full JSON body scan (default). `graphql-only` is cheaper but gives up CRS body-rule coverage for those requests. |
+| Large bodies (> 64 KiB) | yes | Supported with policy | The wasm payload contract is 64 KiB. Bodies above the configured policy fail closed unless `max_inspect_bytes` + an explicit oversize action are set. Full 60 KiB CRS inspection is seconds, not milliseconds. |
+| Native Coraza sidecar | no | Opt-in | ~6× faster body inspection than the wasm reactor; costs an extra process, socket and supervisor. |
+| Native Rust engine | no | Opt-in / experimental | 505/505 rules executed, 2,110/2,112 corpus parity; not yet a default replacement for Coraza. |
+| Allow cache | no | Opt-in | Memoises pure content-rule `Allow` verdicts for a short TTL; never caches blocks or bypasses stateful gates. |
+| Fast-allow | no | Opt-in | Bodyless, query-free routes only; rate/size/geo gates still run. |
+| Memory | — | Documented | Plan roughly `370 + 96 × pool_size` MiB for the wasm reactor (6 workers plateau ~838 MiB RSS at the 64 MiB guest GC bound); see the sizing table. |
+
+### Known limitations
+
+- **Sub-millisecond is not a full-inspection claim.** It applies to bodyless
+  requests, early-blocked requests, allow-cache hits and prefilter fast paths.
+  A request that receives a full OWASP CRS body scan costs milliseconds to
+  hundreds of milliseconds depending on body size and backend.
+- The native Rust engine is **opt-in and experimental**. It is not selected by
+  default and its corpus parity is 2,110/2,112, not 100 %.
+- gRPC streaming bodies are not scanned by CRS. Descriptor-backed field and
+  content scanning only applies when a descriptor artifact and
+  `content_scan = "strings"` are configured.
+- `graphql-only` intentionally withholds the raw GraphQL body from CRS body
+  rules and requires a non-empty operation allowlist; use it only when that
+  coverage gap is acceptable.
+- The native sidecar adds a process, a Unix socket, a shared uid/gid boundary
+  and a separate upgrade lifecycle. There is no cross-host sidecar.
+- The wasm reactor pays a one-off ~4.5–5.6 s compile/warm-up before readiness,
+  and wasm linear memory only grows; size the pool from the plateau table, not
+  from the 256 MiB trap ceiling.
+- Beta releases are supported on a best-effort basis only. See
+  [`docs/operations/support-policy.md`](docs/operations/support-policy.md).
+
 ### Performance
 
 - Harden the engine performance gate against shared-host clock/GC drift. The
