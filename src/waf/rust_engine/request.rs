@@ -629,6 +629,9 @@ impl<'a> RequestData<'a> {
         if !self.multipart_part_headers.is_empty() {
             bit(Collection::MultipartPartHeaders);
         }
+        if !self.xml.is_empty() {
+            bit(Collection::Xml);
+        }
         if !state.tx_is_empty() {
             bit(Collection::Tx);
         }
