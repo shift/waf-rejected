@@ -75,6 +75,31 @@ pub enum Transform {
     CmdLine,
     Base64Decode,
     JsonUnescape,
+    /// Coraza `utf8ToUnicode` (not an identity; see [`Self::is_noop_name`]).
+    Utf8ToUnicode,
+    /// Coraza `sha1`.
+    Sha1,
+    /// Coraza `hexEncode`.
+    HexEncode,
+    /// Coraza `removeCommentsChar`.
+    RemoveCommentsChar,
+    /// Coraza `length`.
+    Length,
+}
+
+/// A pipeline step: byte transform plus a conservative identity pre-check.
+///
+/// [`TransformCache`] is generic over this trait so the native engine can reuse
+/// the arena, prefix memoisation and aliasing while keeping its own transform
+/// implementations. The shared [`Transform`] is the only implementation used by
+/// the CRS prefilter.
+pub trait Step: Copy + PartialEq + Eq + std::hash::Hash + std::fmt::Debug {
+    /// Applies the step to `input`, replacing `output`.
+    fn apply_into(self, input: &[u8], output: &mut Vec<u8>);
+    /// True only when the step is provably the identity on `input`.
+    ///
+    /// Callers still compare the result, so returning `false` is always safe.
+    fn is_identity(self, input: &[u8]) -> bool;
 }
 
 impl Transform {
@@ -166,6 +191,9 @@ impl Transform {
             Self::HtmlEntityDecode => memchr(b'&', input).is_none(),
             Self::CmdLine => cmd_line_is_identity(input),
             Self::Base64Decode => false,
+            Self::Utf8ToUnicode => !input.is_ascii(),
+            Self::Sha1 | Self::HexEncode | Self::Length => false,
+            Self::RemoveCommentsChar => remove_comments_char_is_identity(input),
         }
     }
 
@@ -216,7 +244,27 @@ impl Transform {
             Self::CmdLine => cmd_line_into(input, output),
             Self::Base64Decode => base64_decode_into(input, output),
             Self::JsonUnescape => json_unescape_into(input, output),
+            Self::Utf8ToUnicode => utf8_to_unicode_into(input, output),
+            Self::Sha1 => {
+                use sha1::{Digest, Sha1};
+                let mut hasher = Sha1::new();
+                hasher.update(input);
+                output.extend_from_slice(&hasher.finalize());
+            }
+            Self::HexEncode => hex_encode_into(input, output),
+            Self::RemoveCommentsChar => remove_comments_char_into(input, output),
+            Self::Length => push_decimal(output, input.len()),
         }
+    }
+}
+
+impl Step for Transform {
+    fn apply_into(self, input: &[u8], output: &mut Vec<u8>) {
+        Transform::apply_into(self, input, output);
+    }
+
+    fn is_identity(self, input: &[u8]) -> bool {
+        self.is_identity_on(input)
     }
 }
 
@@ -279,8 +327,8 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
 ///
 /// Steady state allocates nothing: `begin_request` only clears the arena, the
 /// value table and the slot table, all of which keep their capacity.
-#[derive(Debug, Default)]
-pub struct TransformCache {
+#[derive(Debug)]
+pub struct TransformCache<S = Transform> {
     arena: Vec<u8>,
     scratch: Vec<u8>,
     values: Vec<ValueKey>,
@@ -290,13 +338,17 @@ pub struct TransformCache {
     entries: Vec<Entry>,
     /// `(parent slot, step) -> result slot` memo shared by every chain. Two
     /// prefixes that reach equal bytes and apply the same step reuse it.
-    memo: Vec<(u32, Transform, u32)>,
+    memo: Vec<(u32, S, u32)>,
     prefix_count: usize,
+    value_limit: usize,
     arena_limit: usize,
+    /// When set, `value_limit` is the only per-value cap (no `3 * input` guess).
+    explicit_limit: bool,
+    transform_bytes: u64,
 }
 
-impl TransformCache {
-    pub fn new() -> Self {
+impl<S: Step> Default for TransformCache<S> {
+    fn default() -> Self {
         Self {
             arena: Vec::new(),
             scratch: Vec::new(),
@@ -305,8 +357,17 @@ impl TransformCache {
             entries: Vec::new(),
             memo: Vec::new(),
             prefix_count: 1,
+            value_limit: MAX_VALUE_BYTES,
             arena_limit: MAX_ARENA_BYTES,
+            explicit_limit: false,
+            transform_bytes: 0,
         }
+    }
+}
+
+impl<S: Step> TransformCache<S> {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Creates a cache with an explicit arena bound (tests and benchmarks).
@@ -314,6 +375,17 @@ impl TransformCache {
         let mut cache = Self::new();
         cache.arena_limit = arena_limit;
         cache
+    }
+
+    /// Sets explicit per-value and per-request arena bounds.
+    ///
+    /// This also replaces the prefilter's `3 * input` expansion estimate with
+    /// `value_limit`, which engine callers need because some transform chains
+    /// legitimately expand (for example `utf8ToUnicode` and `hexEncode`).
+    pub fn set_bounds(&mut self, value_limit: usize, arena_limit: usize) {
+        self.value_limit = value_limit;
+        self.arena_limit = arena_limit;
+        self.explicit_limit = true;
     }
 
     /// Starts a new request. `prefix_count` is the number of registered chain
@@ -329,7 +401,7 @@ impl TransformCache {
 
     /// Registers an input value and stores its raw form as prefix 0.
     pub fn begin_value(&mut self, value: &[u8]) -> Result<ValueId, TransformError> {
-        if value.len() > MAX_VALUE_BYTES {
+        if value.len() > self.value_limit {
             return Err(TransformError::OutputOverflow);
         }
         let id = u32::try_from(self.values.len()).map_err(|_| TransformError::ArenaOverflow)?;
@@ -338,6 +410,10 @@ impl TransformCache {
         if self.slots.len() < needed {
             self.slots.resize(needed, 0);
         }
+        // The step memo is only meaningful within one value; clearing it here
+        // keeps its length bounded by the prefix count instead of growing with
+        // every value in the request.
+        self.memo.clear();
         let start = self.arena.len();
         self.arena.extend_from_slice(value);
         if self.arena.len() > self.arena_limit {
@@ -367,7 +443,7 @@ impl TransformCache {
         value: ValueId,
         input: &[u8],
         plan: &[u32],
-        prefixes: &[Vec<Transform>],
+        prefixes: &[Vec<S>],
     ) -> Result<Range<usize>, TransformError> {
         let value_index = value.0 as usize;
         if let Some(key) = self.values.get(value_index) {
@@ -387,11 +463,18 @@ impl TransformCache {
             let entry = self.entries[current_slot as usize - 1];
             entry.start as usize..entry.end as usize
         };
-        let limit = input
-            .len()
-            .saturating_mul(3)
-            .saturating_add(64)
-            .min(MAX_VALUE_BYTES);
+        // Fast path: the plan's final prefix is already resolved for this value,
+        // so a repeated `(value, chain)` lookup does not walk the plan.
+        if let Some(&last) = plan.last() {
+            let last = last as usize;
+            if last < self.prefix_count {
+                let slot = self.slots[slot_base + last];
+                if slot != 0 {
+                    return Ok(self.entry_range(slot));
+                }
+            }
+        }
+        let limit = self.step_limit(input);
         for &prefix in plan {
             let prefix_index = prefix as usize;
             if prefix_index >= self.prefix_count {
@@ -409,7 +492,7 @@ impl TransformCache {
                 .ok_or(TransformError::ArenaOverflow)?;
             let step = *steps.last().ok_or(TransformError::ArenaOverflow)?;
             // Cheap identity pre-check: no copy, no compare, no scan.
-            if step.is_identity_on(&self.arena[current.clone()]) {
+            if step.is_identity(&self.arena[current.clone()]) {
                 self.slots[slot_base + prefix_index] = current_slot;
                 continue;
             }
@@ -431,17 +514,13 @@ impl TransformCache {
         &mut self,
         value: ValueId,
         input: &[u8],
-        steps: &[Transform],
+        steps: &[S],
         parents: &[u32],
     ) -> Result<(), TransformError> {
         self.check_value(value, input)?;
         let value_index = value.0 as usize;
         let slot_base = value_index * self.prefix_count;
-        let limit = input
-            .len()
-            .saturating_mul(3)
-            .saturating_add(64)
-            .min(MAX_VALUE_BYTES);
+        let limit = self.step_limit(input);
         let count = self.prefix_count.min(steps.len()).min(parents.len());
         for prefix in 1..count {
             if self.slots[slot_base + prefix] != 0 {
@@ -464,7 +543,7 @@ impl TransformCache {
                 *slot
             } else {
                 let current = self.entry_range(parent_slot);
-                let slot = if step.is_identity_on(&self.arena[current]) {
+                let slot = if step.is_identity(&self.arena[current]) {
                     parent_slot
                 } else {
                     self.push_step(parent_slot, step, limit)?
@@ -496,6 +575,32 @@ impl TransformCache {
         }
     }
 
+    /// True when `id` still refers to `input`.
+    pub fn value_matches(&self, value: ValueId, input: &[u8]) -> bool {
+        self.check_value(value, input).is_ok()
+    }
+
+    /// Total bytes written for transform outputs (raw values excluded).
+    ///
+    /// Callers use deltas of this counter to charge a work budget without
+    /// re-charging aliased or memoised representations.
+    pub fn transform_bytes(&self) -> u64 {
+        self.transform_bytes
+    }
+
+    /// Per-value output cap for `input`.
+    fn step_limit(&self, input: &[u8]) -> usize {
+        if self.explicit_limit {
+            self.value_limit
+        } else {
+            input
+                .len()
+                .saturating_mul(3)
+                .saturating_add(64)
+                .min(self.value_limit)
+        }
+    }
+
     fn entry_range(&self, slot: u32) -> Range<usize> {
         let entry = self.entries[slot as usize - 1];
         entry.start as usize..entry.end as usize
@@ -507,7 +612,7 @@ impl TransformCache {
     fn push_step(
         &mut self,
         parent_slot: u32,
-        step: Transform,
+        step: S,
         limit: usize,
     ) -> Result<u32, TransformError> {
         let current = self.entry_range(parent_slot);
@@ -516,6 +621,7 @@ impl TransformCache {
             arena,
             scratch,
             entries,
+            transform_bytes,
             ..
         } = self;
         step.apply_into(&arena[current.clone()], scratch);
@@ -542,6 +648,7 @@ impl TransformCache {
         if arena.len() > arena_limit {
             return Err(TransformError::ArenaOverflow);
         }
+        *transform_bytes = transform_bytes.saturating_add(scratch.len() as u64);
         entries.push(Entry {
             start: start as u32,
             end: arena.len() as u32,
@@ -562,8 +669,202 @@ impl TransformCache {
 }
 
 // ---------------------------------------------------------------------------
+// Prefix table
+// ---------------------------------------------------------------------------
+
+/// Deduplicated transform prefix DAG for a set of interned chains.
+///
+/// `from_chains` builds one entry per distinct chain prefix, so `N` rules that
+/// share `urlDecodeUni -> htmlEntityDecode` pay for that prefix once per value.
+/// `plan(i)` is the list of prefix ids to pass to [`TransformCache::resolve`].
+#[derive(Debug, Clone)]
+pub struct PrefixTable<S> {
+    prefixes: Vec<Vec<S>>,
+    plans: Vec<Vec<u32>>,
+}
+
+impl<S> Default for PrefixTable<S> {
+    fn default() -> Self {
+        Self {
+            prefixes: vec![Vec::new()],
+            plans: Vec::new(),
+        }
+    }
+}
+
+impl<S: Copy + PartialEq> PrefixTable<S> {
+    /// Builds the prefix table for `chains` (chain order is preserved).
+    pub fn from_chains(chains: &[Vec<S>]) -> Self {
+        let mut prefixes: Vec<Vec<S>> = vec![Vec::new()];
+        let mut plans = Vec::with_capacity(chains.len());
+        for chain in chains {
+            let mut plan = Vec::with_capacity(chain.len());
+            let mut sequence: Vec<S> = Vec::with_capacity(chain.len());
+            for &step in chain {
+                sequence.push(step);
+                let id = match prefixes.iter().position(|prefix| prefix == &sequence) {
+                    Some(id) => id,
+                    None => {
+                        prefixes.push(sequence.clone());
+                        prefixes.len() - 1
+                    }
+                };
+                plan.push(id as u32);
+            }
+            plans.push(plan);
+        }
+        Self { prefixes, plans }
+    }
+
+    /// Number of registered prefixes, including the empty prefix 0.
+    pub fn len(&self) -> usize {
+        self.prefixes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.prefixes.len() <= 1
+    }
+
+    pub fn prefixes(&self) -> &[Vec<S>] {
+        &self.prefixes
+    }
+
+    pub fn plans(&self) -> &[Vec<u32>] {
+        &self.plans
+    }
+
+    /// Plan for chain `index`; an unknown index resolves to the empty plan.
+    pub fn plan(&self, index: usize) -> &[u32] {
+        self.plans.get(index).map_or(&[], Vec::as_slice)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Byte transforms
 // ---------------------------------------------------------------------------
+
+/// Appends the decimal representation of `value`.
+fn push_decimal(output: &mut Vec<u8>, value: usize) {
+    let mut buffer = [0u8; 20];
+    let mut cursor = buffer.len();
+    let mut value = value;
+    loop {
+        cursor -= 1;
+        buffer[cursor] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    output.extend_from_slice(&buffer[cursor..]);
+}
+
+/// Appends `value` as lowercase hexadecimal digits without allocation.
+fn push_hex_lower(output: &mut Vec<u8>, value: u32) {
+    let mut buffer = [0u8; 8];
+    let mut cursor = buffer.len();
+    let mut value = value;
+    loop {
+        cursor -= 1;
+        let digit = (value & 0xf) as u8;
+        buffer[cursor] = if digit < 10 {
+            b'0' + digit
+        } else {
+            b'a' + digit - 10
+        };
+        value >>= 4;
+        if value == 0 {
+            break;
+        }
+    }
+    output.extend_from_slice(&buffer[cursor..]);
+}
+
+/// Coraza `hexEncode` (`encoding/hex.EncodeToString`).
+fn hex_encode_into(input: &[u8], output: &mut Vec<u8>) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    output.reserve(input.len() * 2);
+    for &byte in input {
+        output.push(HEX[usize::from(byte >> 4)]);
+        output.push(HEX[usize::from(byte & 0x0f)]);
+    }
+}
+
+/// Coraza `removeCommentsChar`: drops comment delimiters but keeps the text.
+fn remove_comments_char_into(input: &[u8], output: &mut Vec<u8>) {
+    output.reserve(input.len());
+    let mut index = 0usize;
+    let len = input.len();
+    while index < len {
+        if input[index] == b'/' && index + 1 < len && input[index + 1] == b'*' {
+            index += 2;
+        } else if input[index] == b'*' && index + 1 < len && input[index + 1] == b'/' {
+            index += 2;
+        } else if input[index] == b'<'
+            && index + 3 < len
+            && input[index + 1] == b'!'
+            && input[index + 2] == b'-'
+            && input[index + 3] == b'-'
+        {
+            index += 4;
+        } else if input[index] == b'-'
+            && index + 2 < len
+            && input[index + 1] == b'-'
+            && input[index + 2] == b'>'
+        {
+            index += 3;
+        } else if input[index] == b'-' && index + 1 < len && input[index + 1] == b'-' {
+            index += 2;
+        } else if input[index] == b'#' {
+            index += 1;
+        } else {
+            output.push(input[index]);
+            index += 1;
+        }
+    }
+}
+
+/// Conservative identity check for `removeCommentsChar`.
+fn remove_comments_char_is_identity(input: &[u8]) -> bool {
+    !input
+        .iter()
+        .any(|byte| matches!(byte, b'/' | b'*' | b'<' | b'!' | b'-' | b'#'))
+}
+
+/// Coraza `utf8ToUnicode`: non-ASCII runes become `%uXXXX`.
+fn utf8_to_unicode_into(input: &[u8], output: &mut Vec<u8>) {
+    output.reserve(input.len());
+    let mut index = 0usize;
+    while index < input.len() {
+        let byte = input[index];
+        if byte < 0x80 {
+            output.push(byte);
+            index += 1;
+            continue;
+        }
+        match decode_utf8(&input[index..]) {
+            Some((rune, len)) => {
+                output.extend_from_slice(b"%u");
+                let digits = match rune {
+                    0x0..=0xf => 1,
+                    0x10..=0xff => 2,
+                    0x100..=0xfff => 3,
+                    _ => 4,
+                };
+                for _ in digits..4 {
+                    output.push(b'0');
+                }
+                push_hex_lower(output, rune);
+                index += len;
+            }
+            // Go's `range` over a string yields U+FFFD for each invalid byte.
+            None => {
+                output.extend_from_slice(b"%ufffd");
+                index += 1;
+            }
+        }
+    }
+}
 
 /// True when `compressWhitespace` would return `input` unchanged.
 fn whitespace_is_compressed(input: &[u8]) -> bool {
@@ -1695,7 +1996,7 @@ mod tests {
 
     #[test]
     fn cache_reuses_prefixes_and_matches_direct_application() {
-        let mut cache = TransformCache::new();
+        let mut cache = TransformCache::<Transform>::new();
         let input = b"q=1%20UNION%20SELECT%20password";
         let (plan, prefixes) = chain(&[
             Transform::UrlDecode,
@@ -1732,7 +2033,7 @@ mod tests {
 
     #[test]
     fn shared_prefix_is_computed_once_across_chains() {
-        let mut cache = TransformCache::new();
+        let mut cache = TransformCache::<Transform>::new();
         let input = b"%41%42%43";
         let (short_plan, prefixes) = chain(&[Transform::UrlDecode]);
         // Extend the same registry with a longer chain that shares the prefix.
@@ -1762,7 +2063,7 @@ mod tests {
     fn output_overflow_fails_closed() {
         // The raw value fits (6 bytes) but the decoded copy would exceed the
         // 7-byte arena.
-        let mut cache = TransformCache::with_arena_limit(7);
+        let mut cache = TransformCache::<Transform>::with_arena_limit(7);
         cache.begin_request(2);
         let value = cache.begin_value(b"%41%42").expect("fits");
         let (plan, prefixes) = chain(&[Transform::UrlDecode]);
@@ -1774,7 +2075,7 @@ mod tests {
 
     #[test]
     fn oversized_value_fails_closed() {
-        let mut cache = TransformCache::new();
+        let mut cache = TransformCache::<Transform>::new();
         cache.begin_request(1);
         let big = vec![b'a'; MAX_VALUE_BYTES + 1];
         assert_eq!(
@@ -1785,7 +2086,7 @@ mod tests {
 
     #[test]
     fn value_id_must_match_the_buffer() {
-        let mut cache = TransformCache::new();
+        let mut cache = TransformCache::<Transform>::new();
         let (plan, prefixes) = chain(&[Transform::Identity]);
         cache.begin_request(prefixes.len());
         let value = cache.begin_value(b"abc").expect("fits");
@@ -1796,5 +2097,47 @@ mod tests {
                 .expect_err("mismatched value id"),
             TransformError::OutputOverflow
         );
+    }
+
+    #[test]
+    fn extended_transforms_match_coraza() {
+        let apply = |step: Transform, input: &[u8]| {
+            let mut output = Vec::new();
+            step.apply_into(input, &mut output);
+            output
+        };
+        assert_eq!(apply(Transform::Length, b"abcd"), b"4");
+        assert_eq!(apply(Transform::Length, b""), b"0");
+        assert_eq!(apply(Transform::HexEncode, b"a\xff"), b"61ff");
+        assert_eq!(
+            hex::encode(apply(Transform::Sha1, b"abc")),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+        assert_eq!(
+            apply(Transform::RemoveCommentsChar, b"a/*x*/b<!--c-->#d"),
+            b"axbcd"
+        );
+        assert_eq!(apply(Transform::Utf8ToUnicode, b"abc"), b"abc");
+        assert_eq!(
+            apply(Transform::Utf8ToUnicode, "aäb".as_bytes()),
+            b"a%u00e4b"
+        );
+        assert_eq!(apply(Transform::Utf8ToUnicode, b"a\xffb"), b"a%ufffdb");
+        assert_eq!(apply(Transform::Utf8ToUnicode, "😀".as_bytes()), b"%u1f600");
+    }
+
+    #[test]
+    fn prefix_table_dedups_shared_prefixes() {
+        let chains = vec![
+            vec![Transform::UrlDecode],
+            vec![Transform::UrlDecode, Transform::Lowercase],
+            vec![Transform::Lowercase],
+        ];
+        let table = PrefixTable::from_chains(&chains);
+        assert_eq!(table.plan(0), &[1]);
+        assert_eq!(table.plan(1), &[1, 2]);
+        assert_eq!(table.plan(2), &[3]);
+        assert_eq!(table.len(), 4);
+        assert!(table.plan(99).is_empty());
     }
 }

@@ -34,6 +34,7 @@ use super::request::{
     expand_macros_into, Candidate, Collections, EngineRequest, RequestData, TxState,
 };
 use super::transforms::Transform;
+use crate::waf::transforms::{TransformCache, ValueId};
 use crate::waf::Decision;
 
 /// Default CRS inbound anomaly threshold.
@@ -380,7 +381,16 @@ impl RustEngine {
         captures: &mut Captures,
         scratch: &mut Scratch,
     ) -> Result<Option<Decision>, EngineError> {
-        scratch.cache.begin();
+        scratch
+            .cache
+            .begin_request(self.program.transform_prefixes.len());
+        let limits = budget.limits();
+        scratch.cache.set_bounds(
+            limits.max_value_bytes,
+            limits.max_total_bytes.saturating_mul(2),
+        );
+        scratch.value_ids.clear();
+        scratch.charged_transform_bytes = scratch.cache.transform_bytes();
         scratch.gate_masks.begin();
         let (data, tx_state) = tx.split();
         let mut candidates: Vec<Candidate<'_>> = Vec::new();
@@ -724,12 +734,19 @@ impl RustEngine {
                 #[cfg(feature = "engine-profile")]
                 let transform_sample = super::profile::sample();
                 let value: &[u8] = match candidate.cache_id {
-                    Some(id) => scratch.cache.get(
-                        cache_key(id, rule.pipeline),
-                        &candidate.value,
-                        pipeline,
-                        budget,
-                    )?,
+                    Some(id) => {
+                        let range = resolve_cached(
+                            &mut scratch.cache,
+                            &mut scratch.value_ids,
+                            &self.program.transform_prefixes,
+                            usize::from(rule.pipeline),
+                            id,
+                            &candidate.value,
+                            &mut scratch.charged_transform_bytes,
+                            budget,
+                        )?;
+                        scratch.cache.bytes(range)
+                    }
                     None => {
                         transform_into(
                             &candidate.value,
@@ -894,9 +911,17 @@ impl RustEngine {
             SCRATCH.with(|cell| {
                 let mut guard = cell.borrow_mut();
                 let worker_scratch = &mut *guard;
-                // Scoped workers are fresh threads; reset the generational
-                // caches before the first candidate they evaluate.
-                worker_scratch.cache.begin();
+                // Scoped workers are fresh threads; reset the per-request cache
+                // before the first candidate they evaluate.
+                worker_scratch
+                    .cache
+                    .begin_request(self.program.transform_prefixes.len());
+                worker_scratch.cache.set_bounds(
+                    limits.max_value_bytes,
+                    limits.max_total_bytes.saturating_mul(2),
+                );
+                worker_scratch.value_ids.clear();
+                worker_scratch.charged_transform_bytes = worker_scratch.cache.transform_bytes();
                 worker_scratch.gate_masks.begin();
                 let mut worker_budget = Budget::new(limits);
 
@@ -918,12 +943,19 @@ impl RustEngine {
                 }
 
                 let value: &[u8] = match candidate.cache_id {
-                    Some(id) => worker_scratch.cache.get(
-                        cache_key(id, rule.pipeline),
-                        &candidate.value,
-                        pipeline,
-                        &mut worker_budget,
-                    )?,
+                    Some(id) => {
+                        let range = resolve_cached(
+                            &mut worker_scratch.cache,
+                            &mut worker_scratch.value_ids,
+                            &self.program.transform_prefixes,
+                            usize::from(rule.pipeline),
+                            id,
+                            &candidate.value,
+                            &mut worker_scratch.charged_transform_bytes,
+                            &mut worker_budget,
+                        )?;
+                        worker_scratch.cache.bytes(range)
+                    }
                     None => {
                         transform_into(
                             &candidate.value,
@@ -1026,30 +1058,19 @@ impl RustEngine {
         if let Some(mask) = scratch.gate_masks.get(value_id) {
             return Ok(Some(mask));
         }
-        scratch.gate_slots.clear();
-        for (index, group) in gates.groups().iter().enumerate() {
-            let pipeline = self
-                .program
-                .pipelines
-                .get(usize::from(group.pipeline))
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            let slot = scratch.cache.get_slot(
-                cache_key(value_id, group.pipeline),
+        let mut mask = 0u64;
+        for group in gates.groups() {
+            let range = resolve_cached(
+                &mut scratch.cache,
+                &mut scratch.value_ids,
+                &self.program.transform_prefixes,
+                usize::from(group.pipeline),
+                value_id,
                 &candidate.value,
-                pipeline,
+                &mut scratch.charged_transform_bytes,
                 budget,
             )?;
-            scratch.gate_slots.push((slot as u32, index as u32));
-        }
-
-        let Scratch {
-            cache, gate_slots, ..
-        } = scratch;
-        let mut mask = 0u64;
-        for &(slot, group_index) in gate_slots.iter() {
-            let bytes = &cache.slots[slot as usize];
-            let group = &gates.groups()[group_index as usize];
+            let bytes = scratch.cache.bytes(range);
             if !group.automaton.is_match(bytes) {
                 continue;
             }
@@ -1535,10 +1556,6 @@ fn target_removed_parts(
     })
 }
 
-fn cache_key(value_id: u32, pipeline: u16) -> u64 {
-    (u64::from(value_id) << 16) | u64::from(pipeline)
-}
-
 /// Picks the regex with the most capture groups so one reused
 /// `CaptureLocations` covers every rule in the program.
 fn capture_template(program: &Program) -> Option<regex::bytes::Regex> {
@@ -1663,14 +1680,15 @@ enum CandidateEval {
 
 /// Per-request transform cache and reusable buffers.
 ///
-/// The cache is keyed by `(value id, pipeline id)` and stores owned bytes, so
-/// it can live in a thread-local and be reused across requests without
-/// borrowing the request. The table is open-addressed and generational: a new
-/// phase bumps the generation instead of clearing memory, and every buffer is
-/// reused, so steady-state evaluation performs no transform allocations.
+/// The cache is the shared prefix cache from [`crate::waf::transforms`], keyed
+/// by `(value, chain prefix)`. It stores bytes in a bounded arena, aliases
+/// identity steps, and keeps its capacity across requests, so steady-state
+/// evaluation performs no transform allocations.
 #[derive(Default)]
 struct Scratch {
-    cache: TransformCache,
+    cache: TransformCache<Transform>,
+    value_ids: Vec<Option<ValueId>>,
+    charged_transform_bytes: u64,
     uncached: Vec<u8>,
     uncached_tmp: Vec<u8>,
     multi: MultiBuffer,
@@ -1680,129 +1698,42 @@ struct Scratch {
     capture_locations: Option<regex::bytes::CaptureLocations>,
     tx_state: Option<TxState>,
     gate_masks: GateMaskCache,
-    gate_slots: Vec<(u32, u32)>,
 }
 
-struct TransformCache {
-    slots: Vec<Vec<u8>>,
-    tmp: Vec<u8>,
-    keys: Vec<u64>,
-    values: Vec<u32>,
-    generations: Vec<u32>,
-    generation: u32,
-    used: usize,
-}
-
-impl Default for TransformCache {
-    fn default() -> Self {
-        Self {
-            slots: Vec::new(),
-            tmp: Vec::new(),
-            keys: Vec::new(),
-            values: Vec::new(),
-            generations: Vec::new(),
-            generation: 0,
-            used: 0,
-        }
+/// Resolves `plan` for one value through the shared prefix cache and returns
+/// the output range. The value is registered on first use and re-registered if
+/// the same engine value id now refers to a different buffer.
+#[allow(clippy::too_many_arguments)]
+fn resolve_cached(
+    cache: &mut TransformCache<Transform>,
+    value_ids: &mut Vec<Option<ValueId>>,
+    prefixes: &crate::waf::transforms::PrefixTable<Transform>,
+    plan_index: usize,
+    value_id: u32,
+    input: &[u8],
+    charged: &mut u64,
+    budget: &mut Budget,
+) -> Result<std::ops::Range<usize>, EngineError> {
+    let index = value_id as usize;
+    if value_ids.len() <= index {
+        value_ids.resize(index + 1, None);
     }
-}
-
-impl TransformCache {
-    fn begin(&mut self) {
-        self.used = 0;
-        self.generation = self.generation.wrapping_add(1);
-        if self.generation == 0 {
-            self.generations.fill(0);
-            self.generation = 1;
+    let id = match value_ids[index] {
+        Some(id) if cache.value_matches(id, input) => id,
+        _ => {
+            let id = cache.begin_value(input)?;
+            value_ids[index] = Some(id);
+            id
         }
-        if self.keys.is_empty() {
-            self.keys = vec![0; 64];
-            self.values = vec![0; 64];
-            self.generations = vec![0; 64];
-        }
+    };
+    let range = cache.resolve(id, input, prefixes.plan(plan_index), prefixes.prefixes())?;
+    let total = cache.transform_bytes();
+    let delta = total.saturating_sub(*charged);
+    if delta > 0 {
+        budget.materialised(delta as usize)?;
+        *charged = total;
     }
-
-    fn get(
-        &mut self,
-        key: u64,
-        input: &[u8],
-        pipeline: &[Transform],
-        budget: &mut Budget,
-    ) -> Result<&[u8], EngineError> {
-        let slot = self.get_slot(key, input, pipeline, budget)?;
-        Ok(&self.slots[slot])
-    }
-
-    fn get_slot(
-        &mut self,
-        key: u64,
-        input: &[u8],
-        pipeline: &[Transform],
-        budget: &mut Budget,
-    ) -> Result<usize, EngineError> {
-        let len = self.keys.len();
-        let mut index = (mix_key(key) as usize) & (len - 1);
-        loop {
-            if self.generations[index] != self.generation {
-                break;
-            }
-            if self.keys[index] == key {
-                return Ok(self.values[index] as usize);
-            }
-            index = (index + 1) & (len - 1);
-        }
-
-        let slot = self.used;
-        self.used += 1;
-        if slot == self.slots.len() {
-            self.slots.push(Vec::new());
-        }
-        transform_into(
-            input,
-            pipeline,
-            budget,
-            &mut self.slots[slot],
-            &mut self.tmp,
-        )?;
-        self.generations[index] = self.generation;
-        self.keys[index] = key;
-        self.values[index] = slot as u32;
-        if self.used * 2 >= len {
-            self.grow();
-        }
-        Ok(slot)
-    }
-
-    fn grow(&mut self) {
-        let new_len = self.keys.len() * 2;
-        let mut keys = vec![0u64; new_len];
-        let mut values = vec![0u32; new_len];
-        let mut generations = vec![0u32; new_len];
-        for index in 0..self.keys.len() {
-            if self.generations[index] != self.generation {
-                continue;
-            }
-            let key = self.keys[index];
-            let mut target = (mix_key(key) as usize) & (new_len - 1);
-            while generations[target] == self.generation {
-                target = (target + 1) & (new_len - 1);
-            }
-            keys[target] = key;
-            values[target] = self.values[index];
-            generations[target] = self.generation;
-        }
-        self.keys = keys;
-        self.values = values;
-        self.generations = generations;
-    }
-}
-
-#[inline]
-fn mix_key(key: u64) -> u64 {
-    let mut value = key.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
+    Ok(range)
 }
 
 #[derive(Default)]

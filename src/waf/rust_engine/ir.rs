@@ -411,6 +411,9 @@ pub struct Program {
     pub phase2: Vec<ProgramItem>,
     /// Interned transform pipelines. `CompiledRule::pipeline` indexes this.
     pub pipelines: Vec<TransformChain>,
+    /// Deduplicated prefix DAG over every interned pipeline, built once at load
+    /// time. The per-request cache resolves prefixes through this table.
+    pub transform_prefixes: crate::waf::transforms::PrefixTable<Transform>,
     /// Per-rule mandatory-literal gates, compiled once at load time and shared
     /// through an `Arc` when the engine is cloned across worker threads.
     pub gates: Option<std::sync::Arc<super::gate::GateSet>>,
@@ -452,5 +455,6 @@ impl Program {
             }
         }
         self.pipelines = pipelines;
+        self.transform_prefixes = crate::waf::transforms::PrefixTable::from_chains(&self.pipelines);
     }
 }

@@ -1000,3 +1000,36 @@ See `docs/suggestions_from_agents/engine-hotloop.md`.
   blocker documented in `docs/suggestions_from_agents/transform-hot.md`).
 
 See `docs/suggestions_from_agents/transform-hot.md`.
+
+---
+
+# perf/engine-transforms: shared batched transform pipeline
+
+Branch `perf/engine-transforms` (not pushed, not merged, defaults unchanged).
+Task: delete the engine's private transform cache and use the shared
+`waf::transforms` prefix pipeline without changing detection.
+
+## Plan
+
+- [x] Profile the private-cache path (xform 373 µs + gate 339 µs at 4 KiB).
+- [x] Extend `waf::transforms` with the engine-only steps (`sha1`,
+      `hexEncode`, `removeCommentsChar`, `length`, `utf8ToUnicode`), a generic
+      `Step` trait, a `PrefixTable` and explicit cache bounds.
+- [x] Map `rust_engine::Transform` 1:1 onto the shared steps; drop the
+      duplicated byte codecs.
+- [x] Build a prefix DAG for every interned pipeline; resolve per value with
+      the shared `TransformCache` (identity aliasing, one arena, zero allocs).
+- [x] Replace the private cache in the serial and `parallel-args` paths; gate
+      groups share the same representations.
+- [x] Charge the engine budget from the cache's materialised-byte delta.
+- [x] Parity: 7,320/7,320 fixture, corpus 2,110/2,112, 0 native-only FN.
+- [x] Bench and document `docs/suggestions_from_agents/engine-transforms.md`.
+
+## Results
+
+- p50: bodyless 162.0 → 158.1 µs, 1 KiB 453.6 → 315.9, 4 KiB 1,164.5 →
+  635.8 (< 800 target), 8 KiB 2,110.6 → 1,053.2 (< 1,500 target).
+- p99: bodyless 192.6, 1 KiB 361.8, 4 KiB 701.8, 8 KiB 1,133.8 µs.
+- xform 373.5 → 89.9 µs and gate 338.5 → 102.0 µs at 4 KiB (−76 % / −70 %).
+- 141–145 allocations/request (transform category 0), unchanged.
+- Bodyless < 150 µs missed (158 µs); only ~34 µs of it is transform work.

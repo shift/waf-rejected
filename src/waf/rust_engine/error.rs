@@ -121,3 +121,14 @@ pub enum EngineError {
     #[error("internal engine error: {0}")]
     Internal(&'static str),
 }
+
+impl From<crate::waf::transforms::TransformError> for EngineError {
+    fn from(error: crate::waf::transforms::TransformError) -> Self {
+        match error {
+            crate::waf::transforms::TransformError::OutputOverflow => Self::OutputTooLarge,
+            crate::waf::transforms::TransformError::ArenaOverflow => {
+                Self::Budget("transform arena exceeded its bound")
+            }
+        }
+    }
+}

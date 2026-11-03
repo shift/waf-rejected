@@ -76,6 +76,19 @@ impl Budget {
         Ok(())
     }
 
+    /// Charges transform bytes that were already capped per value.
+    ///
+    /// The prefix cache applies its own per-value cap, so this only re-checks
+    /// the request-wide total. It also skips aliased/memoised representations,
+    /// which never materialised new bytes.
+    pub(crate) fn materialised(&mut self, len: usize) -> Result<(), EngineError> {
+        self.bytes = self.bytes.saturating_add(len);
+        if self.bytes > self.limits.max_total_bytes {
+            return Err(EngineError::Budget("too many materialised bytes"));
+        }
+        Ok(())
+    }
+
     /// Charges one operator match.
     pub fn matched(&mut self) -> Result<(), EngineError> {
         self.matches += 1;
