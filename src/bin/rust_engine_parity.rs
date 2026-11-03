@@ -29,6 +29,8 @@ static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "engine-profile")]
+        waf_ingress::waf::rust_engine::profile::ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         System.alloc(layout)
     }
 
@@ -38,6 +40,8 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "engine-profile")]
+        waf_ingress::waf::rust_engine::profile::ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         System.realloc(ptr, layout, new_size)
     }
 }
@@ -112,6 +116,10 @@ struct Args {
     #[arg(long)]
     bench: bool,
 
+    /// Print the per-category hot-loop profile (requires `engine-profile`).
+    #[arg(long)]
+    profile: bool,
+
     /// Repetitions per latency row.
     #[arg(long, default_value_t = 100)]
     reps: usize,
@@ -140,6 +148,16 @@ fn run(args: &Args) -> Result<(), String> {
     print_support(engine.support_report());
     if args.report_only {
         return Ok(());
+    }
+    if args.profile {
+        #[cfg(feature = "engine-profile")]
+        {
+            return profile(args, &engine);
+        }
+        #[cfg(not(feature = "engine-profile"))]
+        {
+            return Err("--profile requires the `engine-profile` feature".to_string());
+        }
     }
     if args.bench {
         return bench(args, &engine);
@@ -441,6 +459,116 @@ fn percentage(numerator: usize, denominator: usize) -> f64 {
     } else {
         numerator as f64 * 100.0 / denominator as f64
     }
+}
+
+#[cfg(feature = "engine-profile")]
+fn profile(args: &Args, engine: &RustEngine) -> Result<(), String> {
+    use waf_ingress::waf::rust_engine::profile::Report;
+
+    let rows = [
+        ("bodyless", 0usize),
+        ("1KiB", 1024),
+        ("4KiB", 4096),
+        ("8KiB", 8192),
+    ];
+    println!(
+        "{:<10} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>8} {:>8}",
+        "body", "parse", "xform", "cand", "gate", "regex", "score", "capture", "rules", "skipped"
+    );
+    println!(
+        "{:<10} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>8} {:>8}",
+        "", "ns", "ns", "ns", "ns", "ns", "ns", "ns", "run", "gate"
+    );
+    for (label, size) in rows {
+        let (headers, body) = bench_request(size);
+        let request = EngineRequest {
+            method: "POST",
+            uri: "/post",
+            http_version: "HTTP/1.1",
+            headers: &headers,
+            body: if size == 0 { None } else { Some(&body) },
+        };
+        for _ in 0..20 {
+            let _ = engine.evaluate(&request);
+        }
+        let mut total = Report::default();
+        for _ in 0..args.reps.max(1) {
+            let (_, report) = engine.evaluate_profiled(&request);
+            total.parse_ns += report.parse_ns;
+            total.transforms_ns += report.transforms_ns;
+            total.candidates_ns += report.candidates_ns;
+            total.gate_ns += report.gate_ns;
+            total.operators_ns += report.operators_ns;
+            total.scoring_ns += report.scoring_ns;
+            total.captures_ns += report.captures_ns;
+            total.regex_evaluations += report.regex_evaluations;
+            total.regex_skipped += report.regex_skipped;
+        }
+        let reps = args.reps.max(1) as f64;
+        println!(
+            "{:<10} {:>9.0} {:>9.0} {:>9.0} {:>9.0} {:>9.0} {:>9.0} {:>9.0} {:>8.1} {:>8.1}",
+            label,
+            total.parse_ns as f64 / reps,
+            total.transforms_ns as f64 / reps,
+            total.candidates_ns as f64 / reps,
+            total.gate_ns as f64 / reps,
+            total.operators_ns as f64 / reps,
+            total.scoring_ns as f64 / reps,
+            total.captures_ns as f64 / reps,
+            total.regex_evaluations as f64 / reps,
+            total.regex_skipped as f64 / reps,
+        );
+    }
+    println!(
+        "note: `xform` is transform cache misses + pipeline application; `regex` is\
+         operator time; per-category allocation deltas are in the engine-profile report"
+    );
+    println!(
+        "{:<10} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "body", "parse", "xform", "cand", "gate", "regex", "score", "capture", "total"
+    );
+    for (label, size) in rows {
+        let (headers, body) = bench_request(size);
+        let request = EngineRequest {
+            method: "POST",
+            uri: "/post",
+            http_version: "HTTP/1.1",
+            headers: &headers,
+            body: if size == 0 { None } else { Some(&body) },
+        };
+        let mut all = Report::default();
+        for _ in 0..args.reps.max(1) {
+            let (_, report) = engine.evaluate_profiled(&request);
+            all.parse_allocs += report.parse_allocs;
+            all.transforms_allocs += report.transforms_allocs;
+            all.candidates_allocs += report.candidates_allocs;
+            all.gate_allocs += report.gate_allocs;
+            all.operators_allocs += report.operators_allocs;
+            all.scoring_allocs += report.scoring_allocs;
+            all.captures_allocs += report.captures_allocs;
+        }
+        let reps = args.reps.max(1) as f64;
+        let total = all.parse_allocs
+            + all.transforms_allocs
+            + all.candidates_allocs
+            + all.gate_allocs
+            + all.operators_allocs
+            + all.scoring_allocs
+            + all.captures_allocs;
+        println!(
+            "{:<10} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1}",
+            label,
+            all.parse_allocs as f64 / reps,
+            all.transforms_allocs as f64 / reps,
+            all.candidates_allocs as f64 / reps,
+            all.gate_allocs as f64 / reps,
+            all.operators_allocs as f64 / reps,
+            all.scoring_allocs as f64 / reps,
+            all.captures_allocs as f64 / reps,
+            total as f64 / reps,
+        );
+    }
+    Ok(())
 }
 
 #[cfg(feature = "wasm-reactor")]

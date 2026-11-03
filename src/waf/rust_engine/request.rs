@@ -88,6 +88,10 @@ pub struct RequestData<'a> {
 #[derive(Debug, Clone)]
 pub struct TxState {
     tx: HashMap<String, (String, Vec<u8>)>,
+    /// Recycled `(lower name, original name, value buffer)` triples. Keeping
+    /// them across requests makes repeated `setvar`/anomaly updates
+    /// allocation-free after the first request.
+    spare: Vec<(String, String, Vec<u8>)>,
     pub(crate) request_body_processor_override: Option<String>,
     pub(crate) force_request_body_variable: bool,
     body_processed: bool,
@@ -102,6 +106,7 @@ impl Default for TxState {
     fn default() -> Self {
         Self {
             tx: HashMap::new(),
+            spare: Vec::new(),
             request_body_processor_override: None,
             force_request_body_variable: false,
             body_processed: false,
@@ -110,6 +115,28 @@ impl Default for TxState {
             matched_var_name: Vec::new(),
             matched_vars: Vec::new(),
         }
+    }
+}
+
+impl TxState {
+    /// Prepares a recycled state for a new request while keeping the key and
+    /// value allocations for reuse.
+    pub fn reset(&mut self) {
+        const MAX_SPARE: usize = 256;
+        for (lower, (original, value)) in self.tx.drain() {
+            if self.spare.len() < MAX_SPARE {
+                self.spare.push((lower, original, value));
+            }
+        }
+        self.request_body_processor_override = None;
+        self.force_request_body_variable = false;
+        self.body_processed = false;
+        for slot in &mut self.captures {
+            slot.clear();
+        }
+        self.matched_var.clear();
+        self.matched_var_name.clear();
+        self.matched_vars.clear();
     }
 }
 
@@ -123,6 +150,15 @@ pub struct Collections<'a> {
 impl<'a> Collections<'a> {
     /// Builds the phase-1 collection view from the request line and headers.
     pub fn new(request: &EngineRequest<'a>, budget: &mut Budget) -> Result<Self, EngineError> {
+        Self::new_with_state(request, budget, TxState::default())
+    }
+
+    /// Builds a collection view around a recycled transaction state.
+    pub fn new_with_state(
+        request: &EngineRequest<'a>,
+        budget: &mut Budget,
+        state: TxState,
+    ) -> Result<Self, EngineError> {
         let parsed = ParsedUri::parse(request.uri);
         let mut headers = Vec::with_capacity(request.headers.len());
         let mut reqbody_processor = String::new();
@@ -132,10 +168,12 @@ impl<'a> Collections<'a> {
                 value: Cow::Borrowed(value.as_bytes()),
             });
             if name.eq_ignore_ascii_case("content-type") {
-                let lower = value.to_ascii_lowercase();
-                if lower == "application/x-www-form-urlencoded" {
+                if value.eq_ignore_ascii_case("application/x-www-form-urlencoded") {
                     reqbody_processor = "URLENCODED".to_string();
-                } else if lower.starts_with("multipart/form-data") {
+                } else if value
+                    .get(..19)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("multipart/form-data"))
+                {
                     reqbody_processor = "MULTIPART".to_string();
                 }
             }
@@ -194,10 +232,12 @@ impl<'a> Collections<'a> {
                 + data.request_protocol.len()
                 + data.query_string.len(),
         )?;
-        Ok(Self {
-            data,
-            state: TxState::default(),
-        })
+        Ok(Self { data, state })
+    }
+
+    /// Consumes the collections and returns the recyclable transaction state.
+    pub fn into_state(self) -> TxState {
+        self.state
     }
 
     /// Splits the immutable request data from the mutable transaction state.
@@ -236,26 +276,28 @@ impl<'a> Collections<'a> {
             return Ok(());
         }
 
-        let mut processor = self
-            .state
-            .request_body_processor_override
-            .take()
-            .unwrap_or_else(|| self.data.reqbody_processor.clone());
-        if self.state.force_request_body_variable && processor.is_empty() {
-            processor = "URLENCODED".to_string();
+        let mut processor = self.state.request_body_processor_override.take();
+        if self.state.force_request_body_variable
+            && processor
+                .as_deref()
+                .unwrap_or(&self.data.reqbody_processor)
+                .is_empty()
+        {
+            processor = Some("URLENCODED".to_string());
         }
-        self.data.reqbody_processor = processor.clone();
+        let processor_name = processor.as_deref().unwrap_or(&self.data.reqbody_processor);
+        let urlencoded = processor_name.eq_ignore_ascii_case("urlencoded");
+        let multipart = processor_name.eq_ignore_ascii_case("multipart");
         budget.bytes(body.len())?;
 
-        match processor.to_ascii_lowercase().as_str() {
-            "urlencoded" => {
-                self.data.args_post = parse_query(body, b'&');
-                self.data.request_body = Some(Cow::Borrowed(body));
-            }
-            "multipart" => {
-                self.parse_multipart(body, budget)?;
-            }
-            _ => {}
+        if let Some(processor) = processor {
+            self.data.reqbody_processor = processor;
+        }
+        if urlencoded {
+            self.data.args_post = parse_query(body, b'&');
+            self.data.request_body = Some(Cow::Borrowed(body));
+        } else if multipart {
+            self.parse_multipart(body, budget)?;
         }
         Ok(())
     }
@@ -358,7 +400,7 @@ impl<'a> Collections<'a> {
     }
 
     /// Stores a regex capture in `TX:n` and the capture array.
-    pub fn set_capture(&mut self, index: usize, value: Vec<u8>) {
+    pub fn set_capture(&mut self, index: usize, value: &[u8]) {
         self.state.set_capture(index, value);
     }
 
@@ -725,59 +767,123 @@ impl<'a> RequestData<'a> {
 impl TxState {
     /// Returns the TX value, case-insensitive.
     pub fn tx_get(&self, name: &str) -> Option<&[u8]> {
-        self.tx
-            .get(lower_name(name).as_ref())
-            .map(|(_, value)| value.as_slice())
+        if let Some((_, value)) = self.tx.get(name) {
+            return Some(value.as_slice());
+        }
+        // Names are stored lowercased at parse time; only macro-expanded or
+        // caller-supplied names can arrive with different case.
+        if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            return self
+                .tx
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, (_, value))| value.as_slice());
+        }
+        None
     }
 
-    /// Sets a TX value.
+    /// Sets a TX value from owned bytes.
     pub fn tx_set(&mut self, name: &str, value: Vec<u8>) {
-        let lower = lower_name(name).into_owned();
-        match self.tx.get_mut(&lower) {
-            Some((_, slot)) => *slot = value,
-            None => {
-                self.tx.insert(lower, (name.to_string(), value));
-            }
+        self.tx_set_bytes(name, &value);
+    }
+
+    /// Sets a TX value from a borrowed slice. The slot is reused when the
+    /// variable already exists, so repeated `setvar` actions do not allocate.
+    pub fn tx_set_bytes(&mut self, name: &str, value: &[u8]) {
+        let lower = lower_name(name);
+        if let Some((_, slot)) = self.tx.get_mut(lower.as_ref()) {
+            slot.clear();
+            slot.extend_from_slice(value);
+            return;
         }
+        let (key, original, mut slot) = self.take_slot(lower.as_ref(), name);
+        slot.clear();
+        slot.extend_from_slice(value);
+        self.tx.insert(key, (original, slot));
+    }
+
+    /// Takes a recycled `(key, original name, value)` triple, or allocates one
+    /// on the first request that uses this name.
+    fn take_slot(&mut self, lower: &str, name: &str) -> (String, String, Vec<u8>) {
+        if let Some(index) = self.spare.iter().position(|(key, _, _)| key == lower) {
+            return self.spare.swap_remove(index);
+        }
+        (lower.to_string(), name.to_string(), Vec::new())
     }
 
     /// Adds to a TX value. Numeric values are added numerically; otherwise the
     /// new value is appended, matching ModSecurity's `+` setvar semantics.
     pub fn tx_add(&mut self, name: &str, value: &[u8]) {
-        let existing = self.tx_get(name).map(ToOwned::to_owned);
-        let next = match existing {
-            None => value.to_vec(),
-            Some(current) => {
-                if let (Some(left), Some(right)) = (parse_i64(&current), parse_i64(value)) {
-                    left.saturating_add(right).to_string().into_bytes()
-                } else {
-                    let mut combined = current;
-                    combined.extend_from_slice(value);
-                    combined
-                }
+        let lower = lower_name(name);
+        if let Some((_, slot)) = self.tx.get_mut(lower.as_ref()) {
+            if let (Some(left), Some(right)) = (parse_i64(slot), parse_i64(value)) {
+                slot.clear();
+                push_i64(slot, left.saturating_add(right));
+            } else {
+                slot.extend_from_slice(value);
             }
-        };
-        self.tx_set(name, next);
+            return;
+        }
+        let (key, original, mut slot) = self.take_slot(lower.as_ref(), name);
+        slot.clear();
+        slot.extend_from_slice(value);
+        self.tx.insert(key, (original, slot));
     }
 
     /// Subtracts from a TX value.
     pub fn tx_sub(&mut self, name: &str, value: &[u8]) {
-        let existing = self.tx_get(name).map(ToOwned::to_owned).unwrap_or_default();
-        let left = parse_i64(&existing).unwrap_or(0);
-        let right = parse_i64(value).unwrap_or(0);
-        self.tx_set(name, left.saturating_sub(right).to_string().into_bytes());
+        let lower = lower_name(name);
+        let result = self
+            .tx
+            .get(lower.as_ref())
+            .and_then(|(_, current)| parse_i64(current))
+            .unwrap_or(0)
+            .saturating_sub(parse_i64(value).unwrap_or(0));
+        if let Some((_, slot)) = self.tx.get_mut(lower.as_ref()) {
+            slot.clear();
+            push_i64(slot, result);
+            return;
+        }
+        let (key, original, mut slot) = self.take_slot(lower.as_ref(), name);
+        slot.clear();
+        push_i64(&mut slot, result);
+        self.tx.insert(key, (original, slot));
     }
 
     /// Removes a TX value.
     pub fn tx_remove(&mut self, name: &str) {
-        self.tx.remove(lower_name(name).as_ref());
+        if let Some((lower, entry)) = self.tx.remove_entry(name) {
+            self.recycle(lower, entry);
+            return;
+        }
+        if let Some(key) = self
+            .tx
+            .keys()
+            .find(|key| key.eq_ignore_ascii_case(name))
+            .cloned()
+        {
+            if let Some((lower, entry)) = self.tx.remove_entry(&key) {
+                self.recycle(lower, entry);
+            }
+        }
+    }
+
+    fn recycle(&mut self, lower: String, (original, value): (String, Vec<u8>)) {
+        const MAX_SPARE: usize = 256;
+        if self.spare.len() < MAX_SPARE {
+            self.spare.push((lower, original, value));
+        }
     }
 
     /// Stores a regex capture in `TX:n` and the capture array.
-    pub fn set_capture(&mut self, index: usize, value: Vec<u8>) {
+    pub fn set_capture(&mut self, index: usize, value: &[u8]) {
         if index < self.captures.len() {
-            self.tx_set(&index.to_string(), value.clone());
-            self.captures[index] = value;
+            if let Some(name) = capture_name(index) {
+                self.tx_set_bytes(name, value);
+            }
+            let slot = &mut self.captures[index];
+            slot.clear();
+            slot.extend_from_slice(value);
         }
     }
 
@@ -802,6 +908,29 @@ impl TxState {
         self.matched_var.clear();
         self.matched_var_name.clear();
         self.matched_vars.clear();
+    }
+
+    /// Number of values in `MATCHED_VARS` for the current rule group.
+    pub fn matched_len(&self) -> usize {
+        self.matched_vars.len()
+    }
+
+    /// One `MATCHED_VARS` entry as `(name, value)`.
+    pub fn matched_at(&self, index: usize) -> Option<(&str, &[u8])> {
+        self.matched_vars
+            .get(index)
+            .map(|(name, value)| (name.as_str(), value.as_slice()))
+    }
+
+    /// Borrowed `(name, value)` iterator over active TX entries matching
+    /// `selector`. Used for allocation-free pre-checks.
+    pub(crate) fn tx_entries_matching<'s>(
+        &'s self,
+        selector: &'s Selector,
+    ) -> impl Iterator<Item = (&'s str, &'s [u8])> + 's {
+        self.tx.values().filter_map(move |(original, value)| {
+            selector_matches(selector, original).then_some((original.as_str(), value.as_slice()))
+        })
     }
 
     fn tx_values<'a>(
@@ -861,13 +990,18 @@ fn entry_cache_id(collection: Collection, index: usize) -> u32 {
     let base = match collection {
         Collection::Args | Collection::ArgsGet => 0,
         Collection::ArgsPost => 1_000,
-        Collection::RequestHeaders => 2_000,
-        Collection::RequestCookies => 3_000,
-        Collection::Files => 4_000,
-        Collection::FilesNames => 4_100,
-        Collection::FilesSizes => 4_200,
-        Collection::MultipartPartHeaders => 4_300,
-        _ => 5_000,
+        Collection::ArgsNames => 2_000,
+        Collection::ArgsGetNames => 2_100,
+        Collection::ArgsPostNames => 2_200,
+        Collection::RequestHeaders => 3_000,
+        Collection::RequestHeadersNames => 3_100,
+        Collection::RequestCookies => 4_000,
+        Collection::RequestCookiesNames => 4_100,
+        Collection::Files => 5_000,
+        Collection::FilesNames => 5_100,
+        Collection::FilesSizes => 5_200,
+        Collection::MultipartPartHeaders => 5_300,
+        _ => 6_000,
     };
     base + index as u32
 }
@@ -883,6 +1017,18 @@ fn lower_name(name: &str) -> Cow<'_, str> {
 /// Expands `%{...}` macros against immutable request data and TX state.
 pub fn expand_macros(data: &RequestData<'_>, state: &TxState, template: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(template.len());
+    expand_macros_into(data, state, template, &mut out);
+    out
+}
+
+/// [`expand_macros`] with a caller-owned, reused buffer.
+pub fn expand_macros_into(
+    data: &RequestData<'_>,
+    state: &TxState,
+    template: &str,
+    out: &mut Vec<u8>,
+) {
+    out.clear();
     let bytes = template.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -897,18 +1043,17 @@ pub fn expand_macros(data: &RequestData<'_>, state: &TxState, template: &str) ->
         out.push(bytes[i]);
         i += 1;
     }
-    out
 }
 
 impl MacroResolver for Collections<'_> {
-    fn expand(&self, template: &str) -> Vec<u8> {
-        expand_macros(&self.data, &self.state, template)
+    fn expand_into(&self, template: &str, out: &mut Vec<u8>) {
+        expand_macros_into(&self.data, &self.state, template, out);
     }
 }
 
 impl MacroResolver for (&RequestData<'_>, &TxState) {
-    fn expand(&self, template: &str) -> Vec<u8> {
-        expand_macros(self.0, self.1, template)
+    fn expand_into(&self, template: &str, out: &mut Vec<u8>) {
+        expand_macros_into(self.0, self.1, template, out);
     }
 }
 
@@ -999,6 +1144,32 @@ fn selector_matches(selector: &Selector, key: &str) -> bool {
 
 fn parse_i64(value: &[u8]) -> Option<i64> {
     std::str::from_utf8(value).ok()?.trim().parse().ok()
+}
+
+fn push_i64(out: &mut Vec<u8>, value: i64) {
+    let mut buffer = [0u8; 20];
+    let mut cursor = buffer.len();
+    let negative = value < 0;
+    let mut magnitude = value.unsigned_abs();
+    loop {
+        cursor -= 1;
+        buffer[cursor] = b'0' + (magnitude % 10) as u8;
+        magnitude /= 10;
+        if magnitude == 0 {
+            break;
+        }
+    }
+    if negative {
+        cursor -= 1;
+        buffer[cursor] = b'-';
+    }
+    out.extend_from_slice(&buffer[cursor..]);
+}
+
+/// Static names for the ten capture slots, avoiding `to_string` per match.
+fn capture_name(index: usize) -> Option<&'static str> {
+    const NAMES: [&str; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
+    NAMES.get(index).copied()
 }
 
 fn parse_cookies<'a>(value: &[u8], out: &mut Vec<Entry<'a>>) {
@@ -1394,11 +1565,12 @@ mod tests {
         let mut collections = Collections::new(&request, &mut budget).expect("collections");
         collections.tx_set("foo", b"bar".to_vec());
         collections.record_match("ARGS:x".to_string(), b"value");
-        assert_eq!(collections.expand("%{tx.foo}").as_slice(), b"bar");
-        assert_eq!(collections.expand("%{MATCHED_VAR}").as_slice(), b"value");
-        assert_eq!(
-            collections.expand("%{matched_var_name}").as_slice(),
-            b"ARGS:x"
-        );
+        let mut out = Vec::new();
+        collections.expand_into("%{tx.foo}", &mut out);
+        assert_eq!(out.as_slice(), b"bar");
+        collections.expand_into("%{MATCHED_VAR}", &mut out);
+        assert_eq!(out.as_slice(), b"value");
+        collections.expand_into("%{matched_var_name}", &mut out);
+        assert_eq!(out.as_slice(), b"ARGS:x");
     }
 }

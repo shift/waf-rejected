@@ -361,6 +361,10 @@ pub struct CompiledRule {
     pub metadata: RuleMetadata,
     pub file: String,
     pub line: usize,
+    /// Optional mandatory-literal gate id (see [`super::gate`]). Assigned at
+    /// load time only for positive regex rules the prefilter artifact proves
+    /// gated; `None` means the rule always runs.
+    pub gate: Option<u16>,
 }
 
 impl CompiledRule {
@@ -407,6 +411,9 @@ pub struct Program {
     pub phase2: Vec<ProgramItem>,
     /// Interned transform pipelines. `CompiledRule::pipeline` indexes this.
     pub pipelines: Vec<TransformChain>,
+    /// Per-rule mandatory-literal gates, compiled once at load time and shared
+    /// through an `Arc` when the engine is cloned across worker threads.
+    pub gates: Option<std::sync::Arc<super::gate::GateSet>>,
 }
 
 impl Program {

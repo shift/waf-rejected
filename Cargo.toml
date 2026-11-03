@@ -325,6 +325,10 @@ native-detect = []
 # Non-default until differential parity against Coraza is proven. See
 # docs/suggestions_from_agents/rust-engine.md.
 rust-engine = ["dep:aho-corasick", "native-detect"]
+# Compile-in hot-loop instrumentation for the native Rust engine. Non-default
+# and absent from production builds; exposes `RustEngine::evaluate_profiled`.
+# See docs/suggestions_from_agents/engine-hotloop.md.
+engine-profile = []
 # Optional global allocator selection for benchmarking. Non-default; the
 # system allocator remains the default. See docs/suggestions_from_agents/alloc-tuning.md.
 alloc-mimalloc = ["dep:mimalloc"]

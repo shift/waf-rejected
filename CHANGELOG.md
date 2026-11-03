@@ -4,6 +4,20 @@ All notable changes to WAF-Rejected are documented here.
 
 ## [Unreleased]
 
+### Performance
+
+- Native Rust CRS engine hot-loop optimisation (`rust-engine`, non-default):
+  zero-allocation transform pipelines and cache, per-rule mandatory-literal
+  gates from `rules/crs/prefilter.json` (50 gated rules, 55 % of regex
+  evaluations skipped on a 4 KiB body), borrowed TX/MATCHED_VARS evaluation,
+  reused operator macro/capture buffers, and `MATCHED_VAR*` bookkeeping only
+  for groups that read it. Allocations fall from 1,251–1,785 to ~143 per
+  request; p50 on the shared host drops from 327 µs/869 µs/2.15 ms/3.88 ms
+  (bodyless/1/4/8 KiB) to 145 µs/426 µs/1.13 ms/2.07 ms. The 4 KiB and 8 KiB
+  latency targets are not met; see
+  `docs/suggestions_from_agents/engine-hotloop.md`. Adds the non-default
+  `engine-profile` feature and a `--profile` mode to `rust-engine-parity`.
+
 ### Added
 
 - Compact binary request envelope for the Coraza WASI reactor (default), with

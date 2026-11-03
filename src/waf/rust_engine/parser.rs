@@ -164,6 +164,9 @@ impl Compiler {
             return Err(LoadError::Empty);
         }
         self.program.intern_pipelines();
+        let gates = crate::waf::rust_engine::gate::attach(&mut self.program)
+            .map_err(|detail| LoadError::Parse { line: 0, detail })?;
+        self.program.gates = gates;
         Ok((self.program, self.report))
     }
 
@@ -450,6 +453,7 @@ impl Compiler {
             metadata,
             file: raw.file.clone(),
             line: raw.line,
+            gate: None,
         }))
     }
 
@@ -635,7 +639,15 @@ impl Compiler {
             detail: format!("invalid setvar `{value}`"),
         })?;
         let name = name.trim();
-        let name = name.strip_prefix("tx.").unwrap_or(name).to_string();
+        let name = name.strip_prefix("tx.").unwrap_or(name);
+        // TX variable names are case-insensitive. Intern the common static
+        // form in lowercase so the request path never lowercases a name;
+        // macro-bearing names stay verbatim and are expanded at runtime.
+        let name = if name.contains('%') {
+            name.to_string()
+        } else {
+            name.to_ascii_lowercase()
+        };
         let (op, raw_value) = match raw_value.chars().next() {
             Some('+') => (SetVarOp::Add, &raw_value[1..]),
             Some('-') => (SetVarOp::Sub, &raw_value[1..]),
@@ -795,7 +807,14 @@ impl Compiler {
                     })?;
                     Selector::Regex(regex)
                 }
-                Some(selector) => Selector::Key(selector.to_string()),
+                Some(selector) => {
+                    let selector = if case_sensitive_selector(collection) {
+                        selector.to_string()
+                    } else {
+                        selector.to_ascii_lowercase()
+                    };
+                    Selector::Key(selector)
+                }
             };
             specs.push(VariableSpec {
                 collection,

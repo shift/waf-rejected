@@ -27,15 +27,19 @@
 pub mod budget;
 pub mod engine;
 pub mod error;
+pub mod gate;
 pub mod ir;
 pub mod operators;
 pub mod parser;
+#[cfg(feature = "engine-profile")]
+pub mod profile;
 pub mod request;
 pub mod transforms;
 
 pub use budget::{Budget, Limits};
 pub use engine::{Outcome, RustEngine};
 pub use error::{EngineError, LoadError, UnsupportedConstruct};
+pub use gate::GateSet;
 pub use ir::{CompiledRule, Phase, Program, ProgramItem, RuleGroup};
 pub use parser::{parse_conf_path, parse_conf_str, CompilePolicy, ConstructUse, SupportReport};
 pub use request::{

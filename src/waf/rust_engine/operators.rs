@@ -10,9 +10,10 @@ pub const MAX_CAPTURES: usize = 10;
 
 /// Context used to expand `%{...}` macros in operator arguments.
 pub trait MacroResolver {
-    /// Expands every macro in `template`. Unknown macros expand to an empty
-    /// string, matching Coraza's macro expansion for missing variables.
-    fn expand(&self, template: &str) -> Vec<u8>;
+    /// Expands every macro in `template` into `out`. Unknown macros expand to
+    /// an empty string, matching Coraza's macro expansion for missing
+    /// variables. `out` is reused by the caller, so this does not allocate.
+    fn expand_into(&self, template: &str, out: &mut Vec<u8>);
 }
 
 /// Capture sink filled by a matching operator.
@@ -33,8 +34,11 @@ impl CompiledOperator {
         ctx: &dyn MacroResolver,
         capture: bool,
         captures: &mut Captures,
+        scratch: &mut Vec<u8>,
+        capture_locations: Option<&mut regex::bytes::CaptureLocations>,
     ) -> bool {
-        let matched = self.evaluate_inner(value, ctx, capture, captures);
+        let matched =
+            self.evaluate_inner(value, ctx, capture, captures, scratch, capture_locations);
         if self.negated {
             !matched
         } else {
@@ -48,14 +52,21 @@ impl CompiledOperator {
         ctx: &dyn MacroResolver,
         capture: bool,
         captures: &mut Captures,
+        scratch: &mut Vec<u8>,
+        capture_locations: Option<&mut regex::bytes::CaptureLocations>,
     ) -> bool {
         match &self.kind {
             OperatorKind::Rx(regex) => {
                 if capture {
-                    if let Some(found) = regex.captures(value) {
-                        for (index, group) in found.iter().enumerate().take(MAX_CAPTURES) {
-                            captures[index] =
-                                group.map(|m| m.as_bytes().to_vec()).unwrap_or_default();
+                    let Some(locations) = capture_locations else {
+                        return regex.is_match(value);
+                    };
+                    if regex.captures_read(locations, value).is_some() {
+                        for (index, slot) in captures.iter_mut().enumerate().take(MAX_CAPTURES) {
+                            *slot = locations
+                                .get(index)
+                                .map(|(start, end)| value[start..end].to_vec())
+                                .unwrap_or_default();
                         }
                         true
                     } else {
@@ -78,30 +89,45 @@ impl CompiledOperator {
                 }
             }
             OperatorKind::Contains(arg) => {
-                let needle = ctx.expand(&arg.0);
-                contains(value, &needle)
+                ctx.expand_into(&arg.0, scratch);
+                contains(value, scratch)
             }
             OperatorKind::BeginsWith(arg) => {
-                let prefix = ctx.expand(&arg.0);
-                value.starts_with(&prefix)
+                ctx.expand_into(&arg.0, scratch);
+                value.starts_with(scratch)
             }
             OperatorKind::EndsWith(arg) => {
-                let suffix = ctx.expand(&arg.0);
-                value.ends_with(&suffix)
+                ctx.expand_into(&arg.0, scratch);
+                value.ends_with(scratch)
             }
             OperatorKind::Within(arg) => {
-                let haystack = ctx.expand(&arg.0);
-                contains(&haystack, value)
+                ctx.expand_into(&arg.0, scratch);
+                contains(scratch, value)
             }
             OperatorKind::StrEq(arg) => {
-                let expected = ctx.expand(&arg.0);
-                value == expected.as_slice()
+                ctx.expand_into(&arg.0, scratch);
+                value == scratch.as_slice()
             }
-            OperatorKind::Eq(arg) => numeric(value) == numeric(&ctx.expand(&arg.0)),
-            OperatorKind::Lt(arg) => numeric(value) < numeric(&ctx.expand(&arg.0)),
-            OperatorKind::Gt(arg) => numeric(value) > numeric(&ctx.expand(&arg.0)),
-            OperatorKind::Ge(arg) => numeric(value) >= numeric(&ctx.expand(&arg.0)),
-            OperatorKind::Le(arg) => numeric(value) <= numeric(&ctx.expand(&arg.0)),
+            OperatorKind::Eq(arg) => {
+                ctx.expand_into(&arg.0, scratch);
+                numeric(value) == numeric(scratch)
+            }
+            OperatorKind::Lt(arg) => {
+                ctx.expand_into(&arg.0, scratch);
+                numeric(value) < numeric(scratch)
+            }
+            OperatorKind::Gt(arg) => {
+                ctx.expand_into(&arg.0, scratch);
+                numeric(value) > numeric(scratch)
+            }
+            OperatorKind::Ge(arg) => {
+                ctx.expand_into(&arg.0, scratch);
+                numeric(value) >= numeric(scratch)
+            }
+            OperatorKind::Le(arg) => {
+                ctx.expand_into(&arg.0, scratch);
+                numeric(value) <= numeric(scratch)
+            }
             OperatorKind::ValidateByteRange(valid) => {
                 !value.is_empty() && value.iter().any(|byte| !valid[usize::from(*byte)])
             }
@@ -313,8 +339,9 @@ mod tests {
 
     struct Empty;
     impl MacroResolver for Empty {
-        fn expand(&self, template: &str) -> Vec<u8> {
-            template.as_bytes().to_vec()
+        fn expand_into(&self, template: &str, out: &mut Vec<u8>) {
+            out.clear();
+            out.extend_from_slice(template.as_bytes());
         }
     }
 
@@ -329,7 +356,14 @@ mod tests {
             negated: false,
             argument: "0".to_string(),
         };
-        assert!(operator.evaluate(b"not-a-number", &Empty, false, &mut captures()));
+        assert!(operator.evaluate(
+            b"not-a-number",
+            &Empty,
+            false,
+            &mut captures(),
+            &mut Vec::new(),
+            None,
+        ));
     }
 
     #[test]

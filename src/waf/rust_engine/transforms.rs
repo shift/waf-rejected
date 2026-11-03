@@ -3,12 +3,18 @@
 //! These follow the Coraza/ModSecurity byte-oriented semantics closely enough
 //! for differential testing. Values are byte strings, not UTF-8, because
 //! URL/JS/CSS decoding can produce arbitrary bytes.
+//!
+//! Every transform writes into a caller-owned buffer
+//! ([`Transform::apply_into`]). The engine's transform cache and pipeline
+//! runner reuse two scratch buffers, so a steady-state request performs no
+//! transform allocations. [`Transform::apply`] remains as an allocating
+//! convenience wrapper for tests and one-shot callers.
 
 use super::budget::Budget;
 use super::error::EngineError;
 
 /// A SecLang transform.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Transform {
     None,
     Lowercase,
@@ -73,41 +79,73 @@ impl Transform {
     }
 
     /// Applies the transform, charging the request budget.
+    ///
+    /// Allocating convenience wrapper. The request path uses
+    /// [`Self::apply_into`] with reused buffers.
     pub fn apply(self, input: &[u8], budget: &mut Budget) -> Result<Vec<u8>, EngineError> {
-        let out = match self {
-            Self::None => input.to_vec(),
-            Self::Lowercase => lowercase(input),
-            Self::Uppercase => uppercase(input),
-            Self::UrlDecode => url_decode(input, false),
-            Self::UrlDecodeUni => url_decode(input, true),
-            Self::HtmlEntityDecode => html_entity_decode(input),
-            Self::JsDecode => js_decode(input),
-            Self::CssDecode => css_decode(input),
-            Self::CmdLine => cmd_line(input),
-            Self::ReplaceComments => replace_comments(input),
-            Self::EscapeSeqDecode => escape_seq_decode(input),
-            Self::RemoveWhitespace => remove_whitespace(input),
-            Self::NormalizePath => normalize_path(input),
-            Self::NormalizePathWin => normalize_path_win(input),
-            Self::CompressWhitespace => compress_whitespace(input),
-            Self::RemoveNulls => input.iter().copied().filter(|b| *b != 0).collect(),
-            Self::Base64Decode => base64_decode(input),
+        let mut out = Vec::new();
+        self.apply_into(input, &mut out, budget)?;
+        Ok(out)
+    }
+
+    /// Applies the transform into `out`. `out` is cleared first and keeps its
+    /// capacity across calls.
+    pub fn apply_into(
+        self,
+        input: &[u8],
+        out: &mut Vec<u8>,
+        budget: &mut Budget,
+    ) -> Result<(), EngineError> {
+        out.clear();
+        match self {
+            Self::None => out.extend_from_slice(input),
+            Self::Lowercase => lowercase_into(input, out),
+            Self::Uppercase => uppercase_into(input, out),
+            Self::UrlDecode => url_decode_into(input, false, out),
+            Self::UrlDecodeUni => url_decode_into(input, true, out),
+            Self::HtmlEntityDecode => html_entity_decode_into(input, out),
+            Self::JsDecode => js_decode_into(input, out),
+            Self::CssDecode => css_decode_into(input, out),
+            Self::CmdLine => cmd_line_into(input, out),
+            Self::ReplaceComments => replace_comments_into(input, out),
+            Self::EscapeSeqDecode => escape_seq_decode_into(input, out),
+            Self::RemoveWhitespace => remove_whitespace_into(input, out),
+            Self::NormalizePath => normalize_path_into(input, out),
+            Self::NormalizePathWin => normalize_path_win_into(input, out),
+            Self::CompressWhitespace => compress_whitespace_into(input, out),
+            Self::RemoveNulls => out.extend(input.iter().copied().filter(|b| *b != 0)),
+            Self::Base64Decode => base64_decode_into(input, out),
             Self::Sha1 => {
                 use sha1::{Digest, Sha1};
                 let mut hasher = Sha1::new();
                 hasher.update(input);
-                hasher.finalize().to_vec()
+                out.extend_from_slice(&hasher.finalize());
             }
-            Self::HexEncode => hex::encode(input).into_bytes(),
-            Self::RemoveCommentsChar => remove_comments_char(input),
-            Self::Length => input.len().to_string().into_bytes(),
-            Self::Utf8ToUnicode => utf8_to_unicode(input),
-            Self::Trim => trim(input),
-            Self::TrimLeft => trim_left(input),
-            Self::TrimRight => trim_right(input),
-        };
+            Self::HexEncode => hex_encode_into(input, out),
+            Self::RemoveCommentsChar => remove_comments_char_into(input, out),
+            Self::Length => push_u64(out, input.len() as u64),
+            Self::Utf8ToUnicode => utf8_to_unicode_into(input, out),
+            Self::Trim => {
+                let (start, end) = trim_bounds(input);
+                out.extend_from_slice(&input[start..end]);
+            }
+            Self::TrimLeft => {
+                let start = input
+                    .iter()
+                    .position(|byte| !is_latin_space(*byte))
+                    .unwrap_or(input.len());
+                out.extend_from_slice(&input[start..]);
+            }
+            Self::TrimRight => {
+                let end = input
+                    .iter()
+                    .rposition(|byte| !is_latin_space(*byte))
+                    .map_or(0, |pos| pos + 1);
+                out.extend_from_slice(&input[..end]);
+            }
+        }
         budget.bytes(out.len())?;
-        Ok(out)
+        Ok(())
     }
 }
 
@@ -128,22 +166,56 @@ fn x2c(bytes: &[u8]) -> u8 {
     (hex_value(bytes[0]) << 4) | hex_value(bytes[1])
 }
 
-fn lowercase(input: &[u8]) -> Vec<u8> {
+fn lowercase_into(input: &[u8], out: &mut Vec<u8>) {
+    out.reserve(input.len());
     if input.is_ascii() {
-        return input.to_ascii_lowercase();
+        out.extend(input.iter().map(u8::to_ascii_lowercase));
+        return;
     }
-    String::from_utf8_lossy(input).to_lowercase().into_bytes()
+    let text = String::from_utf8_lossy(input);
+    for ch in text.chars() {
+        for lower in ch.to_lowercase() {
+            push_char(out, lower);
+        }
+    }
 }
 
-fn uppercase(input: &[u8]) -> Vec<u8> {
+fn uppercase_into(input: &[u8], out: &mut Vec<u8>) {
+    out.reserve(input.len());
     if input.is_ascii() {
-        return input.to_ascii_uppercase();
+        out.extend(input.iter().map(u8::to_ascii_uppercase));
+        return;
     }
-    String::from_utf8_lossy(input).to_uppercase().into_bytes()
+    let text = String::from_utf8_lossy(input);
+    for ch in text.chars() {
+        for upper in ch.to_uppercase() {
+            push_char(out, upper);
+        }
+    }
 }
 
-fn url_decode(input: &[u8], uni: bool) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len());
+fn push_char(out: &mut Vec<u8>, ch: char) {
+    let mut buffer = [0u8; 4];
+    out.extend_from_slice(ch.encode_utf8(&mut buffer).as_bytes());
+}
+
+fn push_u64(out: &mut Vec<u8>, value: u64) {
+    let mut buffer = [0u8; 20];
+    let mut cursor = buffer.len();
+    let mut value = value;
+    loop {
+        cursor -= 1;
+        buffer[cursor] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(&buffer[cursor..]);
+}
+
+fn url_decode_into(input: &[u8], uni: bool, out: &mut Vec<u8>) {
+    out.reserve(input.len());
     let mut i = 0;
     while i < input.len() {
         let byte = input[i];
@@ -187,11 +259,10 @@ fn url_decode(input: &[u8], uni: bool) -> Vec<u8> {
         }
         i += 1;
     }
-    out
 }
 
-fn html_entity_decode(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len());
+fn html_entity_decode_into(input: &[u8], out: &mut Vec<u8>) {
+    out.reserve(input.len());
     let mut i = 0;
     while i < input.len() {
         if input[i] != b'&' {
@@ -210,20 +281,19 @@ fn html_entity_decode(input: &[u8]) -> Vec<u8> {
             continue;
         }
         let entity = &input[start + 1..j];
-        if let Some(decoded) = decode_entity(entity) {
-            out.extend_from_slice(&decoded);
+        if write_entity(entity, out) {
             i = j + 1;
         } else {
             out.push(b'&');
             i += 1;
         }
     }
-    out
 }
 
-fn decode_entity(entity: &[u8]) -> Option<Vec<u8>> {
+/// Decodes one entity name/value and appends it to `out`.
+fn write_entity(entity: &[u8], out: &mut Vec<u8>) -> bool {
     if entity.is_empty() {
-        return None;
+        return false;
     }
     if entity[0] == b'#' {
         let (digits, radix) = if entity.len() > 1 && (entity[1] | 0x20) == b'x' {
@@ -232,24 +302,29 @@ fn decode_entity(entity: &[u8]) -> Option<Vec<u8>> {
             (&entity[1..], 10)
         };
         if digits.is_empty() {
-            return None;
+            return false;
         }
         let mut value: u32 = 0;
         for digit in digits {
             let d = match radix {
                 16 if is_hex(*digit) => hex_value(*digit),
                 10 if digit.is_ascii_digit() => digit - b'0',
-                _ => return None,
+                _ => return false,
             };
             value = value.saturating_mul(radix).saturating_add(u32::from(d));
         }
         if value == 0 || value > 0x10ffff {
-            return None;
+            return false;
         }
-        let ch = char::from_u32(value)?;
-        return Some(ch.to_string().into_bytes());
+        let Some(ch) = char::from_u32(value) else {
+            return false;
+        };
+        push_char(out, ch);
+        return true;
     }
-    let name = std::str::from_utf8(entity).ok()?;
+    let Ok(name) = std::str::from_utf8(entity) else {
+        return false;
+    };
     let value = match name {
         "amp" => "&",
         "lt" => "<",
@@ -295,13 +370,14 @@ fn decode_entity(entity: &[u8]) -> Option<Vec<u8>> {
         "trade" => "\u{2122}",
         "reg" => "\u{ae}",
         "copy" => "\u{a9}",
-        _ => return None,
+        _ => return false,
     };
-    Some(value.as_bytes().to_vec())
+    out.extend_from_slice(value.as_bytes());
+    true
 }
 
-fn js_decode(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len());
+fn js_decode_into(input: &[u8], out: &mut Vec<u8>) {
+    out.reserve(input.len());
     let mut i = 0;
     while i < input.len() {
         if input[i] != b'\\' || i + 1 >= input.len() {
@@ -364,11 +440,10 @@ fn js_decode(input: &[u8]) -> Vec<u8> {
         out.push(escaped);
         i += 2;
     }
-    out
 }
 
-fn css_decode(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len());
+fn css_decode_into(input: &[u8], out: &mut Vec<u8>) {
+    out.reserve(input.len());
     let mut i = 0;
     while i < input.len() {
         if input[i] != b'\\' {
@@ -433,11 +508,10 @@ fn css_decode(input: &[u8]) -> Vec<u8> {
             i += 1;
         }
     }
-    out
 }
 
-fn cmd_line(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len());
+fn cmd_line_into(input: &[u8], out: &mut Vec<u8>) {
+    out.reserve(input.len());
     let mut space = false;
     for &byte in input {
         match byte {
@@ -461,11 +535,10 @@ fn cmd_line(input: &[u8]) -> Vec<u8> {
             }
         }
     }
-    out
 }
 
-fn replace_comments(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len());
+fn replace_comments_into(input: &[u8], out: &mut Vec<u8>) {
+    out.reserve(input.len());
     let mut i = 0;
     let mut in_comment = false;
     while i < input.len() {
@@ -488,11 +561,10 @@ fn replace_comments(input: &[u8]) -> Vec<u8> {
     if in_comment {
         out.push(b' ');
     }
-    out
 }
 
-fn escape_seq_decode(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len());
+fn escape_seq_decode_into(input: &[u8], out: &mut Vec<u8>) {
+    out.reserve(input.len());
     let mut i = 0;
     while i < input.len() {
         if input[i] != b'\\' || i + 1 >= input.len() {
@@ -545,19 +617,15 @@ fn escape_seq_decode(input: &[u8]) -> Vec<u8> {
         out.push(next);
         i += 2;
     }
-    out
 }
 
-fn remove_whitespace(input: &[u8]) -> Vec<u8> {
-    input
-        .iter()
-        .copied()
-        .filter(|byte| !is_latin_space(*byte))
-        .collect()
+fn remove_whitespace_into(input: &[u8], out: &mut Vec<u8>) {
+    out.reserve(input.len());
+    out.extend(input.iter().copied().filter(|byte| !is_latin_space(*byte)));
 }
 
-fn compress_whitespace(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len());
+fn compress_whitespace_into(input: &[u8], out: &mut Vec<u8>) {
+    out.reserve(input.len());
     let mut in_space = false;
     for &byte in input {
         if is_latin_space(byte) {
@@ -570,7 +638,6 @@ fn compress_whitespace(input: &[u8]) -> Vec<u8> {
             in_space = false;
         }
     }
-    out
 }
 
 fn is_latin_space(byte: u8) -> bool {
@@ -580,60 +647,133 @@ fn is_latin_space(byte: u8) -> bool {
     )
 }
 
-fn normalize_path(input: &[u8]) -> Vec<u8> {
+fn normalize_path_into(input: &[u8], out: &mut Vec<u8>) {
     if input.is_empty() {
-        return Vec::new();
+        return;
     }
-    let text = String::from_utf8_lossy(input);
-    let clean = clean_path(&text);
-    if clean == "." {
-        return Vec::new();
+    clean_path_into(input, false, out);
+    if out.as_slice() == b"." {
+        out.clear();
+        return;
     }
-    let mut out = clean.into_bytes();
     if input.last() == Some(&b'/') && out.last() != Some(&b'/') {
         out.push(b'/');
     }
-    out
 }
 
-fn normalize_path_win(input: &[u8]) -> Vec<u8> {
-    let replaced: Vec<u8> = input
-        .iter()
-        .map(|byte| if *byte == b'\\' { b'/' } else { *byte })
-        .collect();
-    normalize_path(&replaced)
+fn normalize_path_win_into(input: &[u8], out: &mut Vec<u8>) {
+    if input.is_empty() {
+        return;
+    }
+    clean_path_into(input, true, out);
+    if out.as_slice() == b"." {
+        out.clear();
+        return;
+    }
+    if matches!(input.last(), Some(b'/') | Some(b'\\')) && out.last() != Some(&b'/') {
+        out.push(b'/');
+    }
 }
 
-/// A small `path.Clean` equivalent for the byte strings seen in CRS rules.
-fn clean_path(input: &str) -> String {
-    let rooted = input.starts_with('/');
-    let mut parts: Vec<&str> = Vec::new();
-    for part in input.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                if parts.last().is_some_and(|last| *last != "..") {
-                    parts.pop();
+/// A zero-allocation `path.Clean` equivalent for the byte strings seen in CRS
+/// rules. `win` treats `\` as a path separator as well as `/`.
+fn clean_path_into(input: &[u8], win: bool, out: &mut Vec<u8>) {
+    let is_sep = |byte: u8| byte == b'/' || (win && byte == b'\\');
+    let rooted = input.first().is_some_and(|byte| is_sep(*byte));
+    let rooted_len = usize::from(rooted);
+    let mut starts = [0usize; 32];
+    let mut depth = 0usize;
+    let mut spilled: Option<Vec<usize>> = None;
+
+    if rooted {
+        out.push(b'/');
+    }
+    let mut i = 0;
+    while i < input.len() {
+        while i < input.len() && is_sep(input[i]) {
+            i += 1;
+        }
+        let start = i;
+        while i < input.len() && !is_sep(input[i]) {
+            i += 1;
+        }
+        let segment = &input[start..i];
+        match segment {
+            b"" | b"." => {}
+            b".." => {
+                let last = if let Some(stack) = &spilled {
+                    stack.last().copied()
+                } else if depth > 0 {
+                    Some(starts[depth - 1])
+                } else {
+                    None
+                };
+                if let Some(position) = last {
+                    out.truncate(position);
+                    if position > rooted_len && out.last() == Some(&b'/') {
+                        out.pop();
+                    }
+                    depth -= 1;
+                    if let Some(stack) = &mut spilled {
+                        stack.pop();
+                    }
                 } else if !rooted {
-                    parts.push("..");
+                    let position = next_segment_start(out, rooted_len);
+                    push_path_segment(out, b"..", rooted_len);
+                    record_segment(&mut starts, &mut spilled, &mut depth, position);
                 }
             }
-            other => parts.push(other),
+            other => {
+                let position = next_segment_start(out, rooted_len);
+                push_path_segment(out, other, rooted_len);
+                record_segment(&mut starts, &mut spilled, &mut depth, position);
+            }
         }
     }
-    let mut out = String::new();
-    if rooted {
-        out.push('/');
-    }
-    out.push_str(&parts.join("/"));
     if out.is_empty() {
-        out.push('.');
+        if rooted {
+            out.push(b'/');
+        } else {
+            out.push(b'.');
+        }
     }
-    out
 }
 
-fn base64_decode(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+fn push_path_segment(out: &mut Vec<u8>, segment: &[u8], rooted_len: usize) {
+    if out.len() > rooted_len && out.last() != Some(&b'/') {
+        out.push(b'/');
+    }
+    out.extend_from_slice(segment);
+}
+
+fn next_segment_start(out: &[u8], rooted_len: usize) -> usize {
+    if out.len() > rooted_len && out.last() != Some(&b'/') {
+        out.len() + 1
+    } else {
+        out.len()
+    }
+}
+
+fn record_segment(
+    starts: &mut [usize; 32],
+    spilled: &mut Option<Vec<usize>>,
+    depth: &mut usize,
+    position: usize,
+) {
+    if let Some(stack) = spilled {
+        stack.push(position);
+    } else if *depth < starts.len() {
+        starts[*depth] = position;
+    } else {
+        let mut stack: Vec<usize> = starts.to_vec();
+        stack.push(position);
+        *spilled = Some(stack);
+    }
+    *depth += 1;
+}
+
+fn base64_decode_into(input: &[u8], out: &mut Vec<u8>) {
+    out.reserve(input.len() * 3 / 4);
     let mut acc: u32 = 0;
     let mut count = 0;
     for &byte in input {
@@ -669,11 +809,19 @@ fn base64_decode(input: &[u8]) -> Vec<u8> {
         out.push((acc >> 16) as u8);
         out.push((acc >> 8) as u8);
     }
-    out
 }
 
-fn remove_comments_char(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len());
+fn hex_encode_into(input: &[u8], out: &mut Vec<u8>) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.reserve(input.len() * 2);
+    for &byte in input {
+        out.push(HEX[usize::from(byte >> 4)]);
+        out.push(HEX[usize::from(byte & 0x0f)]);
+    }
+}
+
+fn remove_comments_char_into(input: &[u8], out: &mut Vec<u8>) {
+    out.reserve(input.len());
     let mut i = 0;
     while i < input.len() {
         if input[i] == b'/' && i + 1 < input.len() && input[i + 1] == b'*' {
@@ -702,11 +850,10 @@ fn remove_comments_char(input: &[u8]) -> Vec<u8> {
             i += 1;
         }
     }
-    out
 }
 
-fn utf8_to_unicode(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len());
+fn utf8_to_unicode_into(input: &[u8], out: &mut Vec<u8>) {
+    out.reserve(input.len());
     let mut i = 0;
     while i < input.len() {
         let byte = input[i];
@@ -733,7 +880,16 @@ fn utf8_to_unicode(input: &[u8]) -> Vec<u8> {
         let slice = &input[i..i + width];
         if let Ok(text) = std::str::from_utf8(slice) {
             if let Some(ch) = text.chars().next() {
-                out.extend_from_slice(format!("%u{:04x}", ch as u32).as_bytes());
+                out.extend_from_slice(b"%u");
+                let code = ch as u32;
+                for shift in [12u32, 8, 4, 0] {
+                    let digit = ((code >> shift) & 0xf) as u8;
+                    out.push(if digit < 10 {
+                        b'0' + digit
+                    } else {
+                        b'a' + digit - 10
+                    });
+                }
                 i += width;
                 continue;
             }
@@ -741,10 +897,9 @@ fn utf8_to_unicode(input: &[u8]) -> Vec<u8> {
         out.push(byte);
         i += 1;
     }
-    out
 }
 
-fn trim(input: &[u8]) -> Vec<u8> {
+fn trim_bounds(input: &[u8]) -> (usize, usize) {
     let start = input
         .iter()
         .position(|byte| !is_latin_space(*byte))
@@ -753,23 +908,7 @@ fn trim(input: &[u8]) -> Vec<u8> {
         .iter()
         .rposition(|byte| !is_latin_space(*byte))
         .map_or(start, |pos| pos + 1);
-    input[start..end].to_vec()
-}
-
-fn trim_left(input: &[u8]) -> Vec<u8> {
-    let start = input
-        .iter()
-        .position(|byte| !is_latin_space(*byte))
-        .unwrap_or(input.len());
-    input[start..].to_vec()
-}
-
-fn trim_right(input: &[u8]) -> Vec<u8> {
-    let end = input
-        .iter()
-        .rposition(|byte| !is_latin_space(*byte))
-        .map_or(0, |pos| pos + 1);
-    input[..end].to_vec()
+    (start, end)
 }
 
 #[cfg(test)]
@@ -811,10 +950,24 @@ mod tests {
     fn normalize_path_collapses_segments() {
         assert_eq!(apply(Transform::NormalizePath, b"/a/./b/../c/"), b"/a/c/");
         assert_eq!(apply(Transform::NormalizePathWin, b"\\a\\..\\b"), b"/b");
+        assert_eq!(apply(Transform::NormalizePath, b".."), b"..");
+        assert_eq!(apply(Transform::NormalizePath, b"a/../../b"), b"../b");
     }
 
     #[test]
     fn cmd_line_matches_modsecurity() {
         assert_eq!(apply(Transform::CmdLine, b"a ; b/c"), b"a b/c");
+    }
+
+    #[test]
+    fn uppercase_and_lowercase_are_unicode_aware() {
+        assert_eq!(
+            apply(Transform::Lowercase, "ÄÖÜ".as_bytes()),
+            "äöü".as_bytes()
+        );
+        assert_eq!(
+            apply(Transform::Uppercase, "äöü".as_bytes()),
+            "ÄÖÜ".as_bytes()
+        );
     }
 }

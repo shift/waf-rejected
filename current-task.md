@@ -938,3 +938,31 @@ Branch `feat/engine-integration` (not pushed, not merged, defaults unchanged).
       `docs/suggestions_from_agents/engine-integration.md`.
 - [ ] Remaining for default: JSON/XML processors, XPath, URI parity, response
       phases, per-rule literal prefilter, allocation reduction.
+
+---
+
+# perf/engine-hotloop: native engine hot loop
+
+Branch `perf/engine-hotloop` (not pushed, not merged, defaults unchanged).
+
+## Plan
+
+- [x] Add `engine-profile` instrumentation and a parity `--profile` mode.
+- [x] Zero-allocation transform pipeline + generational transform cache.
+- [x] Compile `rules/crs/prefilter.json` into per-rule Aho-Corasick gates.
+- [x] Borrowed TX / MATCHED_VARS evaluation and reused macro/capture buffers.
+- [x] Gate `MATCHED_VAR*` bookkeeping on groups that read it.
+- [x] Verify corpus decisions unchanged; fmt, tests, clippy.
+- [ ] 4 KiB < 0.8 ms / 8 KiB < 1.5 ms targets (missed: 1.13 ms / 2.07 ms).
+- [ ] < 100 allocations/request (missed: ~143; baseline 1,251–1,785).
+
+## Results
+
+- Allocations: 1,251–1,785 → ~143/request.
+- p50: bodyless 327→146 µs, 1 KiB 869→450 µs, 4 KiB 2.15→1.13 ms,
+  8 KiB 3.88→2.07 ms (shared host, load ≈1.9).
+- Gates: 50 rules, 99/181 regex evaluations skipped at 4 KiB (55 %).
+- Parity: decisions byte-for-byte identical to baseline on all 2,112 cases;
+  baseline Coraza parity 2,110/2,112 with 0 native-only FNs preserved.
+
+See `docs/suggestions_from_agents/engine-hotloop.md`.
