@@ -1623,7 +1623,7 @@ mod tests {
     fn scans_content_is_false_when_content_scan_or_scanner_is_absent() {
         let mut config = WafGrpcConfig::default();
         let scanner = FakeScanner::new(false);
-        let (_dir, inspector) = content_inspector(
+        let (_dir, _inspector) = content_inspector(
             &mut config,
             vec![request_field("name", 1, "string", false)],
             Arc::clone(&scanner),

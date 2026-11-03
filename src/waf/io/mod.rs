@@ -7,6 +7,8 @@
 pub mod backend;
 pub mod network;
 pub mod traits;
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+pub mod uring;
 
 pub use backend::*;
 pub use network::*;
@@ -72,5 +74,30 @@ pub fn create_io_handler(config: &IoConfig) -> Result<Box<dyn IoHandler>> {
         IoBackend::Standard => Ok(Box::new(backend::StandardIoHandler::new(config.clone())?)),
         #[cfg(feature = "io-uring")]
         IoBackend::IoUring => Ok(Box::new(backend::IoUringHandler::new(config.clone())?)),
+    }
+}
+
+/// Create a network I/O handler, falling back to the tokio path when the
+/// requested io_uring backend cannot be initialised (old kernel, seccomp, or
+/// missing privileges). This never panics.
+pub fn create_network_io_handler(config: &IoConfig) -> Result<Box<dyn NetworkIo>> {
+    match config.backend {
+        IoBackend::Standard => Ok(Box::new(network::NetworkIoHandler::new(config.clone()))),
+        #[cfg(all(feature = "io-uring", target_os = "linux"))]
+        IoBackend::IoUring => match network::IoUringNetworkHandler::new(config.clone()) {
+            Ok(handler) => Ok(Box::new(handler)),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "io_uring unavailable; falling back to tokio network I/O"
+                );
+                Ok(Box::new(network::NetworkIoHandler::new(config.clone())))
+            }
+        },
+        #[cfg(all(feature = "io-uring", not(target_os = "linux")))]
+        IoBackend::IoUring => {
+            tracing::warn!("io_uring is Linux-only; falling back to tokio network I/O");
+            Ok(Box::new(network::NetworkIoHandler::new(config.clone())))
+        }
     }
 }

@@ -94,9 +94,18 @@ required-features = ["rust-engine"]
 name = "bench-subms"
 path = "src/bin/bench_subms.rs"
 
+# Loopback echo benchmark comparing the default tokio path against the
+# io_uring fd path. Requires the non-default feature.
+[[bin]]
+name = "io-uring-network-bench"
+path = "src/bin/io_uring_network_bench.rs"
+required-features = ["io-uring"]
+
 [dependencies]
 # Async runtime and HTTP
 tokio = { version = "1.0", features = ["full"] }
+# Raw syscalls for the optional io_uring network backend.
+libc = "0.2"
 hyper = { version = "1.0", features = ["full", "server", "client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"

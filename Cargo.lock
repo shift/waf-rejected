@@ -4178,6 +4178,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "ipnetwork 0.20.0",
+ "libc",
  "maxminddb",
  "memchr",
  "mimalloc",

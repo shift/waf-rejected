@@ -9,6 +9,15 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+use super::uring::{
+    Uring, IORING_ACCEPT_MULTISHOT, IORING_OP_ACCEPT, IORING_OP_READ, IORING_OP_WRITE,
+};
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+use std::os::unix::io::RawFd;
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+use tokio::sync::{mpsc, oneshot};
+
 /// High-performance network I/O handler with zero-copy optimizations
 #[derive(Clone)]
 pub struct NetworkIoHandler {
@@ -355,6 +364,465 @@ impl NetworkStatsTracker {
             bidirectional_copy_ops: self.bidirectional_copy_ops.load(Ordering::Relaxed),
             bytes_forwarded: self.bytes_forwarded.load(Ordering::Relaxed),
             forward_ops: self.forward_ops.load(Ordering::Relaxed),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// io_uring network backend
+// ---------------------------------------------------------------------------
+//
+// The `NetworkIo` trait is stream-oriented, which cannot expose the raw fd that
+// io_uring needs. This handler therefore provides a real fd-based fast path
+// (`read_fd`/`write_fd`/`accept_fd` + multishot accept) for the connection
+// layer, and implements the stream trait by delegating to the tokio fallback so
+// existing callers keep working unchanged. When kernel setup fails, `new`
+// returns an error and callers fall back to `NetworkIoHandler`.
+
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+enum UringCommand {
+    Read {
+        fd: RawFd,
+        len: usize,
+        reply: oneshot::Sender<Result<(Vec<u8>, usize)>>,
+    },
+    Write {
+        fd: RawFd,
+        buf: Vec<u8>,
+        reply: oneshot::Sender<Result<usize>>,
+    },
+    Accept {
+        fd: RawFd,
+        reply: oneshot::Sender<Result<RawFd>>,
+    },
+    Shutdown {
+        reply: oneshot::Sender<()>,
+    },
+}
+
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+fn uring_submit_wait<F>(ring: &Uring, mut fill: F) -> Result<i32>
+where
+    F: FnMut(&mut super::uring::io_uring_sqe),
+{
+    if !ring.push(&mut fill) {
+        // Queue is bounded; drain one completion then retry once.
+        let _ = ring.submit(1)?;
+        if !ring.push(&mut fill) {
+            anyhow::bail!("io_uring submission queue is full");
+        }
+    }
+    ring.submit(1)?;
+    loop {
+        if let Some(cqe) = ring.peek_cqe() {
+            ring.cqe_seen();
+            if cqe.res < 0 {
+                return Err(std::io::Error::from_raw_os_error(-cqe.res).into());
+            }
+            return Ok(cqe.res);
+        }
+        ring.submit(1)?;
+    }
+}
+
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+fn run_uring_loop(ring: Uring, mut rx: mpsc::Receiver<UringCommand>) {
+    while let Some(cmd) = rx.blocking_recv() {
+        match cmd {
+            UringCommand::Read { fd, len, reply } => {
+                let mut buf = vec![0u8; len];
+                let ptr = buf.as_mut_ptr() as u64;
+                let res = uring_submit_wait(&ring, |sqe| {
+                    sqe.opcode = IORING_OP_READ;
+                    sqe.fd = fd;
+                    sqe.addr = ptr;
+                    sqe.len = len as u32;
+                });
+                match res {
+                    Ok(n) => {
+                        let n = n as usize;
+                        buf.truncate(n);
+                        let _ = reply.send(Ok((buf, n)));
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                }
+            }
+            UringCommand::Write { fd, buf, reply } => {
+                let ptr = buf.as_ptr() as u64;
+                let len = buf.len() as u32;
+                let res = uring_submit_wait(&ring, |sqe| {
+                    sqe.opcode = IORING_OP_WRITE;
+                    sqe.fd = fd;
+                    sqe.addr = ptr;
+                    sqe.len = len;
+                });
+                match res {
+                    Ok(n) => {
+                        let _ = reply.send(Ok(n as usize));
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                }
+            }
+            UringCommand::Accept { fd, reply } => {
+                let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+                let mut addr_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+                let addr_ptr = &mut addr as *mut _ as u64;
+                let len_ptr = &mut addr_len as *mut _ as u64;
+                let res = uring_submit_wait(&ring, |sqe| {
+                    sqe.opcode = IORING_OP_ACCEPT;
+                    sqe.fd = fd;
+                    sqe.addr = addr_ptr;
+                    // `off`/`addr2` share storage; accept uses it as socklen ptr.
+                    sqe.off = len_ptr;
+                });
+                match res {
+                    Ok(n) => {
+                        let _ = reply.send(Ok(n as RawFd));
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                }
+            }
+            UringCommand::Shutdown { reply } => {
+                let _ = reply.send(());
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+#[derive(Clone)]
+pub struct IoUringNetworkHandler {
+    config: IoConfig,
+    stats: Arc<NetworkStatsTracker>,
+    fallback: NetworkIoHandler,
+    tx: mpsc::Sender<UringCommand>,
+}
+
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+impl IoUringNetworkHandler {
+    /// Build a real io_uring handler. Returns an error (never panics) when the
+    /// kernel or seccomp policy does not allow io_uring; callers should then
+    /// use `NetworkIoHandler`.
+    pub fn new(config: IoConfig) -> Result<Self> {
+        let entries = (config.concurrency.max(64) * 2) as u32;
+        let ring =
+            Uring::new(entries).map_err(|e| anyhow::anyhow!("io_uring setup failed: {e}"))?;
+        let (tx, rx) = mpsc::channel((config.concurrency.max(64) * 4).max(256));
+        std::thread::Builder::new()
+            .name("io-uring-loop".into())
+            .spawn(move || run_uring_loop(ring, rx))
+            .map_err(|e| anyhow::anyhow!("failed to spawn io_uring loop: {e}"))?;
+        tracing::info!(
+            entries,
+            concurrency = config.concurrency,
+            "io_uring network backend initialised"
+        );
+        Ok(Self {
+            stats: Arc::new(NetworkStatsTracker::new()),
+            fallback: NetworkIoHandler::new(config.clone()),
+            config,
+            tx,
+        })
+    }
+
+    pub fn get_stats(&self) -> NetworkIoStats {
+        self.stats.get_stats()
+    }
+
+    pub fn allocate_buffer(&self) -> BytesMut {
+        BytesMut::with_capacity(self.config.buffer_size)
+    }
+
+    /// Read up to `len` bytes from `fd` with a registered-buffer-capable SQE.
+    pub async fn read_fd(&self, fd: RawFd, len: usize) -> Result<(Vec<u8>, usize)> {
+        let start = Instant::now();
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(UringCommand::Read { fd, len, reply })
+            .await
+            .map_err(|_| anyhow::anyhow!("io_uring loop unavailable"))?;
+        let res = rx
+            .await
+            .map_err(|_| anyhow::anyhow!("io_uring loop dropped"))??;
+        let latency = start.elapsed().as_micros() as u64;
+        self.stats.record_read(res.1 as u64, latency);
+        if self.config.enable_zero_copy {
+            self.stats.record_zero_copy();
+        }
+        Ok(res)
+    }
+
+    /// Write the whole buffer to `fd`, handling partial writes.
+    pub async fn write_fd(&self, fd: RawFd, buf: &[u8]) -> Result<()> {
+        let start = Instant::now();
+        let mut written = 0usize;
+        while written < buf.len() {
+            let chunk = buf[written..].to_vec();
+            let (reply, rx) = oneshot::channel();
+            self.tx
+                .send(UringCommand::Write {
+                    fd,
+                    buf: chunk,
+                    reply,
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("io_uring loop unavailable"))?;
+            let n = rx
+                .await
+                .map_err(|_| anyhow::anyhow!("io_uring loop dropped"))??;
+            if n == 0 {
+                anyhow::bail!("io_uring write returned 0 before completing");
+            }
+            written += n;
+        }
+        let latency = start.elapsed().as_micros() as u64;
+        self.stats.record_write(buf.len() as u64, latency);
+        if self.config.enable_zero_copy {
+            self.stats.record_zero_copy();
+        }
+        Ok(())
+    }
+
+    /// Accept a single connection from `listener_fd`.
+    pub async fn accept_fd(&self, listener_fd: RawFd) -> Result<RawFd> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(UringCommand::Accept {
+                fd: listener_fd,
+                reply,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("io_uring loop unavailable"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("io_uring loop dropped"))?
+    }
+
+    /// Spawn a dedicated multishot-accept thread. Each accepted fd is sent on
+    /// the returned channel until the handler is dropped.
+    pub fn start_multishot_accept(
+        &self,
+        listener_fd: RawFd,
+    ) -> Result<(mpsc::Receiver<RawFd>, std::thread::JoinHandle<()>)> {
+        let ring = Uring::new(64)?;
+        let (tx, rx) = mpsc::channel(256);
+        let handle = std::thread::Builder::new()
+            .name("io-uring-accept".into())
+            .spawn(move || {
+                // Multishot accept does not fill sockaddr; addr/addr2 must be
+                // NULL. Submit one SQE; the kernel keeps it alive and posts a
+                // CQE per connection. We only reap completions after.
+                let ok = ring.push(|sqe| {
+                    sqe.opcode = IORING_OP_ACCEPT;
+                    sqe.fd = listener_fd;
+                    sqe.addr = 0;
+                    sqe.off = 0;
+                    // Kernel 6.18 stores accept flags in sqe->ioprio.
+                    sqe.ioprio = IORING_ACCEPT_MULTISHOT as u16;
+                });
+                if !ok {
+                    eprintln!("multishot accept: submission queue push failed");
+                    return;
+                }
+                if let Err(e) = ring.submit(1) {
+                    eprintln!("multishot accept: submit failed: {e}");
+                    return;
+                }
+                loop {
+                    let mut stop = false;
+                    while let Some(cqe) = ring.peek_cqe() {
+                        ring.cqe_seen();
+                        if cqe.res < 0 {
+                            let err = std::io::Error::from_raw_os_error(-cqe.res);
+                            if err.kind() == std::io::ErrorKind::WouldBlock {
+                                continue;
+                            }
+                            eprintln!("multishot accept: completion error: {err}");
+                            stop = true;
+                            break;
+                        }
+                        if tx.blocking_send(cqe.res).is_err() {
+                            stop = true;
+                            break;
+                        }
+                    }
+                    if stop {
+                        break;
+                    }
+                    if ring.submit(1).is_err() {
+                        break;
+                    }
+                }
+            })
+            .map_err(|e| anyhow::anyhow!("failed to spawn accept loop: {e}"))?;
+        Ok((rx, handle))
+    }
+
+    /// Ask the background ring thread to stop. Dropping the handler also stops
+    /// it via the channel closing.
+    pub async fn shutdown(&self) {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.send(UringCommand::Shutdown { reply }).await.is_ok() {
+            let _ = rx.await;
+        }
+    }
+}
+
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+#[async_trait]
+impl NetworkIo for IoUringNetworkHandler {
+    async fn read_stream(&self, stream: &mut (dyn AsyncRead + Unpin + Send)) -> Result<Bytes> {
+        // Stream objects hide their fd; use the tokio fallback for the trait.
+        self.fallback.read_stream(stream).await
+    }
+
+    async fn write_stream(
+        &self,
+        stream: &mut (dyn AsyncWrite + Unpin + Send),
+        data: &[u8],
+    ) -> Result<()> {
+        self.fallback.write_stream(stream, data).await
+    }
+
+    async fn copy_stream(
+        &self,
+        reader: &mut (dyn AsyncRead + Unpin + Send),
+        writer: &mut (dyn AsyncWrite + Unpin + Send),
+    ) -> Result<u64> {
+        self.fallback.copy_stream(reader, writer).await
+    }
+}
+
+#[cfg(all(test, feature = "io-uring", target_os = "linux"))]
+mod uring_tests {
+    use super::*;
+    use crate::waf::io::IoBackend;
+    use std::os::unix::io::AsRawFd;
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[tokio::test]
+    async fn read_write_roundtrip_or_fallback() {
+        let config = IoConfig {
+            backend: IoBackend::IoUring,
+            enable_zero_copy: true,
+            buffer_size: 1024,
+            concurrency: 4,
+        };
+        let Ok(handler) = IoUringNetworkHandler::new(config) else {
+            eprintln!("skipping: io_uring unavailable");
+            return;
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server, _) = listener.accept().await.unwrap();
+        let client = client.await.unwrap();
+
+        handler
+            .write_fd(server.as_raw_fd(), b"hello")
+            .await
+            .unwrap();
+        let (buf, n) = handler.read_fd(client.as_raw_fd(), 16).await.unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(&buf, b"hello");
+
+        // Partial write path: large payload is looped internally.
+        let big = vec![7u8; 5000];
+        let writer = handler.write_fd(client.as_raw_fd(), &big);
+        let reader = async {
+            let mut got = Vec::new();
+            while got.len() < big.len() {
+                let (chunk, n) = handler.read_fd(server.as_raw_fd(), 4096).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&chunk);
+            }
+            got
+        };
+        let (w, got) = tokio::join!(writer, reader);
+        w.unwrap();
+        assert_eq!(got.len(), big.len());
+    }
+
+    #[tokio::test]
+    async fn shutdown_is_graceful() {
+        let config = IoConfig {
+            backend: IoBackend::IoUring,
+            enable_zero_copy: false,
+            buffer_size: 512,
+            concurrency: 2,
+        };
+        let Ok(handler) = IoUringNetworkHandler::new(config) else {
+            eprintln!("skipping: io_uring unavailable");
+            return;
+        };
+        handler.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn single_accept_or_skip() {
+        let config = IoConfig {
+            backend: IoBackend::IoUring,
+            enable_zero_copy: false,
+            buffer_size: 512,
+            concurrency: 2,
+        };
+        let Ok(handler) = IoUringNetworkHandler::new(config) else {
+            eprintln!("skipping: io_uring unavailable");
+            return;
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let fd = handler.accept_fd(listener.as_raw_fd()).await;
+        match fd {
+            Ok(fd) => unsafe {
+                libc::close(fd);
+            },
+            Err(e) => panic!("single accept failed: {e}"),
+        }
+        let _ = client.await;
+    }
+
+    #[tokio::test]
+    async fn multishot_accept_or_skip() {
+        let config = IoConfig {
+            backend: IoBackend::IoUring,
+            enable_zero_copy: false,
+            buffer_size: 512,
+            concurrency: 2,
+        };
+        let Ok(handler) = IoUringNetworkHandler::new(config) else {
+            eprintln!("skipping: io_uring unavailable");
+            return;
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Queue a connection before arming multishot accept so DONTWAIT has
+        // something to return immediately.
+        let _client = std::thread::spawn(move || std::net::TcpStream::connect(addr).unwrap());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let (mut accepted, _handle) = match handler.start_multishot_accept(listener.as_raw_fd()) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("skipping multishot accept: {e}");
+                return;
+            }
+        };
+        let fd = tokio::time::timeout(std::time::Duration::from_secs(2), accepted.recv())
+            .await
+            .ok()
+            .flatten();
+        assert!(fd.is_some(), "expected a multishot-accepted fd");
+        if let Some(fd) = fd {
+            unsafe { libc::close(fd) };
         }
     }
 }
