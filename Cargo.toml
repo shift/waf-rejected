@@ -87,6 +87,12 @@ name = "rust-engine-parity"
 path = "src/bin/rust_engine_parity.rs"
 required-features = ["rust-engine"]
 
+# Serial vs parallel ARGS candidate evaluation prototype. Non-default feature.
+[[bin]]
+name = "parallel-args-bench"
+path = "src/bin/parallel_args_bench.rs"
+required-features = ["rust-engine", "parallel-args"]
+
 # Layered sub-millisecond budget benchmark. Native rows need `coraza-native`
 # and a running sidecar; wasm rows need the default `wasm-reactor` feature.
 #   cargo run --release --features wasm-reactor,coraza-native --bin bench-subms
@@ -329,6 +335,10 @@ rust-engine = ["dep:aho-corasick", "native-detect"]
 # and absent from production builds; exposes `RustEngine::evaluate_profiled`.
 # See docs/suggestions_from_agents/engine-hotloop.md.
 engine-profile = []
+# Experimental candidate-level ARGS parallelism for the native CRS engine. Not
+# part of the default request path; see
+# docs/suggestions_from_agents/parallel-args.md.
+parallel-args = []
 # Optional global allocator selection for benchmarking. Non-default; the
 # system allocator remains the default. See docs/suggestions_from_agents/alloc-tuning.md.
 alloc-mimalloc = ["dep:mimalloc"]

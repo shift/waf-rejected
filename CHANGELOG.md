@@ -4,6 +4,16 @@ All notable changes to WAF-Rejected are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **Experimental (non-default) `parallel-args` feature:** a deterministic
+  candidate-level parallel model for the native Rust CRS engine, with a
+  serial-vs-parallel differential test over the 2,112-case corpus and generated
+  multi-argument bodies. The prototype is **not enabled** because it misses the
+  performance gate (best 8 KiB gain ~2.6%, 4 KiB ~1.3%, multi-argument bodies
+  regress); see `docs/suggestions_from_agents/parallel-args.md`. Defaults,
+  rules and the Coraza path are unchanged.
+
 ### Changed
 
 - Nothing yet.

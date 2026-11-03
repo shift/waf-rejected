@@ -27,6 +27,8 @@ use super::ir::{
     RuleGroup, Selector,
 };
 use super::operators::{Captures, MacroResolver};
+#[cfg(feature = "parallel-args")]
+use super::parallel_args::{map_ordered, ArgsParallelConfig};
 use super::parser::{parse_conf_path, parse_conf_str, CompilePolicy, SupportReport};
 use super::request::{
     expand_macros_into, Candidate, Collections, EngineRequest, RequestData, TxState,
@@ -73,6 +75,10 @@ pub struct RustEngine {
     /// Regex with the largest capture-group count, used to size one reusable
     /// `CaptureLocations` per worker thread.
     capture_template: Option<regex::bytes::Regex>,
+    /// Experimental candidate-level parallelism. `None` (the default) keeps the
+    /// serial candidate loop; see `docs/suggestions_from_agents/parallel-args.md`.
+    #[cfg(feature = "parallel-args")]
+    parallel_args: Option<ArgsParallelConfig>,
 }
 
 impl RustEngine {
@@ -96,6 +102,8 @@ impl RustEngine {
             limits: Limits::default(),
             source: path.display().to_string(),
             capture_template,
+            #[cfg(feature = "parallel-args")]
+            parallel_args: None,
         })
     }
 
@@ -114,12 +122,24 @@ impl RustEngine {
             limits: Limits::default(),
             source: "<memory>".to_string(),
             capture_template,
+            #[cfg(feature = "parallel-args")]
+            parallel_args: None,
         })
     }
 
     /// Overrides the per-request budget (tests and benchmarks).
     pub fn with_limits(mut self, limits: Limits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Enables the experimental per-argument parallel candidate path.
+    ///
+    /// Only available with the non-default `parallel-args` feature. The default
+    /// engine keeps the deterministic serial loop.
+    #[cfg(feature = "parallel-args")]
+    pub fn with_parallel_args(mut self, config: ArgsParallelConfig) -> Self {
+        self.parallel_args = Some(config);
         self
     }
 
@@ -593,6 +613,24 @@ impl RustEngine {
         let multi_match = rule.multi_match();
         let mut matched_any = false;
 
+        #[cfg(feature = "parallel-args")]
+        if let Some(config) = self.parallel_args {
+            if config.applies(candidates.len()) && self.candidate_local(rule) {
+                return self.eval_candidates_parallel(
+                    rule,
+                    data,
+                    tx_state,
+                    budget,
+                    state,
+                    candidates,
+                    scratch,
+                    record_matches,
+                    capture,
+                    config,
+                );
+            }
+        }
+
         for candidate in candidates.iter() {
             if target_removed(rule, candidate, state) {
                 continue;
@@ -758,6 +796,207 @@ impl RustEngine {
                         &mut scratch.macro_name,
                         &mut scratch.macro_value,
                     );
+                }
+            }
+        }
+        Ok(matched_any)
+    }
+
+    /// True when every candidate of `rule` can be evaluated without observing
+    /// another candidate's actions.
+    ///
+    /// The parallel path defers `setvar`/capture/MATCHED_VARS application to a
+    /// serial reduction. That is only equivalent when the operator does not
+    /// expand a macro (which could read TX written by the rule itself) and no
+    /// `ctl` action can change which later candidates are evaluated.
+    #[cfg(feature = "parallel-args")]
+    fn candidate_local(&self, rule: &CompiledRule) -> bool {
+        if rule.multi_match() {
+            return false;
+        }
+        let Some(operator) = rule.operator.as_ref() else {
+            return false;
+        };
+        if !matches!(
+            operator.kind,
+            super::ir::OperatorKind::Rx(_)
+                | super::ir::OperatorKind::Pm(_)
+                | super::ir::OperatorKind::PmFromFile(_)
+                | super::ir::OperatorKind::ValidateByteRange(_)
+                | super::ir::OperatorKind::ValidateUrlEncoding
+                | super::ir::OperatorKind::ValidateUtf8Encoding
+                | super::ir::OperatorKind::UnconditionalMatch
+                | super::ir::OperatorKind::IpMatch(_)
+                | super::ir::OperatorKind::DetectSqlInjection
+                | super::ir::OperatorKind::DetectXss
+        ) {
+            return false;
+        }
+        if rule
+            .actions
+            .iter()
+            .any(|action| matches!(action, Action::Ctl(_)))
+        {
+            return false;
+        }
+        rule.variables.iter().all(|spec| {
+            matches!(
+                spec.collection,
+                Collection::Args
+                    | Collection::ArgsGet
+                    | Collection::ArgsPost
+                    | Collection::ArgsNames
+                    | Collection::ArgsGetNames
+                    | Collection::ArgsPostNames
+            )
+        })
+    }
+
+    /// Evaluates the candidates of one candidate-local ARGS rule on the scoped
+    /// worker set, then applies matches in candidate order.
+    ///
+    /// Operator evaluation is side-effect free (it reads TX without writing
+    /// it). The reduction charges the budget, restores captures, records
+    /// `MATCHED_VARS` and runs `setvar` actions in the exact order of the
+    /// serial loop, so decisions, anomaly order and capture variables match.
+    #[cfg(feature = "parallel-args")]
+    #[allow(clippy::too_many_arguments)]
+    fn eval_candidates_parallel<'r, 'a>(
+        &self,
+        rule: &CompiledRule,
+        data: &'r RequestData<'a>,
+        tx_state: &mut TxState,
+        budget: &mut Budget,
+        state: &mut EvalState,
+        candidates: &[Candidate<'r>],
+        scratch: &mut Scratch,
+        record_matches: bool,
+        capture: bool,
+        config: ArgsParallelConfig,
+    ) -> Result<bool, EngineError> {
+        // Candidates in this rule were validated as candidate-local, so the
+        // worker closure may read TX and the eval state immutably.
+        let tx_shared: &TxState = tx_state;
+        let eval_shared: &EvalState = state;
+        let limits = budget.limits();
+        let pipeline = self
+            .program
+            .pipelines
+            .get(usize::from(rule.pipeline))
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+
+        let outcomes = map_ordered(candidates.len(), config.threads, |index| {
+            let candidate = &candidates[index];
+            if target_removed(rule, candidate, eval_shared) {
+                return Ok(CandidateEval::Removed);
+            }
+            SCRATCH.with(|cell| {
+                let mut guard = cell.borrow_mut();
+                let worker_scratch = &mut *guard;
+                // Scoped workers are fresh threads; reset the generational
+                // caches before the first candidate they evaluate.
+                worker_scratch.cache.begin();
+                worker_scratch.gate_masks.begin();
+                let mut worker_budget = Budget::new(limits);
+
+                if let Some(gate) = rule.gate {
+                    if let Some(mask) =
+                        self.gate_mask(candidate, worker_scratch, &mut worker_budget)?
+                    {
+                        let gates = self
+                            .program
+                            .gates
+                            .as_deref()
+                            .expect("gate id implies gates");
+                        if !gates.allows(gate, mask) {
+                            return Ok(CandidateEval::GateSkipped {
+                                used: worker_budget.used_bytes(),
+                            });
+                        }
+                    }
+                }
+
+                let value: &[u8] = match candidate.cache_id {
+                    Some(id) => worker_scratch.cache.get(
+                        cache_key(id, rule.pipeline),
+                        &candidate.value,
+                        pipeline,
+                        &mut worker_budget,
+                    )?,
+                    None => {
+                        transform_into(
+                            &candidate.value,
+                            pipeline,
+                            &mut worker_budget,
+                            &mut worker_scratch.uncached,
+                            &mut worker_scratch.uncached_tmp,
+                        )?;
+                        &worker_scratch.uncached
+                    }
+                };
+                let mut candidate_captures: Captures = std::array::from_fn(|_| Vec::new());
+                let matched = eval_operator(
+                    rule,
+                    value,
+                    data,
+                    tx_shared,
+                    capture,
+                    &mut candidate_captures,
+                    &mut worker_scratch.op_macro,
+                    worker_scratch.capture_locations.as_mut(),
+                );
+                let recorded = if record_matches && matched {
+                    Some(value.to_vec())
+                } else {
+                    None
+                };
+                Ok(CandidateEval::Evaluated {
+                    matched,
+                    len: value.len(),
+                    used: worker_budget.used_bytes(),
+                    captures: candidate_captures,
+                    recorded,
+                })
+            })
+        });
+
+        let mut matched_any = false;
+        for (candidate, outcome) in candidates.iter().zip(outcomes) {
+            match outcome? {
+                CandidateEval::Removed => {}
+                CandidateEval::GateSkipped { used } => {
+                    budget.absorb(used)?;
+                    state.regex_evaluations_skipped += 1;
+                }
+                CandidateEval::Evaluated {
+                    matched,
+                    len,
+                    used,
+                    captures: candidate_captures,
+                    recorded,
+                } => {
+                    budget.absorb(used)?;
+                    state.operator_evaluations += 1;
+                    if matched {
+                        budget.matched()?;
+                        budget.bytes(len)?;
+                        matched_any = true;
+                        if capture {
+                            copy_captures(tx_state, &candidate_captures);
+                        }
+                        if let Some(value) = recorded {
+                            tx_state.record_match(candidate.matched_name(), &value);
+                        }
+                        self.apply_nondisruptive(
+                            rule,
+                            data,
+                            tx_state,
+                            state,
+                            &mut scratch.macro_name,
+                            &mut scratch.macro_value,
+                        );
+                    }
                 }
             }
         }
@@ -1394,6 +1633,32 @@ fn tx_i64(tx: &Collections<'_>, name: &str) -> i64 {
         .and_then(|value| std::str::from_utf8(value).ok())
         .and_then(|text| text.trim().parse::<i64>().ok())
         .unwrap_or(0)
+}
+
+/// Immutable result of evaluating one candidate on a worker.
+///
+/// The `Evaluated` variant owns the capture slots; boxing it would add one
+/// allocation per candidate, which is exactly what this experiment measures.
+#[cfg(feature = "parallel-args")]
+#[allow(clippy::large_enum_variant)]
+enum CandidateEval {
+    /// `ctl:ruleRemoveTarget*` already excluded this candidate.
+    Removed,
+    /// The mandatory-literal gate proved the rule cannot match.
+    GateSkipped {
+        /// Bytes materialised by the gate transforms in the worker.
+        used: usize,
+    },
+    /// The operator ran. Matches are applied by the serial reduction.
+    Evaluated {
+        matched: bool,
+        len: usize,
+        /// Bytes materialised by transforms in the worker.
+        used: usize,
+        captures: Captures,
+        /// Transformed value for `MATCHED_VAR*` bookkeeping, when recorded.
+        recorded: Option<Vec<u8>>,
+    },
 }
 
 /// Per-request transform cache and reusable buffers.

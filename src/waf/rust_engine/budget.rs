@@ -89,4 +89,18 @@ impl Budget {
     pub fn used_bytes(&self) -> usize {
         self.bytes
     }
+
+    /// Adds bytes already charged in a parallel worker to this budget.
+    ///
+    /// The per-value cap was enforced where the value was produced, so only
+    /// the request-wide total is re-checked here. Used by the experimental
+    /// `parallel-args` reduction to keep the serial overflow point.
+    #[cfg(feature = "parallel-args")]
+    pub(crate) fn absorb(&mut self, len: usize) -> Result<(), EngineError> {
+        self.bytes = self.bytes.saturating_add(len);
+        if self.bytes > self.limits.max_total_bytes {
+            return Err(EngineError::Budget("too many materialised bytes"));
+        }
+        Ok(())
+    }
 }

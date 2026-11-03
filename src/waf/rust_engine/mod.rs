@@ -30,6 +30,8 @@ pub mod error;
 pub mod gate;
 pub mod ir;
 pub mod operators;
+#[cfg(feature = "parallel-args")]
+pub mod parallel_args;
 pub mod parser;
 #[cfg(feature = "engine-profile")]
 pub mod profile;
