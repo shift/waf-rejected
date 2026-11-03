@@ -1359,6 +1359,31 @@ impl WafEngine {
         CoreOutcome::new(Decision::Allow, triggered_rules)
     }
 
+    /// Early allow-cache probe for the synchronous path.
+    ///
+    /// Returns `Some(outcome)` only when the original request's fingerprint
+    /// matches a live entry, in which case the stateless protocol pre-checks
+    /// can be skipped (they already ran, unchanged, during the original
+    /// evaluation). The returned outcome runs the *non-cacheable* rules, so
+    /// stateful and IP-dependent rules still execute. A miss returns `None` and
+    /// leaves the miss counter to the authoritative lookup in
+    /// [`Self::rules_with_cache`], so a miss is counted once.
+    #[cfg(feature = "allow-cache")]
+    fn cache_hit_early(&self, request: &RequestContext) -> Option<CoreOutcome> {
+        let cache = self.allow_cache.as_ref()?;
+        if !cache.applies_to(&request.uri) {
+            return None;
+        }
+        let allow_cache::KeyBuild::Fingerprint(fingerprint) = cache.fingerprint(request) else {
+            return None;
+        };
+        let body = request.body.as_deref().unwrap_or_default();
+        if !cache.probe(fingerprint, body) {
+            return None;
+        }
+        Some(self.rules_core_cache_hit(request))
+    }
+
     /// Rule chain with the experimental allow-verdict cache in front.
     ///
     /// The cache is consulted after the protocol pre-checks and admission (the
@@ -1371,14 +1396,17 @@ impl WafEngine {
         #[cfg(feature = "allow-cache")]
         if let Some(cache) = &self.allow_cache {
             if cache.applies_to(&request.uri) {
-                match cache.build_key(request) {
-                    allow_cache::KeyBuild::Key(key) => {
-                        if cache.get(key) {
+                match cache.fingerprint(request) {
+                    allow_cache::KeyBuild::Fingerprint(fingerprint) => {
+                        // The body digest is verified inside `lookup`; the
+                        // fingerprint alone never authorises an allow.
+                        let body = request.body.as_deref().unwrap_or_default();
+                        if cache.lookup(fingerprint, body) {
                             return self.rules_core_cache_hit(request);
                         }
                         let outcome = self.rules_core(request);
                         if outcome.decision == Decision::Allow {
-                            cache.insert(key);
+                            cache.insert(fingerprint, body);
                         }
                         return outcome;
                     }
@@ -1399,6 +1427,25 @@ impl WafEngine {
     /// keep the inline path (see [`Self::evaluate_shared`]).
     #[cfg(not(any(feature = "wasm-waf", feature = "ai-threat-detection")))]
     fn evaluate_core(&self, request: &RequestContext) -> CoreOutcome {
+        // Early allow-cache probe, *before* the protocol pre-checks.
+        //
+        // The pre-checks are pure functions of method, URI, headers and body,
+        // and the fingerprint hashes all of them (the body as a keyed digest).
+        // An early hit therefore implies the pre-checks already ran on this
+        // exact request during the original evaluation and returned Allow
+        // without stripping the body: a stripped request hashes to a different
+        // fingerprint (body present vs absent), so it cannot hit here and falls
+        // through to the normal pre-check path. Protocol descriptor reloads are
+        // covered by the documented `invalidate_allow_cache()` contract. The
+        // fail-closed init gate is checked first, so a hit can never turn a
+        // 503 into an Allow.
+        #[cfg(feature = "allow-cache")]
+        if self.init_failure().is_none() {
+            if let Some(outcome) = self.cache_hit_early(request) {
+                return outcome;
+            }
+        }
+
         let stripped = match self.precheck_core(request) {
             PrecheckOutcome::Reject(outcome) => return outcome,
             PrecheckOutcome::Continue(stripped) => stripped,
@@ -1437,6 +1484,17 @@ impl WafEngine {
             Ok(guard) => guard,
             Err(decision) => return decision,
         };
+
+        // Same early probe as `evaluate_core`: admission has already run, so a
+        // hit can skip the stateless pre-checks. See the comment there for the
+        // safety argument.
+        #[cfg(feature = "allow-cache")]
+        if self.init_failure().is_none() {
+            if let Some(outcome) = self.cache_hit_early(request) {
+                drop(guard);
+                return outcome.decision;
+            }
+        }
 
         let stripped = match self.precheck_core(request) {
             PrecheckOutcome::Reject(outcome) => {
@@ -3284,6 +3342,38 @@ mod tests {
                 Decision::RateLimit { .. }
             ));
             assert_eq!(cacheable.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn same_metadata_different_body_is_not_allowed() {
+            let mut engine = cache_engine(true, 30, Vec::new(), 1024);
+            let cacheable = Arc::new(AtomicUsize::new(0));
+            engine.add_rule(CacheableContentRule::new(
+                "cacheable-content",
+                Arc::clone(&cacheable),
+                "attack",
+            ));
+
+            // Identical method, URI, headers and body length: only the body
+            // bytes differ, so the two requests share one fingerprint.
+            let benign = post_context("data=benign");
+            let attack = post_context("data=attack");
+            assert_eq!(
+                benign.body.as_ref().unwrap().len(),
+                attack.body.as_ref().unwrap().len()
+            );
+
+            assert_eq!(engine.evaluate(&benign).await, Decision::Allow);
+            assert_eq!(engine.allow_cache().unwrap().stats().hits, 0);
+            assert!(matches!(
+                engine.evaluate(&attack).await,
+                Decision::Block { status: 403, .. }
+            ));
+            assert_eq!(
+                cacheable.load(Ordering::SeqCst),
+                2,
+                "a fingerprint match alone must never allow"
+            );
         }
 
         #[tokio::test]

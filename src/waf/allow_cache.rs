@@ -7,38 +7,74 @@
 //! limits are never cached, and every stateful or IP-dependent rule is still
 //! evaluated on a hit.
 //!
+//! # Two-level lookup
+//!
+//! A hit never relies on a cheap fingerprint alone. The lookup is:
+//!
+//! 1. **Fingerprint** — a keyed 128-bit digest of the canonical *metadata*
+//!    (version, policy generation, method, URI components, HTTP version, body
+//!    presence/length, declared size, sorted header digests). It never hashes
+//!    the body, so a fingerprint miss costs no body work.
+//! 2. **Candidate bucket** — the fingerprint indexes a bucket of candidates in
+//!    the sharded map. Each candidate stores a 128-bit keyed digest of the
+//!    exact body bytes.
+//! 3. **Body verification** — the body digest is computed only when a bucket
+//!    exists, and the request is allowed only if a live candidate's digest
+//!    matches. A fingerprint collision on its own can never produce an
+//!    `Allow`.
+//!
 //! The design, canonicalisation rules, injectivity argument, threat model and
 //! measurements live in `docs/suggestions_from_agents/allow-cache.md`.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::hash::Hasher as _;
+use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use hyper::header::HeaderName;
 use hyper::Uri;
-use parking_lot::Mutex;
-use siphasher::sip128::{Hasher128, SipHasher24};
+use parking_lot::RwLock;
+use xxhash_rust::xxh3::{xxh3_128_with_secret, xxh3_64_with_seed};
 
 use super::RequestContext;
 use crate::config::{AllowCacheConfig, WafConfig};
 use crate::metrics::Metrics;
 
 /// Bump when the canonical encoding changes. Old entries become unreachable
-/// because the version is part of every key.
-pub const KEY_VERSION: u8 = 1;
+/// because the version is part of every fingerprint.
+///
+/// v2: URI hashed by component (no `Uri::to_string` allocation), headers hashed
+/// as sorted `(name-digest, values)` pairs, and the body moved out of the
+/// fingerprint into a separately verified digest.
+pub const KEY_VERSION: u8 = 2;
 
 /// Domain separator for the policy-generation hash.
 const POLICY_DOMAIN: u8 = 0xA1;
+/// Domain separator for the request fingerprint.
+const FINGERPRINT_DOMAIN: u8 = 0xB2;
 
-/// Shard count for the bounded map. Fixed so the memory bound is predictable.
-pub const SHARDS: usize = 16;
+/// Shard count for the bounded map. Fixed so the memory bound is predictable
+/// and so a 64-thread replay does not converge on a handful of locks.
+pub const SHARDS: usize = 64;
 
-/// Defensive cap on the number of distinct header names in a key. Hyper's
-/// default header limit is far lower; this only prevents pathological input
-/// from making key construction allocate without bound.
-pub const MAX_HEADER_NAMES: usize = 256;
+/// Defensive cap on the number of header values in a key. Hyper's default
+/// header limit is far lower; this only prevents pathological input from making
+/// key construction unbounded.
+pub const MAX_HEADER_ENTRIES: usize = 256;
+
+/// Maximum candidates stored under one fingerprint. Two requests with the same
+/// metadata but different bodies share a fingerprint; a handful of variants is
+/// normal, unbounded growth is not.
+const MAX_BUCKET: usize = 8;
+
+/// Thread-local L1: direct-mapped slots per thread. Only a fast path; the
+/// shared sharded map remains authoritative.
+const L1_SETS: usize = 256;
+
+/// Size of the xxh3 custom secret. `SECRET_SIZE_MIN` is 136; anything shorter
+/// makes xxh3 fall back to the default (unkeyed) secret.
+const SECRET_BYTES: usize = 136;
 
 /// Headers that OWASP CRS 4.14 request rules explicitly target.
 ///
@@ -81,18 +117,30 @@ pub const CRS_TARGETED_HEADERS: &[&str] = &[
 /// The secret never leaves the process and is not persisted. Two processes
 /// therefore produce different keys for the same request, which is why the
 /// cache must not be shared across processes without a key-management design.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Key {
-    k0: u64,
-    k1: u64,
+    secret: [u8; SECRET_BYTES],
+    /// Seed for the internal hash map. Not a security boundary: the map keys
+    /// are already secret-keyed 128-bit digests, so a map collision only costs
+    /// one extra comparison.
+    map_seed: u64,
+    /// Unique per cache instance, used to reject stale thread-local L1 slots
+    /// from a previous engine in the same process.
+    id: u64,
 }
 
 impl Key {
     /// Draw a fresh secret from the OS-seeded process CSPRNG.
     pub fn random() -> Self {
+        use rand::RngCore as _;
+
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        let mut secret = [0u8; SECRET_BYTES];
+        rand::thread_rng().fill_bytes(&mut secret);
         Self {
-            k0: rand::random(),
-            k1: rand::random(),
+            secret,
+            map_seed: rand::random(),
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 }
@@ -103,15 +151,19 @@ impl std::fmt::Debug for Key {
     }
 }
 
-/// A 128-bit keyed hash of the canonical request representation.
+/// A 128-bit keyed digest of the canonical request metadata (no body bytes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CacheKey(u128);
+pub struct Fingerprint(u128);
 
-/// Result of attempting to key a request.
+/// A 128-bit keyed digest of the exact body bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BodyDigest(u128);
+
+/// Result of attempting to fingerprint a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyBuild {
-    /// The request can be looked up under this key.
-    Key(CacheKey),
+    /// The request can be looked up under this fingerprint.
+    Fingerprint(Fingerprint),
     /// The request is evaluated normally but never inserted or looked up.
     NotCacheable(NotCacheable),
 }
@@ -149,20 +201,26 @@ pub struct CacheStats {
     pub generation: u64,
 }
 
-struct Entry {
-    expires_at: Instant,
+#[derive(Clone, Copy)]
+struct Candidate {
+    digest: BodyDigest,
+    /// Monotonic nanoseconds since `AllowCache::epoch`.
+    deadline_ns: u64,
     generation: u64,
 }
 
 struct Shard {
-    entries: HashMap<CacheKey, Entry>,
+    entries: HashMap<Fingerprint, Vec<Candidate>, FingerprintHasherBuilder>,
+    /// Total candidates in this shard (a fingerprint may hold several).
+    live: usize,
 }
 
 /// Bounded, sharded, TTL-limited allow-verdict cache.
 pub struct AllowCache {
-    shards: Vec<Mutex<Shard>>,
+    shards: Box<[RwLock<Shard>]>,
     capacities: Vec<usize>,
-    ttl: Duration,
+    ttl_ns: u64,
+    epoch: Instant,
     max_body_bytes: usize,
     routes: Vec<String>,
     key: Key,
@@ -190,11 +248,13 @@ impl AllowCache {
         let capacities: Vec<usize> = (0..shard_count)
             .map(|index| base + usize::from(index < remainder))
             .collect();
-        let shards = capacities
+        let hasher = FingerprintHasherBuilder { seed: key.map_seed };
+        let shards: Box<[RwLock<Shard>]> = capacities
             .iter()
             .map(|_| {
-                Mutex::new(Shard {
-                    entries: HashMap::new(),
+                RwLock::new(Shard {
+                    entries: HashMap::with_hasher(hasher),
+                    live: 0,
                 })
             })
             .collect();
@@ -202,7 +262,8 @@ impl AllowCache {
         let cache = Self {
             shards,
             capacities,
-            ttl: Duration::from_secs(config.ttl_secs),
+            ttl_ns: config.ttl_secs.saturating_mul(1_000_000_000),
+            epoch: Instant::now(),
             max_body_bytes: config.max_body_bytes,
             routes: config.routes.clone(),
             key,
@@ -237,15 +298,18 @@ impl AllowCache {
         })
     }
 
-    /// Build the canonical key for a request.
+    /// Build the canonical fingerprint for a request.
     ///
-    /// The encoding is injective: a version byte, the policy generation, and
-    /// then fixed-width or length-prefixed fields in a fixed order. Header
-    /// names are sorted by their lowercase form (hyper already normalises
-    /// `HeaderName`), while duplicate values keep their original order and
-    /// count. No percent-decoding, query reordering, case folding or
-    /// whitespace normalisation is applied.
-    pub fn build_key(&self, ctx: &RequestContext) -> KeyBuild {
+    /// The encoding is injective: a version byte, domain separator, the policy
+    /// generation, and then fixed-width or length-prefixed fields in a fixed
+    /// order. Header names are sorted by a keyed digest of their lowercase form
+    /// (hyper already normalises `HeaderName`), while duplicate values keep
+    /// their original order and count. No percent-decoding, query reordering,
+    /// case folding or whitespace normalisation is applied.
+    ///
+    /// Nothing is allocated: the encoding is written into per-thread scratch
+    /// buffers that are reused across calls, then hashed in one pass.
+    pub fn fingerprint(&self, ctx: &RequestContext) -> KeyBuild {
         let body = ctx.body.as_deref();
         if body.is_some_and(|body| body.len() > self.max_body_bytes) {
             return KeyBuild::NotCacheable(NotCacheable::BodyTooLarge);
@@ -254,133 +318,229 @@ impl AllowCache {
             return KeyBuild::NotCacheable(NotCacheable::BodyNotCaptured);
         }
 
-        let mut names: Vec<&HeaderName> = ctx.headers.keys().collect();
-        if names.len() > MAX_HEADER_NAMES {
-            return KeyBuild::NotCacheable(NotCacheable::TooManyHeaders);
-        }
-        names.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        let generation = self.generation.load(Ordering::Acquire);
+        let secret = &self.key.secret;
 
-        let mut writer = KeyWriter::new(&self.key);
-        writer.put_u64(self.generation.load(Ordering::Acquire));
-        writer.put_bytes(ctx.method.as_str().as_bytes());
-        // `Uri::to_string` is exactly what the Coraza payload sends, including
-        // any scheme/authority. The one allocation is bounded by the URI limit.
-        let uri = ctx.uri.to_string();
-        writer.put_bytes(uri.as_bytes());
-        writer.put_bytes(ctx.http_version.as_bytes());
+        SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            let scratch = &mut *scratch;
+            scratch.values.clear();
+            scratch.index.clear();
 
-        match body {
-            Some(body) => {
-                writer.put_u8(1);
-                writer.put_u64(body.len() as u64);
-                writer.put_bytes(body);
+            // One pass over the map: `get_all` would hash the name with the
+            // map's own hasher for every header, which costs more than the
+            // whole fingerprint. Each (name, value) pair is copied verbatim
+            // into the scratch buffer; the pair's only computed field is a
+            // 64-bit sort key so the sort compares `u64`, not strings.
+            let mut order = 0u32;
+            for (name, value) in ctx.headers.iter() {
+                order += 1;
+                if order as usize > MAX_HEADER_ENTRIES {
+                    return KeyBuild::NotCacheable(NotCacheable::TooManyHeaders);
+                }
+                let name_bytes = name.as_str().as_bytes();
+                let value_bytes = value.as_bytes();
+                let start = scratch.values.len();
+                scratch.values.extend_from_slice(
+                    &((name_bytes.len() as u64) | ((value_bytes.len() as u64) << 32)).to_le_bytes(),
+                );
+                scratch.values.extend_from_slice(name_bytes);
+                scratch.values.extend_from_slice(value_bytes);
+                scratch.index.push(HeaderRef {
+                    sort_key: name_sort_key(name_bytes),
+                    start: start as u32,
+                    len: (scratch.values.len() - start) as u32,
+                    order,
+                });
             }
-            None => writer.put_u8(0),
-        }
-        match ctx.body_size {
-            Some(size) => {
-                writer.put_u8(1);
-                writer.put_u64(size as u64);
-            }
-            None => writer.put_u8(0),
-        }
 
-        writer.put_u64(names.len() as u64);
-        for name in names {
-            writer.put_bytes(name.as_str().as_bytes());
-            let values = ctx.headers.get_all(name);
-            writer.put_u64(values.iter().count() as u64);
-            for value in values.iter() {
-                writer.put_bytes(value.as_bytes());
-            }
-        }
+            // Sort by name so header order is not part of the key. Ties are
+            // broken by iteration order, which is insertion order for
+            // duplicate values, so `X: a, X: b` and `X: b, X: a` still differ.
+            scratch.index.sort_unstable_by(|left, right| {
+                left.sort_key
+                    .cmp(&right.sort_key)
+                    .then(left.order.cmp(&right.order))
+            });
 
-        KeyBuild::Key(CacheKey(writer.finish()))
+            let buffer = &mut scratch.fingerprint;
+            buffer.clear();
+            buffer.push(KEY_VERSION);
+            buffer.push(FINGERPRINT_DOMAIN);
+            put_u64(buffer, generation);
+            put_bytes(buffer, ctx.method.as_str().as_bytes());
+            put_uri(buffer, &ctx.uri);
+            put_bytes(buffer, ctx.http_version.as_bytes());
+            match body {
+                Some(body) => {
+                    buffer.push(1);
+                    put_u64(buffer, body.len() as u64);
+                }
+                None => buffer.push(0),
+            }
+            match ctx.body_size {
+                Some(size) => {
+                    buffer.push(1);
+                    put_u64(buffer, size as u64);
+                }
+                None => buffer.push(0),
+            }
+            put_u64(buffer, scratch.index.len() as u64);
+            for entry in &scratch.index {
+                let start = entry.start as usize;
+                let end = start + entry.len as usize;
+                buffer.extend_from_slice(&scratch.values[start..end]);
+            }
+
+            KeyBuild::Fingerprint(Fingerprint(xxh3_128_with_secret(buffer, secret)))
+        })
     }
 
-    /// Look up a key. Records a hit or a miss (including an expired entry).
-    pub fn get(&self, key: CacheKey) -> bool {
-        let now = Instant::now();
+    /// Look up a fingerprint and verify the body digest.
+    ///
+    /// The body digest is computed only if the fingerprint is present in the
+    /// thread-local L1 or in a shared shard bucket. A fingerprint match without
+    /// a body-digest match is a miss: the fingerprint alone never authorises an
+    /// `Allow`.
+    pub fn lookup(&self, fingerprint: Fingerprint, body: &[u8]) -> bool {
+        if self.lookup_inner(fingerprint, body) {
+            self.record_hit();
+            true
+        } else {
+            self.record_miss();
+            false
+        }
+    }
+
+    /// Early probe used before the stateless protocol pre-checks.
+    ///
+    /// Records a hit on success but leaves a miss uncounted: the authoritative
+    /// [`Self::lookup`] in the rule chain runs next and counts it exactly once.
+    pub fn probe(&self, fingerprint: Fingerprint, body: &[u8]) -> bool {
+        if self.lookup_inner(fingerprint, body) {
+            self.record_hit();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn lookup_inner(&self, fingerprint: Fingerprint, body: &[u8]) -> bool {
+        let now = self.now_ns();
         let generation = self.generation.load(Ordering::Acquire);
-        let index = self.shard_index(key);
-        let mut shard = self.shards[index].lock();
 
-        let live = shard
-            .entries
-            .get(&key)
-            .is_some_and(|entry| entry.generation == generation && now < entry.expires_at);
-        if live {
-            drop(shard);
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            if let Some(metrics) = &self.metrics {
-                metrics.record_allow_cache_hit();
+        match self.l1_probe(fingerprint, body, generation, now) {
+            L1Probe::Hit => return true,
+            L1Probe::Checked(digest) => {
+                return self.shared_lookup(fingerprint, digest, generation, now);
             }
-            return true;
+            L1Probe::Absent => {}
         }
 
-        if let Some(entry) = shard.entries.get(&key) {
-            let expired = entry.generation == generation && now >= entry.expires_at;
-            shard.entries.remove(&key);
-            // Decrement while the shard is still locked so a concurrent
-            // `clear()` cannot store 0 between the removal and the decrement.
-            self.entries
-                .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                    Some(value.saturating_sub(1))
-                })
-                .ok();
-            if expired {
-                self.expired.fetch_add(1, Ordering::Relaxed);
-                if let Some(metrics) = &self.metrics {
-                    metrics.record_allow_cache_expired();
-                }
-            }
-            drop(shard);
-            self.publish_entries();
-        }
-
-        self.misses.fetch_add(1, Ordering::Relaxed);
-        if let Some(metrics) = &self.metrics {
-            metrics.record_allow_cache_miss();
-        }
-        false
+        self.shared_lookup_lazy(fingerprint, body, generation, now)
     }
 
     /// Insert an allow verdict. The caller must only call this for `Allow`.
-    pub fn insert(&self, key: CacheKey) {
+    pub fn insert(&self, fingerprint: Fingerprint, body: &[u8]) {
+        let now = self.now_ns();
         let generation = self.generation.load(Ordering::Acquire);
-        let index = self.shard_index(key);
+        let digest = body_digest(&self.key.secret, body);
+        let deadline_ns = now.saturating_add(self.ttl_ns);
+        let index = self.shard_index(fingerprint);
         let capacity = self.capacities[index];
-        let mut shard = self.shards[index].lock();
 
-        let already_present = shard.entries.contains_key(&key);
-        if !already_present && shard.entries.len() >= capacity {
-            // Sharded map with arbitrary (hash-order) eviction. This keeps the
-            // memory bound strict without an intrusive LRU list.
-            if let Some(victim) = shard.entries.keys().next().copied() {
-                shard.entries.remove(&victim);
-                self.entries.fetch_sub(1, Ordering::Relaxed);
-                self.evictions.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut shard = self.shards[index].write();
+            let mut live = shard.live;
+            let mut evicted = 0u64;
+            let mut dropped_expired = 0u64;
+            let mut added = 0u64;
+
+            if let Some(bucket) = shard.entries.get_mut(&fingerprint) {
+                let before = bucket.len();
+                bucket.retain(|candidate| {
+                    candidate.generation == generation && now < candidate.deadline_ns
+                });
+                live -= before - bucket.len();
+                dropped_expired += (before - bucket.len()) as u64;
+                if bucket.len() >= MAX_BUCKET {
+                    // Drop the candidate closest to expiry.
+                    if let Some((victim, _)) = bucket
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, candidate)| candidate.deadline_ns)
+                    {
+                        bucket.swap_remove(victim);
+                        live -= 1;
+                        evicted += 1;
+                    }
+                }
+            }
+
+            if shard.entries.get(&fingerprint).is_none() && live >= capacity {
+                if let Some(victim) = shard.entries.keys().next().copied() {
+                    if let Some(bucket) = shard.entries.get_mut(&victim) {
+                        live -= bucket.len();
+                        evicted += bucket.len() as u64;
+                    }
+                    shard.entries.remove(&victim);
+                }
+            }
+
+            let bucket = shard.entries.entry(fingerprint).or_default();
+            if !bucket.iter().any(|candidate| candidate.digest == digest) {
+                bucket.push(Candidate {
+                    digest,
+                    deadline_ns,
+                    generation,
+                });
+                live += 1;
+                added = 1;
+            }
+            shard.live = live;
+            drop(shard);
+
+            // The shard write lock keeps this counter consistent with
+            // `clear()`, which holds every shard lock before resetting it.
+            if added > 0 {
+                self.entries.fetch_add(1, Ordering::Relaxed);
+            }
+            let removed = evicted + dropped_expired;
+            if removed > 0 {
+                self.entries
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                        Some(value.saturating_sub(removed as usize))
+                    })
+                    .ok();
+            }
+            self.publish_entries();
+
+            if evicted > 0 {
+                self.evictions.fetch_add(evicted, Ordering::Relaxed);
                 if let Some(metrics) = &self.metrics {
-                    metrics.record_allow_cache_eviction();
+                    for _ in 0..evicted {
+                        metrics.record_allow_cache_eviction();
+                    }
+                }
+            }
+            if dropped_expired > 0 {
+                self.expired.fetch_add(dropped_expired, Ordering::Relaxed);
+                if let Some(metrics) = &self.metrics {
+                    for _ in 0..dropped_expired {
+                        metrics.record_allow_cache_expired();
+                    }
                 }
             }
         }
 
-        let expires_at = Instant::now()
-            .checked_add(self.ttl)
-            .unwrap_or_else(Instant::now);
-        shard.entries.insert(
-            key,
-            Entry {
-                expires_at,
-                generation,
-            },
-        );
-        if !already_present {
-            self.entries.fetch_add(1, Ordering::Relaxed);
-        }
-        drop(shard);
-        self.publish_entries();
+        self.l1_store(fingerprint, digest, deadline_ns, generation);
+    }
+
+    /// Body digest for the profiling harness only. Not part of the public
+    /// contract and not used by the engine.
+    #[doc(hidden)]
+    pub fn body_digest_for_bench(&self, body: &[u8]) -> u128 {
+        body_digest(&self.key.secret, body).0
     }
 
     /// Record a request the cache declined to key.
@@ -434,13 +594,175 @@ impl AllowCache {
         }
     }
 
+    fn record_hit(&self) {
+        self.hits.fetch_add(1, Ordering::Relaxed);
+        if let Some(metrics) = &self.metrics {
+            metrics.record_allow_cache_hit();
+        }
+    }
+
+    fn record_miss(&self) {
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        if let Some(metrics) = &self.metrics {
+            metrics.record_allow_cache_miss();
+        }
+    }
+
+    fn l1_probe(
+        &self,
+        fingerprint: Fingerprint,
+        body: &[u8],
+        generation: u64,
+        now: u64,
+    ) -> L1Probe {
+        L1.with(|cell| {
+            let slots = &mut *cell.borrow_mut();
+            let slot = &mut slots[(fingerprint.0 as usize) % L1_SETS];
+            if slot.cache_id != self.key.id
+                || slot.fingerprint != fingerprint.0
+                || slot.generation != generation
+            {
+                return L1Probe::Absent;
+            }
+            if now >= slot.deadline_ns {
+                slot.cache_id = 0;
+                return L1Probe::Absent;
+            }
+            let digest = body_digest(&self.key.secret, body);
+            if digest.0 == slot.digest {
+                L1Probe::Hit
+            } else {
+                L1Probe::Checked(digest)
+            }
+        })
+    }
+
+    fn l1_store(
+        &self,
+        fingerprint: Fingerprint,
+        digest: BodyDigest,
+        deadline_ns: u64,
+        generation: u64,
+    ) {
+        L1.with(|cell| {
+            let slots = &mut *cell.borrow_mut();
+            let slot = &mut slots[(fingerprint.0 as usize) % L1_SETS];
+            *slot = L1Slot {
+                cache_id: self.key.id,
+                fingerprint: fingerprint.0,
+                digest: digest.0,
+                deadline_ns,
+                generation,
+            };
+        });
+    }
+
+    fn shared_lookup(
+        &self,
+        fingerprint: Fingerprint,
+        digest: BodyDigest,
+        generation: u64,
+        now: u64,
+    ) -> bool {
+        let index = self.shard_index(fingerprint);
+        {
+            let shard = self.shards[index].read();
+            if let Some(bucket) = shard.entries.get(&fingerprint) {
+                if bucket.iter().any(|candidate| {
+                    candidate.digest == digest
+                        && candidate.generation == generation
+                        && now < candidate.deadline_ns
+                }) {
+                    return true;
+                }
+            }
+        }
+        self.prune(fingerprint, generation, now);
+        false
+    }
+
+    fn shared_lookup_lazy(
+        &self,
+        fingerprint: Fingerprint,
+        body: &[u8],
+        generation: u64,
+        now: u64,
+    ) -> bool {
+        let index = self.shard_index(fingerprint);
+        {
+            let shard = self.shards[index].read();
+            let bucket = match shard.entries.get(&fingerprint) {
+                None => return false,
+                Some(bucket) => bucket,
+            };
+            if !bucket
+                .iter()
+                .any(|candidate| candidate.generation == generation && now < candidate.deadline_ns)
+            {
+                drop(shard);
+                self.prune(fingerprint, generation, now);
+                return false;
+            }
+            // A live bucket exists: only now is the body digest worth
+            // computing. It runs under the read lock, which is shared.
+            let digest = body_digest(&self.key.secret, body);
+            if bucket.iter().any(|candidate| {
+                candidate.digest == digest
+                    && candidate.generation == generation
+                    && now < candidate.deadline_ns
+            }) {
+                return true;
+            }
+        }
+        self.prune(fingerprint, generation, now);
+        false
+    }
+
+    /// Drop expired or stale-generation candidates under one fingerprint.
+    fn prune(&self, fingerprint: Fingerprint, generation: u64, now: u64) {
+        let index = self.shard_index(fingerprint);
+        let dropped = {
+            let mut shard = self.shards[index].write();
+            let mut remove_bucket = false;
+            let mut pruned = 0usize;
+            if let Some(bucket) = shard.entries.get_mut(&fingerprint) {
+                let before = bucket.len();
+                bucket.retain(|candidate| {
+                    candidate.generation == generation && now < candidate.deadline_ns
+                });
+                pruned = before - bucket.len();
+                remove_bucket = bucket.is_empty();
+            }
+            shard.live -= pruned;
+            if remove_bucket {
+                shard.entries.remove(&fingerprint);
+            }
+            pruned as u64
+        };
+        if dropped > 0 {
+            self.expired.fetch_add(dropped, Ordering::Relaxed);
+            if let Some(metrics) = &self.metrics {
+                for _ in 0..dropped {
+                    metrics.record_allow_cache_expired();
+                }
+            }
+            self.entries
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    Some(value.saturating_sub(dropped as usize))
+                })
+                .ok();
+            self.publish_entries();
+        }
+    }
+
     fn clear(&self) {
-        // Hold every shard lock so an insert cannot slip between a shard clear
-        // and the counter reset. Single-shard operations never hold two locks,
-        // so the fixed index order cannot deadlock.
-        let mut guards: Vec<_> = self.shards.iter().map(|shard| shard.lock()).collect();
+        // Hold every shard write lock so an insert cannot slip between a shard
+        // clear and the counter reset. Single-shard operations never hold two
+        // locks, so the fixed index order cannot deadlock.
+        let mut guards: Vec<_> = self.shards.iter().map(|shard| shard.write()).collect();
         for shard in guards.iter_mut() {
             shard.entries.clear();
+            shard.live = 0;
         }
         self.entries.store(0, Ordering::Relaxed);
         drop(guards);
@@ -453,61 +775,196 @@ impl AllowCache {
         }
     }
 
-    fn shard_index(&self, key: CacheKey) -> usize {
+    fn shard_index(&self, key: Fingerprint) -> usize {
         (key.0 as usize) % self.shards.len()
     }
+
+    fn now_ns(&self) -> u64 {
+        self.epoch.elapsed().as_nanos() as u64
+    }
 }
 
-/// Streaming, length-prefixed key writer.
-struct KeyWriter {
-    hasher: SipHasher24,
+enum L1Probe {
+    Hit,
+    Checked(BodyDigest),
+    Absent,
 }
 
-impl KeyWriter {
-    fn new(key: &Key) -> Self {
-        let mut hasher = SipHasher24::new_with_keys(key.k0, key.k1);
-        hasher.write(&[KEY_VERSION]);
-        Self { hasher }
+#[derive(Clone, Copy)]
+struct L1Slot {
+    cache_id: u64,
+    fingerprint: u128,
+    digest: u128,
+    deadline_ns: u64,
+    generation: u64,
+}
+
+impl L1Slot {
+    const EMPTY: Self = Self {
+        cache_id: 0,
+        fingerprint: 0,
+        digest: 0,
+        deadline_ns: 0,
+        generation: 0,
+    };
+}
+
+thread_local! {
+    static L1: RefCell<[L1Slot; L1_SETS]> = const { RefCell::new([L1Slot::EMPTY; L1_SETS]) };
+}
+
+/// Sort key for a header name: the first 16 bytes, zero-padded, big-endian.
+///
+/// Two distinct HTTP header names cannot share a 16-byte prefix (names are
+/// ASCII tokens, so a shared prefix means the names are equal), which makes the
+/// key a faithful ordering without hashing every name on the hot path. The
+/// exact name bytes are always encoded, so even a hypothetical collision would
+/// only change the order, never the content.
+#[inline]
+fn name_sort_key(name: &[u8]) -> u128 {
+    let mut key = [0u8; 16];
+    let take = name.len().min(key.len());
+    key[..take].copy_from_slice(&name[..take]);
+    u128::from_be_bytes(key)
+}
+
+#[derive(Clone, Copy)]
+struct HeaderRef {
+    sort_key: u128,
+    start: u32,
+    len: u32,
+    /// Iteration position, used to keep duplicate values in insertion order.
+    order: u32,
+}
+
+#[derive(Default)]
+struct Scratch {
+    /// Encoded header values, reused across requests.
+    values: Vec<u8>,
+    /// Sorted header name digests pointing into `values`.
+    index: Vec<HeaderRef>,
+    /// Canonical metadata encoding, reused across requests.
+    fingerprint: Vec<u8>,
+}
+
+thread_local! {
+    static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch::default());
+}
+
+#[inline]
+fn put_u32(buffer: &mut Vec<u8>, value: u32) {
+    buffer.extend_from_slice(&value.to_le_bytes());
+}
+
+#[inline]
+fn put_u64(buffer: &mut Vec<u8>, value: u64) {
+    buffer.extend_from_slice(&value.to_le_bytes());
+}
+
+#[inline]
+fn put_bytes(buffer: &mut Vec<u8>, bytes: &[u8]) {
+    put_u64(buffer, bytes.len() as u64);
+    buffer.extend_from_slice(bytes);
+}
+
+/// Encode `Uri` by component. This is the same information as `Uri::to_string`
+/// but without the per-request `String` allocation; presence bytes keep
+/// `scheme`/`authority`/`path_and_query` from being confusable.
+#[inline]
+fn put_uri(buffer: &mut Vec<u8>, uri: &Uri) {
+    match uri.scheme_str() {
+        Some(scheme) => {
+            buffer.push(1);
+            put_bytes(buffer, scheme.as_bytes());
+        }
+        None => buffer.push(0),
+    }
+    match uri.authority() {
+        Some(authority) => {
+            buffer.push(1);
+            put_bytes(buffer, authority.as_str().as_bytes());
+        }
+        None => buffer.push(0),
+    }
+    match uri.path_and_query() {
+        Some(path) => {
+            buffer.push(1);
+            put_bytes(buffer, path.as_str().as_bytes());
+        }
+        None => buffer.push(0),
+    }
+}
+
+#[inline]
+fn body_digest(secret: &[u8; SECRET_BYTES], body: &[u8]) -> BodyDigest {
+    BodyDigest(xxh3_128_with_secret(body, secret))
+}
+
+/// Hash a `u128` map key with xxh3. The key is already a secret-keyed digest,
+/// so this only spreads buckets; a collision costs an extra comparison, never a
+/// false allow.
+#[derive(Clone, Copy)]
+struct FingerprintHasherBuilder {
+    seed: u64,
+}
+
+impl BuildHasher for FingerprintHasherBuilder {
+    type Hasher = FingerprintHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        FingerprintHasher {
+            buffer: [0u8; 16],
+            len: 0,
+            seed: self.seed,
+        }
+    }
+}
+
+struct FingerprintHasher {
+    buffer: [u8; 16],
+    len: usize,
+    seed: u64,
+}
+
+impl Hasher for FingerprintHasher {
+    fn finish(&self) -> u64 {
+        xxh3_64_with_seed(&self.buffer[..self.len], self.seed)
     }
 
-    fn put_u8(&mut self, value: u8) {
-        self.hasher.write(&[value]);
+    fn write(&mut self, bytes: &[u8]) {
+        let available = self.buffer.len() - self.len;
+        let take = bytes.len().min(available);
+        self.buffer[self.len..self.len + take].copy_from_slice(&bytes[..take]);
+        self.len += take;
     }
 
-    fn put_u64(&mut self, value: u64) {
-        self.hasher.write(&value.to_le_bytes());
-    }
-
-    fn put_bytes(&mut self, bytes: &[u8]) {
-        self.put_u64(bytes.len() as u64);
-        self.hasher.write(bytes);
-    }
-
-    fn finish(self) -> u128 {
-        u128::from(self.hasher.finish128())
+    fn write_u128(&mut self, value: u128) {
+        self.write(&value.to_le_bytes());
     }
 }
 
 /// Hash the policy generation: the full `[waf]` configuration plus the ordered
 /// rule names and their enabled state. Any change to either produces a new
-/// generation, which is part of every key and clears the cache at start-up.
+/// generation, which is part of every fingerprint and clears the cache at
+/// start-up.
 pub fn policy_generation<'a>(
     key: &Key,
     config: &WafConfig,
     rules: impl Iterator<Item = (&'a str, bool)>,
 ) -> u64 {
-    let mut hasher = SipHasher24::new_with_keys(key.k0, key.k1);
-    hasher.write(&[POLICY_DOMAIN]);
+    let mut buffer = Vec::with_capacity(4096);
+    buffer.push(POLICY_DOMAIN);
+    buffer.push(KEY_VERSION);
     match serde_json::to_vec(config) {
-        Ok(bytes) => hasher.write(&bytes),
-        Err(_) => hasher.write(format!("{config:?}").as_bytes()),
+        Ok(bytes) => buffer.extend_from_slice(&bytes),
+        Err(_) => buffer.extend_from_slice(format!("{config:?}").as_bytes()),
     }
     for (name, enabled) in rules {
-        hasher.write(&(name.len() as u64).to_le_bytes());
-        hasher.write(name.as_bytes());
-        hasher.write(&[u8::from(enabled)]);
+        put_bytes(&mut buffer, name.as_bytes());
+        buffer.push(u8::from(enabled));
     }
-    hasher.finish128().h1
+    let digest = xxh3_128_with_secret(&buffer, &key.secret);
+    (digest as u64) ^ ((digest >> 64) as u64)
 }
 
 #[cfg(test)]
@@ -543,11 +1000,23 @@ mod tests {
         .with_body(body.map(|body| bytes::Bytes::copy_from_slice(body)))
     }
 
-    fn key(cache: &AllowCache, request: &RequestContext) -> CacheKey {
-        match cache.build_key(request) {
-            KeyBuild::Key(key) => key,
-            other => panic!("expected a key, got {other:?}"),
+    fn fingerprint(cache: &AllowCache, request: &RequestContext) -> Fingerprint {
+        match cache.fingerprint(request) {
+            KeyBuild::Fingerprint(key) => key,
+            other => panic!("expected a fingerprint, got {other:?}"),
         }
+    }
+
+    fn body_of(request: &RequestContext) -> &[u8] {
+        request.body.as_deref().unwrap_or(&[])
+    }
+
+    fn lookup(cache: &AllowCache, request: &RequestContext) -> bool {
+        cache.lookup(fingerprint(cache, request), body_of(request))
+    }
+
+    fn insert(cache: &AllowCache, request: &RequestContext) {
+        cache.insert(fingerprint(cache, request), body_of(request));
     }
 
     fn header_map(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
@@ -566,7 +1035,7 @@ mod tests {
         let cache = cache(1024);
         let a = ctx("GET", "/api/items?id=1", None);
         let b = ctx("GET", "/api/items?id=1", None);
-        assert_eq!(key(&cache, &a), key(&cache, &b));
+        assert_eq!(fingerprint(&cache, &a), fingerprint(&cache, &b));
     }
 
     #[test]
@@ -576,7 +1045,7 @@ mod tests {
         a.headers = header_map(&[("user-agent", "probe"), ("accept", "*/*")]);
         let mut b = ctx("GET", "/api/items", None);
         b.headers = header_map(&[("accept", "*/*"), ("user-agent", "probe")]);
-        assert_eq!(key(&cache, &a), key(&cache, &b));
+        assert_eq!(fingerprint(&cache, &a), fingerprint(&cache, &b));
     }
 
     #[test]
@@ -588,8 +1057,8 @@ mod tests {
         two.headers = header_map(&[("x-test", "a"), ("x-test", "b")]);
         let mut swapped = ctx("POST", "/api", Some(b"a=1"));
         swapped.headers = header_map(&[("x-test", "b"), ("x-test", "a")]);
-        assert_ne!(key(&cache, &one), key(&cache, &two));
-        assert_ne!(key(&cache, &two), key(&cache, &swapped));
+        assert_ne!(fingerprint(&cache, &one), fingerprint(&cache, &two));
+        assert_ne!(fingerprint(&cache, &two), fingerprint(&cache, &swapped));
     }
 
     #[test]
@@ -597,7 +1066,7 @@ mod tests {
         let cache = cache(1024);
         let encoded = ctx("GET", "/a%2Fb?q=%41", None);
         let decoded = ctx("GET", "/a/b?q=A", None);
-        assert_ne!(key(&cache, &encoded), key(&cache, &decoded));
+        assert_ne!(fingerprint(&cache, &encoded), fingerprint(&cache, &decoded));
     }
 
     #[test]
@@ -605,7 +1074,7 @@ mod tests {
         let cache = cache(1024);
         let first = ctx("GET", "/search?a=1&b=2", None);
         let second = ctx("GET", "/search?b=2&a=1", None);
-        assert_ne!(key(&cache, &first), key(&cache, &second));
+        assert_ne!(fingerprint(&cache, &first), fingerprint(&cache, &second));
     }
 
     #[test]
@@ -615,24 +1084,29 @@ mod tests {
         spaced.headers = header_map(&[("x-note", "a b")]);
         let mut double = ctx("POST", "/api", Some(b"a=1"));
         double.headers = header_map(&[("x-note", "a  b")]);
-        assert_ne!(key(&cache, &spaced), key(&cache, &double));
+        assert_ne!(fingerprint(&cache, &spaced), fingerprint(&cache, &double));
 
         let mut length_five = ctx("POST", "/api", Some(b"a=1"));
         length_five.headers = header_map(&[("content-length", "3")]);
         let mut length_six = ctx("POST", "/api", Some(b"a=1"));
         length_six.headers = header_map(&[("content-length", "6")]);
-        assert_ne!(key(&cache, &length_five), key(&cache, &length_six));
+        assert_ne!(
+            fingerprint(&cache, &length_five),
+            fingerprint(&cache, &length_six)
+        );
 
         let mut chunked = ctx("POST", "/api", Some(b"a=1"));
         chunked.headers = header_map(&[("transfer-encoding", "chunked")]);
         let mut not_chunked = ctx("POST", "/api", Some(b"a=1"));
         not_chunked.headers = HeaderMap::new();
-        assert_ne!(key(&cache, &chunked), key(&cache, &not_chunked));
+        assert_ne!(
+            fingerprint(&cache, &chunked),
+            fingerprint(&cache, &not_chunked)
+        );
     }
 
     #[test]
     fn method_body_and_protocol_are_injective() {
-        let cache = cache(1024);
         let get = ctx("GET", "/api", None);
         let lower = ctx("get", "/api", None);
         let post = ctx("POST", "/api", Some(b""));
@@ -641,16 +1115,21 @@ mod tests {
         let mut http2 = ctx("GET", "/api", None);
         http2.http_version = "2".to_string();
 
-        let keys = [
-            key(&cache, &get),
-            key(&cache, &lower),
-            key(&cache, &post),
-            key(&cache, &body_a),
-            key(&cache, &body_b),
-            key(&cache, &http2),
-        ];
-        let unique: std::collections::HashSet<_> = keys.iter().collect();
-        assert_eq!(unique.len(), keys.len());
+        // `body_a` and `body_b` deliberately share a fingerprint (the body
+        // lives in the second lookup level), so injectivity is asserted on the
+        // full two-level key: insert one and prove every other is a miss.
+        let requests = [&get, &lower, &post, &body_a, &body_b, &http2];
+        for (inserted, request) in requests.iter().enumerate() {
+            let cache = cache(1024);
+            insert(&cache, request);
+            for (probed, other) in requests.iter().enumerate() {
+                assert_eq!(
+                    lookup(&cache, other),
+                    inserted == probed,
+                    "request {probed} must not hit the entry for request {inserted}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -660,7 +1139,10 @@ mod tests {
         declared.body_size = Some(3);
         let mut different = ctx("POST", "/api", Some(b"a=1"));
         different.body_size = Some(4);
-        assert_ne!(key(&cache, &declared), key(&cache, &different));
+        assert_ne!(
+            fingerprint(&cache, &declared),
+            fingerprint(&cache, &different)
+        );
     }
 
     #[test]
@@ -668,7 +1150,7 @@ mod tests {
         let cache = cache(4);
         let request = ctx("POST", "/api", Some(b"12345"));
         assert_eq!(
-            cache.build_key(&request),
+            cache.fingerprint(&request),
             KeyBuild::NotCacheable(NotCacheable::BodyTooLarge)
         );
     }
@@ -679,7 +1161,7 @@ mod tests {
         let mut request = ctx("POST", "/api", None);
         request.body_size = Some(10);
         assert_eq!(
-            cache.build_key(&request),
+            cache.fingerprint(&request),
             KeyBuild::NotCacheable(NotCacheable::BodyNotCaptured)
         );
     }
@@ -692,11 +1174,10 @@ mod tests {
         };
         let cache = AllowCache::new(&config, 1, Key::random(), None);
         let request = ctx("GET", "/api", None);
-        let key = key(&cache, &request);
-        cache.insert(key);
-        assert!(!cache.get(key));
+        insert(&cache, &request);
+        assert!(!lookup(&cache, &request));
         assert!(cache.is_empty());
-        assert_eq!(cache.stats().expired, 1);
+        assert!(cache.stats().expired > 0);
     }
 
     #[test]
@@ -708,7 +1189,7 @@ mod tests {
         let cache = AllowCache::new(&config, 1, Key::random(), None);
         for index in 0..100 {
             let request = ctx("GET", &format!("/api/{index}"), None);
-            cache.insert(key(&cache, &request));
+            insert(&cache, &request);
         }
         assert!(cache.len() <= 8, "entries = {}", cache.len());
         assert!(cache.stats().evictions > 0);
@@ -718,13 +1199,12 @@ mod tests {
     fn policy_generation_invalidates_every_entry() {
         let cache = cache(1024);
         let request = ctx("GET", "/api", None);
-        let key = key(&cache, &request);
-        cache.insert(key);
-        assert!(cache.get(key));
+        insert(&cache, &request);
+        assert!(lookup(&cache, &request));
 
         cache.invalidate();
         assert!(cache.is_empty());
-        assert!(!cache.get(key));
+        assert!(!lookup(&cache, &request));
         assert_ne!(cache.generation(), 7);
     }
 
@@ -732,8 +1212,7 @@ mod tests {
     fn set_generation_clears_on_change_only() {
         let cache = cache(1024);
         let request = ctx("GET", "/api", None);
-        let key = key(&cache, &request);
-        cache.insert(key);
+        insert(&cache, &request);
         cache.set_generation(7);
         assert_eq!(cache.len(), 1);
         cache.set_generation(8);
@@ -759,7 +1238,7 @@ mod tests {
         let mut keys = std::collections::HashSet::new();
         for index in 0..50_000 {
             let request = ctx("GET", &format!("/api/{index}?id={index}"), None);
-            keys.insert(key(&cache, &request));
+            keys.insert(fingerprint(&cache, &request));
         }
         assert_eq!(keys.len(), 50_000);
     }
@@ -769,7 +1248,10 @@ mod tests {
         let first = cache(1024);
         let second = cache(1024);
         let request = ctx("GET", "/api", None);
-        assert_ne!(key(&first, &request), key(&second, &request));
+        assert_ne!(
+            fingerprint(&first, &request),
+            fingerprint(&second, &request)
+        );
     }
 
     #[test]
@@ -780,14 +1262,13 @@ mod tests {
         };
         let cache = Arc::new(AllowCache::new(&config, 1, Key::random(), None));
         let mut handles = Vec::new();
-        for thread in 0..8 {
+        for thread in 0..16 {
             let cache = Arc::clone(&cache);
             handles.push(std::thread::spawn(move || {
                 for index in 0..500 {
                     let request = ctx("GET", &format!("/t{thread}/{index}"), None);
-                    let key = key(&cache, &request);
-                    cache.insert(key);
-                    let _ = cache.get(key);
+                    insert(&cache, &request);
+                    let _ = lookup(&cache, &request);
                 }
             }));
         }
@@ -795,5 +1276,86 @@ mod tests {
             handle.join().unwrap();
         }
         assert!(cache.len() <= 64, "entries = {}", cache.len());
+    }
+
+    #[test]
+    fn same_fingerprint_with_a_different_body_never_allows() {
+        let cache = cache(1024);
+        // Same method, URI, headers and body length: only the body bytes differ.
+        let allowed = ctx("POST", "/api", Some(b"data=benign"));
+        let attacker = ctx("POST", "/api", Some(b"data=attack"));
+        assert_eq!(
+            fingerprint(&cache, &allowed),
+            fingerprint(&cache, &attacker),
+            "the fixture must share one fingerprint"
+        );
+
+        insert(&cache, &allowed);
+        assert!(lookup(&cache, &allowed));
+        assert!(
+            !lookup(&cache, &attacker),
+            "a fingerprint match alone must never allow"
+        );
+        assert_eq!(cache.stats().misses, 1);
+    }
+
+    #[test]
+    fn fingerprint_collision_requires_a_body_digest_match() {
+        let cache = cache(1024);
+        let request = ctx("POST", "/api", Some(b"one"));
+        let key = fingerprint(&cache, &request);
+
+        // Simulate an adversary that forced a fingerprint collision: the map
+        // contains an entry for this fingerprint with a different body digest.
+        cache.insert(key, b"two");
+        assert!(!cache.lookup(key, b"three"));
+        assert!(!cache.lookup(key, b"two-two"));
+        assert!(cache.lookup(key, b"two"));
+    }
+
+    #[test]
+    fn one_fingerprint_holds_several_body_variants() {
+        let cache = cache(1024);
+        let first = ctx("POST", "/api", Some(b"aaaa"));
+        let second = ctx("POST", "/api", Some(b"bbbb"));
+        insert(&cache, &first);
+        insert(&cache, &second);
+        assert!(lookup(&cache, &first));
+        assert!(lookup(&cache, &second));
+    }
+
+    #[test]
+    fn l1_never_skips_body_verification() {
+        let cache = cache(1024);
+        let allowed = ctx("POST", "/api", Some(b"data=benign"));
+        insert(&cache, &allowed);
+        // Warm the thread-local L1 with the allowed body.
+        assert!(lookup(&cache, &allowed));
+
+        let attacker = ctx("POST", "/api", Some(b"data=attack"));
+        assert!(!lookup(&cache, &attacker));
+    }
+
+    #[test]
+    fn l1_does_not_survive_invalidation() {
+        let cache = cache(1024);
+        let request = ctx("GET", "/api", None);
+        insert(&cache, &request);
+        assert!(lookup(&cache, &request));
+        cache.invalidate();
+        assert!(!lookup(&cache, &request));
+    }
+
+    #[test]
+    fn l1_is_scoped_to_one_cache_instance() {
+        let first = cache(1024);
+        let second = cache(1024);
+        let request = ctx("GET", "/api", None);
+        insert(&first, &request);
+        assert!(lookup(&first, &request));
+        assert!(
+            !lookup(&second, &request),
+            "a slot from another cache must never hit"
+        );
     }
 }

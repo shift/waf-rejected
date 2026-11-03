@@ -184,10 +184,10 @@ memchr = "2.7"
 # Multi-pattern matcher used by the experimental CRS literal prefilter
 # (`crs-prefilter`). Already in the lockfile as a `regex` transitive dep.
 aho-corasick = { version = "1.1", optional = true }
-# Keyed SipHash-2-4 (128-bit output) for the experimental allow-verdict cache.
+# Keyed xxh3-128 (secret mode, SIMD) for the experimental allow-verdict cache.
 # Non-default feature `allow-cache`; see
 # docs/suggestions_from_agents/allow-cache.md.
-siphasher = { version = "1.0", optional = true }
+xxhash-rust = { version = "0.8", features = ["xxh3"], optional = true }
 
 # Precompiled DFA regex sets for the experimental native engine kernel
 # (`engine-kernel`). Already in the lockfile as a `regex` transitive dep.
@@ -292,7 +292,7 @@ fastpath = ["dep:aho-corasick"]
 # Experimental content-addressed allow-verdict cache. Non-default and opt-in:
 # it only memoises the verdict of pure content rules for a short TTL and never
 # caches blocks. See docs/suggestions_from_agents/allow-cache.md.
-allow-cache = ["dep:siphasher"]
+allow-cache = ["dep:xxhash-rust"]
 
 # Experimental native Rust WAF evaluation kernel (prototype, non-default).
 # Demonstrates the execution model for a future Coraza replacement: parsed
