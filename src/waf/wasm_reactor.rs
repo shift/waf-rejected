@@ -27,7 +27,8 @@ use wasmtime_wasi::WasiCtxBuilder;
 
 use crate::metrics::Metrics;
 use crate::waf::coraza_payload::{
-    build_payload_with_policy_and_rules, BodyInspectionPolicy, PayloadBuild,
+    build_binary_payload_with_policy_and_rules, build_payload_with_policy_and_rules,
+    BodyInspectionPolicy, PayloadBuild,
 };
 use crate::waf::{Decision, RequestContext, WafRule};
 
@@ -44,6 +45,41 @@ pub const GUEST_ERROR_BODY_ENCODING: i32 = -5;
 pub const BODY_ENCODING_UTF8: &str = "utf8";
 /// Payload `body_encoding` value for a base64-encoded binary body.
 pub const BODY_ENCODING_BASE64: &str = "base64";
+
+/// Environment switch that forces the legacy JSON request envelope.
+///
+/// The compact binary envelope is the default. Set `WAF_CORAZA_JSON_ABI=1` to
+/// fall back to JSON for compatibility with older guest modules and for A/B
+/// benchmarking. The guest accepts both formats, so this only affects the
+/// host-side encoder.
+pub const JSON_ABI_ENV: &str = "WAF_CORAZA_JSON_ABI";
+
+/// Returns true when the legacy JSON envelope should be used.
+pub fn json_abi_requested() -> bool {
+    match JSON_ABI_OVERRIDE.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => matches!(
+            std::env::var(JSON_ABI_ENV).as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        ),
+    }
+}
+
+/// Process-wide override for the ABI selection, used by benchmarks and tests.
+/// `None` restores the environment-variable behaviour.
+pub fn set_json_abi(enabled: Option<bool>) {
+    JSON_ABI_OVERRIDE.store(
+        match enabled {
+            Some(false) => 0,
+            Some(true) => 1,
+            None => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+static JSON_ABI_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
 
 /// Offset in linear memory where the host writes the request payload.
 pub const INPUT_BASE: usize = 1024;
@@ -546,6 +582,10 @@ struct CachedInstance {
     eval: TypedFunc<(i32, i32), i32>,
     free: TypedFunc<(i32, i32), ()>,
     input_base: usize,
+    /// Optional address of the guest's fixed decision header. When present the
+    /// host reads the decision code and HTTP status from guest memory instead
+    /// of relying only on the scalar `eval` return value.
+    decision_base: Option<usize>,
 }
 
 impl CachedInstance {
@@ -921,12 +961,25 @@ impl WorkerConfig {
             Err(_) => INPUT_BASE,
         };
 
+        let decision_base = match instance.get_typed_func::<(), i32>(&mut store, "decision_base") {
+            Ok(func) => {
+                let base = func.call(&mut store, ()).map_err(map_guest_error)?;
+                if base < 0 {
+                    None
+                } else {
+                    Some(base as usize)
+                }
+            }
+            Err(_) => None,
+        };
+
         Ok(CachedInstance {
             store,
             memory,
             eval,
             free,
             input_base,
+            decision_base,
         })
     }
 
@@ -965,10 +1018,28 @@ impl WorkerConfig {
         // per request. A failure here does not invalidate the instance.
         let _ = cached.free.call(&mut cached.store, (base_i32, len_i32));
 
+        // Read the fixed decision header when the guest exports one. The
+        // scalar return value remains authoritative for the decision code; the
+        // header carries the HTTP status for a block without another copy.
+        let mut status = 403u16;
+        if let Some(header) = cached.decision_base {
+            let mut bytes = [0u8; 8];
+            if cached
+                .memory
+                .read(&mut cached.store, header, &mut bytes)
+                .is_ok()
+            {
+                let header_status = u32::from_le_bytes(bytes[4..8].try_into().unwrap_or([0; 4]));
+                if header_status != 0 && header_status <= u32::from(u16::MAX) {
+                    status = header_status as u16;
+                }
+            }
+        }
+
         let decision = match code {
             DECISION_ALLOW => ReactorDecision::Allow,
             DECISION_BLOCK => ReactorDecision::Block {
-                status: 403,
+                status,
                 reason: "blocked by wasm reactor".to_string(),
             },
             GUEST_ERROR_BODY_ENCODING => {
@@ -1116,6 +1187,17 @@ impl WasmReactor {
     /// The call is idempotent and thread-safe. A failed worker aborts the whole
     /// warm-up so start-up can fail closed; later calls retry from scratch.
     pub fn warm(&self) -> Result<(), ReactorError> {
+        self.warm_workers(self.pool_size)
+    }
+
+    /// Pre-warms exactly `workers` reactor instances (clamped to
+    /// `1..=MAX_REACTOR_POOL_SIZE`) before readiness is marked healthy.
+    ///
+    /// Every worker runs `_initialize` + `init` on its own OS thread and the
+    /// call blocks until all of them report ready. Any failure aborts the pool
+    /// and returns an error so proxy startup can fail closed. Once a pool is
+    /// built, later calls are no-ops and keep the original size.
+    pub fn warm_workers(&self, workers: usize) -> Result<(), ReactorError> {
         if self.pool.get().is_some() {
             return Ok(());
         }
@@ -1128,6 +1210,7 @@ impl WasmReactor {
             return Ok(());
         }
 
+        let size = workers.clamp(1, MAX_REACTOR_POOL_SIZE);
         let pool = ReactorPool::start(
             WorkerConfig {
                 id: self.id,
@@ -1137,12 +1220,12 @@ impl WasmReactor {
                 limits: self.limits.clone(),
                 linear_memory_bytes: Arc::clone(&self.linear_memory_bytes),
             },
-            self.pool_size,
+            size,
         )?;
         let _ = self.pool.set(Arc::new(pool));
         info!(
             reactor = self.id,
-            pool_size = self.pool_size,
+            pool_size = size,
             "Coraza WASI reactor pool warmed"
         );
         Ok(())
@@ -1419,8 +1502,11 @@ impl WafRule for WasmReactorRule {
         }
         #[cfg(not(feature = "crs-prefilter"))]
         let remove_rule_ids: Vec<u32> = Vec::new();
-        let payload_result =
-            build_payload_with_policy_and_rules(ctx, &self.body_policy, &remove_rule_ids);
+        let payload_result = if json_abi_requested() {
+            build_payload_with_policy_and_rules(ctx, &self.body_policy, &remove_rule_ids)
+        } else {
+            build_binary_payload_with_policy_and_rules(ctx, &self.body_policy, &remove_rule_ids)
+        };
         let (payload, inspected_bytes, truncated) = match payload_result {
             Ok(PayloadBuild::Built {
                 payload,

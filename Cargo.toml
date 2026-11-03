@@ -62,6 +62,11 @@ path = "src/bin/fastpath_bench.rs"
 required-features = ["fastpath"]
 
 [[bin]]
+name = "coraza_abi_bench"
+path = "src/bin/coraza_abi_bench.rs"
+required-features = ["wasm-reactor"]
+
+[[bin]]
 name = "native_detect_bench"
 path = "src/bin/native_detect_bench.rs"
 required-features = ["native-detect"]

@@ -6,6 +6,16 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Added
 
+- Compact binary request envelope for the Coraza WASI reactor (default), with
+  the legacy JSON envelope kept behind `WAF_CORAZA_JSON_ABI=1`. The host writes
+  the length-prefixed struct directly into the guest's static input buffer and
+  reads the decision from a fixed `decision_base` header, removing JSON parsing
+  and base64 from the per-request path. Adds `WasmReactor::warm_workers(n)` for
+  fail-closed start-up pre-warming and a `coraza_abi_bench` binary. Measured
+  p50 is unchanged because CRS evaluation dominates; the 4 KiB body p99 drops
+  from 546 ms to 502 ms, and pre-warming removes the ~1.3–1.7 s first-request
+  Go/CRS initialisation. See `docs/coraza-wasi-reactor.md`.
+
 - Engine-level performance regression gate (`benchmarks/perf-gate/`). A
   reproducible runner measures the Coraza WASI reactor, the native Rust CRS
   engine and the experimental kernel behind the same bodyless, 4 KiB allow and

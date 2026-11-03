@@ -176,6 +176,7 @@ Expected exports:
 | `memory` | linear memory | Imported by the host. |
 | `_initialize` | `() -> ()` | Go reactor initialiser; must run before any other export. |
 | `input_base` | `() -> i32` | Address of the static request buffer. |
+| `decision_base` | `() -> i32` | Optional address of the fixed 8-byte decision header. |
 | `init` | `() -> i32` | `0` = ready, non-zero = WAF construction failed. |
 | `eval` | `(i32, i32) -> i32` | `0` allow, `1` block, negative protocol error. |
 | `free` | `(i32, i32) -> ()` | No-op; the input buffer is static. |
@@ -210,20 +211,25 @@ wasmtime-wasi.
 ## ABI
 
 `WasmReactor::warm()` starts a fixed-size pool of dedicated OS threads and
-blocks until every one of them has finished start-up:
+blocks until every one of them has finished start-up. `warm_workers(n)` is the
+explicit form: it pre-warms exactly `n` instances (clamped to `1..=8`) and is
+what proxy start-up should call before marking readiness healthy. Any failure
+aborts the pool and returns an error, so start-up fails closed.
 
 1. instantiates the module with the WASI shim;
 2. calls `_initialize` (Go runtime start-up);
 3. calls `init` (compiles the embedded SecLang rules);
-4. resolves `input_base`.
+4. resolves `input_base` and, when exported, `decision_base`.
 
 Every request then only:
 
 1. hands the payload to an idle pool worker;
 2. sets the wasmtime epoch deadline from `waf.coraza.eval_timeout_ms`;
-3. copies the JSON payload to `input_base`;
+3. writes the payload directly into the guest's static input buffer at
+   `input_base` (no host-side JSON string is built for the binary ABI);
 4. calls `eval(base, len)`;
-5. calls `free(base, len)`.
+5. reads the fixed decision header at `decision_base` (code + HTTP status);
+6. calls `free(base, len)`.
 
 `eval` creates and closes a Coraza transaction per request, so decisions do not
 leak between requests. A failed evaluation (trap, epoch timeout, failed init)
@@ -301,7 +307,28 @@ Set `waf.admission.enabled = false` to restore the historical behaviour
 
 ### Payload
 
-UTF-8 JSON, matching `build_payload` in `src/waf/wasm_reactor.rs`:
+The default request envelope is a compact binary struct written directly into
+the guest's static input buffer. It removes JSON parsing, base64 encoding and
+the associated allocations from the per-request path. All integers are
+little-endian:
+
+```text
+magic u32 = 0xCAFEBABE | version u16 = 1 | flags u16 (bit 0 = binary)
+method_len u32 | uri_len u32 | http_version_len u32
+body_len u32 | header_count u32 | remove_rule_count u32
+method | uri | http_version | body (raw bytes)
+header_count * (name_len u32 | name | value_len u32 | value)
+remove_rule_count * u32
+```
+
+The body is raw bytes, so binary bodies (protobuf/gRPC, msgpack, compressed
+payloads) are inspected without a base64 round trip. `remove_rule_count` is
+bounded by 256 on both sides. The guest detects the envelope by the magic
+number; anything else is parsed as the legacy JSON payload.
+
+The legacy JSON envelope remains available behind `WAF_CORAZA_JSON_ABI=1`
+(or `set_json_abi(Some(true))` in-process) for compatibility with older guest
+modules and for A/B benchmarking:
 
 ```json
 {
@@ -718,6 +745,32 @@ the pool: `370 + 96 × pool_size` MiB is a conservative cap (1/2/4/6/8 workers
 whose `rss-peak` and `rss-growth` gates cover host and proxy buffers.
 
 ## Benchmarks
+
+### Binary ABI vs JSON and pre-warm (measured)
+
+`src/bin/coraza_abi_bench.rs` compares the two envelopes and a cold pool
+against a pre-warmed pool on the same host:
+
+```sh
+CORAZA_BENCH_REPS=120 \
+  nix develop -c cargo run --release --bin coraza_abi_bench --features wasm-reactor
+```
+
+Reference host, 2-worker pool, p50/p99 in ms:
+
+| case | binary warm | JSON warm | binary cold first call |
+| --- | --- | --- | --- |
+| allow | 3.18 / 3.99 | 3.17 / 3.76 | 1677 ms |
+| SQLi | 4.16 / 8.94 | 4.17 / 7.80 | 6.6 ms |
+| 4 KiB body | 397 / 502 | 392 / 546 | 185 ms |
+
+The binary envelope is neutral on p50 because CRS evaluation dominates the
+request (roughly 95 % of the time); it removes JSON/base64 work and improves
+the 4 KiB body p99 (502 vs 546 ms). The absolute p50 is about 2.6× below the
+historical 8.4 ms allow / 10.6 ms SQLi baseline on this host, but that gain is
+host/toolchain, not the envelope alone. Pre-warming is the large win: the first
+allow request drops from ~1.3–1.7 s (Go runtime + CRS compilation) to ~3.7 ms
+once `warm_workers(n)` has completed.
 
 The reactor has a feature-gated Criterion benchmark:
 

@@ -9,6 +9,7 @@ package main
 import (
 	"embed"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"io/fs"
 	"runtime/debug"
@@ -165,6 +166,17 @@ func filteredRemoveRuleIDs(ids []uint32) []int {
 // host may keep using the returned offset for the lifetime of the instance.
 var inputBuf [maxInputBytes]byte
 
+// decisionBuf is the fixed decision header. Byte 0..3 hold the decision code
+// (0 allow, 1 block, negative guest error); bytes 4..7 hold the HTTP status
+// for a block. The host reads this after `eval` returns so it can recover the
+// extended decision without another copy or JSON decode.
+var decisionBuf [8]byte
+
+//go:wasmexport decision_base
+func wafDecisionBase() int32 {
+	return int32(uintptr(unsafe.Pointer(&decisionBuf[0])))
+}
+
 var (
 	engine  coraza.WAF
 	initErr error
@@ -260,6 +272,112 @@ func decodeHeaders(raw json.RawMessage) [][2]string {
 	return nil
 }
 
+// binaryMagic marks the compact binary request envelope. It must match
+// crate::waf::coraza_payload::BINARY_MAGIC on the host.
+const binaryMagic = 0xCAFEBABE
+
+// binaryHeaderBytes is the fixed prefix of the binary envelope.
+const binaryHeaderBytes = 32
+
+// parsedRequest is the backend-neutral request shape used by the evaluator.
+type parsedRequest struct {
+	method        string
+	uri           string
+	httpVersion   string
+	headers       [][2]string
+	body          []byte
+	hasBody       bool
+	bodyErr       int32
+	removeRuleIDs []uint32
+}
+
+// bytesToString aliases a byte slice as a string without copying. The payload
+// lives in the static input buffer for the duration of the evaluation, so the
+// alias is valid while the transaction runs.
+func bytesToString(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	return unsafe.String(&b[0], len(b))
+}
+
+// parseBinaryRequest decodes the compact binary envelope written by the host.
+// It returns nil when the payload is not a binary envelope (for example the
+// legacy JSON payload), so the caller can fall back to JSON.
+func parseBinaryRequest(payload []byte) (*parsedRequest, int) {
+	if len(payload) < binaryHeaderBytes {
+		return nil, 0
+	}
+	if binary.LittleEndian.Uint32(payload[0:4]) != binaryMagic {
+		return nil, 0
+	}
+	if binary.LittleEndian.Uint16(payload[4:6]) != 1 {
+		return nil, errPayload
+	}
+	methodLen := int(binary.LittleEndian.Uint32(payload[8:12]))
+	uriLen := int(binary.LittleEndian.Uint32(payload[12:16]))
+	versionLen := int(binary.LittleEndian.Uint32(payload[16:20]))
+	bodyLen := int(binary.LittleEndian.Uint32(payload[20:24]))
+	headerCount := int(binary.LittleEndian.Uint32(payload[24:28]))
+	removeCount := int(binary.LittleEndian.Uint32(payload[28:32]))
+	if removeCount > maxRemoveRuleIDs {
+		return nil, errPayload
+	}
+
+	off := binaryHeaderBytes
+	need := func(n int) bool { return n >= 0 && off+n <= len(payload) }
+	if !need(methodLen + uriLen + versionLen + bodyLen) {
+		return nil, errBounds
+	}
+	req := &parsedRequest{}
+	req.method = bytesToString(payload[off : off+methodLen])
+	off += methodLen
+	req.uri = bytesToString(payload[off : off+uriLen])
+	off += uriLen
+	req.httpVersion = bytesToString(payload[off : off+versionLen])
+	off += versionLen
+	if bodyLen > 0 {
+		req.body = payload[off : off+bodyLen]
+		req.hasBody = true
+	}
+	off += bodyLen
+
+	req.headers = make([][2]string, 0, headerCount)
+	for i := 0; i < headerCount; i++ {
+		if !need(4) {
+			return nil, errBounds
+		}
+		nameLen := int(binary.LittleEndian.Uint32(payload[off : off+4]))
+		off += 4
+		if !need(nameLen) {
+			return nil, errBounds
+		}
+		name := bytesToString(payload[off : off+nameLen])
+		off += nameLen
+		if !need(4) {
+			return nil, errBounds
+		}
+		valueLen := int(binary.LittleEndian.Uint32(payload[off : off+4]))
+		off += 4
+		if !need(valueLen) {
+			return nil, errBounds
+		}
+		value := bytesToString(payload[off : off+valueLen])
+		off += valueLen
+		req.headers = append(req.headers, [2]string{name, value})
+	}
+
+	req.removeRuleIDs = make([]uint32, 0, removeCount)
+	for i := 0; i < removeCount; i++ {
+		if !need(4) {
+			return nil, errBounds
+		}
+		req.removeRuleIDs = append(req.removeRuleIDs, binary.LittleEndian.Uint32(payload[off:off+4]))
+		off += 4
+	}
+	return req, 0
+}
+
 func ensureEngine() {
 	if engine != nil || initErr != nil {
 		return
@@ -300,7 +418,15 @@ func wafInit() int32 {
 }
 
 //go:wasmexport eval
-func wafEval(ptr int32, length int32) int32 {
+func wafEval(ptr int32, length int32) (code int32) {
+	defer func() {
+		binary.LittleEndian.PutUint32(decisionBuf[0:4], uint32(code))
+		if code == 1 {
+			binary.LittleEndian.PutUint32(decisionBuf[4:8], 403)
+		} else {
+			binary.LittleEndian.PutUint32(decisionBuf[4:8], 0)
+		}
+	}()
 	if engine == nil {
 		ensureEngine()
 		if initErr != nil {
@@ -321,6 +447,17 @@ func wafEval(ptr int32, length int32) int32 {
 	}
 
 	payload := unsafe.Slice((*byte)(unsafe.Pointer(p)), int(length))
+
+	// Fast path: the compact binary envelope. The host writes it directly into
+	// the static input buffer, so the guest only slices it and never decodes
+	// JSON or base64. A non-matching magic falls back to the legacy JSON path.
+	if req, code := parseBinaryRequest(payload); req != nil {
+		if code != 0 {
+			return int32(code)
+		}
+		return evalParsed(req)
+	}
+
 	var req Request
 	if err := json.Unmarshal(payload, &req); err != nil {
 		return errPayload
@@ -329,28 +466,49 @@ func wafEval(ptr int32, length int32) int32 {
 		return errPayload
 	}
 
+	parsed := &parsedRequest{
+		method:        req.Method,
+		uri:           req.URI,
+		httpVersion:   req.HTTPVersion,
+		headers:       decodeHeaders(req.Headers),
+		removeRuleIDs: req.RemoveRuleIDs,
+	}
+	if req.Body != nil && *req.Body != "" {
+		body, code := decodeBody(&req)
+		if code != 0 {
+			parsed.bodyErr = int32(code)
+		} else {
+			parsed.body = body
+			parsed.hasBody = true
+		}
+	}
+	return evalParsed(parsed)
+}
+
+// evalParsed runs one transaction from the backend-neutral request shape.
+func evalParsed(req *parsedRequest) int32 {
 	tx := engine.NewTransaction()
 	defer tx.Close()
 
 	// Remove only the host-proven gated rules before the first phase so they
 	// never evaluate. Ungated and unknown ids are ignored by removeRules.
-	removeRules(tx, req.RemoveRuleIDs)
+	removeRules(tx, req.removeRuleIDs)
 
-	version := req.HTTPVersion
+	version := req.httpVersion
 	if version == "" {
 		version = "HTTP/1.1"
 	}
-	uri := req.URI
+	uri := req.uri
 	if uri == "" {
 		uri = "/"
 	}
-	method := req.Method
+	method := req.method
 	if method == "" {
 		method = "GET"
 	}
 
 	tx.ProcessURI(uri, method, version)
-	for _, h := range decodeHeaders(req.Headers) {
+	for _, h := range req.headers {
 		tx.AddRequestHeader(h[0], h[1])
 	}
 
@@ -358,12 +516,14 @@ func wafEval(ptr int32, length int32) int32 {
 		return 1
 	}
 
-	if req.Body != nil && *req.Body != "" {
-		body, code := decodeBody(&req)
-		if code != 0 {
-			return int32(code)
-		}
-		if _, _, err := tx.WriteRequestBody(body); err != nil {
+	// A malformed body is only reported after phase-1 rules had a chance to
+	// deny the request, preserving the historical fail-closed ordering.
+	if req.bodyErr != 0 {
+		return req.bodyErr
+	}
+
+	if req.hasBody && len(req.body) > 0 {
+		if _, _, err := tx.WriteRequestBody(req.body); err != nil {
 			return errBody
 		}
 	}

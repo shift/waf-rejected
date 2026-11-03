@@ -114,6 +114,99 @@ pub fn select_body<'a>(
     }
 }
 
+/// Magic number at the start of the compact binary request envelope.
+pub const BINARY_MAGIC: u32 = 0xCAFE_BABE;
+/// Version of the compact binary request envelope.
+pub const BINARY_VERSION: u16 = 1;
+
+/// Hard cap on rule ids accepted in the binary envelope. Matches the guest's
+/// `maxRemoveRuleIDs` and `crate::waf::prefilter::MAX_REMOVE_RULE_IDS`.
+pub const MAX_BINARY_REMOVE_RULE_IDS: usize = 256;
+
+/// Serialises the request context into the compact binary envelope.
+///
+/// Layout (all integers little-endian):
+///
+/// ```text
+/// magic u32 | version u16 | flags u16
+/// method_len u32 | uri_len u32 | http_version_len u32
+/// body_len u32 | header_count u32 | remove_rule_count u32
+/// method | uri | http_version | body
+/// header_count * (name_len u32 | name | value_len u32 | value)
+/// remove_rule_count * u32
+/// ```
+///
+/// The body is sent as raw bytes (no base64), so binary bodies survive
+/// inspection without an encode/decode round trip. `flags` bit 0 is set to
+/// mark the envelope as binary; the guest uses the magic to distinguish it
+/// from the legacy JSON payload.
+pub fn build_binary_payload_with_policy_and_rules(
+    ctx: &RequestContext,
+    policy: &BodyInspectionPolicy,
+    remove_rule_ids: &[u32],
+) -> Result<PayloadBuild, serde_json::Error> {
+    let (inspected, _original_size, truncated) = match select_body(ctx, policy) {
+        BodySelection::Inspect {
+            body,
+            original_size,
+            truncated,
+            ..
+        } => (body, original_size, truncated),
+        BodySelection::Reject { size, limit } => {
+            return Ok(PayloadBuild::Reject { size, limit });
+        }
+    };
+
+    let method = ctx.method.as_str().as_bytes();
+    let uri = ctx.uri.to_string();
+    let uri = uri.as_bytes();
+    let http_version = ctx.http_version.as_bytes();
+    let body = inspected.unwrap_or(&[]);
+    let inspected_bytes = body.len();
+
+    let header_count = ctx.headers.len();
+    let remove_count = remove_rule_ids.len().min(MAX_BINARY_REMOVE_RULE_IDS);
+
+    let mut out = Vec::with_capacity(
+        32 + method.len()
+            + uri.len()
+            + http_version.len()
+            + body.len()
+            + header_count * 16
+            + remove_count * 4,
+    );
+    out.extend_from_slice(&BINARY_MAGIC.to_le_bytes());
+    out.extend_from_slice(&BINARY_VERSION.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes()); // flags: binary
+    out.extend_from_slice(&(method.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(uri.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(http_version.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(header_count as u32).to_le_bytes());
+    out.extend_from_slice(&(remove_count as u32).to_le_bytes());
+    out.extend_from_slice(method);
+    out.extend_from_slice(uri);
+    out.extend_from_slice(http_version);
+    out.extend_from_slice(body);
+    for (name, value) in ctx.headers.iter() {
+        let name = name.as_str().as_bytes();
+        let value = value.as_bytes();
+        out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        out.extend_from_slice(name);
+        out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        out.extend_from_slice(value);
+    }
+    for id in &remove_rule_ids[..remove_count] {
+        out.extend_from_slice(&id.to_le_bytes());
+    }
+
+    Ok(PayloadBuild::Built {
+        payload: out,
+        inspected_bytes,
+        truncated,
+    })
+}
+
 /// Serialises the request context into the reactor/sidecar JSON payload using
 /// the default (inspect-all) policy.
 pub fn build_payload(ctx: &RequestContext) -> Result<Vec<u8>, serde_json::Error> {
@@ -263,5 +356,62 @@ mod tests {
             value["remove_rule_ids"],
             serde_json::json!([941100, 942200])
         );
+    }
+
+    #[test]
+    fn binary_payload_round_trips_fields_and_keeps_raw_body() {
+        let ctx = context();
+        let policy = BodyInspectionPolicy::default();
+        let payload =
+            match build_binary_payload_with_policy_and_rules(&ctx, &policy, &[941100, 942200])
+                .unwrap()
+            {
+                PayloadBuild::Built {
+                    payload,
+                    inspected_bytes,
+                    truncated,
+                } => {
+                    assert_eq!(inspected_bytes, 3);
+                    assert!(!truncated);
+                    payload
+                }
+                PayloadBuild::Reject { .. } => panic!("default policy must not reject"),
+            };
+        assert_eq!(&payload[0..4], &BINARY_MAGIC.to_le_bytes());
+        assert_eq!(&payload[4..6], &BINARY_VERSION.to_le_bytes());
+        assert_eq!(&payload[6..8], &1u16.to_le_bytes());
+        let method_len = u32::from_le_bytes(payload[8..12].try_into().unwrap()) as usize;
+        let uri_len = u32::from_le_bytes(payload[12..16].try_into().unwrap()) as usize;
+        let body_len = u32::from_le_bytes(payload[20..24].try_into().unwrap()) as usize;
+        assert_eq!(method_len, 4); // POST
+        assert_eq!(uri_len, 7); // /submit
+        assert_eq!(body_len, 3); // a=1
+        let body_off = 32 + method_len + uri_len + 3; // http_version "1.1"
+        assert_eq!(&payload[body_off..body_off + body_len], b"a=1");
+    }
+
+    #[test]
+    fn binary_payload_encodes_binary_bodies_without_base64() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "example.test".parse().unwrap());
+        let ctx = RequestContext::new(
+            "127.0.0.1".parse::<IpAddr>().unwrap(),
+            Method::POST,
+            "/search".parse::<Uri>().unwrap(),
+            headers,
+            Some(4),
+        )
+        .with_body(Some(Bytes::from_static(b"\xff\xfeq=1")));
+        let payload = match build_binary_payload_with_policy_and_rules(
+            &ctx,
+            &BodyInspectionPolicy::default(),
+            &[],
+        )
+        .unwrap()
+        {
+            PayloadBuild::Built { payload, .. } => payload,
+            PayloadBuild::Reject { .. } => panic!("default policy must not reject"),
+        };
+        assert!(payload.windows(5).any(|w| w == b"\xff\xfeq=1"));
     }
 }
