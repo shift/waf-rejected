@@ -985,3 +985,18 @@ Branch `perf/engine-hotloop` (not pushed, not merged, defaults unchanged).
   baseline Coraza parity 2,110/2,112 with 0 native-only FNs preserved.
 
 See `docs/suggestions_from_agents/engine-hotloop.md`.
+
+## Delegated: transform/gate hot path (perf/transform-hot)
+
+- [x] Profile plain-vs-percent slowdown; root cause is per-`&` HTML entity
+  lookups plus repeated plan walks / O(n²) cache memo.
+- [x] Batch transform prefixes per value (`resolve_all`), remove O(n²) memo,
+  alias identity/unchanged values, sampled dedup hash.
+- [x] Entity hash index + legacy no-semicolon table; ASCII transform fast paths.
+- [x] Single case-insensitive union automaton + per-pattern group/rule bitsets.
+- [x] Verify transform parity 7,320/7,320; lib tests with
+  `wasm-reactor,crs-prefilter,rust-engine` pass; clippy clean.
+- [ ] 4 KiB prefilter < 120 µs: percent ~48 µs (met), plain ~145 µs (missed;
+  blocker documented in `docs/suggestions_from_agents/transform-hot.md`).
+
+See `docs/suggestions_from_agents/transform-hot.md`.

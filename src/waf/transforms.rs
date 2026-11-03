@@ -131,9 +131,19 @@ impl Transform {
             Self::UrlDecode | Self::UrlDecodeUni => memchr2(b'%', b'+', input).is_none(),
             Self::RemoveNulls | Self::ReplaceNulls => memchr(0, input).is_none(),
             Self::CompressWhitespace => whitespace_is_compressed(input),
-            Self::RemoveWhitespace => !input.iter().any(|byte| {
-                matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') || *byte >= 0x80
-            }),
+            Self::RemoveWhitespace => {
+                if input.is_ascii() {
+                    memchr3(b' ', b'\t', b'\n', input).is_none()
+                        && memchr3(0x0b, 0x0c, b'\r', input).is_none()
+                } else {
+                    !input.iter().any(|byte| {
+                        matches!(
+                            byte,
+                            b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | 0x85 | 0xa0
+                        )
+                    })
+                }
+            }
             Self::Trim | Self::TrimLeft | Self::TrimRight => {
                 let left = matches!(
                     input.first(),
@@ -233,29 +243,29 @@ struct ValueKey {
 struct Entry {
     start: u32,
     end: u32,
-    /// Range of the parent value this entry was derived from. Together with
-    /// `step`, this is the memoisation key: the same step on the same bytes
-    /// always produces the same output.
-    parent_start: u32,
-    parent_end: u32,
     hash: u64,
-    step: Transform,
 }
 
-/// Fast, non-cryptographic hash used only for content deduplication. Every
-/// candidate is verified with a byte comparison, so collisions are harmless.
+/// Fast, sampled, non-cryptographic hash used only to bucket content-dedup
+/// candidates. Every candidate is verified with a byte comparison, so a
+/// collision or a skipped sample can only cost a comparison, never correctness.
 fn hash_bytes(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    let (chunks, remainder) = bytes.as_chunks::<8>();
-    for chunk in chunks {
-        let word = u64::from_le_bytes(*chunk);
-        hash = (hash ^ word).wrapping_mul(0x100_0000_01b3);
-        hash ^= hash >> 29;
+    let mut hash = (bytes.len() as u64).wrapping_mul(0xcbf2_9ce4_8422_2325);
+    let sample = |hash: &mut u64, byte: u8| {
+        *hash = (*hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+        *hash ^= *hash >> 29;
+    };
+    for &byte in bytes.iter().take(16) {
+        sample(&mut hash, byte);
     }
-    for &byte in remainder {
-        hash = (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+    let step = (bytes.len() / 16).max(1);
+    for index in (0..bytes.len()).step_by(step) {
+        sample(&mut hash, bytes[index]);
     }
-    hash
+    for &byte in bytes.iter().rev().take(16) {
+        sample(&mut hash, byte);
+    }
+    hash | 1
 }
 
 /// Per-request transform arena and prefix cache.
@@ -278,6 +288,9 @@ pub struct TransformCache {
     /// (0 means "not computed for this value").
     slots: Vec<u32>,
     entries: Vec<Entry>,
+    /// `(parent slot, step) -> result slot` memo shared by every chain. Two
+    /// prefixes that reach equal bytes and apply the same step reuse it.
+    memo: Vec<(u32, Transform, u32)>,
     prefix_count: usize,
     arena_limit: usize,
 }
@@ -290,6 +303,7 @@ impl TransformCache {
             values: Vec::new(),
             slots: Vec::new(),
             entries: Vec::new(),
+            memo: Vec::new(),
             prefix_count: 1,
             arena_limit: MAX_ARENA_BYTES,
         }
@@ -310,6 +324,7 @@ impl TransformCache {
         self.values.clear();
         self.slots.clear();
         self.entries.clear();
+        self.memo.clear();
     }
 
     /// Registers an input value and stores its raw form as prefix 0.
@@ -332,10 +347,7 @@ impl TransformCache {
         self.entries.push(Entry {
             start: start as u32,
             end: end as u32,
-            parent_start: start as u32,
-            parent_end: end as u32,
             hash: hash_bytes(value),
-            step: Transform::Identity,
         });
         self.slots[slot_base] = self.entries.len() as u32;
         self.values.push(ValueKey {
@@ -380,7 +392,6 @@ impl TransformCache {
             .saturating_mul(3)
             .saturating_add(64)
             .min(MAX_VALUE_BYTES);
-        let arena_limit = self.arena_limit;
         for &prefix in plan {
             let prefix_index = prefix as usize;
             if prefix_index >= self.prefix_count {
@@ -397,73 +408,146 @@ impl TransformCache {
                 .get(prefix_index)
                 .ok_or(TransformError::ArenaOverflow)?;
             let step = *steps.last().ok_or(TransformError::ArenaOverflow)?;
-            // Memoise (parent bytes, step): two chains that reach the same
-            // bytes through different paths share the result without running
-            // the transform again.
-            if let Some((index, entry)) = self.entries.iter().enumerate().find(|(_, entry)| {
-                entry.step == step
-                    && entry.parent_start as usize == current.start
-                    && entry.parent_end as usize == current.end
-            }) {
-                current_slot = (index + 1) as u32;
-                current = entry.start as usize..entry.end as usize;
-                self.slots[slot_base + prefix_index] = current_slot;
-                continue;
-            }
             // Cheap identity pre-check: no copy, no compare, no scan.
             if step.is_identity_on(&self.arena[current.clone()]) {
                 self.slots[slot_base + prefix_index] = current_slot;
                 continue;
             }
-
-            let TransformCache {
-                arena,
-                scratch,
-                entries,
-                slots,
-                ..
-            } = self;
-            step.apply_into(&arena[current.clone()], scratch);
-            if scratch.len() > limit {
-                return Err(TransformError::OutputOverflow);
-            }
-            // A transform that leaves the value unchanged aliases the parent
-            // representation: no arena copy, no extra scan bytes.
-            if scratch.as_slice() == &arena[current.clone()] {
-                slots[slot_base + prefix_index] = current_slot;
-                continue;
-            }
-            // Content dedup: alias an existing value with identical bytes so
-            // later chains share both the arena entry and the scan.
-            let hash = hash_bytes(scratch);
-            if let Some((index, entry)) = entries.iter().enumerate().find(|(_, entry)| {
-                entry.hash == hash
-                    && (entry.end - entry.start) as usize == scratch.len()
-                    && &arena[entry.start as usize..entry.end as usize] == scratch.as_slice()
-            }) {
-                slots[slot_base + prefix_index] = (index + 1) as u32;
-                current_slot = (index + 1) as u32;
-                current = entry.start as usize..entry.end as usize;
-                continue;
-            }
-            let start = arena.len();
-            arena.extend_from_slice(scratch);
-            if arena.len() > arena_limit {
-                return Err(TransformError::ArenaOverflow);
-            }
-            entries.push(Entry {
-                start: start as u32,
-                end: arena.len() as u32,
-                parent_start: current.start as u32,
-                parent_end: current.end as u32,
-                hash,
-                step,
-            });
-            current_slot = entries.len() as u32;
-            slots[slot_base + prefix_index] = current_slot;
-            current = start..arena.len();
+            current_slot = self.push_step(current_slot, step, limit)?;
+            let entry = self.entries[current_slot as usize - 1];
+            current = entry.start as usize..entry.end as usize;
+            self.slots[slot_base + prefix_index] = current_slot;
         }
         Ok(current)
+    }
+
+    /// Computes every registered chain prefix for one value exactly once.
+    ///
+    /// `parents[i]` is the prefix id of `steps[..i]` (the immediate parent of
+    /// prefix `i`); the prefix table is built parent-before-child, so a single
+    /// forward pass resolves the whole DAG. Groups then read their final
+    /// prefix without re-walking their plan.
+    pub fn resolve_all(
+        &mut self,
+        value: ValueId,
+        input: &[u8],
+        steps: &[Transform],
+        parents: &[u32],
+    ) -> Result<(), TransformError> {
+        self.check_value(value, input)?;
+        let value_index = value.0 as usize;
+        let slot_base = value_index * self.prefix_count;
+        let limit = input
+            .len()
+            .saturating_mul(3)
+            .saturating_add(64)
+            .min(MAX_VALUE_BYTES);
+        let count = self.prefix_count.min(steps.len()).min(parents.len());
+        for prefix in 1..count {
+            if self.slots[slot_base + prefix] != 0 {
+                continue;
+            }
+            let parent = parents[prefix] as usize;
+            if parent >= prefix {
+                return Err(TransformError::ArenaOverflow);
+            }
+            let parent_slot = self.slots[slot_base + parent];
+            if parent_slot == 0 {
+                return Err(TransformError::ArenaOverflow);
+            }
+            let step = steps[prefix];
+            let slot = if let Some((_, _, slot)) = self
+                .memo
+                .iter()
+                .find(|(parent, cached, _)| *parent == parent_slot && *cached == step)
+            {
+                *slot
+            } else {
+                let current = self.entry_range(parent_slot);
+                let slot = if step.is_identity_on(&self.arena[current]) {
+                    parent_slot
+                } else {
+                    self.push_step(parent_slot, step, limit)?
+                };
+                self.memo.push((parent_slot, step, slot));
+                slot
+            };
+            self.slots[slot_base + prefix] = slot;
+        }
+        Ok(())
+    }
+
+    /// Borrows the cached range for one (value, prefix) pair.
+    pub fn prefix_range(&self, value: ValueId, prefix: usize) -> Option<Range<usize>> {
+        let slot = *self
+            .slots
+            .get(value.0 as usize * self.prefix_count + prefix)?;
+        if slot == 0 {
+            None
+        } else {
+            Some(self.entry_range(slot))
+        }
+    }
+
+    fn check_value(&self, value: ValueId, input: &[u8]) -> Result<(), TransformError> {
+        match self.values.get(value.0 as usize) {
+            Some(key) if key.ptr == input.as_ptr() as usize && key.len == input.len() => Ok(()),
+            _ => Err(TransformError::OutputOverflow),
+        }
+    }
+
+    fn entry_range(&self, slot: u32) -> Range<usize> {
+        let entry = self.entries[slot as usize - 1];
+        entry.start as usize..entry.end as usize
+    }
+
+    /// Applies one step to the representation in `parent_slot` and returns the
+    /// slot of the result. Unchanged output aliases the parent (no arena copy);
+    /// equal output aliases an existing entry so the scan is shared too.
+    fn push_step(
+        &mut self,
+        parent_slot: u32,
+        step: Transform,
+        limit: usize,
+    ) -> Result<u32, TransformError> {
+        let current = self.entry_range(parent_slot);
+        let arena_limit = self.arena_limit;
+        let TransformCache {
+            arena,
+            scratch,
+            entries,
+            ..
+        } = self;
+        step.apply_into(&arena[current.clone()], scratch);
+        if scratch.len() > limit {
+            return Err(TransformError::OutputOverflow);
+        }
+        let hash = hash_bytes(scratch);
+        let parent = entries[parent_slot as usize - 1];
+        if hash == parent.hash
+            && (parent.end - parent.start) as usize == scratch.len()
+            && scratch.as_slice() == &arena[current]
+        {
+            return Ok(parent_slot);
+        }
+        if let Some(index) = entries.iter().position(|entry| {
+            entry.hash == hash
+                && (entry.end - entry.start) as usize == scratch.len()
+                && &arena[entry.start as usize..entry.end as usize] == scratch.as_slice()
+        }) {
+            return Ok((index + 1) as u32);
+        }
+        let start = arena.len();
+        arena.extend_from_slice(scratch);
+        if arena.len() > arena_limit {
+            return Err(TransformError::ArenaOverflow);
+        }
+        entries.push(Entry {
+            start: start as u32,
+            end: arena.len() as u32,
+            hash,
+        });
+        Ok(entries.len() as u32)
     }
 
     /// Borrows a previously resolved range.
@@ -483,6 +567,20 @@ impl TransformCache {
 
 /// True when `compressWhitespace` would return `input` unchanged.
 fn whitespace_is_compressed(input: &[u8]) -> bool {
+    if input.is_ascii() {
+        if memchr3(b'\t', b'\n', b'\r', input).is_some() || memchr2(0x0b, 0x0c, input).is_some() {
+            return false;
+        }
+        let mut start = 0usize;
+        while let Some(offset) = memchr(b' ', &input[start..]) {
+            let at = start + offset;
+            if input.get(at + 1) == Some(&b' ') {
+                return false;
+            }
+            start = at + 1;
+        }
+        return true;
+    }
     let mut previous_space = false;
     for &byte in input {
         if is_latin_space(byte) {
@@ -497,25 +595,29 @@ fn whitespace_is_compressed(input: &[u8]) -> bool {
     true
 }
 
+/// True when `cmdLine` has work beyond ASCII case folding.
+fn cmd_line_has_special(input: &[u8]) -> bool {
+    if memchr3(b'"', b'\'', b'\\', input).is_some()
+        || memchr3(b'^', b',', b';', input).is_some()
+        || memchr3(b'\t', b'\r', b'\n', input).is_some()
+        || memchr2(b'/', b'(', input).is_some()
+    {
+        return true;
+    }
+    let mut start = 0usize;
+    while let Some(offset) = memchr(b' ', &input[start..]) {
+        let at = start + offset;
+        if input.get(at + 1) == Some(&b' ') {
+            return true;
+        }
+        start = at + 1;
+    }
+    false
+}
+
 /// True when `cmdLine` would return `input` unchanged.
 fn cmd_line_is_identity(input: &[u8]) -> bool {
-    let mut previous_space = false;
-    for &byte in input {
-        match byte {
-            b' ' => {
-                if previous_space {
-                    return false;
-                }
-                previous_space = true;
-            }
-            b'"' | b'\'' | b'\\' | b'^' | b',' | b';' | b'\t' | b'\r' | b'\n' | b'/' | b'(' => {
-                return false;
-            }
-            b'A'..=b'Z' => return false,
-            _ => previous_space = false,
-        }
-    }
-    true
+    !cmd_line_has_special(input) && !input.iter().any(|byte| byte.is_ascii_uppercase())
 }
 
 fn output_push_rune(output: &mut Vec<u8>, rune: u32) {
@@ -559,6 +661,16 @@ fn table_lookup(table: &[(u32, u32)], rune: u32) -> Option<u32> {
 /// Go string.
 fn map_case(input: &[u8], output: &mut Vec<u8>, table: &[(u32, u32)], lower: bool) {
     output.reserve(input.len());
+    if input.is_ascii() {
+        let start = output.len();
+        output.extend_from_slice(input);
+        if lower {
+            output[start..].make_ascii_lowercase();
+        } else {
+            output[start..].make_ascii_uppercase();
+        }
+        return;
+    }
     let mut index = 0usize;
     while index < input.len() {
         let byte = input[index];
@@ -657,6 +769,28 @@ fn is_latin_space(byte: u8) -> bool {
 
 fn compress_whitespace_into(input: &[u8], output: &mut Vec<u8>) {
     output.reserve(input.len());
+    if input.is_ascii() {
+        let start = output.len();
+        output.extend_from_slice(input);
+        let mut write = start;
+        let mut in_space = false;
+        for read in start..output.len() {
+            let byte = output[read];
+            if is_latin_space(byte) {
+                if !in_space {
+                    output[write] = b' ';
+                    write += 1;
+                    in_space = true;
+                }
+            } else {
+                output[write] = byte;
+                write += 1;
+                in_space = false;
+            }
+        }
+        output.truncate(write);
+        return;
+    }
     let mut in_space = false;
     for &byte in input {
         if is_latin_space(byte) {
@@ -674,6 +808,34 @@ fn compress_whitespace_into(input: &[u8], output: &mut Vec<u8>) {
 /// Go's `unicode.IsSpace`, applied through `strings.Map`.
 fn remove_whitespace_into(input: &[u8], output: &mut Vec<u8>) {
     output.reserve(input.len());
+    if input.is_ascii() {
+        // Spaces dominate real bodies. When the other five ASCII whitespace
+        // bytes are absent, copy whole spans between spaces instead of
+        // branching per byte.
+        let rare =
+            memchr3(b'\t', b'\n', b'\r', input).is_some() || memchr2(0x0b, 0x0c, input).is_some();
+        if !rare {
+            let mut start = 0usize;
+            while let Some(offset) = memchr(b' ', &input[start..]) {
+                output.extend_from_slice(&input[start..start + offset]);
+                start += offset + 1;
+            }
+            output.extend_from_slice(&input[start..]);
+            return;
+        }
+        let start = output.len();
+        output.extend_from_slice(input);
+        let mut write = start;
+        for read in start..output.len() {
+            let byte = output[read];
+            if !matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
+                output[write] = byte;
+                write += 1;
+            }
+        }
+        output.truncate(write);
+        return;
+    }
     let mut index = 0usize;
     while index < input.len() {
         let byte = input[index];
@@ -1108,12 +1270,81 @@ const HTML_REPLACEMENT_TABLE: [u32; 32] = [
     0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178,
 ];
 
+/// Open-addressed index over the HTML5 entity table. Entity names are short
+/// ASCII keys; four failed binary searches per `&` in a form body cost more
+/// than the decode itself, so the hot path hashes the bytes once instead.
+struct EntityIndex {
+    entries: Vec<(&'static str, [u32; 2])>,
+    /// Open-addressed slots; 0 is empty, otherwise `entry index + 1`.
+    slots: Vec<u32>,
+}
+
+impl EntityIndex {
+    fn new(entries: Vec<(&'static str, [u32; 2])>) -> Self {
+        let capacity = (entries.len() * 2).next_power_of_two().max(16);
+        let mut index = Self {
+            entries,
+            slots: vec![0; capacity],
+        };
+        for (entry, (name, _)) in index.entries.iter().enumerate() {
+            let mut slot = entity_hash(name.as_bytes()) & (capacity - 1);
+            while index.slots[slot] != 0 {
+                slot = (slot + 1) & (capacity - 1);
+            }
+            index.slots[slot] = entry as u32 + 1;
+        }
+        index
+    }
+
+    fn lookup(&self, name: &[u8]) -> Option<[u32; 2]> {
+        let mask = self.slots.len() - 1;
+        let mut slot = entity_hash(name) & mask;
+        loop {
+            match self.slots[slot] {
+                0 => return None,
+                entry => {
+                    let (candidate, value) = self.entries[entry as usize - 1];
+                    if candidate.as_bytes() == name {
+                        return Some(value);
+                    }
+                }
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+}
+
+fn entity_hash(name: &[u8]) -> usize {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &byte in name {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+    }
+    hash as usize
+}
+
 fn entity_lookup(name: &[u8]) -> Option<[u32; 2]> {
-    let text = std::str::from_utf8(name).ok()?;
-    entities::ENTITIES
-        .binary_search_by(|(candidate, _)| (*candidate).cmp(text))
-        .ok()
-        .map(|index| entities::ENTITIES[index].1)
+    static INDEX: std::sync::OnceLock<EntityIndex> = std::sync::OnceLock::new();
+    INDEX
+        .get_or_init(|| EntityIndex::new(entities::ENTITIES.to_vec()))
+        .lookup(name)
+}
+
+/// Entity names that do not require a trailing `;`. A no-semicolon reference
+/// can only match one of these, so the common `&key=value` form searches ~100
+/// entries instead of the full 2,231-entry HTML5 table.
+fn legacy_entity_lookup(name: &[u8]) -> Option<[u32; 2]> {
+    static INDEX: std::sync::OnceLock<EntityIndex> = std::sync::OnceLock::new();
+    INDEX
+        .get_or_init(|| {
+            EntityIndex::new(
+                entities::ENTITIES
+                    .iter()
+                    .copied()
+                    .filter(|(name, _)| !name.ends_with(';'))
+                    .collect(),
+            )
+        })
+        .lookup(name)
 }
 
 /// Go's `html.UnescapeString` entity reader (non-attribute context).
@@ -1171,20 +1402,28 @@ fn unescape_entity(s: &[u8], output: &mut Vec<u8>) -> usize {
     }
 
     let mut index = 1usize;
+    let mut semicolon = false;
     while index < s.len() {
         let byte = s[index];
         index += 1;
         if byte.is_ascii_alphanumeric() {
             continue;
         }
-        if byte != b';' {
+        if byte == b';' {
+            semicolon = true;
+        } else {
             index -= 1;
         }
         break;
     }
+    let lookup = if semicolon {
+        entity_lookup
+    } else {
+        legacy_entity_lookup
+    };
     let name = &s[1..index];
     if !name.is_empty() {
-        if let Some(value) = entity_lookup(name) {
+        if let Some(value) = lookup(name) {
             output_push_rune(output, value[0]);
             if value[1] != 0 {
                 output_push_rune(output, value[1]);
@@ -1193,7 +1432,7 @@ fn unescape_entity(s: &[u8], output: &mut Vec<u8>) -> usize {
         }
         let max_len = name.len().saturating_sub(1).min(6);
         for length in (2..=max_len).rev() {
-            if let Some(value) = entity_lookup(&name[..length]) {
+            if let Some(value) = lookup(&name[..length]) {
                 output_push_rune(output, value[0]);
                 return length + 1;
             }
@@ -1221,8 +1460,20 @@ fn html_entity_decode_into(input: &[u8], output: &mut Vec<u8>) {
 }
 
 /// Coraza's `cmdLine`.
+/// True when `cmdLine` only needs case folding: no quote/escape/comma/semicolon
+/// or separator characters and no whitespace run to collapse.
+fn cmd_line_needs_only_case_fold(input: &[u8]) -> bool {
+    !cmd_line_has_special(input)
+}
+
 fn cmd_line_into(input: &[u8], output: &mut Vec<u8>) {
     output.reserve(input.len());
+    if input.is_ascii() && cmd_line_needs_only_case_fold(input) {
+        let start = output.len();
+        output.extend_from_slice(input);
+        output[start..].make_ascii_lowercase();
+        return;
+    }
     let mut space = false;
     for &byte in input {
         match byte {

@@ -27,7 +27,8 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
-use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, AhoCorasickKind, MatchKind};
+use memchr::memchr;
 
 #[cfg(feature = "hyperscan-eval")]
 use crate::waf::hyperscan::{HsError, LiteralPattern, SharedHsDatabase};
@@ -148,7 +149,12 @@ struct CompiledGroup {
     /// Chain prefix ids for every step of this group's pipeline. Prefix 0 is
     /// the raw input; each later id adds one step.
     plan: Vec<u32>,
-    case_insensitive: bool,
+}
+
+impl CompiledGroup {
+    fn scan_prefix(&self) -> u32 {
+        *self.plan.last().unwrap_or(&0)
+    }
 }
 
 /// One Aho-Corasick automaton over the union of every literal with the same
@@ -159,15 +165,26 @@ struct CompiledGroup {
 /// group, but turns 84 passes into one pass per unique representation.
 struct UnionAutomaton {
     automaton: AhoCorasick,
-    /// Pattern index -> (group index, rule ids that require this literal).
-    pattern_groups: PatternGroups,
+    /// Flattened per-pattern ownership and rule bitsets.
+    patterns: PatternData,
 }
 
-/// Pattern index -> (group index, rule ids that require this literal).
-type PatternGroups = Vec<Vec<(u32, Vec<u32>)>>;
+/// Per-pattern bitsets. Attribution is a handful of word operations per match
+/// instead of walking a group/rule list for every occurrence.
+struct PatternData {
+    group_words: usize,
+    rule_words: usize,
+    /// `patterns * group_words`: groups that need this literal's representation.
+    group_bits: Box<[u64]>,
+    /// `patterns * rule_words`: gated rules that require this literal.
+    rule_bits: Box<[u64]>,
+}
 
 /// Literal -> (group index, rule ids) for one case sensitivity.
 type LiteralGroups = BTreeMap<String, Vec<(u32, Vec<u32>)>>;
+
+/// Pattern index -> (group index, rule ids) before the bitsets are built.
+type PatternEntries = Vec<Vec<(u32, Vec<u32>)>>;
 
 /// Reusable scan buffers (resolved group ranges and a group bitset).
 #[derive(Default)]
@@ -175,6 +192,15 @@ struct ScanScratch {
     /// `(start, end, group index)` for every group, sorted by range.
     resolved: Vec<(u32, u32, u32)>,
     bits: Vec<u64>,
+    /// Gated-rule hit bitset, accumulated across every input and group.
+    matched_bits: Vec<u64>,
+}
+
+impl ScanScratch {
+    fn reset_matched(&mut self, words: usize) {
+        self.matched_bits.clear();
+        self.matched_bits.resize(words.max(1), 0);
+    }
 }
 
 /// One compiled Hyperscan database for a transform chain. Extraction is applied
@@ -215,6 +241,10 @@ pub struct Prefilter {
     groups: Vec<CompiledGroup>,
     /// Registered transform-chain prefixes. `prefixes[0]` is empty.
     prefixes: Vec<Vec<Transform>>,
+    /// Parent prefix id for every prefix (parent-before-child order).
+    prefix_parents: Vec<u32>,
+    /// The step that turns a prefix's parent into the prefix itself.
+    prefix_steps: Vec<Transform>,
     sensitive: Option<UnionAutomaton>,
     insensitive: Option<UnionAutomaton>,
     gated_rule_ids: Vec<u32>,
@@ -337,14 +367,26 @@ impl Prefilter {
         let mut groups = Vec::with_capacity(pending.len());
         let mut prefix_index: BTreeMap<Vec<Transform>, u32> = BTreeMap::new();
         prefix_index.insert(Vec::new(), 0);
+        // Prefix tree: every prefix records its parent id and the step that
+        // adds it, so one forward pass resolves the whole DAG per value.
+        let mut prefix_parents: Vec<u32> = vec![u32::MAX];
+        let mut prefix_steps: Vec<Transform> = vec![Transform::Identity];
         // One literal map per case sensitivity: literal -> (group, rules).
         let mut case_maps: [LiteralGroups; 2] = [BTreeMap::new(), BTreeMap::new()];
         for (index, (key, patterns)) in pending.into_iter().enumerate() {
             let mut plan = Vec::with_capacity(key.steps.len());
             for length in 1..=key.steps.len() {
                 let prefix = key.steps[..length].to_vec();
-                let next = prefix_index.len() as u32;
-                let id = *prefix_index.entry(prefix).or_insert(next);
+                let parent = plan.last().copied().unwrap_or(0);
+                let id = if let Some(&id) = prefix_index.get(&prefix) {
+                    id
+                } else {
+                    let id = prefix_index.len() as u32;
+                    prefix_index.insert(prefix, id);
+                    prefix_parents.push(parent);
+                    prefix_steps.push(key.steps[length - 1]);
+                    id
+                };
                 plan.push(id);
             }
             let case = usize::from(key.case_insensitive);
@@ -354,10 +396,7 @@ impl Prefilter {
                     .or_default()
                     .push((index as u32, ids.into_iter().collect()));
             }
-            groups.push(CompiledGroup {
-                plan,
-                case_insensitive: key.case_insensitive,
-            });
+            groups.push(CompiledGroup { plan });
         }
         let mut prefixes = vec![Vec::new(); prefix_index.len()];
         for (steps, id) in prefix_index {
@@ -370,20 +409,48 @@ impl Prefilter {
             if map.is_empty() {
                 return Ok(None);
             }
-            let (patterns, pattern_groups): (Vec<String>, PatternGroups) = map.into_iter().unzip();
+            let (patterns, pattern_groups): (Vec<String>, PatternEntries) = map.into_iter().unzip();
+            let group_words = groups.len().div_ceil(64).max(1);
+            let rule_words = gated.len().div_ceil(64).max(1);
+            let mut group_bits = vec![0u64; patterns.len() * group_words];
+            let mut rule_bits = vec![0u64; patterns.len() * rule_words];
+            for (pattern, entries) in pattern_groups.iter().enumerate() {
+                for (group, rules) in entries {
+                    group_bits[pattern * group_words + *group as usize / 64] |=
+                        1u64 << (*group % 64);
+                    for rule in rules {
+                        if let Ok(index) = gated.binary_search(rule) {
+                            rule_bits[pattern * rule_words + index / 64] |= 1u64 << (index % 64);
+                        }
+                    }
+                }
+            }
             let automaton = AhoCorasickBuilder::new()
                 .ascii_case_insensitive(case_insensitive)
                 .match_kind(MatchKind::Standard)
+                .kind(Some(AhoCorasickKind::DFA))
                 .build(&patterns)
                 .map_err(|err| PrefilterError::Build(err.to_string()))?;
             Ok(Some(UnionAutomaton {
                 automaton,
-                pattern_groups,
+                patterns: PatternData {
+                    group_words,
+                    rule_words,
+                    group_bits: group_bits.into_boxed_slice(),
+                    rule_bits: rule_bits.into_boxed_slice(),
+                },
             }))
         };
-        let [sensitive_map, insensitive_map] = case_maps;
-        let sensitive = build_union(sensitive_map, false)?;
-        let insensitive = build_union(insensitive_map, true)?;
+        // One case-insensitive automaton covers both case classes. Matching a
+        // case-sensitive literal case-insensitively can only add hits, and a
+        // hit only keeps a rule running; it never removes one. This halves the
+        // automaton passes over every representation.
+        let [mut combined_map, insensitive_map] = case_maps;
+        for (literal, mut groups) in insensitive_map {
+            combined_map.entry(literal).or_default().append(&mut groups);
+        }
+        let sensitive = build_union(combined_map, true)?;
+        let insensitive = None;
 
         #[cfg(feature = "hyperscan-eval")]
         let (hyperscan, hyperscan_error) = if _use_hyperscan {
@@ -400,6 +467,8 @@ impl Prefilter {
         Ok(Self {
             groups,
             prefixes,
+            prefix_parents,
+            prefix_steps,
             sensitive,
             insensitive,
             gated_rule_ids: gated,
@@ -461,33 +530,29 @@ impl Prefilter {
     /// already own a per-request arena).
     pub fn evaluate_with_cache(&self, body: &[u8], cache: &mut TransformCache) -> PrefilterHit {
         cache.begin_request(self.prefixes.len());
-        let mut matched = Vec::new();
-        let mut scanned = 0usize;
-        let mut representations = 0usize;
-        match self.scan_value(
-            cache,
-            body,
-            &mut matched,
-            &mut scanned,
-            &mut representations,
-            true,
-        ) {
-            Ok(true) => PrefilterHit {
-                hit: true,
-                forced_reason: None,
-                scanned_bytes: scanned,
-                representations,
-                matched_rules: matched,
-            },
-            Ok(false) => PrefilterHit {
-                hit: false,
-                forced_reason: None,
-                scanned_bytes: scanned,
-                representations,
-                matched_rules: Vec::new(),
-            },
-            Err(_) => PrefilterHit::forced(TRANSFORM_OVERFLOW),
-        }
+        let words = self.gated_rule_ids.len().div_ceil(64);
+        with_scan_scratch(|scratch| {
+            scratch.reset_matched(words);
+            let mut scanned = 0usize;
+            let mut representations = 0usize;
+            match self.scan_value(
+                cache,
+                body,
+                scratch,
+                &mut scanned,
+                &mut representations,
+                true,
+            ) {
+                Ok(hit) => PrefilterHit {
+                    hit,
+                    forced_reason: None,
+                    scanned_bytes: scanned,
+                    representations,
+                    matched_rules: self.matched_rule_ids(&scratch.matched_bits),
+                },
+                Err(_) => PrefilterHit::forced(TRANSFORM_OVERFLOW),
+            }
+        })
     }
 
     /// Resolves every group for one value, then scans each distinct
@@ -500,65 +565,62 @@ impl Prefilter {
         &self,
         cache: &mut TransformCache,
         input: &[u8],
-        matched: &mut Vec<u32>,
+        scratch: &mut ScanScratch,
         scanned: &mut usize,
         representations: &mut usize,
         stop_on_hit: bool,
     ) -> Result<bool, TransformError> {
         let value = cache.begin_value(input)?;
-        with_scan_scratch(|scratch| {
-            let ScanScratch { resolved, bits } = scratch;
-            resolved.clear();
-            for (index, group) in self.groups.iter().enumerate() {
-                let range = cache.resolve(value, input, &group.plan, &self.prefixes)?;
-                resolved.push((range.start as u32, range.end as u32, index as u32));
-            }
-            resolved.sort_unstable();
+        cache.resolve_all(value, input, &self.prefix_steps, &self.prefix_parents)?;
+        let ScanScratch {
+            resolved,
+            bits,
+            matched_bits,
+        } = scratch;
+        resolved.clear();
+        for (index, group) in self.groups.iter().enumerate() {
+            let prefix = group.scan_prefix() as usize;
+            let range = cache
+                .prefix_range(value, prefix)
+                .ok_or(TransformError::ArenaOverflow)?;
+            resolved.push((range.start as u32, range.end as u32, index as u32));
+        }
+        resolved.sort_unstable();
 
-            let mut found = false;
-            let mut index = 0usize;
-            while index < resolved.len() {
-                let (start, end, _) = resolved[index];
-                let mut next = index + 1;
-                while next < resolved.len() && resolved[next].0 == start && resolved[next].1 == end
-                {
-                    next += 1;
-                }
-                bits.fill(0);
-                let mut has_sensitive = false;
-                let mut has_insensitive = false;
-                for &(_, _, group) in &resolved[index..next] {
-                    let words = self.groups.len().div_ceil(64);
-                    if bits.len() < words {
-                        bits.resize(words, 0);
-                    }
-                    bits[group as usize / 64] |= 1u64 << (group % 64);
-                    if self.groups[group as usize].case_insensitive {
-                        has_insensitive = true;
-                    } else {
-                        has_sensitive = true;
-                    }
-                }
-                let representation = cache.bytes(start as usize..end as usize);
-                *scanned += representation.len();
-                *representations += 1;
-                if has_sensitive
-                    && self.scan_representation(representation, bits, false, matched, stop_on_hit)
-                {
-                    found = true;
-                }
-                if has_insensitive
-                    && self.scan_representation(representation, bits, true, matched, stop_on_hit)
-                {
-                    found = true;
-                }
-                if found && stop_on_hit {
-                    return Ok(true);
-                }
-                index = next;
+        let group_words = self.groups.len().div_ceil(64).max(1);
+        if bits.len() < group_words {
+            bits.resize(group_words, 0);
+        }
+        let mut found = false;
+        let mut index = 0usize;
+        while index < resolved.len() {
+            let (start, end, _) = resolved[index];
+            let mut next = index + 1;
+            while next < resolved.len() && resolved[next].0 == start && resolved[next].1 == end {
+                next += 1;
             }
-            Ok(found)
-        })
+            bits[..group_words].fill(0);
+            for &(_, _, group) in &resolved[index..next] {
+                bits[group as usize / 64] |= 1u64 << (group % 64);
+            }
+            let representation = cache.bytes(start as usize..end as usize);
+            *scanned += representation.len();
+            *representations += 1;
+            if self.scan_representation(
+                representation,
+                &bits[..group_words],
+                false,
+                matched_bits,
+                stop_on_hit,
+            ) {
+                found = true;
+            }
+            if found && stop_on_hit {
+                return Ok(true);
+            }
+            index = next;
+        }
+        Ok(found)
     }
 
     /// Scans one representation with the union automaton and keeps only the
@@ -568,7 +630,7 @@ impl Prefilter {
         representation: &[u8],
         groups: &[u64],
         case_insensitive: bool,
-        matched: &mut Vec<u32>,
+        matched_bits: &mut [u64],
         stop_on_hit: bool,
     ) -> bool {
         let union = if case_insensitive {
@@ -584,31 +646,65 @@ impl Prefilter {
         if !union.automaton.is_match(representation) {
             return false;
         }
+        let data = &union.patterns;
         let mut found = false;
         for mat in union.automaton.find_overlapping_iter(representation) {
-            for (group, rules) in &union.pattern_groups[mat.pattern().as_usize()] {
-                let bit = 1u64 << (group % 64);
-                if groups
-                    .get(*group as usize / 64)
-                    .is_none_or(|word| word & bit == 0)
-                {
-                    continue;
-                }
-                for &rule in rules {
-                    if !matched.contains(&rule) {
-                        matched.push(rule);
-                        if matched.len() >= MAX_REPORTED_RULES {
-                            return true;
-                        }
-                    }
-                }
-                found = true;
+            let pattern = mat.pattern().as_usize();
+            let group_at = pattern * data.group_words;
+            let owns = data.group_bits[group_at..group_at + data.group_words]
+                .iter()
+                .zip(groups.iter())
+                .any(|(pattern_groups, owner_groups)| pattern_groups & owner_groups != 0);
+            if !owns {
+                continue;
             }
-            if found && stop_on_hit {
+            let rule_at = pattern * data.rule_words;
+            for (target, source) in matched_bits
+                .iter_mut()
+                .zip(&data.rule_bits[rule_at..rule_at + data.rule_words])
+            {
+                *target |= *source;
+            }
+            found = true;
+            if stop_on_hit {
                 return true;
             }
         }
         found
+    }
+
+    /// Converts the accumulated rule bitset into the bounded, sorted rule-id
+    /// list exposed by the public result types.
+    fn matched_rule_ids(&self, bits: &[u64]) -> Vec<u32> {
+        let mut ids = Vec::with_capacity(bits.len() * 4);
+        for (word_index, word) in bits.iter().enumerate() {
+            let mut word = *word;
+            while word != 0 {
+                let bit = word.trailing_zeros() as usize;
+                let index = word_index * 64 + bit;
+                if let Some(id) = self.gated_rule_ids.get(index) {
+                    if ids.len() < MAX_REPORTED_RULES {
+                        ids.push(*id);
+                    }
+                }
+                word &= word - 1;
+            }
+        }
+        ids
+    }
+
+    /// Diagnostics: run the union automata over one byte slice without any
+    /// transform or attribution work.
+    #[doc(hidden)]
+    pub fn scan_bytes_for_bench(&self, bytes: &[u8]) -> usize {
+        let mut hits = 0;
+        if let Some(union) = &self.sensitive {
+            hits += usize::from(union.automaton.is_match(bytes));
+        }
+        if let Some(union) = &self.insensitive {
+            hits += usize::from(union.automaton.is_match(bytes));
+        }
+        hits
     }
 
     /// Number of logical (representation × transform pipeline) groups.
@@ -732,48 +828,49 @@ impl Prefilter {
         cache: &mut TransformCache,
     ) -> RuleGate {
         cache.begin_request(self.prefixes.len());
-
-        let mut scanned = 0usize;
-        let mut matched: Vec<u32> = Vec::new();
-        for input in inputs {
-            if input.is_empty() {
-                continue;
+        let words = self.gated_rule_ids.len().div_ceil(64);
+        with_scan_scratch(|scratch| {
+            scratch.reset_matched(words);
+            let mut scanned = 0usize;
+            for input in inputs {
+                if input.is_empty() {
+                    continue;
+                }
+                let mut representations = 0usize;
+                if self
+                    .scan_value(
+                        cache,
+                        input,
+                        scratch,
+                        &mut scanned,
+                        &mut representations,
+                        false,
+                    )
+                    .is_err()
+                {
+                    return transform_overflow_gate();
+                }
             }
-            let mut representations = 0usize;
-            if self
-                .scan_value(
-                    cache,
-                    input,
-                    &mut matched,
-                    &mut scanned,
-                    &mut representations,
-                    false,
-                )
-                .is_err()
-            {
-                return transform_overflow_gate();
+            let matched = self.matched_rule_ids(&scratch.matched_bits);
+
+            let mut removable_rule_ids =
+                Vec::with_capacity(self.gated_rule_ids.len().min(MAX_REMOVE_RULE_IDS));
+            removable_rule_ids.extend(
+                self.gated_rule_ids
+                    .iter()
+                    .copied()
+                    .filter(|id| !matched.contains(id))
+                    .filter(|id| self.ungated_body_rule_ids.binary_search(id).is_err())
+                    .take(MAX_REMOVE_RULE_IDS),
+            );
+
+            RuleGate {
+                forced_reason: None,
+                scanned_bytes: scanned,
+                matched_rules: matched,
+                removable_rule_ids,
             }
-        }
-        matched.sort_unstable();
-        matched.dedup();
-
-        let mut removable_rule_ids =
-            Vec::with_capacity(self.gated_rule_ids.len().min(MAX_REMOVE_RULE_IDS));
-        removable_rule_ids.extend(
-            self.gated_rule_ids
-                .iter()
-                .copied()
-                .filter(|id| !matched.contains(id))
-                .filter(|id| self.ungated_body_rule_ids.binary_search(id).is_err())
-                .take(MAX_REMOVE_RULE_IDS),
-        );
-
-        RuleGate {
-            forced_reason: None,
-            scanned_bytes: scanned,
-            matched_rules: matched,
-            removable_rule_ids,
-        }
+        })
     }
 
     /// Scans the request context (URI, query, headers, cookies and body) and
@@ -1211,9 +1308,22 @@ fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || haystack.len() < needle.len() {
         return false;
     }
-    haystack
-        .windows(needle.len())
-        .any(|window| window.eq_ignore_ascii_case(needle))
+    // The only needles are `<!DOCTYPE`/`<!ENTITY`, so anchor on the rare `<`
+    // instead of comparing a full window at every byte offset. This keeps the
+    // mandatory pre-scan for DTD/entity declarations off the hot path.
+    let first = needle[0];
+    let mut start = 0usize;
+    while let Some(offset) = memchr(first, &haystack[start..]) {
+        let at = start + offset;
+        if at + needle.len() > haystack.len() {
+            return false;
+        }
+        if haystack[at..at + needle.len()].eq_ignore_ascii_case(needle) {
+            return true;
+        }
+        start = at + 1;
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------

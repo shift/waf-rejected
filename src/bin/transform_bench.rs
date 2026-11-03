@@ -23,7 +23,6 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
 
 use waf_ingress::waf::prefilter::{Prefilter, EMBEDDED_ARTIFACT};
 use waf_ingress::waf::prefilter_extract::PrefilterArtifact;
@@ -84,12 +83,42 @@ impl Variant {
     }
 }
 
-fn percentile(sorted: &[Duration], percentile: f64) -> Duration {
+#[repr(C)]
+struct Timespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+extern "C" {
+    fn clock_gettime(clock_id: i32, time: *mut Timespec) -> i32;
+}
+
+const CLOCK_PROCESS_CPUTIME_ID: i32 = 2;
+
+/// Process CPU time. The shared build host is heavily loaded, so wall-clock
+/// p50s mix in scheduling delays; CPU time isolates the work under test.
+fn cpu_now_ns() -> u64 {
+    let mut time = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `time` is a valid, writable `timespec`.
+    unsafe {
+        clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &mut time);
+    }
+    (time.tv_sec as u64) * 1_000_000_000 + time.tv_nsec as u64
+}
+
+fn percentile(sorted: &[u64], percentile: f64) -> u64 {
     if sorted.is_empty() {
-        return Duration::ZERO;
+        return 0;
     }
     let index = ((sorted.len() as f64 - 1.0) * percentile).round() as usize;
     sorted[index]
+}
+
+fn micros(ns: u64) -> f64 {
+    ns as f64 / 1_000.0
 }
 
 fn main() {
@@ -144,9 +173,9 @@ fn main() {
                 let mut hit = false;
                 let mut scanned = 0usize;
                 for _ in 0..REPETITIONS {
-                    let started = Instant::now();
+                    let started = cpu_now_ns();
                     let gate = black_box(prefilter.evaluate_inputs(&[black_box(body.as_slice())]));
-                    samples.push(started.elapsed());
+                    samples.push(cpu_now_ns().saturating_sub(started));
                     hit |= !gate.matched_rules.is_empty();
                     scanned = gate.scanned_bytes;
                 }
@@ -157,13 +186,36 @@ fn main() {
                     format!("{}KiB", size / 1024),
                     variant.name(),
                     label,
-                    percentile(&samples, 0.50).as_secs_f64() * 1e6,
-                    percentile(&samples, 0.99).as_secs_f64() * 1e6,
+                    micros(percentile(&samples, 0.50)),
+                    micros(percentile(&samples, 0.99)),
                     allocations as f64 / REPETITIONS as f64,
                     scanned as f64 / 1024.0,
                     hit
                 );
             }
+
+            // Union-automaton cost on the raw body only (no transforms).
+            for _ in 0..WARMUP {
+                black_box(embedded.scan_bytes_for_bench(body.as_slice()));
+            }
+            let mut samples = Vec::with_capacity(REPETITIONS);
+            for _ in 0..REPETITIONS {
+                let started = cpu_now_ns();
+                black_box(embedded.scan_bytes_for_bench(black_box(body.as_slice())));
+                samples.push(cpu_now_ns().saturating_sub(started));
+            }
+            samples.sort_unstable();
+            println!(
+                "{:<6} {:<8} {:<18} {:>10.2} {:>10.2} {:>10.2} {:>9.1} {:>6}",
+                format!("{}KiB", size / 1024),
+                variant.name(),
+                "scan-only",
+                micros(percentile(&samples, 0.50)),
+                micros(percentile(&samples, 0.99)),
+                0.0,
+                body.len() as f64 / 1024.0,
+                ""
+            );
 
             // Body-withhold scan: early exit on the first hit, reusable cache.
             for _ in 0..WARMUP {
@@ -173,11 +225,11 @@ fn main() {
             let mut samples = Vec::with_capacity(REPETITIONS);
             let mut scanned = 0usize;
             for _ in 0..REPETITIONS {
-                let started = Instant::now();
+                let started = cpu_now_ns();
                 let hit = black_box(
                     embedded.evaluate_with_cache(black_box(body.as_slice()), &mut scratch),
                 );
-                samples.push(started.elapsed());
+                samples.push(cpu_now_ns().saturating_sub(started));
                 scanned = hit.scanned_bytes;
             }
             let allocations = ALLOCATIONS.load(Ordering::Relaxed) - before;
@@ -187,11 +239,53 @@ fn main() {
                 format!("{}KiB", size / 1024),
                 variant.name(),
                 "body-withhold",
-                percentile(&samples, 0.50).as_secs_f64() * 1e6,
-                percentile(&samples, 0.99).as_secs_f64() * 1e6,
+                micros(percentile(&samples, 0.50)),
+                micros(percentile(&samples, 0.99)),
                 allocations as f64 / REPETITIONS as f64,
                 scanned as f64 / 1024.0,
                 ""
+            );
+        }
+    }
+
+    // Per-transform cost on the 4 KiB plain body: isolates the expensive
+    // byte loops from the arena, cache and automaton work.
+    println!();
+    println!("# Single transform on 4 KiB plain body");
+    println!(
+        "{:<6} {:<8} {:<18} {:>10} {:>10}",
+        "size", "variant", "transform", "p50_us", "p99_us"
+    );
+    let body = Variant::Plain.body(4096);
+    let amp_body: Vec<u8> = b"&city=paris".iter().copied().cycle().take(4096).collect();
+    for (label, body) in [("plain", &body), ("amp", &amp_body)] {
+        for step in [
+            Transform::HtmlEntityDecode,
+            Transform::UrlDecode,
+            Transform::UrlDecodeUni,
+            Transform::CompressWhitespace,
+            Transform::RemoveWhitespace,
+            Transform::Lowercase,
+            Transform::CmdLine,
+        ] {
+            let mut output = Vec::new();
+            for _ in 0..WARMUP {
+                step.apply_into(body, &mut output);
+            }
+            let mut samples = Vec::with_capacity(REPETITIONS);
+            for _ in 0..REPETITIONS {
+                let started = cpu_now_ns();
+                step.apply_into(black_box(body), &mut output);
+                samples.push(cpu_now_ns().saturating_sub(started));
+            }
+            samples.sort_unstable();
+            println!(
+                "{:<6} {:<8} {:<18} {:>10.2} {:>10.2}",
+                "4KiB",
+                label,
+                format!("{step:?}"),
+                micros(percentile(&samples, 0.50)),
+                micros(percentile(&samples, 0.99))
             );
         }
     }
@@ -245,11 +339,11 @@ fn main() {
             for _ in 0..REPETITIONS {
                 scratch.begin_request(prefixes.len());
                 let value = scratch.begin_value(black_box(&body)).expect("fits");
-                let started = Instant::now();
+                let started = cpu_now_ns();
                 let range = scratch
                     .resolve(value, &body, &plan, &prefixes)
                     .expect("resolves");
-                samples.push(started.elapsed());
+                samples.push(cpu_now_ns().saturating_sub(started));
                 output_len = scratch.bytes(range).len();
             }
             let allocations = ALLOCATIONS.load(Ordering::Relaxed) - before;
@@ -259,8 +353,8 @@ fn main() {
                 format!("{}KiB", size / 1024),
                 variant.name(),
                 "long-chain",
-                percentile(&samples, 0.50).as_secs_f64() * 1e6,
-                percentile(&samples, 0.99).as_secs_f64() * 1e6,
+                micros(percentile(&samples, 0.50)),
+                micros(percentile(&samples, 0.99)),
                 allocations as f64 / REPETITIONS as f64,
                 output_len as f64 / 1024.0,
                 output_len != body.len()
