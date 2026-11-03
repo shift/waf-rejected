@@ -6,8 +6,10 @@ of `main` at the commit below on one shared host; absolute values are only
 comparable to another run from `scripts/verify-performance.sh` on the same host
 class with the same governor and turbo state.
 
-**Commit:** `fdb3ca7` (`perf(proxy): zero-copy request path between proxy and
-engine (#136)`), the tip after the performance branch merge window.
+**Commit:** `aca35db` (`perf(waf): batch transform prefixes and share
+literal-gate bitsets (#143)`), with the post-optimization remeasurement in
+§3.6. Sections §3.1–§3.5 are the earlier `fdb3ca7` snapshot and are kept for
+history; §3.6 supersedes them for current numbers.
 
 ## 1. Question
 
@@ -292,6 +294,125 @@ PERF-GATE RSS: coraza peak 422 716 KiB, Rust engine 21 732 KiB, kernel
 The host-side decision path is already sub-microsecond. Everything above it is
 rule-engine work, proxy I/O, or queueing.
 
+### 3.6 Post-optimization remeasurement (`aca35db`)
+
+The transform/gate merge (`#143`) was re-measured on the same host class with
+the governor at `performance`, turbo enabled, and every measured process
+pinned with `taskset -c 2-5`. Three independent engine-gate runs were taken
+(load average 0.86–7.24 at start); the cleanest run (0.86) is shown, with the
+other runs in the variance column. All engine/prefilter latencies are process
+CPU time.
+
+**Important scope finding.** `#143` changes the *shared* modules
+`src/waf/transforms.rs` and `src/waf/prefilter.rs`, but the Rust engine
+(`src/waf/rust_engine`) and the experimental kernel (`src/waf/engine_kernel`)
+do **not** import them: each has its own `TransformCache`, gate and prefilter.
+`git diff 5fae75d..aca35db -- src/waf/rust_engine src/waf/engine_kernel` is
+empty. The engine therefore did not get faster because of `#143`; its gain
+against the committed baseline is the earlier hot-loop work (`#137`, `#132`).
+The `#143` win is visible in the standalone shared prefilter and in its
+consumers (fastpath, native sidecar body-wither, optional wasm gate).
+
+#### Rust engine, `rust-engine-parity --bench` (run 2, `--reps 200`)
+
+| body | p50 | p95 | p99 | allocs/req | p50 run 1 |
+|---|---:|---:|---:|---:|---:|
+| bodyless | 146.04 µs | 161.86 µs | 191.95 µs | 144.0 | 150.68 µs |
+| 1 KiB | 468.26 µs | 478.18 µs | 542.78 µs | 148.2 | 451.17 µs |
+| 4 KiB | 1 224.43 µs | 1 321.53 µs | 1 417.60 µs | 143.4 | 1 264.57 µs |
+| 8 KiB | 2 251.50 µs | 2 332.26 µs | 2 388.64 µs | 143.4 | 2 354.74 µs |
+
+Run-to-run p50 spread is ≤ 4 % at every size. Allocations are steady at
+128–157/request (the 4 KiB gate row is 143), versus 4 789/request in the
+committed baseline.
+
+#### Shared prefilter, `transform-bench` (two runs)
+
+| size | variant | p50 | p99 | allocs/call | p50 run 2 |
+|---|---|---:|---:|---:|---:|
+| 1 KiB | plain | 42.57 µs | 44.41 µs | 2.0 | 42.52 µs |
+| 1 KiB | percent | 15.69 µs | 16.66 µs | 2.0 | 15.72 µs |
+| 1 KiB | double | 19.15 µs | 20.08 µs | 2.0 | 19.18 µs |
+| 4 KiB | plain | 150.96 µs | 152.86 µs | 2.0 | 151.58 µs |
+| 4 KiB | percent | 47.76 µs | 48.82 µs | 2.0 | 47.76 µs |
+| 4 KiB | double | 61.53 µs | 62.58 µs | 2.0 | 61.51 µs |
+| 8 KiB | plain | 291.75 µs | 331.94 µs | 2.0 | 294.49 µs |
+| 8 KiB | percent | 90.45 µs | 91.60 µs | 2.0 | 90.46 µs |
+| 8 KiB | double | 117.70 µs | 153.12 µs | 2.0 | 117.77 µs |
+
+Against the pre-`#143` 4 KiB numbers (604 / 184 / 214 µs) this is −75 % plain,
+−74 % percent and −71 % double, and the two post-merge runs agree within 2 %.
+The plain row is still above the < 120 µs target; the residual is the 19.2 KiB
+of genuinely distinct representations scanned, as documented in
+`docs/suggestions_from_agents/transform-hot.md`.
+
+#### Allow-cache hit, `allow_cache_microbench components`
+
+| body | p50 | p95 | p99 |
+|---|---:|---:|---:|
+| 1 KiB | 536 ns | 545 ns | 625 ns |
+| 4 KiB | 699 ns | 756 ns | 783 ns |
+| 8 KiB | 927 ns | 1.02 µs | 1.18 µs |
+
+This reproduces the earlier 560 / 730 / 960 ns claim within noise; the body
+digest (68 / 229 / 457 ns) and thread-local lookup (101 / 266 / 487 ns) still
+dominate the hit path.
+
+#### Fast-allow, `bodyless-bench --profile`
+
+| path | p50 | p95 | p99 |
+|---|---:|---:|---:|
+| fast-allow (compiled route) | 342 ns | 350 ns | 389 ns |
+| fast-allow (no rate gates) | 188 ns | 193 ns | 196 ns |
+
+Run 1 measured 375/385/423 ns and 208/215/222 ns, so the claimed ~0.38 µs and
+~0.20 µs paths hold on both runs.
+
+#### Coraza reactor (`bench-subms` L0; clean wasm run, native run 1)
+
+| backend | size | p50 | p95 | p99 | allocs/op | alloc B/op |
+|---|---|---:|---:|---:|---:|---:|
+| wasm | bodyless | 4.270 µs | 4.719 µs | 6.466 µs | 4.04 | 2 648 |
+| wasm | 1 KiB | 39.471 µs | 70.013 µs | 71.500 µs | 4.04 | 3 745 |
+| wasm | 4 KiB | 166.055 µs | 374.407 µs | 378.759 µs | 4.02 | 6 787 |
+| wasm | 8 KiB | 346.980 µs | 829.515 µs | 834.948 µs | 4.04 | 10 913 |
+| native | bodyless | 0.629 µs | 0.734 µs | 1.066 µs | 1.00 | 126 |
+| native | 1 KiB | 7.587 µs | 7.917 µs | 8.090 µs | 1.00 | 193 |
+| native | 4 KiB | 29.026 µs | 31.754 µs | 35.467 µs | 1.00 | 193 |
+| native | 8 KiB | 58.299 µs | 59.828 µs | 60.387 µs | 1.00 | 193 |
+
+The wasm p95/p99 remain bimodal at the ~373 ms guest-GC mode; p50 alone is the
+comparable column.
+
+#### Engine gate versus the committed baseline (`baseline.json`, `efb56b5`)
+
+| backend | case | baseline | run 1 | run 2 | run 3 | Δ run 3 |
+|---|---|---:|---:|---:|---:|---:|
+| coraza | bodyless | 3.6528 | 3.4594 | 3.2620 | 3.2805 | −10.2 % |
+| coraza | 4k-allow | 177.6622 | 174.6417 | 164.9296 | 165.3082 | −6.9 % |
+| coraza | 4k-sqli | 263.3323 | 173.9483 | 168.4344 | 167.0350 | −36.6 % |
+| rust | bodyless | 0.2016 | 0.1255 | 0.1206 | 0.1243 | −38.3 % |
+| rust | 4k-allow | 1.9191 | 1.1765 | 1.1136 | 1.1129 | −42.0 % |
+| rust | 4k-sqli | 1.8617 | 1.1672 | 1.1256 | 1.1299 | −39.3 % |
+| kernel | bodyless | 0.00930 | 0.00955 | 0.00928 | 0.00930 | +0.1 % |
+| kernel | 4k-allow | 0.5702 | 0.6441 | 0.6223 | 0.6233 | +9.3 % |
+| kernel | 4k-sqli | 0.3180 | 0.3391 | 0.3255 | 0.3262 | +2.6 % |
+
+The Rust rows are reproducible to ≤ 6 % and are the only rows updated in the
+committed baseline. The Coraza SQLi row is again in its fast GC mode (~167 ms,
+sqli/allow ratio 1.01) and is not a rule-path improvement. The kernel source is
+unchanged since the baseline; its longer allow row is consistent with a
+host/clock difference (bodyless is unchanged and the attack/allow ratio moved
+−6 %), so the kernel baseline rows were deliberately left untouched.
+
+#### Corpus
+
+Re-running the full 2,112-case corpus at `aca35db` reproduces the §4 counts
+exactly: wasm and native 2,016/2,112 (5 false negatives, 91 false positives,
+2,112/2,112 agreement); Rust 2,016/2,112 with 3 false negatives and the same
+91 false positives, agreeing with Coraza on 2,110/2,112. Detection and parity
+are unchanged.
+
 ## 4. CRS detection corpus
 
 Pinned corpus: OWASP CRS 4.14.0, commit `b5b788b`, 2,112 cases (1,700 positive
@@ -360,10 +481,11 @@ one-off test-harness link, not the tests (the 458 tests themselves run in
 Ranked by share of the measured budget:
 
 1. **Coraza WASI rule evaluation is 99 % of the wasm budget.**
-   Reactor p50 is 4.94 ms bodyless, 74 ms at 1 KiB, 180 ms at 4 KiB and 375 ms
-   at 8 KiB; L3 − L2 matches the reactor within noise. Payload construction is
-   7.6 µs at 4 KiB, i.e. 0.004 % of the request. No proxy or serialisation
-   optimisation can move this.
+   The `fdb3ca7` reactor p50 was 4.94 ms bodyless, 74 ms at 1 KiB, 180 ms at
+   4 KiB and 375 ms at 8 KiB; the `aca35db` clean remeasurement is 4.27 / 39.5
+   / 166.1 / 347.0 ms. L3 − L2 matches the reactor within noise. Payload
+   construction is 7.3 µs at 4 KiB, i.e. 0.004 % of the request. No proxy or
+   serialisation optimisation can move this.
 
 2. **The reported 4 KiB SQLi regression was a measurement artefact.**
    The row is bimodal at ~164 ms (no guest GC) and ~373 ms (GC cycle); a run
@@ -379,10 +501,10 @@ Ranked by share of the measured budget:
    adds only ~70 µs bodyless. Sidecar RSS peaks at 159 MB. The native path is
    ~5–6× the wasm path, not a sub-millisecond path at any body size.
 
-4. **The Rust engine trades CPU for allocations.** 1.24 ms and 646 KB / 1 772
-   allocs at 4 KiB, versus the kernel's 0.68 ms and 33 B / 1 alloc. It improved
-   36 % over baseline but still allocates ~500× more bytes than the kernel for
-   the same decision class.
+4. **The Rust engine is now allocation-light, but still CPU-bound.** At
+   `aca35db` it is 1.11–1.22 ms and 143 allocs at 4 KiB, down from 1.92 ms and
+   4 789 allocs in the committed baseline. Its remaining cost is transform,
+   literal-gate and regex CPU (§6.1), not allocation.
 
 5. **Queueing, not rule cost, dominates concurrency.** L3 c=8 wasm was 32 ms
    bodyless (vs 4.0 ms at c=1) and 251 ms at 1 KiB with 65/400 non-200
@@ -395,10 +517,24 @@ Ranked by share of the measured budget:
    sustained load explains part of it; a dedicated host is required before
    quoting p99 or throughput.
 
-The allow-cache hit path (0.56–0.96 µs claimed in earlier work) is **not
-reproduced here**: `allow-cache` is a non-default feature and `main` has no
-benchmark binary for it. It should be measured before it is quoted as a
-backend row.
+The allow-cache hit path is now measured: 536 / 699 / 927 ns p50 at
+1 / 4 / 8 KiB (§3.6), reproducing the earlier 560 / 730 / 960 ns claim. It
+remains a non-default feature and applies only to repeat requests.
+
+### 6.1 Post-optimization top three (`aca35db`, Rust engine at 4 KiB)
+
+The engine source is unchanged since the hot-loop merge, so its last profile
+still describes the 1.11–1.22 ms 4 KiB row:
+
+| rank | hot spot | cost at 4 KiB | share | why it remains |
+|---:|---|---:|---:|---|
+| 1 | Rust-engine transform pipeline | ~400 µs | ~36 % | private `TransformCache` + per-step transform, not the batched shared pipeline that `#143` improved |
+| 2 | Regex / operator evaluation | ~374 µs | ~33 % | 181 operator evaluations at 4 KiB; literal gates skip 99 of them, the rest still run `regex` |
+| 3 | Rust-engine literal gate | ~360 µs | ~32 % | private gate: per-value transform + AC scan without the shared case-insensitive union / rule-bitset attribution |
+
+Candidate resolution, scoring, parse and captures together are under 6 %. For
+the wasm backend the dominant cost is still Coraza rule evaluation, with the
+~373 ms guest-GC tail as the largest p95/p99 risk.
 
 ## 7. Next five optimisations
 
@@ -411,6 +547,20 @@ Ranked by expected gain / effort / risk. None is implemented by this report.
 | 3 | **Remove Rust-engine allocations.** 646 KB / 1 772 allocs at 4 KiB versus kernel 33 B / 1. Reuse an arena/scratch across evaluation and borrow request strings. | 20–40 % of the 1.24 ms 4 KiB row; brings Rust engine near the kernel's 0.68 ms | M–H | M (aliasing/lifetime correctness, differential corpus required) |
 | 4 | **Prove a body prefilter and skip Coraza for clean bodies.** Hyperscan/literal prefilter or the compiled fast path currently covers only a small clean subset (44/2,112 in the prototype). | 2–3× on allow paths if parity holds; enables sub-ms at 1–4 KiB without changing the rule engine | H | H (false negatives, corpus proof, fallback correctness) |
 | 5 | **Cut the proxy floor and batch the sidecar transport.** L2 allocates 50–73 KB / 83–93 allocs per request; native bodyless spends ~70 µs on the round trip and 0.85 ms in CRS. Batch/pipeline native evaluations and lazy-init the buffer pool. | 50–80 µs bodyless proxy; ~0.1–0.2 ms native bodyless; more under c=8 | M | L (proxy) / M (protocol) |
+
+### 7.1 Post-optimization next steps (`aca35db`)
+
+| # | change | expected gain | effort | risk |
+|---|---|---|---|---|
+| 1 | **Unify the Rust engine with the shared transform pipeline and gate.** It has a private `TransformCache`/gate, so the `#143` batching, identity aliasing, entity index, case-insensitive union and rule bitsets never reach it. Port them or refactor the engine onto `src/waf/transforms.rs` + `src/waf/prefilter.rs`. | 30–40 % off the 4 KiB row (≈1.11 → 0.7–0.8 ms) and a similar share at 8 KiB, based on the shared prefilter going 604 → 151 µs | M–H | M (byte-for-byte corpus parity required) |
+| 2 | **Attack the remaining regex/operator cost.** After (1), regex evaluation is the largest bucket: compile gate-selected rule sets to dense `regex-automata` DFAs with a bounded per-group build budget, or add a per-group literal prefilter. | 15–25 % off the 4 KiB row; larger at 8 KiB | H | M (DFA size/startup, parity) |
+| 3 | **Stabilise the Coraza guest GC tail.** The 164/373 ms bimodality is still the wasm p95 root cause; p50 166 ms is unchanged in the fast mode. | p95 373 → ~168 ms | M | M (RSS/soak tradeoff) |
+
+The shared prefilter itself is now fast enough (47.8 µs percent, 151 µs plain
+at 4 KiB) that the next meaningful gain is integrating it into the engine
+rather than optimising it further. The plain-input < 120 µs target still needs
+content-type-aware extraction or a whitespace/case-aware matcher, as recorded
+in `docs/suggestions_from_agents/transform-hot.md`.
 
 An allow-cache hit path (if the feature is adopted) is the only mechanism that
 turns a 4.9 ms wasm bodyless request into a sub-microsecond one, but it applies
@@ -425,10 +575,10 @@ transport to stay under roughly **0.85 ms**.
 
 | backend | bodyless | 1 KiB | 4 KiB | 8 KiB | sub-ms today? |
 |---|---:|---:|---:|---:|---|
-| Coraza wasm | 3.98 ms | 75.7 ms | 179.1 ms | 376.9 ms | no, by 4–450× |
-| Coraza native | 1.68 ms | 9.91 ms | 31.5 ms | 60.5 ms | no, by 1.7–60× |
-| Rust engine (L0 only) | 0.158 ms | 0.477 ms | 1.241 ms | 2.266 ms | bodyless and 1 KiB yes *if* wired into the proxy; 4 KiB no |
-| Kernel (covered subset) | 0.0099 ms | — | 0.676 ms | — | bodyless and 4 KiB yes on the covered rule subset |
+| Coraza wasm | 4.27 ms | 39.5 ms | 166.1 ms | 347.0 ms | no, by 4–400× |
+| Coraza native | 0.63 ms | 7.59 ms | 29.0 ms | 58.3 ms | no, by 1.5–60× |
+| Rust engine (L0 only) | 0.124 ms | 0.468 ms | 1.113 ms | 2.252 ms | bodyless and 1 KiB yes *if* wired into the proxy; 4 KiB no |
+| Kernel (covered subset) | 0.0093 ms | — | 0.623 ms | — | bodyless and 4 KiB yes on the covered rule subset |
 
 To make the claim honestly, all of the following are needed:
 

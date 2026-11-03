@@ -138,46 +138,49 @@
       "throughput_rps": 97912.88886103811
     },
     {
-      "alloc_bytes_per_op": 2024667.0,
-      "allocs_per_op": 4789.0,
+      "alloc_bytes_per_op": 7714.0,
+      "allocs_per_op": 143.0,
       "backend": "rust",
       "case": "4k-allow",
       "decision": "allow",
-      "max_ms": 2.090262,
-      "mean_ms": 1.93523468,
-      "p50_ms": 1.919107,
-      "p95_ms": 2.047999,
-      "p99_ms": 2.090262,
-      "samples": 50,
-      "throughput_rps": 514.7337173356674
+      "max_ms": 1.194532,
+      "mean_ms": 1.11619941,
+      "p50_ms": 1.112888,
+      "p95_ms": 1.121993,
+      "p99_ms": 1.184124,
+      "samples": 100,
+      "throughput_rps": 892.3321408355325
     },
     {
-      "alloc_bytes_per_op": 2029145.0,
-      "allocs_per_op": 4865.0,
+      "alloc_bytes_per_op": 12081.0,
+      "allocs_per_op": 157.0,
       "backend": "rust",
       "case": "4k-sqli",
       "decision": "block",
-      "max_ms": 2.275522,
-      "mean_ms": 1.89110456,
-      "p50_ms": 1.861728,
-      "p95_ms": 2.004566,
-      "p99_ms": 2.275522,
-      "samples": 50,
-      "throughput_rps": 526.8011230304197
+      "max_ms": 1.213652,
+      "mean_ms": 1.13692659,
+      "p50_ms": 1.129854,
+      "p95_ms": 1.171552,
+      "p99_ms": 1.202227,
+      "samples": 100,
+      "throughput_rps": 875.8059976911302
     },
     {
-      "alloc_bytes_per_op": 125379.0,
-      "allocs_per_op": 2666.0,
+      "alloc_bytes_per_op": 5166.0,
+      "allocs_per_op": 128.0,
       "backend": "rust",
       "case": "bodyless",
       "decision": "allow",
-      "max_ms": 0.240775,
-      "mean_ms": 0.20619418,
-      "p50_ms": 0.201619,
-      "p95_ms": 0.238587,
-      "p99_ms": 0.240775,
-      "samples": 50,
-      "throughput_rps": 4807.444539396815
+      "max_ms": 0.162643,
+      "mean_ms": 0.12596321000000002,
+      "p50_ms": 0.124347,
+      "p95_ms": 0.127788,
+      "p99_ms": 0.161218,
+      "samples": 100,
+      "throughput_rps": 7857.950879006102
     }
-  ]
+  ],
+  "updated_at": "2026-11-03T13:14:25Z",
+  "updated_commit": "aca35db",
+  "notes": "Rust rows refreshed from the aca35db post-optimization run (clean run 3, loadavg 0.86). Coraza and kernel rows retained from the efb56b5 baseline: Coraza is faster in the current runs (conservative), and the kernel source is unchanged since the baseline, so its 4k-allow row is left as the stricter reference."
 }
