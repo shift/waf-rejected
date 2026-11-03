@@ -6,6 +6,85 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Added
 
+- Nothing yet.
+
+## [0.1.0-beta.13] - 2026-11-03
+
+### Release summary
+
+Beta 13 makes the **native Rust CRS engine the default request-inspection
+backend**. A default-feature build compiles `rust-engine`, selects
+`waf.coraza.backend = "rust"` when no backend is configured, and parses the
+pinned OWASP CRS 4.14.0 bundle (505/505 rules) into the engine IR once at
+start-up (~210 ms). A strict load failure aborts start-up; there is no silent
+fallback. Coraza 3.3.3 in the WASI reactor remains the **reference oracle** and
+is selectable at any time with `waf.coraza.backend = "wasm"` (builds without
+`rust-engine` also default to `wasm`).
+
+Headline numbers on the reference host:
+
+- **Coverage:** 505/505 rules, 2,110/2,112 detection-corpus agreement, **0
+  native-only false negatives**. The two differences are documented and match
+  the corpus labels.
+- **Start-up / memory:** Rust engine 276 ms and ~30 MiB RSS, versus Coraza
+  ~4.9 s and ~801 MiB.
+- **End-to-end proxy p50** (bodyless / 1 / 4 / 8 KiB): **0.414 / 0.642 / 1.091
+  / 1.614 ms** for the Rust engine, versus Coraza 4.47 / 40.13 / 169.56 /
+  354.09 ms.
+- **Engine-only request path:** ~566–591 µs at 4 KiB and ~992 µs at 8 KiB;
+  allow-cache hits 0.56–0.96 µs and fast-allow 0.38 µs.
+- **Prefilter:** expanded sound literal gating skips 137 regex evaluations on a
+  4 KiB body (previously 99), and the opt-in Vectorscan candidate pass skips
+  per-rule regexes whose pattern did not hit.
+
+Also in this release: a soundness fix for XML collection presence in the
+empty-target gate, an opt-in io_uring listener, HTTP/2 connection/flow-control
+tuning, upstream streaming, and allocator/TLS build options.
+
+### Support matrix
+
+The full matrix, measured numbers and sizing guidance are in
+[`docs/operations/support-matrix.md`](docs/operations/support-matrix.md).
+
+| Workload / path | Default | Status | Latency and coverage notes |
+| --- | --- | --- | --- |
+| Bodyless, no query | yes | Supported | Rust engine end-to-end p50 0.414 ms. Sub-millisecond also covers allow-cache hits and fast-allow; Coraza is ~4.5 ms. |
+| Small bodies (≤ 4 KiB) | yes | Supported | Rust engine end-to-end p50 0.642 ms at 1 KiB and 1.091 ms at 4 KiB (engine request path ~566–591 µs at 4 KiB). Coraza reference: 40.13 ms and 169.56 ms. |
+| Medium bodies (8 KiB) | yes | Supported | Rust engine end-to-end p50 1.614 ms (~992 µs engine request path). Coraza reference: 354.09 ms. |
+| Large bodies (> 64 KiB) | yes | Supported with policy | The wasm payload contract remains 64 KiB. Above the configured policy, requests fail closed unless `max_inspect_bytes` + an explicit oversize action are set. |
+| gRPC | yes | Supported | Protocol-aware envelope plus optional descriptor content scan; protobuf bodies are withheld from CRS. |
+| GraphQL | yes | Supported | `body_scan = "crs"` keeps the full JSON scan (default); `graphql-only` trades coverage for cost. |
+| Coraza WASI reactor | no | Reference / explicit `wasm` | Full rule coverage and the differential oracle, but start-up is ~4.9 s / ~801 MiB RSS and body inspection is much slower than the Rust engine. |
+| Native Coraza sidecar | no | Opt-in | ~6× faster body inspection than the wasm reactor; adds a process, socket and supervisor. |
+| Allow cache / fast-allow | no | Opt-in | Cache hits 0.56–0.96 µs; fast-allow 0.38 µs, bodyless/query-free routes only. |
+| Response inspection | — | Plumbed, not proxy-wired | Engine phases 3–5 and response collections exist, but the proxy does not yet wire response bodies through them. |
+| io_uring listener | no | Opt-in | `server.io_backend = "io_uring"` with fallback to tokio. |
+| Hyperscan / Vectorscan | no | Opt-in | `hyperscan-eval`; falls back to the pure-Rust prefilter when unavailable. |
+
+### Known limitations
+
+- **Sub-millisecond is a path claim, not a full-inspection claim.** It applies
+  to bodyless requests, allow-cache hits and prefilter/fast-allow paths, and to
+  the Rust engine's request path at these body sizes. The engine's measured
+  4 KiB cost is ~0.6 ms and 8 KiB ~1.0 ms; the end-to-end proxy adds forwarding
+  and I/O.
+- **Coraza remains available but is slower.** It is the reference oracle and
+  the `backend = "wasm"` switch-back, not the default. It costs seconds to
+  start and hundreds of milliseconds for larger bodies.
+- **Response inspection is plumbed but not proxy-wired.** Opt-in engine phases
+  3–5 can evaluate response headers/body collections, but the proxy does not
+  yet feed responses through them.
+- **io_uring and Hyperscan/Vectorscan are opt-in** build/config paths, not
+  defaults, and both fall back to their portable implementations.
+- Corpus agreement is 2,110/2,112, not 100 %; the two remaining differences
+  are documented and match the corpus labels.
+- gRPC streaming bodies remain envelope-only; `graphql-only` intentionally
+  gives up CRS body-rule coverage.
+- Beta releases have best-effort support only; see
+  [`docs/operations/support-policy.md`](docs/operations/support-policy.md).
+
+### Added
+
 - **Vectorscan multi-pattern candidate pass for the residual engine regex
   subset** (non-default `hyperscan-eval`). Positive `@rx` rules without a
   mandatory-literal gate are compiled into one block-mode Vectorscan database
@@ -81,6 +160,20 @@ All notable changes to WAF-Rejected are documented here.
   blocking indefinitely in `io_uring_enter`.
 - Accept errors no longer tear down the proxy listener; they are logged and
   retried.
+
+### Fixed
+
+- **XML collection presence in the native engine empty-target gate.** Rules
+  whose positive targets are XML collections are no longer skipped when the
+  request body processor did populate `XML`/`XML:/*`/`XML://@*`. The gate now
+  reports XML collection presence consistently with the Coraza oracle, closing
+  a soundness gap for XML-body rules. No defaults or rules changed.
+- **gRPC envelope inspection on the default Rust backend.** Attaching the
+  gRPC inspector to the backend scanner consumed and dropped the inspector when
+  the backend returned no legacy reactor scanner, so unary gRPC bodies with a
+  `Content-Length` could reach CRS body rules and be blocked. The inspector is
+  now preserved, and the Rust engine exposes its own gRPC field-content
+  scanner. Valid gRPC frames are withheld from CRS as documented.
 
 ## [0.1.0-beta.12] - 2026-11-03
 

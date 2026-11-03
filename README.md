@@ -1,10 +1,12 @@
 # WAF-Rejected
 
-**Current Beta:** `0.1.0-beta.9` · prebuilt image tarball attached to the GitHub release
+**Current Beta:** `0.1.0-beta.13` · prebuilt image tarball attached to the GitHub release
 
 A Rust reverse-proxy web application firewall. Requests are inspected by a
 configurable rule chain (SQL injection, XSS, command injection, path traversal,
 request-size and rate limits) before being forwarded to an upstream service.
+The default inspection backend is the native Rust CRS engine; Coraza remains
+the reference oracle and an explicit `waf.coraza.backend = "wasm"` switch-back.
 
 ## What works
 
@@ -234,10 +236,17 @@ Key points:
   bundle (505/505 rules) into the engine IR once in ~210 ms and the process
   reaches readiness in ~276 ms with ~30 MiB RSS. The engine matches the Coraza
   oracle on 2,110/2,112 corpus cases (the two differences are documented and
-  match the corpus labels) and fails closed on any load or runtime error.
-  Coraza remains the **reference implementation** and can be selected with
+  match the corpus labels), executes all 505/505 rules, and fails closed on any
+  load or runtime error. End-to-end proxy p50 is 0.414 / 0.642 / 1.091 /
+  1.614 ms for bodyless / 1 / 4 / 8 KiB, versus Coraza 4.47 / 40.13 / 169.56 /
+  354.09 ms. Those sub-millisecond figures are path claims (bodyless,
+  allow-cache, prefilter/fast-allow and the engine request path); the engine's
+  own request path is ~566–591 µs at 4 KiB and ~992 µs at 8 KiB. Coraza remains
+  the **reference implementation** and can be selected with
   `waf.coraza.backend = "wasm"`; `waf.coraza.fallback = "wasm"` opts into
-  re-evaluating a request with Coraza after a Rust-engine runtime error. See
+  re-evaluating a request with Coraza after a Rust-engine runtime error.
+  Response inspection is plumbed in the engine but not proxy-wired yet, and
+  io_uring/Hyperscan remain opt-in. See
   [`docs/suggestions_from_agents/rust-engine.md`](docs/suggestions_from_agents/rust-engine.md).
 - **ModSecurity/Coraza WASM execution remains available and unchanged.** The
   bundled `rules/coraza.wasm` is a Go-JS demo module; the live Coraza engine is

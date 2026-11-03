@@ -139,6 +139,86 @@ impl RustEngineRule {
     pub fn engine(&self) -> &RustEngine {
         &self.engine
     }
+
+    /// Builds the gRPC field-content scanner backed by this engine.
+    pub fn content_scanner(&self) -> Arc<dyn crate::waf::grpc::GrpcContentScanner> {
+        Arc::new(RustEngineContentScanner {
+            engine: Arc::clone(&self.engine),
+        })
+    }
+}
+
+/// Evaluates a request against the native engine.
+fn evaluate_request(engine: &RustEngine, ctx: &RequestContext) -> Result<Decision, EngineError> {
+    let uri = ctx.uri.to_string();
+    let headers: Vec<(String, String)> = ctx
+        .headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            )
+        })
+        .collect();
+    let body = ctx.body.as_deref();
+    let request = EngineRequest {
+        method: ctx.method.as_str(),
+        uri: &uri,
+        http_version: &ctx.http_version,
+        headers: &headers,
+        body,
+    };
+    engine
+        .evaluate_detailed(&request)
+        .map(|outcome| outcome.decision)
+}
+
+/// gRPC field-content scanner for the default Rust backend.
+///
+/// The raw protobuf never reaches the engine; the gRPC inspector hands over
+/// the same synthetic `f0=...&f1=...` form payload the Coraza scanner used.
+pub struct RustEngineContentScanner {
+    engine: Arc<RustEngine>,
+}
+
+impl crate::waf::grpc::GrpcContentScanner for RustEngineContentScanner {
+    fn scan(&self, payload: &[u8]) -> Result<Decision, String> {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::CONTENT_TYPE,
+            hyper::header::HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+        headers.insert(
+            hyper::header::HOST,
+            hyper::header::HeaderValue::from_static("grpc-content-scan.invalid"),
+        );
+        headers.insert(
+            hyper::header::USER_AGENT,
+            hyper::header::HeaderValue::from_static("waf-grpc-content-scan/1.0"),
+        );
+        headers.insert(
+            hyper::header::ACCEPT,
+            hyper::header::HeaderValue::from_static("*/*"),
+        );
+        // A POST without Content-Length trips CRS protocol rule 920180.
+        headers.insert(
+            hyper::header::CONTENT_LENGTH,
+            hyper::header::HeaderValue::from_str(&payload.len().to_string())
+                .map_err(|err| format!("failed to build gRPC content-scan length: {err}"))?,
+        );
+
+        let ctx = RequestContext::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            hyper::Method::POST,
+            hyper::Uri::from_static("/__grpc__/content-scan"),
+            headers,
+            Some(payload.len()),
+        )
+        .with_body(Some(bytes::Bytes::copy_from_slice(payload)));
+
+        evaluate_request(&self.engine, &ctx).map_err(|err| err.to_string())
+    }
 }
 
 impl WafRule for RustEngineRule {
@@ -157,27 +237,8 @@ impl WafRule for RustEngineRule {
     }
 
     fn evaluate(&self, ctx: &RequestContext) -> Decision {
-        let uri = ctx.uri.to_string();
-        let headers: Vec<(String, String)> = ctx
-            .headers
-            .iter()
-            .map(|(name, value)| {
-                (
-                    name.as_str().to_string(),
-                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
-                )
-            })
-            .collect();
-        let body = ctx.body.as_deref();
-        let request = EngineRequest {
-            method: ctx.method.as_str(),
-            uri: &uri,
-            http_version: &ctx.http_version,
-            headers: &headers,
-            body,
-        };
-        match self.engine.evaluate_detailed(&request) {
-            Ok(outcome) => outcome.decision,
+        match evaluate_request(&self.engine, ctx) {
+            Ok(decision) => decision,
             Err(err) => match &self.fallback {
                 Some(fallback) => {
                     tracing::warn!(

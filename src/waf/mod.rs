@@ -552,9 +552,14 @@ impl WafEngine {
 
         // gRPC field-content scanning reuses the same backend directly. It is
         // attached after the Coraza rule so no second reactor is compiled.
+        // Only take the inspector when a scanner exists: taking it on a `None`
+        // scanner would silently drop gRPC envelope inspection (the Rust
+        // backend has no legacy reactor scanner of its own).
         #[cfg(feature = "wasm-reactor")]
-        if let (Some(inspector), Some(scanner)) = (engine.grpc_inspector.take(), content_scanner) {
-            engine.grpc_inspector = Some(inspector.with_content_scanner(scanner));
+        if let Some(scanner) = content_scanner {
+            if let Some(inspector) = engine.grpc_inspector.take() {
+                engine.grpc_inspector = Some(inspector.with_content_scanner(scanner));
+            }
         }
 
         // Add default rules based on configuration
@@ -688,6 +693,10 @@ impl WafEngine {
                             "Compiled the Rust engine rule IR at startup"
                         );
                         let rule = rust_engine::RustEngineRule::new(Arc::new(engine));
+                        #[cfg(feature = "wasm-reactor")]
+                        let scanner: GrpcContentScannerHandle = rule.content_scanner();
+                        #[cfg(not(feature = "wasm-reactor"))]
+                        let scanner: GrpcContentScannerHandle = ();
                         let rule = match config.waf.coraza.fallback {
                             crate::config::CorazaFallback::None => rule,
                             crate::config::CorazaFallback::Wasm => {
@@ -703,7 +712,7 @@ impl WafEngine {
                                 rule.with_fallback(fallback)
                             }
                         };
-                        Ok((Box::new(rule) as Box<dyn WafRule>, None))
+                        Ok((Box::new(rule) as Box<dyn WafRule>, Some(scanner)))
                     })
             }
             #[cfg(not(feature = "rust-engine"))]
@@ -2265,6 +2274,16 @@ mod tests {
         frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         frame.extend_from_slice(payload);
         Bytes::from(frame)
+    }
+
+    #[cfg(all(feature = "wasm-reactor", feature = "rust-engine"))]
+    #[test]
+    fn rust_backend_keeps_the_grpc_inspector() {
+        let engine = WafEngine::with_config(&crate::config::Config::default());
+        assert!(
+            engine.grpc_inspector.is_some(),
+            "the default Rust backend must keep gRPC envelope inspection"
+        );
     }
 
     #[cfg(feature = "wasm-reactor")]

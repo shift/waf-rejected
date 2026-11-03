@@ -1,8 +1,8 @@
 # Support Matrix
 
-**Release line:** `0.1.0-beta.12`  
+**Release line:** `0.1.0-beta.13`  
 **Default engine:** native Rust CRS engine (`rust-engine`, 505/505 rules)  
-**Reference engine / explicit fallback:** Coraza 3.3.3 + OWASP CRS 4.14.0 in the WASI reactor  
+**Reference engine / explicit switch-back:** Coraza 3.3.3 + OWASP CRS 4.14.0 in the WASI reactor (`backend = "wasm"`)  
 **Toolchain:** Rust 1.99.1, wasmtime 49
 
 This document states what the beta release supports, which paths are on by
@@ -10,24 +10,31 @@ default, and what latency and coverage to expect from each one. It is the
 long-form companion to the release summary in `CHANGELOG.md`.
 
 > **Headline caveat.** The sub-millisecond claims apply to **bodyless
-> requests, early-blocked requests, allow-cache hits and prefilter fast paths**.
-> They do **not** apply to a request that receives a full OWASP CRS body scan.
-> The native Rust engine is the default request-inspection backend; Coraza
-> remains the reference implementation and the explicit `wasm` backend.
+> requests, early-blocked requests, allow-cache hits and prefilter fast paths**,
+> and to the Rust engine's request path. They do **not** apply to a request that
+> receives a full OWASP CRS body scan on the Coraza reference backend. The
+> native Rust engine is the default request-inspection backend; Coraza remains
+> the reference implementation and the explicit `wasm` backend. Response
+> inspection is plumbed in the engine but is not proxy-wired yet.
 
 ## Workload matrix
 
+Measured p50 unless stated otherwise. `native` = native Rust engine
+(`backend = "rust"`), `wasm` = Coraza WASI reactor.
+
 | Workload | Default path | Status | Typical measured cost | Notes |
 | --- | --- | --- | --- | --- |
-| Bodyless (`GET`/`HEAD`, no body, no query) | Rust engine + early blocking | Supported | wasm p50 ~4.5 ms; native p50 ~0.9 ms end-to-end | Sub-millisecond is reachable only with fast-allow and/or allow-cache, or when an early-block rule fires before CRS body work. |
-| Small bodies (≤ 4 KiB) | Full CRS body scan | Supported | wasm ~66 ms at 1 KiB, ~172 ms at 4 KiB; native ~8 ms at 1 KiB, ~29 ms at 4 KiB | CRS evaluation is ~99 % of the cost. This is the main supported inspection path. Native is ~6× faster but still CRS-bound. |
-| Medium bodies (8–16 KiB) | Full CRS body scan | Supported | wasm ~354 ms at 8 KiB proxy p50; native ~58 ms at 8 KiB | Byte-linear cost; admission control protects bodyless traffic from starvation. |
+| Bodyless (`GET`/`HEAD`, no body, no query) | Rust engine + early blocking | Supported | native end-to-end 0.414 ms (engine request path ~0.11 ms); wasm ~4.5 ms | Sub-millisecond also covers allow-cache hits (0.56–0.96 µs) and fast-allow (0.38 µs). |
+| Small bodies (≤ 4 KiB) | Full CRS body scan | Supported | native end-to-end 0.642 ms at 1 KiB, 1.091 ms at 4 KiB (engine request path ~566–591 µs at 4 KiB); wasm 40.13 ms and 169.56 ms | CRS evaluation dominates. The Rust engine is two orders of magnitude faster than the wasm reactor at these sizes. |
+| Medium bodies (8 KiB) | Full CRS body scan | Supported | native end-to-end 1.614 ms (engine request path ~992 µs); wasm 354.09 ms | Byte-linear cost; admission control protects bodyless traffic from starvation. |
 | Large bodies (32–64 KiB) | Full CRS body scan up to the wasm payload contract | Supported with policy | native ~737 ms p50 for 60 KiB at c=1; wasm seconds | The wasm reactor payload contract is 64 KiB. Above that, default behaviour fails closed unless `max_inspect_bytes` and `oversize_action` are configured explicitly. |
 | Bodies above the policy limit | `reject` or `forward-uninspected` | Policy-dependent | Rejection is immediate; forwarding does not inspect the tail | `reject` returns `413` (or `503` on the wasm payload cap). `forward-uninspected` forwards a partially inspected body. Both are opt-in. |
 | gRPC | Protocol-aware envelope + optional descriptor content scan | Supported | native 1 KiB envelope p50 ~3 ms, ~478 RPS at c=4 (zero 503) | Protobuf frames are validated structurally and withheld from CRS body rules. `content_scan = "strings"` adds a bounded content scan using a descriptor artifact. Streaming bodies remain envelope-only. |
 | GraphQL | CRS JSON body scan (`body_scan = "crs"`) | Supported | CRS body cost for the JSON payload | `graphql-only` removes the CRS JSON scan at the cost of CRS body-rule coverage and requires a non-empty operation allowlist. `off` disables GraphQL-specific checks but keeps CRS scanning. |
 | Native Coraza sidecar | `waf.coraza.backend = "native"` | Opt-in | ~6× faster body inspection than wasm | Extra process, Unix socket, shared uid/gid and separate upgrade lifecycle. See `native-performance-profile.md`. |
-| Native Rust engine | `waf.coraza.backend = "rust"` | **Default** (compiled with `rust-engine`) | End-to-end proxy p50 0.41 / 0.64 / 1.09 / 1.61 ms for bodyless / 1 / 4 / 8 KiB; start-up 276 ms, 30 MiB RSS | 505/505 rules, 2,110/2,112 corpus parity. Coraza remains the reference oracle. Runtime errors fail closed unless `waf.coraza.fallback = "wasm"`. |
+| Native Rust engine | `waf.coraza.backend = "rust"` | **Default** (compiled with `rust-engine`) | End-to-end proxy p50 0.414 / 0.642 / 1.091 / 1.614 ms for bodyless / 1 / 4 / 8 KiB; start-up 276 ms, ~30 MiB RSS | 505/505 rules, 2,110/2,112 corpus parity, 0 native-only FNs. Coraza remains the reference oracle. Runtime errors fail closed unless `waf.coraza.fallback = "wasm"`. |
+| Coraza WASI reactor | `waf.coraza.backend = "wasm"` | Reference / explicit switch-back | End-to-end proxy p50 4.47 / 40.13 / 169.56 / 354.09 ms for bodyless / 1 / 4 / 8 KiB; start-up ~4.9 s, ~801 MiB RSS | Full reference implementation and differential oracle. Available in default builds; slower than the Rust engine. |
+| Response inspection | engine phases 3–5 | Plumbed, not proxy-wired | Not on the proxy path | Response header/body collections and outbound scoring exist, but the proxy does not yet feed responses through them. |
 
 Measured numbers are from the reference 6-core laptop described in
 `performance-validation.md` and `subms-budget.md`. They are **capacity floors**
@@ -76,10 +83,14 @@ separate transport cap and does not change WAF inspection depth.
 ### Prefilter and Hyperscan
 
 - **Build:** `crs-prefilter` (pure Rust) or `hyperscan-eval` (links Vectorscan).
-- **What it does:** required-literal gating and multi-pattern prefilters skip
-  rule groups that cannot match a representation.
-- **Limits:** non-default evaluation modes. Hyperscan falls back to the pure
-  Rust automata when unavailable or when a scan fails.
+- **What it does:** required-literal gating skips rule groups and individual
+  regex evaluations that cannot match a representation (137 skipped on a
+  4 KiB body in this release). The opt-in Vectorscan candidate pass adds one
+  block-mode multi-pattern scan per `(value, transform pipeline)` and skips
+  per-rule regexes whose pattern did not hit.
+- **Limits:** non-default evaluation modes. Vectorscan is x86-64/AVX2 only,
+  bounded (256 rules, 16 MiB per group, 64 MiB total, 5 s compile), and falls
+  back to the pure Rust automata when unavailable or when a scan fails.
 
 ## Native profile
 
@@ -120,7 +131,16 @@ mode `0660`).
 
 ## Memory sizing
 
-### WASI reactor (default)
+### Native Rust engine (default)
+
+The engine holds the compiled CRS IR and request state in-process. Measured
+start-up is ~276 ms with ~30 MiB RSS for the 505-rule bundle; sizing scales
+with concurrency and request/body buffers rather than a per-worker wasm pool.
+The Coraza reactor is not instantiated when `backend = "rust"` and
+`fallback = "none"` (the default), so its ~801 MiB steady-state footprint does
+not apply.
+
+### WASI reactor (reference / `backend = "wasm"`)
 
 Host-side limits: 256 MiB wasm linear-memory trap ceiling, 8 MiB wasm stack,
 5 s evaluation timeout, and `pool_size` pre-warmed workers (auto = cores
@@ -159,9 +179,17 @@ owns every core**. Leave at least one core for the proxy, TLS and networking.
 
 ## Known limitations
 
-- Sub-millisecond latency is a **fast-path** property, not a full CRS body
-  inspection property.
-- The native Rust engine is opt-in and not fully parity-tested.
+- Sub-millisecond latency is a **path** property: bodyless, allow-cache,
+  fast-allow/prefilter and the Rust engine request path. Engine cost is
+  ~566–591 µs at 4 KiB and ~992 µs at 8 KiB; the end-to-end proxy adds
+  forwarding and I/O.
+- The native Rust engine is the default, but corpus agreement is 2,110/2,112,
+  not 100 %; the two differences are documented and match the corpus labels.
+  Coraza remains available but slower (`backend = "wasm"`).
+- Response inspection is plumbed but **not proxy-wired**; phases 3–5 do not
+  run on proxied responses yet.
+- io_uring and Hyperscan/Vectorscan are **opt-in** and fall back to portable
+  implementations.
 - gRPC streaming bodies are not sent to CRS; descriptor content scanning is
   opt-in and bounded.
 - `graphql-only` intentionally gives up CRS body-rule coverage for GraphQL

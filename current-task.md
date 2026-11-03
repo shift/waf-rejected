@@ -1,4 +1,4 @@
-# P0-09: Beta Release (current: 0.1.0-beta.9) (NORTH STAR)
+# P0-09: Beta Release (current: 0.1.0-beta.13) (NORTH STAR)
 
 ## Perf: Vectorscan multi-pattern candidate pass (`perf/hyperscan-candidates`)
 
@@ -1069,3 +1069,18 @@ experiment (RegexSet, dense DFA, lazy meta) was implemented and measured but
 regressed 4 KiB latency to 725-958 µs, so it was removed. Details and profile
 breakdown in `docs/suggestions_from_agents/engine-ruleloop.md`; CHANGELOG
 updated. No defaults, versions, transforms, prefilter, proxy or Coraza changes.
+
+## Release 0.1.0-beta.13 (`release/v0.1.0-beta.13`)
+
+- [x] Bump Cargo.toml/Cargo.lock to 0.1.0-beta.13.
+- [x] CHANGELOG: `[0.1.0-beta.13] - 2026-11-03` with engine-default summary,
+      support matrix, limitations; fresh `[Unreleased]`.
+- [x] Update README and `docs/operations/support-matrix.md` for the
+      Rust-engine default, Coraza `wasm` switch-back, response-wiring and
+      opt-in caveats.
+- [x] Fix gRPC envelope inspection on the Rust backend (inspector was consumed
+      when no legacy scanner existed) and add a Rust field-content scanner.
+- [x] fmt, clippy (wasm-reactor and +rust-engine), lib tests, release ignored
+      Coraza tests, 2,110/2,112 parity, reactor size check, `nix build`.
+- [x] Package binary/sidecar/Coraza/artifacts, isolated-storage image, smoke
+      tests (Rust default and `backend = "wasm"`).
