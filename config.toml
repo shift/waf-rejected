@@ -106,6 +106,16 @@ instance_pool_size = 10
 hot_reload = true
 rules_config = "rules/coraza.conf"
 
+[waf.coraza]
+# Request-inspection backend. "rust" is the default when the binary is built
+# with the default `rust-engine` feature (505/505 CRS rules compiled at
+# startup). "wasm" selects the Coraza reference implementation; "native"
+# selects the opt-in Go sidecar over a Unix socket.
+# backend = "rust"
+# Fallback after a Rust-engine runtime error: "none" (fail closed, default) or
+# "wasm" (re-evaluate that request with Coraza).
+# fallback = "none"
+
 [waf.grpc]
 # Protocol-aware gRPC inspection (active when waf.coraza.enabled is true).
 # Protobuf bodies are validated at the frame level and never sent to CRS body

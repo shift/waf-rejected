@@ -1008,13 +1008,44 @@ pub struct WasmConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CorazaBackend {
-    /// In-process WASI reactor hosted by wasmtime (default).
+    /// In-process WASI reactor hosted by wasmtime. This is the reference
+    /// implementation and the default when `rust-engine` is not compiled in.
     #[default]
     Wasm,
     /// Native Go sidecar over a Unix domain socket (`coraza-native` feature).
     Native,
-    /// In-process native Rust CRS engine (`rust-engine` feature).
+    /// In-process native Rust CRS engine (`rust-engine` feature). This is the
+    /// default when the feature is compiled in.
     Rust,
+}
+
+impl CorazaBackend {
+    /// The backend selected when `waf.coraza.backend` is not configured.
+    ///
+    /// The Rust engine is the default whenever it is compiled in; builds
+    /// without `rust-engine` keep the Coraza WASI reactor as the default.
+    pub const fn compiled_default() -> Self {
+        if cfg!(feature = "rust-engine") {
+            Self::Rust
+        } else {
+            Self::Wasm
+        }
+    }
+}
+
+/// Fallback behaviour when the Rust engine fails at request time
+/// (`waf.coraza.fallback`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CorazaFallback {
+    /// No fallback: a Rust-engine runtime error is a fail-closed block
+    /// (default).
+    #[default]
+    None,
+    /// Re-evaluate the request with the Coraza WASI reactor after a Rust-engine
+    /// runtime error. The Coraza decision is used, and a Coraza error is
+    /// fail-closed. Requires the `wasm-reactor` feature.
+    Wasm,
 }
 
 /// What the reactor does when a request body is larger than
@@ -1065,8 +1096,13 @@ pub struct WafCorazaConfig {
     /// Enable the real Coraza WASI reactor.
     pub enabled: bool,
 
-    /// Evaluation backend: `wasm` (default) or `native`.
+    /// Evaluation backend: `rust` (default when compiled with `rust-engine`),
+    /// `wasm` (Coraza reference implementation) or `native`.
     pub backend: CorazaBackend,
+
+    /// Fallback when the Rust engine fails at request time. `none` (default)
+    /// fails closed; `wasm` re-evaluates with the Coraza reactor.
+    pub fallback: CorazaFallback,
 
     /// Unix domain socket for the native sidecar. Ignored by the wasm backend.
     pub native_socket_path: Option<String>,
@@ -1123,7 +1159,8 @@ impl Default for WafCorazaConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            backend: CorazaBackend::Wasm,
+            backend: CorazaBackend::compiled_default(),
+            fallback: CorazaFallback::None,
             native_socket_path: None,
             module_path: None,
             max_payload_bytes: 64 * 1024,
@@ -2104,6 +2141,16 @@ impl Config {
                 "waf.coraza.native_socket_path is required when waf.coraza.backend = \"native\""
             );
         }
+        if self.waf.coraza.backend == CorazaBackend::Rust && !cfg!(feature = "rust-engine") {
+            anyhow::bail!(
+                "waf.coraza.backend = \"rust\" requires a build with the `rust-engine` feature"
+            );
+        }
+        if self.waf.coraza.fallback == CorazaFallback::Wasm && !cfg!(feature = "wasm-reactor") {
+            anyhow::bail!(
+                "waf.coraza.fallback = \"wasm\" requires a build with the `wasm-reactor` feature"
+            );
+        }
         if self.waf.admission.enabled && self.waf.admission.queue_timeout_ms == 0 {
             anyhow::bail!("waf.admission.queue_timeout_ms must be greater than zero");
         }
@@ -2606,7 +2653,8 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
     #[test]
     fn native_coraza_backend_requires_a_socket() {
         let mut config = Config::default();
-        assert_eq!(config.waf.coraza.backend, CorazaBackend::Wasm);
+        assert_eq!(config.waf.coraza.backend, CorazaBackend::compiled_default());
+        assert_eq!(config.waf.coraza.fallback, CorazaFallback::None);
         assert!(config.validate().is_ok());
 
         config.waf.coraza.backend = CorazaBackend::Native;
@@ -2628,6 +2676,60 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
             serde_json::to_string(&CorazaBackend::Rust).expect("serialize"),
             "\"rust\""
         );
+    }
+
+    #[test]
+    fn backend_default_tracks_the_compiled_engine() {
+        let config = Config::default();
+        #[cfg(feature = "rust-engine")]
+        assert_eq!(config.waf.coraza.backend, CorazaBackend::Rust);
+        #[cfg(not(feature = "rust-engine"))]
+        assert_eq!(config.waf.coraza.backend, CorazaBackend::Wasm);
+    }
+
+    #[test]
+    fn backend_parsing_accepts_all_selectable_values() {
+        for (text, expected) in [
+            ("wasm", CorazaBackend::Wasm),
+            ("rust", CorazaBackend::Rust),
+            ("native", CorazaBackend::Native),
+        ] {
+            let backend: CorazaBackend =
+                serde_json::from_str(&format!("\"{text}\"")).expect("backend parses");
+            assert_eq!(backend, expected);
+        }
+        assert!(serde_json::from_str::<CorazaBackend>("\"bogus\"").is_err());
+    }
+
+    #[test]
+    fn fallback_parsing_accepts_none_and_wasm_only() {
+        assert_eq!(
+            serde_json::from_str::<CorazaFallback>("\"none\"").expect("none"),
+            CorazaFallback::None
+        );
+        assert_eq!(
+            serde_json::from_str::<CorazaFallback>("\"wasm\"").expect("wasm"),
+            CorazaFallback::Wasm
+        );
+        assert!(serde_json::from_str::<CorazaFallback>("\"rust\"").is_err());
+    }
+
+    #[cfg(not(feature = "rust-engine"))]
+    #[test]
+    fn rust_backend_without_the_feature_is_rejected_at_validation() {
+        let mut config = Config::default();
+        config.waf.coraza.backend = CorazaBackend::Rust;
+        let error = config.validate().expect_err("must reject");
+        assert!(error.to_string().contains("rust-engine"));
+    }
+
+    #[cfg(not(feature = "wasm-reactor"))]
+    #[test]
+    fn wasm_fallback_without_the_feature_is_rejected_at_validation() {
+        let mut config = Config::default();
+        config.waf.coraza.fallback = CorazaFallback::Wasm;
+        let error = config.validate().expect_err("must reject");
+        assert!(error.to_string().contains("wasm-reactor"));
     }
 
     #[test]

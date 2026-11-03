@@ -1,7 +1,8 @@
 # Support Matrix
 
 **Release line:** `0.1.0-beta.12`  
-**Default engine:** Coraza 3.3.3 + OWASP CRS 4.14.0 in the WASI reactor  
+**Default engine:** native Rust CRS engine (`rust-engine`, 505/505 rules)  
+**Reference engine / explicit fallback:** Coraza 3.3.3 + OWASP CRS 4.14.0 in the WASI reactor  
 **Toolchain:** Rust 1.99.1, wasmtime 49
 
 This document states what the beta release supports, which paths are on by
@@ -11,13 +12,14 @@ long-form companion to the release summary in `CHANGELOG.md`.
 > **Headline caveat.** The sub-millisecond claims apply to **bodyless
 > requests, early-blocked requests, allow-cache hits and prefilter fast paths**.
 > They do **not** apply to a request that receives a full OWASP CRS body scan.
-> The native Rust engine is **opt-in**, not the default.
+> The native Rust engine is the default request-inspection backend; Coraza
+> remains the reference implementation and the explicit `wasm` backend.
 
 ## Workload matrix
 
 | Workload | Default path | Status | Typical measured cost | Notes |
 | --- | --- | --- | --- | --- |
-| Bodyless (`GET`/`HEAD`, no body, no query) | Coraza reactor + early blocking | Supported | wasm p50 ~4.5 ms; native p50 ~0.9 ms end-to-end | Sub-millisecond is reachable only with fast-allow and/or allow-cache, or when an early-block rule fires before CRS body work. |
+| Bodyless (`GET`/`HEAD`, no body, no query) | Rust engine + early blocking | Supported | wasm p50 ~4.5 ms; native p50 ~0.9 ms end-to-end | Sub-millisecond is reachable only with fast-allow and/or allow-cache, or when an early-block rule fires before CRS body work. |
 | Small bodies (≤ 4 KiB) | Full CRS body scan | Supported | wasm ~66 ms at 1 KiB, ~172 ms at 4 KiB; native ~8 ms at 1 KiB, ~29 ms at 4 KiB | CRS evaluation is ~99 % of the cost. This is the main supported inspection path. Native is ~6× faster but still CRS-bound. |
 | Medium bodies (8–16 KiB) | Full CRS body scan | Supported | wasm ~354 ms at 8 KiB proxy p50; native ~58 ms at 8 KiB | Byte-linear cost; admission control protects bodyless traffic from starvation. |
 | Large bodies (32–64 KiB) | Full CRS body scan up to the wasm payload contract | Supported with policy | native ~737 ms p50 for 60 KiB at c=1; wasm seconds | The wasm reactor payload contract is 64 KiB. Above that, default behaviour fails closed unless `max_inspect_bytes` and `oversize_action` are configured explicitly. |
@@ -25,7 +27,7 @@ long-form companion to the release summary in `CHANGELOG.md`.
 | gRPC | Protocol-aware envelope + optional descriptor content scan | Supported | native 1 KiB envelope p50 ~3 ms, ~478 RPS at c=4 (zero 503) | Protobuf frames are validated structurally and withheld from CRS body rules. `content_scan = "strings"` adds a bounded content scan using a descriptor artifact. Streaming bodies remain envelope-only. |
 | GraphQL | CRS JSON body scan (`body_scan = "crs"`) | Supported | CRS body cost for the JSON payload | `graphql-only` removes the CRS JSON scan at the cost of CRS body-rule coverage and requires a non-empty operation allowlist. `off` disables GraphQL-specific checks but keeps CRS scanning. |
 | Native Coraza sidecar | `waf.coraza.backend = "native"` | Opt-in | ~6× faster body inspection than wasm | Extra process, Unix socket, shared uid/gid and separate upgrade lifecycle. See `native-performance-profile.md`. |
-| Native Rust engine | `waf.coraza.backend = "rust"` | Opt-in / experimental | Not a default SLA | 505/505 rules executed, 2,110/2,112 corpus parity. Not a drop-in replacement today. |
+| Native Rust engine | `waf.coraza.backend = "rust"` | **Default** (compiled with `rust-engine`) | End-to-end proxy p50 0.41 / 0.64 / 1.09 / 1.61 ms for bodyless / 1 / 4 / 8 KiB; start-up 276 ms, 30 MiB RSS | 505/505 rules, 2,110/2,112 corpus parity. Coraza remains the reference oracle. Runtime errors fail closed unless `waf.coraza.fallback = "wasm"`. |
 
 Measured numbers are from the reference 6-core laptop described in
 `performance-validation.md` and `subms-budget.md`. They are **capacity floors**
@@ -94,14 +96,27 @@ mode `0660`).
 | Failure mode | Keep `fail_mode = "closed"`; a sidecar outage returns `503`, never a silent allow. |
 | Scaling | One sidecar per proxy pod/host. Unix sockets are local-only. |
 
-## Rust engine
+## Rust engine (default)
 
-- **Build:** non-default Cargo feature `rust-engine`.
-- **Config:** `waf.coraza.backend = "rust"`.
-- **Status:** experimental. It executes 505/505 rules and matches 2,110/2,112
-  corpus cases; the remaining two are documented parity gaps.
-- **Do not** treat it as a supported default replacement for Coraza in this
-  beta.
+- **Build:** default Cargo feature `rust-engine` (also listed explicitly in
+  `flake.nix` and the `Dockerfile`). Builds without it default to `wasm`.
+- **Config:** `waf.coraza.backend = "rust"` is the compiled default; set
+  `backend = "wasm"` to switch back to the Coraza reference implementation at
+  any time, or `backend = "native"` for the sidecar.
+- **Startup:** the pinned CRS bundle is parsed and compiled into the IR once at
+  start-up (505/505 rules, ~210 ms); there is no per-request rule parsing. The
+  compile time, rule counts and process RSS are logged, and startup is aborted
+  (fail closed) if strict loading fails. The bundle is shipped in the package
+  (`share/waf/rules/crs`) and resolved by the binary; `WAF_CRS_CONF` overrides
+  the path.
+- **Fallback:** `waf.coraza.fallback = "none"` (default) turns a runtime engine
+  error into a fail-closed block. `fallback = "wasm"` re-evaluates that request
+  with the Coraza reactor; if both fail the request is still blocked. The
+  fallback costs re-inspection, so enable it only when availability outweighs
+  latency and you accept two engines in memory.
+- **Status:** 505/505 rules and 2,110/2,112 corpus agreement with Coraza; the
+  two differences are documented and match the corpus labels. Coraza remains
+  the reference oracle.
 
 ## Memory sizing
 

@@ -228,22 +228,34 @@ Key points:
 
 ## Security limitations (read before production)
 
-- **ModSecurity/Coraza WASM execution is on by default.** The bundled
-  `rules/coraza.wasm` remains a Go-JS demo module. The live engine is a real
-  Coraza WASI reactor on wasmtime 49, compiled by the default `wasm-reactor`
-  feature; it embeds OWASP CRS 4.14 (request-side, paranoia level 1) and runs
-  before the built-in heuristic rules. `waf.coraza.enabled = false` (or
-  `--no-default-features`) disables it. Start-up compiles the ~20 MiB module
-  once (~4.5 s) and warms the reactor pool (~1.1 s) before readiness; measured
-  steady-state cost is ~8–10 ms p50 per request with full CRS. The host is
-  built with Rust 1.99.1. See
+- **The native Rust CRS engine is the default request-inspection backend.**
+  Builds with the default features compile `rust-engine` and select
+  `waf.coraza.backend = "rust"`. Start-up compiles the pinned OWASP CRS 4.14
+  bundle (505/505 rules) into the engine IR once in ~210 ms and the process
+  reaches readiness in ~276 ms with ~30 MiB RSS. The engine matches the Coraza
+  oracle on 2,110/2,112 corpus cases (the two differences are documented and
+  match the corpus labels) and fails closed on any load or runtime error.
+  Coraza remains the **reference implementation** and can be selected with
+  `waf.coraza.backend = "wasm"`; `waf.coraza.fallback = "wasm"` opts into
+  re-evaluating a request with Coraza after a Rust-engine runtime error. See
+  [`docs/suggestions_from_agents/rust-engine.md`](docs/suggestions_from_agents/rust-engine.md).
+- **ModSecurity/Coraza WASM execution remains available and unchanged.** The
+  bundled `rules/coraza.wasm` is a Go-JS demo module; the live Coraza engine is
+  a WASI reactor on wasmtime 49 compiled by the default `wasm-reactor` feature.
+  It embeds OWASP CRS 4.14 (request-side, paranoia level 1) and runs before the
+  built-in heuristic rules when selected or used as the fallback.
+  `waf.coraza.enabled = false` (or `--no-default-features`) disables it.
+  Start-up compiles the ~20 MiB module once (~4.5 s) and warms the reactor pool
+  (~1.1 s) before readiness; measured steady-state cost is ~8–10 ms p50 per
+  request with full CRS. The host is built with Rust 1.99.1. See
   [`docs/coraza-wasi-reactor.md`](docs/coraza-wasi-reactor.md) and
   [`docs/wasm-integration-status.md`](docs/wasm-integration-status.md).
 - **A native Coraza sidecar profile is available for high-throughput body
   inspection.** It is opt-in (`config/performance-native.toml`, Compose and
   Kubernetes examples under `deploy/`), requires the `coraza-native` feature and
-  a sidecar process, and is about 6× faster on body inspection than wasm. The
-  default backend remains `wasm`. See
+  a sidecar process, and is about 6× faster on body inspection than wasm. It is
+  selected explicitly (`waf.coraza.backend = "native"`); the default backend is
+  `rust` (or `wasm` in builds without `rust-engine`). See
   [`docs/operations/native-performance-profile.md`](docs/operations/native-performance-profile.md).
 - **WebTransport is feature-gated and terminating.** Build with
   `--features webtransport`, enable `server.webtransport`, and configure Origin

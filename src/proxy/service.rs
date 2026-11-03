@@ -611,9 +611,14 @@ impl WafProxyService {
         ));
 
         // The WAF engine is a configured security control: a start-up failure
-        // (Coraza compile/validation/warm, or the gRPC allowlist artifact)
-        // must stop start-up instead of surfacing as a 503 per request.
-        #[cfg(feature = "wasm-reactor")]
+        // (Coraza compile/validation/warm, the Rust engine strict load, or the
+        // gRPC/GraphQL allowlist artifact) must stop start-up instead of
+        // surfacing as a 503 per request. There is no silent fallback.
+        #[cfg(any(
+            feature = "wasm-reactor",
+            feature = "coraza-native",
+            feature = "rust-engine"
+        ))]
         if let Some(err) = waf_engine.waf_init_error() {
             return Err(WafError::internal(format!(
                 "WAF engine initialisation failed (fail-closed): {err}"
@@ -2628,6 +2633,7 @@ mod tests {
             },
             ..Default::default()
         };
+        config.waf.coraza.backend = crate::config::CorazaBackend::Wasm;
         config.waf.coraza.module_path = Some("/nonexistent/coraza-reactor.wasm".to_string());
 
         let error = WafProxyService::new(config)

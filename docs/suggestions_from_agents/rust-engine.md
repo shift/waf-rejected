@@ -1,10 +1,37 @@
 # Native Rust CRS engine: core vertical slice
 
-**Status:** experimental, feature-gated behind `rust-engine`, **not enabled by
-default**.
-**Branch:** `feat/rust-engine`
+**Status:** default request-inspection backend (`rust-engine`); Coraza remains
+the reference implementation and the explicit `wasm` fallback.
+**Branch:** `feat/engine-default`
 **Bundle:** OWASP CRS 4.14.0 (`wasm/coraza_reactor/rules/crs/crs.conf`), PL1.
 **Oracle:** the existing Coraza WASI reactor (`wasm-reactor`).
+
+## Default selection
+
+When `rust-engine` is compiled (it is in the default feature set), a plain
+configuration selects `waf.coraza.backend = "rust"`. Builds without the feature
+keep `"wasm"` as the default, and `"wasm"` / `"native"` remain explicitly
+selectable. The rule bundle is parsed and compiled **once at startup** in strict
+mode; a load failure aborts startup (`WafProxyService::new`) instead of falling
+back to a weaker engine. On the reference host start-up takes ~276 ms end to
+end (~210 ms in the IR compiler) and the process RSS is ~30 MiB, versus ~4.9 s
+and ~800 MiB for the wasm reactor pool.
+
+`waf.coraza.fallback` controls runtime errors:
+
+| Value | Behaviour | Trade-off |
+| --- | --- | --- |
+| `none` (default) | A Rust-engine runtime error returns a fail-closed `500` block | Lowest memory; a bug or budget overflow rejects the request |
+| `wasm` | The request is re-evaluated by the Coraza reactor; if Coraza also fails the request is blocked | Availability during engine bugs, at the cost of two engines in memory and re-inspection latency |
+
+Load failures never use the fallback: they are configuration errors and stop
+startup. The fallback is only for request-time `EngineError` (budget overflow,
+transform overflow, internal invariant).
+
+The package ships the pinned bundle under `share/waf/rules/crs` (Nix and
+container images). At startup the resolver checks `WAF_CRS_CONF`, then the
+source-tree path, then `<exe>/../share/waf/rules/crs`, then
+`/usr/share/waf/rules/crs`; there is no download or runtime rule fetching.
 
 ## TL;DR
 
@@ -39,8 +66,11 @@ opt-in response API.
    `Decision::Block { status: 500, .. }`. A budget overflow never allows.
 4. **Bounded.** Every request gets a `Budget` (`Limits::default()`: 4,096
    values/rule, 1 MiB/value, 8 MiB/request, 4,096 matches/rule).
-5. **Feature-gated.** `rust-engine` is non-default; Coraza remains the default
-   backend and the differential oracle.
+5. **Default with an explicit reference.** `rust-engine` is compiled by
+   default and selected by `CorazaBackend::compiled_default()`. Coraza stays
+   the reference oracle and can be selected with
+   `waf.coraza.backend = "wasm"`; a missing feature, strict-load failure or
+   runtime error never silently degrades to an uninspected request.
 
 ## Architecture
 
@@ -212,6 +242,30 @@ ratio is the useful signal. The native binary was built with LTO disabled to
 keep the build tractable; the shipped `release` profile enables LTO and should
 be slightly faster. Coraza's own reference numbers for the same bodies on an
 idle host are ~2.3 ms / 39 ms / 168 ms / 351 ms (bodyless / 1 / 4 / 8 KiB).
+
+### Default-backend verification (feat/engine-default)
+
+Release `bench-subms` full proxy (loopback client + upstream), c=1, 60
+requests/cell, default configuration selecting the backend explicitly:
+
+| Body | Coraza `wasm` p50 | Rust default p50 | Rust p99 |
+|---|---:|---:|---:|
+| bodyless | 4.471 ms | **0.414 ms** | 0.485 ms |
+| 1 KiB | 40.131 ms | **0.642 ms** | 0.770 ms |
+| 4 KiB | 169.561 ms | **1.091 ms** | 1.187 ms |
+| 8 KiB | 354.089 ms | **1.614 ms** | 1.676 ms |
+| gRPC 1 KiB frame (HTTP/1.1, both blocked by 949110) | 4.913 ms | **1.050 ms** | — |
+
+Corpus through `rust-engine-parity --engine both` with the default feature set:
+2,112 cases, 0 errors, 2,110/2,112 agreement with Coraza. Startup: ~276 ms end
+to end (IR compile ~211 ms) and ~30 MiB RSS, versus ~4.9 s and ~800 MiB for the
+wasm reactor pool at `pool_size = 0` (auto). `cargo build --release` for the
+main binary took ~7m46s on the shared host including dependencies; the release
+`waf-ingress` binary is ~40 MiB.
+
+gRPC and GraphQL pre-checks run before the Coraza/Rust rule in the chain, so
+both protocols use the selected engine; protobuf/GraphQL bodies withheld by a
+pre-check are not inspected a second time.
 
 ## Remaining work to full replacement
 

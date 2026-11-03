@@ -469,6 +469,14 @@ fn heuristics_config(upstream: SocketAddr) -> Config {
     config
 }
 
+#[cfg(feature = "rust-engine")]
+fn rust_config(upstream: SocketAddr, eval_timeout_ms: u64) -> Config {
+    let mut config = base_config(upstream, eval_timeout_ms);
+    config.waf.coraza.backend = CorazaBackend::Rust;
+    config.waf.coraza.fallback = waf_ingress::config::CorazaFallback::None;
+    config
+}
+
 #[cfg(all(feature = "coraza-native", unix))]
 fn native_config(
     upstream: SocketAddr,
@@ -614,6 +622,31 @@ fn run_l0(cli: &Cli, runtime: &tokio::runtime::Runtime) -> Result<Vec<Row>> {
 
     #[cfg(not(feature = "wasm-reactor"))]
     println!("L0 wasm rows skipped: build without the `wasm-reactor` feature");
+
+    #[cfg(feature = "rust-engine")]
+    {
+        let engine = WafEngine::with_config_and_metrics(
+            &rust_config("127.0.0.1:1".parse().expect("valid addr"), 5_000),
+            None,
+        );
+        if let Some(error) = engine.waf_init_error() {
+            bail!("rust WAF engine failed to initialise: {error}");
+        }
+
+        for size in SIZES {
+            let ctx = synthetic_context(size);
+            let (stats, decision) = measure_engine(runtime, &engine, &ctx, cli.samples, cli.warmup);
+            let (bytes, calls) = measure_engine_alloc(runtime, &engine, &ctx, cli.samples.min(50));
+            rows.push(
+                Row::new("L0-engine", "rust", size.label(), stats)
+                    .with_alloc(bytes, calls)
+                    .with_note(describe(&decision)),
+            );
+        }
+    }
+
+    #[cfg(not(feature = "rust-engine"))]
+    println!("L0 rust rows skipped: build without the `rust-engine` feature");
 
     #[cfg(all(feature = "coraza-native", unix))]
     if let Some(socket) = cli.native_socket.as_deref() {
@@ -1057,7 +1090,7 @@ fn tail_gate(rows: &[Row], backend: &str, size: &str) -> GateResult {
 
 fn gate_results(rows: &[Row]) -> Vec<GateResult> {
     let mut gates = Vec::new();
-    for backend in ["wasm", "native"] {
+    for backend in ["wasm", "native", "rust"] {
         for (size, limit) in [("bodyless", 0.5), ("1 KiB", 0.8), ("4 KiB", 1.5)] {
             gates.push(gate(rows, backend, size, limit));
         }
@@ -1252,6 +1285,22 @@ fn main() -> Result<()> {
                             cli.requests.min(50),
                         ))
                         .context("run L3 native proxy layer")?,
+                );
+            }
+
+            #[cfg(feature = "rust-engine")]
+            {
+                let config = rust_config(upstream, cli.eval_timeout_ms);
+                rows.extend(
+                    runtime
+                        .block_on(run_proxy_layer(
+                            &cli,
+                            config,
+                            "L3-proxy",
+                            "rust",
+                            cli.requests.min(50),
+                        ))
+                        .context("run L3 rust proxy layer")?,
                 );
             }
         }

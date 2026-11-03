@@ -125,6 +125,24 @@ type GrpcContentScannerHandle = Arc<dyn grpc::GrpcContentScanner>;
 #[cfg(not(feature = "wasm-reactor"))]
 type GrpcContentScannerHandle = ();
 
+/// Resident set size of the current process, when the platform exposes it.
+///
+/// Used only for start-up diagnostics (the Rust engine compile time and the
+/// resulting footprint are logged once at startup).
+#[cfg(feature = "rust-engine")]
+pub(crate) fn rss_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+        Some(pages.saturating_mul(4096))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 /// WAF decision on how to handle a request
 #[derive(Debug, Clone, PartialEq)]
 pub enum Decision {
@@ -237,12 +255,20 @@ pub trait WafRule: Send + Sync {
 }
 
 /// Fail-closed placeholder used when a configured reactor cannot be loaded.
-#[cfg(any(feature = "wasm-reactor", feature = "coraza-native"))]
+#[cfg(any(
+    feature = "wasm-reactor",
+    feature = "coraza-native",
+    feature = "rust-engine"
+))]
 struct UnavailableCorazaRule {
     reason: String,
 }
 
-#[cfg(any(feature = "wasm-reactor", feature = "coraza-native"))]
+#[cfg(any(
+    feature = "wasm-reactor",
+    feature = "coraza-native",
+    feature = "rust-engine"
+))]
 impl WafRule for UnavailableCorazaRule {
     fn name(&self) -> &str {
         "coraza-backend-unavailable"
@@ -268,7 +294,11 @@ pub struct WafEngine {
     /// reactor or the gRPC allowlist artifact). This is fatal for
     /// [`WafProxyService::new`](crate::proxy::WafProxyService::new) rather
     /// than deferred to request time.
-    #[cfg(feature = "wasm-reactor")]
+    #[cfg(any(
+        feature = "wasm-reactor",
+        feature = "coraza-native",
+        feature = "rust-engine"
+    ))]
     waf_init_error: Option<String>,
     /// Protocol-aware gRPC pre-check; runs before the Coraza reactor and
     /// withholds protobuf bodies from CRS body rules.
@@ -355,7 +385,11 @@ impl Clone for WafEngine {
             enabled: self.enabled,
             fail_closed: self.fail_closed,
             wasm_init_failed: self.wasm_init_failed,
-            #[cfg(feature = "wasm-reactor")]
+            #[cfg(any(
+                feature = "wasm-reactor",
+                feature = "coraza-native",
+                feature = "rust-engine"
+            ))]
             waf_init_error: self.waf_init_error.clone(),
             #[cfg(feature = "wasm-reactor")]
             grpc_inspector: self.grpc_inspector.clone(),
@@ -383,7 +417,11 @@ impl WafEngine {
             enabled: true,
             fail_closed: true,
             wasm_init_failed: false,
-            #[cfg(feature = "wasm-reactor")]
+            #[cfg(any(
+                feature = "wasm-reactor",
+                feature = "coraza-native",
+                feature = "rust-engine"
+            ))]
             waf_init_error: None,
             #[cfg(feature = "wasm-reactor")]
             grpc_inspector: None,
@@ -437,7 +475,11 @@ impl WafEngine {
             enabled: config.waf.enabled,
             fail_closed: config.waf.fail_mode != "open",
             wasm_init_failed,
-            #[cfg(feature = "wasm-reactor")]
+            #[cfg(any(
+                feature = "wasm-reactor",
+                feature = "coraza-native",
+                feature = "rust-engine"
+            ))]
             waf_init_error: None,
             #[cfg(feature = "wasm-reactor")]
             grpc_inspector: None,
@@ -501,7 +543,11 @@ impl WafEngine {
         }
 
         // The Coraza reactor must run before the traditional heuristics.
-        #[cfg(any(feature = "wasm-reactor", feature = "coraza-native"))]
+        #[cfg(any(
+            feature = "wasm-reactor",
+            feature = "coraza-native",
+            feature = "rust-engine"
+        ))]
         let content_scanner = engine.add_coraza_rule(config);
 
         // gRPC field-content scanning reuses the same backend directly. It is
@@ -551,7 +597,11 @@ impl WafEngine {
         engine
     }
 
-    #[cfg(any(feature = "wasm-reactor", feature = "coraza-native"))]
+    #[cfg(any(
+        feature = "wasm-reactor",
+        feature = "coraza-native",
+        feature = "rust-engine"
+    ))]
     fn add_coraza_rule(&mut self, config: &Config) -> Option<GrpcContentScannerHandle> {
         if !config.waf.enabled || !config.waf.coraza.enabled {
             return None;
@@ -568,6 +618,14 @@ impl WafEngine {
         }
 
         let backend = config.waf.coraza.backend;
+        if backend != crate::config::CorazaBackend::Rust
+            && config.waf.coraza.fallback == crate::config::CorazaFallback::Wasm
+        {
+            warn!(
+                backend = ?backend,
+                "waf.coraza.fallback = \"wasm\" only applies to the rust backend; ignoring it"
+            );
+        }
         let result = match backend {
             #[cfg(feature = "wasm-reactor")]
             crate::config::CorazaBackend::Wasm => {
@@ -611,12 +669,42 @@ impl WafEngine {
             #[cfg(feature = "rust-engine")]
             crate::config::CorazaBackend::Rust => {
                 let path = rust_engine::default_crs_conf_path();
+                let started = Instant::now();
                 rust_engine::RustEngine::from_conf_path(&path)
-                    .map(|engine| {
-                        let rule = rust_engine::RustEngineRule::new(Arc::new(engine));
-                        (Box::new(rule) as Box<dyn WafRule>, None)
-                    })
                     .map_err(|err| err.to_string())
+                    .and_then(|engine| {
+                        let load_ms = started.elapsed().as_secs_f64() * 1000.0;
+                        let report = engine.support_report();
+                        info!(
+                            backend = "rust",
+                            source = %path.display(),
+                            startup_ms = load_ms,
+                            rules_seen = report.rules_seen,
+                            rules_compiled = report.rules_compiled,
+                            rules_skipped = report.rules_skipped,
+                            rule_groups = engine.rule_groups(),
+                            pipelines = engine.pipeline_count(),
+                            rss_bytes = rss_bytes().unwrap_or(0),
+                            "Compiled the Rust engine rule IR at startup"
+                        );
+                        let rule = rust_engine::RustEngineRule::new(Arc::new(engine));
+                        let rule = match config.waf.coraza.fallback {
+                            crate::config::CorazaFallback::None => rule,
+                            crate::config::CorazaFallback::Wasm => {
+                                let fallback = Self::wasm_fallback_rule(
+                                    &config.waf.coraza,
+                                    self.fail_closed,
+                                    self.metrics.as_ref(),
+                                )?;
+                                info!(
+                                    "Rust engine fallback is enabled: runtime errors re-evaluate \
+                                     with the Coraza WASI reactor"
+                                );
+                                rule.with_fallback(fallback)
+                            }
+                        };
+                        Ok((Box::new(rule) as Box<dyn WafRule>, None))
+                    })
             }
             #[cfg(not(feature = "rust-engine"))]
             crate::config::CorazaBackend::Rust => Err(
@@ -655,9 +743,40 @@ impl WafEngine {
         None
     }
 
+    /// Builds the explicit Rust-engine fallback (Coraza WASI reactor).
+    #[cfg(feature = "rust-engine")]
+    fn wasm_fallback_rule(
+        config: &crate::config::WafCorazaConfig,
+        fail_closed: bool,
+        metrics: Option<&Arc<crate::metrics::Metrics>>,
+    ) -> Result<Box<dyn WafRule>, String> {
+        #[cfg(feature = "wasm-reactor")]
+        {
+            let rule = wasm_reactor::WasmReactorRule::from_config(config, fail_closed)
+                .map_err(|err| format!("Coraza fallback reactor failed to initialise: {err}"))?;
+            let rule = match metrics {
+                Some(metrics) => rule.with_metrics(Arc::clone(metrics)),
+                None => rule,
+            };
+            Ok(Box::new(rule))
+        }
+        #[cfg(not(feature = "wasm-reactor"))]
+        {
+            let _ = (config, fail_closed, metrics);
+            Err(
+                "waf.coraza.fallback = \"wasm\" requires a build with the `wasm-reactor` feature"
+                    .to_string(),
+            )
+        }
+    }
+
     /// Records a start-up failure, keeping earlier ones so the operator sees
     /// every misconfigured component.
-    #[cfg(feature = "wasm-reactor")]
+    #[cfg(any(
+        feature = "wasm-reactor",
+        feature = "coraza-native",
+        feature = "rust-engine"
+    ))]
     fn record_init_error(&mut self, reason: String) {
         match &mut self.waf_init_error {
             Some(existing) => {
@@ -672,7 +791,11 @@ impl WafEngine {
     /// reactor or the gRPC allowlist artifact) could not be loaded or
     /// initialised. Proxy start-up treats this as fatal so the process never
     /// serves traffic without its WAF engine.
-    #[cfg(feature = "wasm-reactor")]
+    #[cfg(any(
+        feature = "wasm-reactor",
+        feature = "coraza-native",
+        feature = "rust-engine"
+    ))]
     pub fn waf_init_error(&self) -> Option<&str> {
         self.waf_init_error.as_deref()
     }
@@ -1841,6 +1964,16 @@ impl WafEngine {
         self.rules.read().unwrap().len()
     }
 
+    /// Names of the configured rule chain, in evaluation order.
+    pub fn rule_names(&self) -> Vec<String> {
+        self.rules
+            .read()
+            .unwrap()
+            .iter()
+            .map(|rule| rule.name().to_string())
+            .collect()
+    }
+
     pub fn enabled_rule_count(&self) -> usize {
         self.rules
             .read()
@@ -1870,6 +2003,35 @@ impl WafEngine {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[cfg(feature = "rust-engine")]
+    #[test]
+    fn default_config_selects_the_rust_engine() {
+        let config = crate::config::Config::default();
+        let engine = WafEngine::with_config(&config);
+        assert!(
+            engine.waf_init_error().is_none(),
+            "startup failed: {:?}",
+            engine.waf_init_error()
+        );
+        assert!(
+            engine.rule_names().iter().any(|name| name == "rust-engine"),
+            "rust backend was not installed: {:?}",
+            engine.rule_names()
+        );
+    }
+
+    #[cfg(all(feature = "rust-engine", feature = "wasm-reactor"))]
+    #[test]
+    fn explicit_wasm_selection_keeps_the_coraza_reactor() {
+        let mut config = crate::config::Config::default();
+        config.waf.coraza.backend = crate::config::CorazaBackend::Wasm;
+        let engine = WafEngine::with_config(&config);
+        assert!(engine.waf_init_error().is_none());
+        let names = engine.rule_names();
+        assert!(names.iter().any(|name| name.starts_with("coraza")));
+        assert!(!names.iter().any(|name| name == "rust-engine"));
+    }
 
     struct TestRule {
         name: String,
@@ -2052,6 +2214,7 @@ mod tests {
         config.waf.rate_limit.per_ip_enabled = false;
         config.waf.rate_limit.global_enabled = false;
         config.waf.geo_blocking.enabled = false;
+        config.waf.coraza.backend = crate::config::CorazaBackend::Wasm;
         config.waf.coraza.enabled = true;
         config
     }

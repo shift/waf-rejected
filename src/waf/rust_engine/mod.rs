@@ -59,9 +59,50 @@ use crate::waf::{Decision, RequestContext, WafRule};
 /// Repository-relative path of the pinned CRS bundle used by the reactor.
 pub const CRS_CONF_RELATIVE: &str = "wasm/coraza_reactor/rules/crs/crs.conf";
 
-/// Returns the pinned CRS bundle path for this checkout.
+/// Returns the pinned CRS bundle path for this checkout or installation.
+///
+/// Resolution order:
+/// 1. `WAF_CRS_CONF` (explicit override for custom bundles).
+/// 2. The source-tree path (development builds and tests).
+/// 3. `<exe>/../share/waf/rules/crs/crs.conf` (Nix package layout).
+/// 4. `/usr/share/waf/rules/crs/crs.conf` (container layout).
+/// 5. `/usr/local/share/waf/rules/crs/crs.conf`.
+///
+/// The source-tree path is returned as the final fallback so a missing bundle
+/// produces a clear strict-load error instead of an empty path.
 pub fn default_crs_conf_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(CRS_CONF_RELATIVE)
+    if let Some(path) = std::env::var_os("WAF_CRS_CONF") {
+        return PathBuf::from(path);
+    }
+
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(CRS_CONF_RELATIVE);
+    if source.is_file() {
+        return source;
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(bin_dir) = exe.parent() {
+            let installed = bin_dir
+                .join("../share/waf/rules/crs/crs.conf")
+                .canonicalize()
+                .unwrap_or_else(|_| bin_dir.join("../share/waf/rules/crs/crs.conf"));
+            if installed.is_file() {
+                return installed;
+            }
+        }
+    }
+
+    for path in [
+        "/usr/share/waf/rules/crs/crs.conf",
+        "/usr/local/share/waf/rules/crs/crs.conf",
+    ] {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return path;
+        }
+    }
+
+    source
 }
 
 /// [`WafRule`] adapter for the native engine.
@@ -71,12 +112,24 @@ pub fn default_crs_conf_path() -> PathBuf {
 /// integration tests exercise the same `WafRule` contract.
 pub struct RustEngineRule {
     engine: Arc<RustEngine>,
+    /// Optional explicit fallback (Coraza WASI reactor) used only when the
+    /// native engine returns a runtime error. Load failures never reach here.
+    fallback: Option<Box<dyn WafRule>>,
 }
 
 impl RustEngineRule {
     /// Wraps a compiled engine.
     pub fn new(engine: Arc<RustEngine>) -> Self {
-        Self { engine }
+        Self {
+            engine,
+            fallback: None,
+        }
+    }
+
+    /// Attaches an explicit fallback used only for Rust-engine runtime errors.
+    pub fn with_fallback(mut self, fallback: Box<dyn WafRule>) -> Self {
+        self.fallback = Some(fallback);
+        self
     }
 
     /// Returns the underlying engine.
@@ -88,6 +141,16 @@ impl RustEngineRule {
 impl WafRule for RustEngineRule {
     fn name(&self) -> &str {
         "rust-engine"
+    }
+
+    fn cacheable(&self) -> bool {
+        true
+    }
+
+    fn fast_allow_policy(&self) -> crate::waf::fast_allow::FastAllowPolicy {
+        // Like the Coraza reactor: an explicitly allowlisted route opts out of
+        // inspection.
+        crate::waf::fast_allow::FastAllowPolicy::Skip
     }
 
     fn evaluate(&self, ctx: &RequestContext) -> Decision {
@@ -103,12 +166,139 @@ impl WafRule for RustEngineRule {
             })
             .collect();
         let body = ctx.body.as_deref();
-        self.engine.evaluate(&EngineRequest {
+        let request = EngineRequest {
             method: ctx.method.as_str(),
             uri: &uri,
             http_version: &ctx.http_version,
             headers: &headers,
             body,
+        };
+        match self.engine.evaluate_detailed(&request) {
+            Ok(outcome) => outcome.decision,
+            Err(err) => match &self.fallback {
+                Some(fallback) => {
+                    tracing::warn!(
+                        error = %err,
+                        fallback = fallback.name(),
+                        "Rust engine runtime error; re-evaluating with the explicit fallback"
+                    );
+                    fallback.evaluate(ctx)
+                }
+                None => Decision::Block {
+                    status: 500,
+                    reason: format!("Rust engine runtime error (fail-closed): {err}"),
+                },
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod adapter_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn context() -> RequestContext {
+        RequestContext::new(
+            "127.0.0.1".parse().unwrap(),
+            hyper::Method::GET,
+            "/?q=evil".parse().unwrap(),
+            hyper::HeaderMap::new(),
+            None,
+        )
+    }
+
+    fn engine_with_zero_budget() -> RustEngine {
+        RustEngine::from_conf_str(
+            r#"SecRule ARGS "@rx evil" "id:1001,phase:1,deny,status:403""#,
+            ".",
+            CompilePolicy::Report,
+        )
+        .expect("test rule compiles")
+        .with_limits(Limits {
+            max_values_per_rule: 0,
+            max_value_bytes: 0,
+            max_total_bytes: 0,
+            max_matches_per_rule: 0,
         })
+    }
+
+    struct RecordingFallback {
+        decision: Decision,
+        calls: AtomicUsize,
+    }
+
+    impl WafRule for RecordingFallback {
+        fn name(&self) -> &str {
+            "test-fallback"
+        }
+
+        fn evaluate(&self, _ctx: &RequestContext) -> Decision {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.decision.clone()
+        }
+    }
+
+    #[test]
+    fn runtime_error_without_fallback_fails_closed() {
+        let rule = RustEngineRule::new(Arc::new(engine_with_zero_budget()));
+        assert!(matches!(
+            rule.evaluate(&context()),
+            Decision::Block { status: 500, .. }
+        ));
+    }
+
+    #[test]
+    fn runtime_error_with_fallback_uses_the_fallback_decision() {
+        let fallback = Arc::new(RecordingFallback {
+            decision: Decision::Block {
+                status: 403,
+                reason: "fallback".to_string(),
+            },
+            calls: AtomicUsize::new(0),
+        });
+        struct SharedFallback(Arc<RecordingFallback>);
+        impl WafRule for SharedFallback {
+            fn name(&self) -> &str {
+                "test-fallback"
+            }
+            fn evaluate(&self, ctx: &RequestContext) -> Decision {
+                self.0.evaluate(ctx)
+            }
+        }
+        let rule = RustEngineRule::new(Arc::new(engine_with_zero_budget()))
+            .with_fallback(Box::new(SharedFallback(Arc::clone(&fallback))));
+        assert!(matches!(
+            rule.evaluate(&context()),
+            Decision::Block { status: 403, .. }
+        ));
+        assert_eq!(fallback.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn successful_evaluation_never_calls_the_fallback() {
+        let fallback = Arc::new(RecordingFallback {
+            decision: Decision::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        struct SharedFallback(Arc<RecordingFallback>);
+        impl WafRule for SharedFallback {
+            fn name(&self) -> &str {
+                "test-fallback"
+            }
+            fn evaluate(&self, ctx: &RequestContext) -> Decision {
+                self.0.evaluate(ctx)
+            }
+        }
+        let engine = RustEngine::from_conf_str(
+            r#"SecRule ARGS "@rx never-matches" "id:1001,phase:1,deny,status:403""#,
+            ".",
+            CompilePolicy::Report,
+        )
+        .expect("test rule compiles");
+        let rule = RustEngineRule::new(Arc::new(engine))
+            .with_fallback(Box::new(SharedFallback(Arc::clone(&fallback))));
+        assert_eq!(rule.evaluate(&context()), Decision::Allow);
+        assert_eq!(fallback.calls.load(Ordering::Relaxed), 0);
     }
 }

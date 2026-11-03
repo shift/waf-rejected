@@ -58,6 +58,13 @@ block_tor = false
 block_vpn = false
 block_datacenter = false
 
+[waf.coraza]
+# Default request-inspection backend: "rust" (compiled with `rust-engine`).
+# Set "wasm" for the Coraza reference reactor or "native" for the sidecar.
+# backend = "rust"
+# Runtime-error fallback: "none" (fail closed, default) or "wasm".
+# fallback = "none"
+
 [waf.wasm]
 enabled = false
 

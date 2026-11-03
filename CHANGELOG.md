@@ -6,6 +6,18 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Added
 
+- **Native Rust engine is the default request-inspection backend.** `rust-engine`
+  is now part of the default feature set and a plain configuration selects
+  `waf.coraza.backend = "rust"`; builds without the feature keep `"wasm"`. The
+  pinned CRS bundle is compiled into the engine IR once at startup (~210 ms,
+  505/505 rules) with the elapsed time, rule counts and RSS logged. A strict
+  load failure aborts startup; there is no silent fallback. Coraza remains the
+  reference implementation and is selectable with
+  `waf.coraza.backend = "wasm"`.
+- **`waf.coraza.fallback = "none" | "wasm"`** (default `none`). `wasm`
+  re-evaluates a request with the Coraza reactor after a Rust-engine runtime
+  error; if both fail the request is blocked. Load failures always abort
+  startup and never use the fallback.
 - **Native Rust engine body processors and response phases:** Coraza-compatible
   JSON (`gjson`-style `json.` flattening into `ARGS_POST`) and XML
   (`XML:/*`/`XML://@*`, no external DTD/entity access) request body processors,

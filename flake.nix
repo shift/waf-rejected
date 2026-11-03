@@ -86,10 +86,11 @@
           pname = "waf-ingress";
           
           # Build main binary
-          # `coraza-native` enables the opt-in native sidecar backend only; the
-          # default `waf.coraza.backend` stays "wasm".
-          cargoBuildCommand = "cargo build --release --bin waf-ingress --features http3,webtransport,wasm-reactor,coraza-native";
-          cargoCheckCommand = "cargo check --release --bin waf-ingress --features http3,webtransport,wasm-reactor,coraza-native";
+          # `coraza-native` enables the opt-in native sidecar backend. `rust-engine` is
+          # compiled explicitly as well as being a default feature; the default
+          # `waf.coraza.backend` is "rust".
+          cargoBuildCommand = "cargo build --release --bin waf-ingress --features http3,webtransport,wasm-reactor,coraza-native,rust-engine";
+          cargoCheckCommand = "cargo check --release --bin waf-ingress --features http3,webtransport,wasm-reactor,coraza-native,rust-engine";
           # Tests run in the dedicated CI/test jobs; keeping them out of the
           # package build avoids compiling every test utility binary twice.
           doCheck = false;
@@ -97,7 +98,7 @@
           # Ship the Coraza reactor at a stable, read-only path next to the
           # binary. Fail the package build if the digest or size budget drifts.
           postInstall = ''
-            mkdir -p "$out/share/waf/wasm"
+            mkdir -p "$out/share/waf/wasm" "$out/share/waf/rules"
             install -m644 ${./wasm/coraza_reactor/coraza_reactor.wasm} \
               "$out/share/waf/wasm/coraza_reactor.wasm"
             install -m644 ${./wasm/coraza_reactor/LICENSE-CRS} \
@@ -106,6 +107,9 @@
               "$out/share/waf/wasm/PROVENANCE.md"
             install -m644 ${./wasm/coraza_reactor/SHA256SUMS} \
               "$out/share/waf/wasm/SHA256SUMS"
+            cp -r ${./wasm/coraza_reactor/rules/crs} "$out/share/waf/rules/crs"
+            chmod -R u=rwX,go=rX "$out/share/waf/rules/crs"
+            test -s "$out/share/waf/rules/crs/crs.conf"
             (cd "$out/share/waf/wasm" && sha256sum --check SHA256SUMS)
             test "$(stat -c%s "$out/share/waf/wasm/coraza_reactor.wasm")" -le 33554432
           '';

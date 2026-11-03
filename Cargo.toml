@@ -99,6 +99,7 @@ required-features = ["rust-engine", "parallel-args"]
 [[bin]]
 name = "bench-subms"
 path = "src/bin/bench_subms.rs"
+required-features = ["coraza-native"]
 
 # Loopback echo benchmark comparing the default tokio path against the
 # io_uring fd path. Requires the non-default feature.
@@ -276,7 +277,7 @@ rcgen = "0.14"
 wtransport = { version = "0.7.2", default-features = false, features = ["ring", "quinn", "dangerous-configuration"] }
 
 [features]
-default = ["export-system", "websocket", "wasm-reactor"]
+default = ["export-system", "websocket", "wasm-reactor", "rust-engine"]
 integration-tests = []
 wasm-waf = []
 # Request-in/decision-out WASM reactor ABI (wasmtime host) that runs the
@@ -328,7 +329,8 @@ native-detect = []
 
 
 # Native Rust replacement for the Coraza request engine (core vertical slice).
-# Non-default until differential parity against Coraza is proven. See
+# Compiled by default and the default `waf.coraza.backend`. Coraza remains the
+# reference implementation and an explicit fallback. See
 # docs/suggestions_from_agents/rust-engine.md.
 rust-engine = ["dep:aho-corasick", "native-detect"]
 # Compile-in hot-loop instrumentation for the native Rust engine. Non-default
