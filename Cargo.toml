@@ -364,6 +364,12 @@ compliance = ["sled"]
 name = "security_performance"
 harness = false
 
+# Opt-in HTTP/2 and upstream-pool tuning benchmark.
+#   cargo bench --bench http2_tuning -- --tuned
+[[bench]]
+name = "http2_tuning"
+harness = false
+
 # Coraza WASI reactor benchmarks; only built with the non-default feature.
 #   cargo bench --features wasm-reactor --bench coraza
 [[bench]]

@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,7 +12,7 @@ use hyper::header::HeaderValue;
 use hyper::service::service_fn;
 use hyper::{HeaderMap, Request, Response, StatusCode, Uri};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
-use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::connect::{Connection, HttpConnector};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use ipnetwork::IpNetwork;
@@ -26,6 +27,7 @@ use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::protocol::Role;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
+use tower::Service;
 use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
@@ -49,7 +51,7 @@ use crate::waf::{Decision, RequestContext, WafEngine};
 /// Supports HTTP/1.0-3, WebSocket, and WebTransport protocols.
 pub struct WafProxyService {
     waf_engine: Arc<WafEngine>,
-    upstream_client: Client<HttpsConnector<HttpConnector>, ProxyBody>,
+    upstream_client: UpstreamClient,
     upstream_uri: Uri,
     config: Arc<Config>,
     buffer_pool: Arc<BufferPool>,
@@ -66,6 +68,50 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
 
 /// Error type shared by every proxied request and response body.
 pub(crate) type ProxyBodyError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Upstream connector wrapper that counts newly established connections.
+///
+/// The hyper connection pool reuses idle connections transparently; this
+/// wrapper only observes connector calls, which happen exactly once per new
+/// TCP/TLS connection. Comparing this counter with
+/// `waf_upstream_requests_total` yields the pool reuse ratio.
+#[derive(Clone)]
+pub(crate) struct UpstreamConnector<C> {
+    inner: C,
+    metrics: Arc<Metrics>,
+}
+
+impl<C> Service<Uri> for UpstreamConnector<C>
+where
+    C: Service<Uri> + Clone + Send + Sync + 'static,
+    C::Future: Send + 'static,
+    C::Response: hyper::rt::Read + hyper::rt::Write + Connection + Unpin + Send + 'static,
+    C::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    type Response = C::Response;
+    type Error = C::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<C::Response, C::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        let metrics = Arc::clone(&self.metrics);
+        let future = self.inner.call(uri);
+        Box::pin(async move {
+            let result = future.await;
+            if result.is_ok() {
+                metrics.record_upstream_connection();
+            }
+            result
+        })
+    }
+}
+
+/// Upstream HTTP client type, including the observing connector.
+pub(crate) type UpstreamClient =
+    Client<UpstreamConnector<HttpsConnector<HttpConnector>>, ProxyBody>;
 
 /// gRPC request classification derived from the request headers.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -381,7 +427,7 @@ fn is_webtransport_upgrade(headers: &hyper::HeaderMap) -> bool {
 #[derive(Clone)]
 pub(crate) struct ProxyState {
     pub(crate) waf_engine: Arc<WafEngine>,
-    pub(crate) upstream_client: Client<HttpsConnector<HttpConnector>, ProxyBody>,
+    pub(crate) upstream_client: UpstreamClient,
     pub(crate) upstream_uri: Uri,
     pub(crate) config: Arc<Config>,
     pub(crate) buffer_pool: Arc<BufferPool>,
@@ -500,6 +546,59 @@ fn build_upstream_tls_config(
     }
 }
 
+/// Build the absolute URI probed by upstream health checks.
+fn upstream_health_uri(base: &Uri, path: &str) -> Option<Uri> {
+    let scheme = base.scheme_str()?;
+    let authority = base.authority()?;
+    Uri::builder()
+        .scheme(scheme)
+        .authority(authority.as_str())
+        .path_and_query(path)
+        .build()
+        .ok()
+}
+
+/// Periodically probe the upstream so a dead idle connection is evicted before
+/// a client request is routed onto it. Failures are counted, not fatal: the
+/// proxy keeps serving and the hyper pool retries with a fresh connection.
+async fn run_upstream_health_checks(
+    client: UpstreamClient,
+    health_uri: Uri,
+    interval: Duration,
+    metrics: Arc<Metrics>,
+) {
+    loop {
+        tokio::time::sleep(interval).await;
+
+        let request = match Request::builder()
+            .method(hyper::Method::GET)
+            .uri(health_uri.clone())
+            .header(
+                hyper::header::HOST,
+                health_uri.authority().map(|a| a.as_str()).unwrap_or(""),
+            )
+            .body(ProxyBody::full(Bytes::new()))
+        {
+            Ok(request) => request,
+            Err(error) => {
+                warn!("Failed to build upstream health-check request: {}", error);
+                metrics.record_upstream_health_check(false);
+                continue;
+            }
+        };
+
+        let ok = matches!(
+            tokio::time::timeout(Duration::from_secs(5), client.request(request)).await,
+            Ok(Ok(response)) if response.status().is_success()
+        );
+        metrics.record_upstream_request();
+        metrics.record_upstream_health_check(ok);
+        if !ok {
+            warn!("Upstream health check {} failed", health_uri);
+        }
+    }
+}
+
 impl WafProxyService {
     /// Create a new WAF proxy service with optimized connection pooling
     pub fn new(config: Config) -> Result<Self, WafError> {
@@ -548,13 +647,50 @@ impl WafProxyService {
             .enable_http1()
             .enable_http2()
             .wrap_connector(connector);
+        let connector = UpstreamConnector {
+            inner: connector,
+            metrics: Arc::clone(&metrics),
+        };
 
-        // Create HTTP client with optimized configuration for all protocols
-        let upstream_client = Client::builder(TokioExecutor::new())
+        let h2 = config.server.http2.clone();
+        let pool = config.proxy.pool.clone();
+
+        // Create HTTP client with optimized configuration for all protocols.
+        // HTTP/2 tuning and bounded pool reuse are opt-in so the default
+        // behaviour is unchanged.
+        let mut client_builder = Client::builder(TokioExecutor::new());
+        client_builder
             .http1_title_case_headers(true)
             .http1_preserve_header_case(true)
-            .http2_only(false) // Support HTTP/1.x and HTTP/2
-            .build(connector);
+            .http2_only(false); // Support HTTP/1.x and HTTP/2
+
+        if h2.enabled {
+            client_builder
+                .timer(TokioTimer::new())
+                .http2_adaptive_window(h2.adaptive_window)
+                .http2_initial_stream_window_size(h2.initial_stream_window_bytes)
+                .http2_initial_connection_window_size(h2.initial_connection_window_bytes)
+                .http2_initial_max_send_streams(h2.max_concurrent_streams as usize)
+                .http2_keep_alive_timeout(Duration::from_secs(h2.keep_alive_timeout_secs.max(1)))
+                .http2_keep_alive_while_idle(h2.keep_alive_while_idle);
+            if h2.keep_alive_interval_secs > 0 {
+                client_builder
+                    .http2_keep_alive_interval(Duration::from_secs(h2.keep_alive_interval_secs));
+            }
+        }
+
+        if pool.enabled {
+            client_builder
+                .pool_timer(TokioTimer::new())
+                .pool_idle_timeout(Duration::from_secs(pool.idle_timeout_secs))
+                .pool_max_idle_per_host(pool.max_idle_per_host);
+            info!(
+                "Upstream pool tuning enabled (max_idle_per_host={}, idle_timeout={}s, health_check={}s)",
+                pool.max_idle_per_host, pool.idle_timeout_secs, pool.health_check_interval_secs
+            );
+        }
+
+        let upstream_client = client_builder.build(connector);
 
         // Parse upstream URI from config using the helper method
         let upstream_uri = config
@@ -686,6 +822,31 @@ impl WafProxyService {
             metrics: Arc::clone(&self.metrics),
         };
 
+        if self.config.proxy.pool.enabled && self.config.proxy.pool.health_check_interval_secs > 0 {
+            match upstream_health_uri(
+                &self.upstream_uri,
+                &self.config.proxy.pool.health_check_path,
+            ) {
+                Some(health_uri) => {
+                    let client = self.upstream_client.clone();
+                    let metrics = Arc::clone(&self.metrics);
+                    let interval =
+                        Duration::from_secs(self.config.proxy.pool.health_check_interval_secs);
+                    tokio::spawn(async move {
+                        run_upstream_health_checks(client, health_uri, interval, metrics).await;
+                    });
+                    info!(
+                        "Upstream health checks enabled every {}s",
+                        interval.as_secs()
+                    );
+                }
+                None => warn!(
+                    "Cannot build upstream health-check URI from '{}'",
+                    self.upstream_uri
+                ),
+            }
+        }
+
         #[cfg(feature = "http3")]
         if self.config.server.enable_http3 {
             if !self
@@ -806,14 +967,33 @@ impl WafProxyService {
         // Plaintext listeners therefore speak HTTP/1.1; HTTP/2 is enabled only
         // when TLS ALPN negotiated h2.
         let enable_http2 = negotiated_h2 && state.config.server.enable_http2;
+        let http2_tuning = state.config.server.http2.clone();
         let service =
             service_fn(move |req| Self::handle_request(req, state.clone(), peer_ip, is_https));
 
         if enable_http2 {
-            hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                .timer(TokioTimer::new())
-                .keep_alive_interval(Some(Duration::from_secs(30)))
-                .keep_alive_timeout(Duration::from_secs(10))
+            let tuning = &http2_tuning;
+            let mut builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+            builder.timer(TokioTimer::new());
+            if tuning.enabled {
+                builder
+                    .adaptive_window(tuning.adaptive_window)
+                    .initial_stream_window_size(tuning.initial_stream_window_bytes)
+                    .initial_connection_window_size(tuning.initial_connection_window_bytes)
+                    .max_concurrent_streams(tuning.max_concurrent_streams)
+                    .max_pending_accept_reset_streams(tuning.max_pending_accept_reset_streams)
+                    .keep_alive_timeout(Duration::from_secs(tuning.keep_alive_timeout_secs.max(1)));
+                builder.keep_alive_interval(if tuning.keep_alive_interval_secs > 0 {
+                    Some(Duration::from_secs(tuning.keep_alive_interval_secs))
+                } else {
+                    None
+                });
+            } else {
+                builder
+                    .keep_alive_interval(Some(Duration::from_secs(30)))
+                    .keep_alive_timeout(Duration::from_secs(10));
+            }
+            builder
                 .serve_connection(io, service)
                 .await
                 .map_err(|e| WafError::NetworkError(format!("HTTP/2 connection error: {}", e)))
@@ -959,19 +1139,23 @@ impl WafProxyService {
                     Decision::Allow => {
                         let (parts, _body) = req.into_parts();
                         state.metrics.record_allowed();
-                        let response = Self::forward_to_upstream_with_protocol(
-                            parts,
-                            ProxyBody::buffered(Bytes::new(), None),
-                            state.upstream_client,
-                            state.upstream_uri,
-                            start_time,
-                            http_version,
-                            &state.metrics,
-                            client_ip,
-                            is_https,
-                            state.config.server.max_body_size,
-                        )
-                        .await;
+                        let response =
+                            Self::forward_to_upstream_with_protocol(
+                                parts,
+                                ProxyBody::buffered(Bytes::new(), None),
+                                state.upstream_client,
+                                state.upstream_uri,
+                                start_time,
+                                http_version,
+                                &state.metrics,
+                                client_ip,
+                                is_https,
+                                state.config.server.max_body_size,
+                                state.config.proxy.streaming.enabled.then_some(
+                                    state.config.proxy.streaming.response_threshold_bytes,
+                                ),
+                            )
+                            .await;
                         state.metrics.record_request_duration(start_time.elapsed());
                         return response;
                     }
@@ -1209,6 +1393,12 @@ impl WafProxyService {
                     client_ip,
                     is_https,
                     state.config.server.max_body_size,
+                    state
+                        .config
+                        .proxy
+                        .streaming
+                        .enabled
+                        .then_some(state.config.proxy.streaming.response_threshold_bytes),
                 )
                 .await;
                 state.metrics.record_request_duration(start_time.elapsed());
@@ -1878,15 +2068,19 @@ impl WafProxyService {
 
     /// Protocol-aware request forwarding with version preservation.
     ///
-    /// The request body is already buffered (and inspected) by the caller. The
-    /// upstream response is collected for inspection and its trailing headers
-    /// are re-emitted unchanged so `grpc-status` survives even with an empty
-    /// body.
+    /// The request body is already buffered (and inspected) by the caller. By
+    /// default the upstream response is collected for inspection and its
+    /// trailing headers are re-emitted unchanged so `grpc-status` survives even
+    /// with an empty body. When `stream_response_threshold` is set and the
+    /// upstream advertises a `content-length` at or above it, the body is
+    /// relayed frame by frame under the same byte cap instead of being
+    /// buffered. Response bodies are not WAF-inspected in either mode; the
+    /// size cap and the request-side inspection are unchanged.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn forward_to_upstream_with_protocol(
         parts: hyper::http::request::Parts,
         body: ProxyBody,
-        upstream_client: Client<HttpsConnector<HttpConnector>, ProxyBody>,
+        upstream_client: UpstreamClient,
         upstream_uri: Uri,
         start_time: Instant,
         http_version: &str,
@@ -1894,6 +2088,7 @@ impl WafProxyService {
         client_ip: IpAddr,
         is_https: bool,
         max_response_bytes: usize,
+        stream_response_threshold: Option<usize>,
     ) -> Result<Response<ProxyBody>, Infallible> {
         let proxy_req = match Self::build_upstream_request(
             parts,
@@ -1907,6 +2102,7 @@ impl WafProxyService {
             Err(response) => return Ok(*response),
         };
 
+        metrics.record_upstream_request();
         match tokio::time::timeout(Duration::from_secs(30), upstream_client.request(proxy_req))
             .await
         {
@@ -1916,18 +2112,44 @@ impl WafProxyService {
 
                 let (parts, body) = response.into_parts();
                 let has_trailer_header = parts.headers.contains_key(hyper::header::TRAILER);
-                if let Some(length) = parts
+                let content_length = parts
                     .headers
                     .get(hyper::header::CONTENT_LENGTH)
                     .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<usize>().ok())
-                {
+                    .and_then(|v| v.parse::<usize>().ok());
+                if let Some(length) = content_length {
                     if length > max_response_bytes {
                         metrics.record_upstream_error();
                         return Ok(Self::create_error_response(
                             StatusCode::BAD_GATEWAY,
                             "Upstream response too large",
                         ));
+                    }
+                }
+
+                if let Some(threshold) = stream_response_threshold {
+                    if content_length.is_some_and(|length| length >= threshold) {
+                        let response_builder = Self::build_upstream_response_head(
+                            parts.status,
+                            parts.version,
+                            parts.headers,
+                            None,
+                            processing_time,
+                        );
+                        return match response_builder.body(ProxyBody::guarded(
+                            body,
+                            max_response_bytes,
+                            Duration::from_secs(30),
+                        )) {
+                            Ok(response) => Ok(response),
+                            Err(e) => {
+                                error!("Failed to build streamed response: {}", e);
+                                Ok(Self::create_error_response(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "Failed to build response",
+                                ))
+                            }
+                        };
                     }
                 }
 
@@ -1980,10 +2202,6 @@ impl WafProxyService {
                     }
                 }
 
-                let mut response_builder = Response::builder()
-                    .status(parts.status)
-                    .version(parts.version);
-
                 let announced_trailers =
                     if !has_trailer_header && matches!(http_version, "1.0" | "1.1") {
                         trailers
@@ -2000,31 +2218,13 @@ impl WafProxyService {
                         None
                     };
 
-                // Copy response headers, dropping only connection-specific
-                // values. `trailer` announces trailing fields and is preserved.
-                for (key, value) in parts.headers {
-                    if let Some(key) = key {
-                        let name = key.as_str().to_ascii_lowercase();
-                        if !is_hop_by_hop_header(&name) {
-                            response_builder = response_builder.header(key, value);
-                        }
-                    }
-                }
-
-                if let Some(names) = announced_trailers {
-                    response_builder = response_builder.header(hyper::header::TRAILER, names);
-                }
-
-                response_builder = response_builder
-                    .header(
-                        "x-waf-processing-time-ms",
-                        processing_time.as_millis().to_string(),
-                    )
-                    .header(
-                        "x-waf-version",
-                        concat!("waf-rejected/", env!("CARGO_PKG_VERSION")),
-                    )
-                    .header("x-content-type-options", "nosniff");
+                let response_builder = Self::build_upstream_response_head(
+                    parts.status,
+                    parts.version,
+                    parts.headers,
+                    announced_trailers,
+                    processing_time,
+                );
 
                 match response_builder.body(ProxyBody::buffered(Bytes::from(collected), trailers)) {
                     Ok(response) => Ok(response),
@@ -2054,6 +2254,44 @@ impl WafProxyService {
                 ))
             }
         }
+    }
+
+    /// Build the client response head shared by the buffered and streamed
+    /// upstream response paths.
+    fn build_upstream_response_head(
+        status: StatusCode,
+        version: hyper::Version,
+        headers: HeaderMap,
+        announced_trailers: Option<String>,
+        processing_time: Duration,
+    ) -> hyper::http::response::Builder {
+        let mut response_builder = Response::builder().status(status).version(version);
+
+        // Copy response headers, dropping only connection-specific values.
+        // `trailer` announces trailing fields and is preserved.
+        for (key, value) in headers {
+            if let Some(key) = key {
+                let name = key.as_str().to_ascii_lowercase();
+                if !is_hop_by_hop_header(&name) {
+                    response_builder = response_builder.header(key, value);
+                }
+            }
+        }
+
+        if let Some(names) = announced_trailers {
+            response_builder = response_builder.header(hyper::header::TRAILER, names);
+        }
+
+        response_builder
+            .header(
+                "x-waf-processing-time-ms",
+                processing_time.as_millis().to_string(),
+            )
+            .header(
+                "x-waf-version",
+                concat!("waf-rejected/", env!("CARGO_PKG_VERSION")),
+            )
+            .header("x-content-type-options", "nosniff")
     }
 
     /// Relay a streaming gRPC exchange without buffering either direction.
@@ -2092,6 +2330,7 @@ impl WafProxyService {
             Err(response) => return *response,
         };
 
+        state.metrics.record_upstream_request();
         match tokio::time::timeout(max_duration, state.upstream_client.request(proxy_req)).await {
             Ok(Ok(response)) => {
                 let processing_time = start_time.elapsed();
@@ -2342,6 +2581,7 @@ mod tests {
                 upstream_ca_path: None,
                 upstream_client_cert_path: None,
                 upstream_client_key_path: None,
+                ..ProxyConfig::default()
             },
             ..Default::default()
         };
@@ -2363,6 +2603,7 @@ mod tests {
                 upstream_ca_path: None,
                 upstream_client_cert_path: None,
                 upstream_client_key_path: None,
+                ..ProxyConfig::default()
             },
             ..Default::default()
         };
@@ -2391,6 +2632,7 @@ mod tests {
                 upstream_ca_path: None,
                 upstream_client_cert_path: None,
                 upstream_client_key_path: None,
+                ..ProxyConfig::default()
             },
             ..Default::default()
         };
@@ -2451,6 +2693,28 @@ mod tests {
         let ip =
             WafProxyService::resolve_client_ip("10.0.0.5".parse().unwrap(), &headers, &trusted);
         assert_eq!(ip, "198.51.100.7".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn upstream_health_uri_preserves_scheme_and_authority() {
+        let base: Uri = "https://upstream.internal:8443/base".parse().unwrap();
+        let health = upstream_health_uri(&base, "/healthz").unwrap();
+        assert_eq!(health.scheme_str(), Some("https"));
+        assert_eq!(
+            health.authority().unwrap().as_str(),
+            "upstream.internal:8443"
+        );
+        assert_eq!(health.path(), "/healthz");
+        assert!(upstream_health_uri(&Uri::from_static("/relative"), "/healthz").is_none());
+    }
+
+    #[test]
+    fn tuning_defaults_are_opt_in() {
+        let config = Config::default();
+        assert!(!config.proxy.pool.enabled);
+        assert!(!config.proxy.streaming.enabled);
+        assert!(!config.server.http2.enabled);
+        config.validate().unwrap();
     }
 
     proptest! {

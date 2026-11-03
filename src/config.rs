@@ -204,6 +204,92 @@ pub struct ProxyConfig {
     ///
     /// Must be set together with `upstream_client_cert_path`.
     pub upstream_client_key_path: Option<String>,
+
+    /// Opt-in upstream connection-pool tuning.
+    pub pool: UpstreamPoolConfig,
+
+    /// Opt-in streaming policy for large upstream responses.
+    pub streaming: StreamingConfig,
+}
+
+/// Opt-in upstream connection-pool policy.
+///
+/// Disabled by default: when `enabled` is `false` the hyper connection pool
+/// keeps its built-in behaviour (unbounded idle connections, its default idle
+/// timeout, no out-of-band health probes).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpstreamPoolConfig {
+    /// Enable bounded idle reuse and (optionally) upstream health checks.
+    pub enabled: bool,
+
+    /// Maximum idle upstream connections kept per host. Must be greater than
+    /// zero when the pool is enabled.
+    pub max_idle_per_host: usize,
+
+    /// Idle connections older than this are closed instead of reused.
+    pub idle_timeout_secs: u64,
+
+    /// Interval between out-of-band upstream health probes. `0` disables them.
+    pub health_check_interval_secs: u64,
+
+    /// Path probed by the health check (for example `/healthz`).
+    pub health_check_path: String,
+}
+
+/// Opt-in streaming policy for large upstream responses.
+///
+/// Disabled by default: every upstream response body is buffered so the
+/// existing size cap applies before anything is written to the client.
+/// When enabled, responses that advertise a `content-length` at or above
+/// `response_threshold_bytes` are relayed frame by frame under the same byte
+/// cap and a deadline, instead of being collected in memory first.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StreamingConfig {
+    /// Enable streaming of large upstream response bodies.
+    pub enabled: bool,
+
+    /// Minimum advertised `content-length` that is streamed.
+    pub response_threshold_bytes: usize,
+}
+
+/// Opt-in HTTP/2 tuning for ingress connections and upstream client connections.
+///
+/// Disabled by default: when `enabled` is `false` the existing hard-coded
+/// keep-alive policy (30s interval / 10s timeout) and hyper's HTTP/2 defaults
+/// are left untouched.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Http2TuningConfig {
+    /// Apply this tuning block to ingress and upstream HTTP/2 connections.
+    pub enabled: bool,
+
+    /// Per-stream flow-control window in bytes.
+    pub initial_stream_window_bytes: u32,
+
+    /// Per-connection flow-control window in bytes.
+    pub initial_connection_window_bytes: u32,
+
+    /// Maximum concurrent streams per ingress connection. Bounds how many
+    /// requests a single h2 connection can pin to the reactor pool.
+    pub max_concurrent_streams: u32,
+
+    /// Maximum pending accept-reset streams per ingress connection.
+    pub max_pending_accept_reset_streams: usize,
+
+    /// HTTP/2 PING interval in seconds; `0` disables PING keep-alive.
+    pub keep_alive_interval_secs: u64,
+
+    /// Time to wait for a PING acknowledgement before closing the connection.
+    pub keep_alive_timeout_secs: u64,
+
+    /// Send keep-alive PINGs while the connection is idle.
+    pub keep_alive_while_idle: bool,
+
+    /// Let the h2 stack size flow-control windows adaptively (overrides the
+    /// explicit window sizes).
+    pub adaptive_window: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -255,6 +341,9 @@ pub struct ServerConfig {
 
     /// TLS configuration
     pub tls: TlsConfig,
+
+    /// Opt-in HTTP/2 flow-control, multiplexing and keep-alive tuning.
+    pub http2: Http2TuningConfig,
 
     /// WebTransport over HTTP/3 configuration
     pub webtransport: WebTransportConfig,
@@ -1646,6 +1735,45 @@ impl Default for ProxyConfig {
             upstream_ca_path: None,
             upstream_client_cert_path: None,
             upstream_client_key_path: None,
+            pool: UpstreamPoolConfig::default(),
+            streaming: StreamingConfig::default(),
+        }
+    }
+}
+
+impl Default for UpstreamPoolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_idle_per_host: 32,
+            idle_timeout_secs: 90,
+            health_check_interval_secs: 0,
+            health_check_path: "/healthz".to_string(),
+        }
+    }
+}
+
+impl Default for StreamingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            response_threshold_bytes: 1024 * 1024,
+        }
+    }
+}
+
+impl Default for Http2TuningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            initial_stream_window_bytes: 1024 * 1024,
+            initial_connection_window_bytes: 16 * 1024 * 1024,
+            max_concurrent_streams: 256,
+            max_pending_accept_reset_streams: 1024,
+            keep_alive_interval_secs: 30,
+            keep_alive_timeout_secs: 10,
+            keep_alive_while_idle: false,
+            adaptive_window: false,
         }
     }
 }
@@ -1670,6 +1798,7 @@ impl Default for ServerConfig {
             grpc_max_stream_seconds: 300,
             grpc_aware_rejections: false,
             tls: TlsConfig::default(),
+            http2: Http2TuningConfig::default(),
             webtransport: WebTransportConfig::default(),
         }
     }
@@ -1866,6 +1995,32 @@ impl Config {
         }
         if self.proxy.timeout_seconds == 0 || self.server.request_timeout_secs == 0 {
             anyhow::bail!("request timeouts must be greater than zero");
+        }
+        if self.proxy.pool.enabled {
+            if self.proxy.pool.max_idle_per_host == 0 {
+                anyhow::bail!("proxy.pool.max_idle_per_host must be greater than zero");
+            }
+            if self.proxy.pool.idle_timeout_secs == 0 {
+                anyhow::bail!("proxy.pool.idle_timeout_secs must be greater than zero");
+            }
+            if !self.proxy.pool.health_check_path.starts_with('/') {
+                anyhow::bail!("proxy.pool.health_check_path must start with '/'");
+            }
+        }
+        if self.proxy.streaming.enabled && self.proxy.streaming.response_threshold_bytes == 0 {
+            anyhow::bail!("proxy.streaming.response_threshold_bytes must be greater than zero");
+        }
+        if self.server.http2.enabled {
+            if self.server.http2.initial_stream_window_bytes == 0
+                || self.server.http2.initial_connection_window_bytes == 0
+            {
+                anyhow::bail!("server.http2 flow-control windows must be greater than zero");
+            }
+            if self.server.http2.max_concurrent_streams == 0
+                || self.server.http2.max_pending_accept_reset_streams == 0
+            {
+                anyhow::bail!("server.http2 multiplexing limits must be greater than zero");
+            }
         }
         if self.waf.rate_limit.per_ip_window_secs == 0 && self.waf.rate_limit.per_ip_enabled {
             anyhow::bail!("waf.rate_limit.per_ip_window_secs must be greater than zero");

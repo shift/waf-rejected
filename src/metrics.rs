@@ -26,6 +26,10 @@ pub struct Metrics {
     auth_failures_total: AtomicU64,
     rate_limited_total: AtomicU64,
     upstream_errors_total: AtomicU64,
+    upstream_requests_total: AtomicU64,
+    upstream_connections_total: AtomicU64,
+    upstream_health_checks_total: AtomicU64,
+    upstream_health_check_failures_total: AtomicU64,
     webtransport_sessions_total: AtomicU64,
     webtransport_allowed_total: AtomicU64,
     webtransport_blocked_total: AtomicU64,
@@ -100,6 +104,10 @@ impl Metrics {
             auth_failures_total: AtomicU64::new(0),
             rate_limited_total: AtomicU64::new(0),
             upstream_errors_total: AtomicU64::new(0),
+            upstream_requests_total: AtomicU64::new(0),
+            upstream_connections_total: AtomicU64::new(0),
+            upstream_health_checks_total: AtomicU64::new(0),
+            upstream_health_check_failures_total: AtomicU64::new(0),
             webtransport_sessions_total: AtomicU64::new(0),
             webtransport_allowed_total: AtomicU64::new(0),
             webtransport_blocked_total: AtomicU64::new(0),
@@ -181,6 +189,29 @@ impl Metrics {
 
     pub fn record_upstream_error(&self) {
         self.upstream_errors_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one request handed to the upstream client. Together with
+    /// `waf_upstream_connections_total` this yields the pool reuse ratio:
+    /// `1 - connections / requests`.
+    pub fn record_upstream_request(&self) {
+        self.upstream_requests_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one newly established upstream TCP/TLS connection.
+    pub fn record_upstream_connection(&self) {
+        self.upstream_connections_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one upstream health probe and whether it succeeded.
+    pub fn record_upstream_health_check(&self, ok: bool) {
+        self.upstream_health_checks_total
+            .fetch_add(1, Ordering::Relaxed);
+        if !ok {
+            self.upstream_health_check_failures_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Observe one request duration in the histogram.
@@ -481,6 +512,18 @@ impl Metrics {
              # HELP waf_upstream_errors_total Upstream connection/read failures.\n\
              # TYPE waf_upstream_errors_total counter\n\
              waf_upstream_errors_total {}\n\
+             # HELP waf_upstream_requests_total Requests handed to the upstream client.\n\
+             # TYPE waf_upstream_requests_total counter\n\
+             waf_upstream_requests_total {}\n\
+             # HELP waf_upstream_connections_total New upstream TCP/TLS connections opened.\n\
+             # TYPE waf_upstream_connections_total counter\n\
+             waf_upstream_connections_total {}\n\
+             # HELP waf_upstream_health_checks_total Out-of-band upstream health probes.\n\
+             # TYPE waf_upstream_health_checks_total counter\n\
+             waf_upstream_health_checks_total {}\n\
+             # HELP waf_upstream_health_check_failures_total Failed upstream health probes.\n\
+             # TYPE waf_upstream_health_check_failures_total counter\n\
+             waf_upstream_health_check_failures_total {}\n\
              # HELP waf_webtransport_sessions_total WebTransport sessions accepted.\n\
              # TYPE waf_webtransport_sessions_total counter\n\
              waf_webtransport_sessions_total {}\n\
@@ -502,6 +545,11 @@ impl Metrics {
             self.auth_failures_total.load(Ordering::Relaxed),
             self.rate_limited_total.load(Ordering::Relaxed),
             self.upstream_errors_total.load(Ordering::Relaxed),
+            self.upstream_requests_total.load(Ordering::Relaxed),
+            self.upstream_connections_total.load(Ordering::Relaxed),
+            self.upstream_health_checks_total.load(Ordering::Relaxed),
+            self.upstream_health_check_failures_total
+                .load(Ordering::Relaxed),
             self.webtransport_sessions_total.load(Ordering::Relaxed),
             self.webtransport_allowed_total.load(Ordering::Relaxed),
             self.webtransport_blocked_total.load(Ordering::Relaxed),

@@ -30,6 +30,9 @@ mod native_coraza_tests;
 #[path = "integration/https_upstream_tests.rs"]
 mod https_upstream_tests;
 
+#[path = "integration/http2_tuning_tests.rs"]
+mod http2_tuning_tests;
+
 #[path = "integration/pipeline_tests.rs"]
 mod pipeline_tests;
 

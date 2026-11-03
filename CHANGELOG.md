@@ -20,6 +20,17 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Added
 
+- Opt-in HTTP/2 and upstream connection tuning. `[proxy.pool]` bounds idle
+  upstream reuse (`max_idle_per_host`, `idle_timeout_secs`) with optional
+  out-of-band health probes; `[server.http2]` controls ingress/upstream
+  flow-control windows, concurrent-stream and pending-reset limits, and the
+  PING keep-alive policy; `[proxy.streaming]` relays large upstream responses
+  frame by frame under the existing byte cap instead of buffering them.
+  Defaults are unchanged (every block is disabled). Adds upstream request /
+  connection / health-check Prometheus counters, a reproducible
+  `benches/http2_tuning.rs` throughput and percentile harness, and
+  `docs/developer-guide/http2-tuning.md`.
+
 - Compact binary request envelope for the Coraza WASI reactor (default), with
   the legacy JSON envelope kept behind `WAF_CORAZA_JSON_ABI=1`. The host writes
   the length-prefixed struct directly into the guest's static input buffer and

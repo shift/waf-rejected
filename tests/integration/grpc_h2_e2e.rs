@@ -444,6 +444,10 @@ async fn spawn_proxy_with_content_scan(
     config.upstream_uri = format!("https://127.0.0.1:{}", upstream.port());
     config.proxy.upstream_ca_path = Some(ca_path.to_string_lossy().into_owned());
     config.server.enable_http2 = true;
+    config.server.http2.enabled = true;
+    config.server.http2.max_concurrent_streams = 32;
+    config.server.http2.initial_stream_window_bytes = 256 * 1024;
+    config.server.http2.initial_connection_window_bytes = 1024 * 1024;
     config.server.enable_http3 = false;
     config.server.tls.enabled = true;
     config.server.tls.cert_path = cert_path.to_string_lossy().into_owned();

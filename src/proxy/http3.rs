@@ -324,6 +324,12 @@ async fn handle_request(
                 client_ip,
                 true,
                 max_body_size,
+                state
+                    .config
+                    .proxy
+                    .streaming
+                    .enabled
+                    .then_some(state.config.proxy.streaming.response_threshold_bytes),
             )
             .await;
             let response = match response {

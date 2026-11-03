@@ -941,6 +941,25 @@ Branch `feat/engine-integration` (not pushed, not merged, defaults unchanged).
 
 ---
 
+# perf/http2-tuning: HTTP/2 + upstream connection throughput (subagent)
+
+Branch `perf/http2-tuning` (not pushed, not merged, defaults unchanged).
+
+- [x] Measured h1/h2 streams-per-connection, window policy, keep-alive reuse,
+      pool reuse and concurrency behaviour with `benches/http2_tuning.rs`.
+- [x] Opt-in `[proxy.pool]`: bounded idle reuse + optional health probes and
+      upstream request/connection/health metrics.
+- [x] Opt-in `[server.http2]`: 1 MiB stream / 16 MiB connection windows,
+      concurrent-stream and pending-reset caps, PING keep-alive.
+- [x] Opt-in `[proxy.streaming]`: frame-by-frame relay of large responses
+      under the existing byte cap and deadline.
+- [x] Tests: pool reuse, idle eviction, streaming TTFB/correctness, h1
+      keep-alive, h2 e2e (gRPC h2 harness now runs with tuning enabled).
+- [x] Docs `docs/developer-guide/http2-tuning.md` + CHANGELOG entry.
+- Verification: fmt, lib tests, integration tests, clippy, audit (see report).
+
+---
+
 # perf/engine-hotloop: native engine hot loop
 
 Branch `perf/engine-hotloop` (not pushed, not merged, defaults unchanged).
