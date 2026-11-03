@@ -24,6 +24,7 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::ptr;
+use std::sync::{Arc, Mutex};
 
 /// `HS_SUCCESS`.
 const HS_SUCCESS: c_int = 0;
@@ -134,6 +135,10 @@ pub enum HsError {
 }
 
 /// A compiled block-mode database and its scratch region.
+///
+/// This is the single-threaded convenience type used by the evaluation
+/// benchmark. Production callers should use [`SharedHsDatabase`], which shares
+/// the compiled database across threads and pools scratch regions.
 pub struct HsScanner {
     db: *mut HsDatabase,
     scratch: *mut HsScratch,
@@ -160,9 +165,260 @@ impl Drop for HsScanner {
     }
 }
 
+/// Owned, reference-counted Hyperscan database.
+///
+/// Hyperscan documents that a compiled database is immutable and may be used
+/// concurrently from multiple threads. The scratch region is the only mutable
+/// state, so it is pooled separately in [`SharedHsDatabase`].
+struct DatabaseHandle {
+    db: *mut HsDatabase,
+}
+
+// SAFETY: the database is immutable after compilation and Hyperscan permits
+// concurrent `hs_scan` calls against one database.
+unsafe impl Send for DatabaseHandle {}
+unsafe impl Sync for DatabaseHandle {}
+
+impl Drop for DatabaseHandle {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.db.is_null() {
+                hs_free_database(self.db);
+            }
+        }
+    }
+}
+
+/// Owned scratch region. Not `Sync`: a scratch region must not be used by two
+/// scans at once. The pool hands it to exactly one caller at a time.
+struct ScratchHandle {
+    scratch: *mut HsScratch,
+}
+
+unsafe impl Send for ScratchHandle {}
+
+impl Drop for ScratchHandle {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.scratch.is_null() {
+                hs_free_scratch(self.scratch);
+            }
+        }
+    }
+}
+
+/// A process-shareable compiled database with a bounded scratch pool.
+///
+/// The database is compiled once and wrapped in an `Arc`; every scan borrows a
+/// scratch region from the pool, so concurrent workers do not serialise on the
+/// matcher itself. The pool is capped so a burst of threads cannot grow memory
+/// without bound; excess scratches are dropped when returned.
+pub struct SharedHsDatabase {
+    // Field order matters: the pool (scratch regions) must drop before the
+    // database they were allocated against.
+    pool: Mutex<Vec<ScratchHandle>>,
+    pattern_rules: Vec<Vec<u32>>,
+    db: Arc<DatabaseHandle>,
+}
+
+// SAFETY: the database is immutable and shared; the pool is a `Mutex`.
+unsafe impl Send for SharedHsDatabase {}
+unsafe impl Sync for SharedHsDatabase {}
+
+/// Maximum number of idle scratch regions kept per database.
+const MAX_POOLED_SCRATCH: usize = 64;
+
+impl SharedHsDatabase {
+    /// Compiles a database once. The returned value is cheap to share via
+    /// `Arc` and safe to scan from multiple threads.
+    pub fn compile(patterns: &[LiteralPattern]) -> Result<Self, HsError> {
+        let raw = compile_raw(patterns)?;
+        let db = Arc::new(DatabaseHandle { db: raw.db });
+        let pool = Mutex::new(vec![ScratchHandle {
+            scratch: raw.scratch,
+        }]);
+        Ok(Self {
+            pool,
+            pattern_rules: patterns.iter().map(|p| p.rule_ids.clone()).collect(),
+            db,
+        })
+    }
+
+    fn take_scratch(&self) -> Result<ScratchHandle, HsError> {
+        if let Ok(mut pool) = self.pool.lock() {
+            if let Some(scratch) = pool.pop() {
+                return Ok(scratch);
+            }
+        }
+        let mut scratch: *mut HsScratch = ptr::null_mut();
+        let rc = unsafe { hs_alloc_scratch(self.db.db, &mut scratch) };
+        if rc != HS_SUCCESS {
+            return Err(HsError::Runtime(rc));
+        }
+        Ok(ScratchHandle { scratch })
+    }
+
+    fn return_scratch(&self, scratch: ScratchHandle) {
+        let mut scratch = Some(scratch);
+        if let Ok(mut pool) = self.pool.lock() {
+            if pool.len() < MAX_POOLED_SCRATCH {
+                if let Some(scratch) = scratch.take() {
+                    pool.push(scratch);
+                }
+            }
+        }
+        // `scratch` is dropped here when the pool is full.
+    }
+
+    /// Scans one body. When `first_only` is true the callback terminates on the
+    /// first match (boolean prefilter); otherwise every matching pattern is
+    /// reported so per-rule removal stays sound.
+    pub fn scan(&self, body: &[u8], first_only: bool) -> Result<HsMatch, HsError> {
+        if body.len() > c_uint::MAX as usize {
+            return Err(HsError::BodyTooLarge(body.len()));
+        }
+        let scratch = self.take_scratch()?;
+        let mut context = ScanContext {
+            pattern_rules: &self.pattern_rules,
+            hit: false,
+            first_only,
+            matched_rule_ids: Vec::new(),
+        };
+        let rc = unsafe {
+            hs_scan(
+                self.db.db,
+                body.as_ptr() as *const c_char,
+                body.len() as c_uint,
+                0,
+                scratch.scratch,
+                Some(on_match),
+                &mut context as *mut ScanContext<'_> as *mut c_void,
+            )
+        };
+        self.return_scratch(scratch);
+        if rc != HS_SUCCESS && rc != HS_SCAN_TERMINATED {
+            return Err(HsError::Runtime(rc));
+        }
+        context.matched_rule_ids.sort_unstable();
+        context.matched_rule_ids.dedup();
+        Ok(HsMatch {
+            hit: context.hit,
+            matched_rule_ids: context.matched_rule_ids,
+        })
+    }
+
+    /// Number of compiled patterns.
+    pub fn pattern_count(&self) -> usize {
+        self.pattern_rules.len()
+    }
+
+    /// Size of the compiled database in bytes, if the library reports it.
+    pub fn database_size(&self) -> Option<usize> {
+        let mut size = 0usize;
+        let rc = unsafe { hs_database_size(self.db.db, &mut size) };
+        (rc == HS_SUCCESS).then_some(size)
+    }
+}
+
+struct RawCompiled {
+    db: *mut HsDatabase,
+    scratch: *mut HsScratch,
+}
+
+/// Compiles a block-mode database and allocates one scratch region.
+fn compile_raw(patterns: &[LiteralPattern]) -> Result<RawCompiled, HsError> {
+    if patterns.is_empty() {
+        return Err(HsError::CompileGeneral("empty pattern set".to_string()));
+    }
+    if unsafe { hs_valid_platform() } != HS_SUCCESS {
+        return Err(HsError::UnsupportedPlatform);
+    }
+
+    let mut expressions = Vec::with_capacity(patterns.len());
+    let mut cstrings = Vec::with_capacity(patterns.len());
+    let mut flags = Vec::with_capacity(patterns.len());
+    let mut ids = Vec::with_capacity(patterns.len());
+    for (index, pattern) in patterns.iter().enumerate() {
+        let escaped = escape_literal(&pattern.literal);
+        let cstring = CString::new(escaped.clone())
+            .map_err(|_| HsError::InteriorNul(pattern.literal.clone()))?;
+        expressions.push(cstring.as_ptr());
+        cstrings.push(cstring);
+        let mut flag = HS_FLAG_SINGLEMATCH;
+        if pattern.caseless {
+            flag |= HS_FLAG_CASELESS;
+        }
+        flags.push(flag);
+        ids.push(index as c_uint);
+    }
+
+    let mut db: *mut HsDatabase = ptr::null_mut();
+    let mut error: *mut HsCompileError = ptr::null_mut();
+    let rc = unsafe {
+        hs_compile_multi(
+            expressions.as_ptr(),
+            flags.as_ptr(),
+            ids.as_ptr(),
+            patterns.len() as c_uint,
+            HS_MODE_BLOCK,
+            ptr::null(),
+            &mut db,
+            &mut error,
+        )
+    };
+
+    if rc != HS_SUCCESS {
+        let (index, message) = if error.is_null() {
+            (usize::MAX, format!("hs_compile_multi returned {rc}"))
+        } else {
+            let message = unsafe {
+                if (*error).message.is_null() {
+                    "unknown compile error".to_string()
+                } else {
+                    CStr::from_ptr((*error).message)
+                        .to_string_lossy()
+                        .into_owned()
+                }
+            };
+            let index = unsafe { (*error).expression };
+            unsafe {
+                hs_free_compile_error(error);
+            }
+            (
+                if index < 0 {
+                    usize::MAX
+                } else {
+                    index as usize
+                },
+                message,
+            )
+        };
+        if index == usize::MAX {
+            return Err(HsError::CompileGeneral(message));
+        }
+        return Err(HsError::Compile { index, message });
+    }
+
+    let mut scratch: *mut HsScratch = ptr::null_mut();
+    let rc = unsafe { hs_alloc_scratch(db, &mut scratch) };
+    if rc != HS_SUCCESS {
+        unsafe {
+            hs_free_database(db);
+        }
+        return Err(HsError::Runtime(rc));
+    }
+
+    // Keep the CString allocations alive until after compilation. The
+    // compiler copies the expressions, so they can be dropped here.
+    drop(cstrings);
+
+    Ok(RawCompiled { db, scratch })
+}
+
 struct ScanContext<'a> {
     pattern_rules: &'a [Vec<u32>],
     hit: bool,
+    first_only: bool,
     matched_rule_ids: Vec<u32>,
 }
 
@@ -174,14 +430,18 @@ unsafe extern "C" fn on_match(
     context: *mut c_void,
 ) -> c_int {
     // `context` always points at a live `ScanContext` for the duration of
-    // `hs_scan`. Terminate on the first hit: the prefilter only needs a
-    // boolean, and early termination keeps attack bodies cheap.
+    // `hs_scan`. Boolean callers terminate on the first hit; removal callers
+    // keep scanning so every matching rule is reported.
     let context = &mut *(context as *mut ScanContext<'_>);
     context.hit = true;
     if let Some(rules) = context.pattern_rules.get(id as usize) {
         context.matched_rule_ids.extend_from_slice(rules);
     }
-    1
+    if context.first_only {
+        1
+    } else {
+        0
+    }
 }
 
 /// Vectorscan runtime version, for diagnostics.
@@ -216,94 +476,10 @@ impl HsScanner {
     /// An empty pattern list is rejected because Hyperscan has nothing to
     /// compile; callers should skip groups without literals.
     pub fn compile(patterns: &[LiteralPattern]) -> Result<Self, HsError> {
-        if patterns.is_empty() {
-            return Err(HsError::CompileGeneral("empty pattern set".to_string()));
-        }
-        if unsafe { hs_valid_platform() } != HS_SUCCESS {
-            return Err(HsError::UnsupportedPlatform);
-        }
-
-        let mut expressions = Vec::with_capacity(patterns.len());
-        let mut cstrings = Vec::with_capacity(patterns.len());
-        let mut flags = Vec::with_capacity(patterns.len());
-        let mut ids = Vec::with_capacity(patterns.len());
-        for (index, pattern) in patterns.iter().enumerate() {
-            let escaped = escape_literal(&pattern.literal);
-            let cstring = CString::new(escaped.clone())
-                .map_err(|_| HsError::InteriorNul(pattern.literal.clone()))?;
-            expressions.push(cstring.as_ptr());
-            cstrings.push(cstring);
-            let mut flag = HS_FLAG_SINGLEMATCH;
-            if pattern.caseless {
-                flag |= HS_FLAG_CASELESS;
-            }
-            flags.push(flag);
-            ids.push(index as c_uint);
-        }
-
-        let mut db: *mut HsDatabase = ptr::null_mut();
-        let mut error: *mut HsCompileError = ptr::null_mut();
-        let rc = unsafe {
-            hs_compile_multi(
-                expressions.as_ptr(),
-                flags.as_ptr(),
-                ids.as_ptr(),
-                patterns.len() as c_uint,
-                HS_MODE_BLOCK,
-                ptr::null(),
-                &mut db,
-                &mut error,
-            )
-        };
-
-        if rc != HS_SUCCESS {
-            let (index, message) = if error.is_null() {
-                (usize::MAX, format!("hs_compile_multi returned {rc}"))
-            } else {
-                let message = unsafe {
-                    if (*error).message.is_null() {
-                        "unknown compile error".to_string()
-                    } else {
-                        CStr::from_ptr((*error).message)
-                            .to_string_lossy()
-                            .into_owned()
-                    }
-                };
-                let index = unsafe { (*error).expression };
-                unsafe {
-                    hs_free_compile_error(error);
-                }
-                (
-                    if index < 0 {
-                        usize::MAX
-                    } else {
-                        index as usize
-                    },
-                    message,
-                )
-            };
-            if index == usize::MAX {
-                return Err(HsError::CompileGeneral(message));
-            }
-            return Err(HsError::Compile { index, message });
-        }
-
-        let mut scratch: *mut HsScratch = ptr::null_mut();
-        let rc = unsafe { hs_alloc_scratch(db, &mut scratch) };
-        if rc != HS_SUCCESS {
-            unsafe {
-                hs_free_database(db);
-            }
-            return Err(HsError::Runtime(rc));
-        }
-
-        // Keep the CString allocations alive until after compilation. The
-        // compiler copies the expressions, so they can be dropped here.
-        drop(cstrings);
-
+        let raw = compile_raw(patterns)?;
         Ok(Self {
-            db,
-            scratch,
+            db: raw.db,
+            scratch: raw.scratch,
             pattern_rules: patterns.iter().map(|p| p.rule_ids.clone()).collect(),
         })
     }
@@ -316,6 +492,7 @@ impl HsScanner {
         let mut context = ScanContext {
             pattern_rules: &self.pattern_rules,
             hit: false,
+            first_only: true,
             matched_rule_ids: Vec::new(),
         };
         let rc = unsafe {
@@ -350,5 +527,90 @@ impl HsScanner {
         let mut size = 0usize;
         let rc = unsafe { hs_database_size(self.db, &mut size) };
         (rc == HS_SUCCESS).then_some(size)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn patterns(literals: &[(&str, bool, u32)]) -> Vec<LiteralPattern> {
+        literals
+            .iter()
+            .map(|(literal, caseless, rule)| LiteralPattern {
+                literal: (*literal).to_string(),
+                caseless: *caseless,
+                rule_ids: vec![*rule],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn shared_database_matches_literals() {
+        let db = SharedHsDatabase::compile(&patterns(&[
+            ("select", true, 942100),
+            ("<script", false, 941100),
+        ]))
+        .expect("compile");
+        assert_eq!(db.pattern_count(), 2);
+        assert!(db.database_size().is_some());
+
+        assert!(db.scan(b"q=1 SELECT password", true).expect("scan").hit);
+        assert!(db.scan(b"x=<script>", true).expect("scan").hit);
+        assert!(!db.scan(b"name=alice", true).expect("scan").hit);
+        // Empty input is a no-op, not an error.
+        assert!(!db.scan(b"", true).expect("scan").hit);
+    }
+
+    #[test]
+    fn shared_database_reports_all_matches_when_requested() {
+        let db = SharedHsDatabase::compile(&patterns(&[
+            ("select", true, 942100),
+            ("union", true, 942101),
+        ]))
+        .expect("compile");
+        let first = db.scan(b"union select", true).expect("scan");
+        assert!(first.hit);
+        assert_eq!(first.matched_rule_ids.len(), 1);
+
+        let all = db.scan(b"union select", false).expect("scan");
+        assert!(all.hit);
+        assert_eq!(all.matched_rule_ids, vec![942100, 942101]);
+    }
+
+    #[test]
+    fn shared_database_handles_unicode_and_large_input() {
+        let db = SharedHsDatabase::compile(&patterns(&[("café", false, 1)])).expect("compile");
+        assert!(db.scan("café".as_bytes(), true).expect("scan").hit);
+        assert!(!db.scan("cafe".as_bytes(), true).expect("scan").hit);
+
+        let large = vec![b'z'; 1024 * 1024];
+        assert!(!db.scan(&large, true).expect("scan").hit);
+    }
+
+    #[test]
+    fn shared_database_is_safe_to_scan_from_multiple_threads() {
+        let db = Arc::new(
+            SharedHsDatabase::compile(&patterns(&[("select", true, 942100)])).expect("compile"),
+        );
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let db = Arc::clone(&db);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..64 {
+                    assert!(db.scan(b"SELECT 1", true).expect("scan").hit);
+                    assert!(!db.scan(b"benign", true).expect("scan").hit);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("thread");
+        }
+    }
+
+    #[test]
+    fn empty_pattern_set_is_rejected() {
+        assert!(SharedHsDatabase::compile(&[]).is_err());
     }
 }

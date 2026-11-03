@@ -27,6 +27,21 @@ All notable changes to WAF-Rejected are documented here.
   comparison against ModSecurity/CRS and public cloud WAF latency claims. See
   `docs/suggestions_from_agents/perf-gate.md`.
 
+- Production-grade CRS prefilter backend (`hyperscan-eval`, non-default).
+  The Hyperscan database set is compiled once per process and shared through
+  the cached `Prefilter`, with an `Arc`-shared immutable database and a bounded
+  scratch pool so concurrent workers do not serialise on the matcher. Extraction
+  runs once per representation instead of per group, provably-identity
+  transforms are skipped, and each rule group carries a required-byte gate that
+  skips groups whose literals cannot occur in the scanned view. When Hyperscan
+  is unavailable, unsupported on the CPU, or a scan fails, evaluation falls back
+  to the pure-Rust Aho-Corasick automata; defaults are unchanged. Adds
+  `scripts/bench-prefilter.sh` and
+  `docs/suggestions_from_agents/simd-prefilter.md`. After rebasing onto the
+  union-automaton/transform-cache work, the pure-Rust path is faster for the
+  all-extraction scan; Hyperscan remains a win for content-type-aware and
+  first-hit attack scans.
+
 - Experimental native Rust evaluation kernel (`engine-kernel`, non-default).
   Standalone prototype of a Coraza replacement: zero-copy request spans, a
   per-value transform-pipeline cache, a compiled DAG of cheap predicates,

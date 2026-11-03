@@ -23,10 +23,14 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+#[cfg(feature = "hyperscan-eval")]
+use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 
+#[cfg(feature = "hyperscan-eval")]
+use crate::waf::hyperscan::{HsError, LiteralPattern, SharedHsDatabase};
 use crate::waf::prefilter_extract::{Coverage, PrefilterArtifact, SCHEMA_VERSION};
 use crate::waf::transforms::{Transform, TransformCache, TransformError};
 
@@ -173,6 +177,39 @@ struct ScanScratch {
     bits: Vec<u64>,
 }
 
+/// One compiled Hyperscan database for a transform chain. Extraction is applied
+/// once per representation and the same database is reused for every variant.
+#[cfg(feature = "hyperscan-eval")]
+struct HsChain {
+    transforms: Vec<Transform>,
+    database: SharedHsDatabase,
+    required_byte: Option<u8>,
+}
+
+#[cfg(feature = "hyperscan-eval")]
+type HsPendingGroups = BTreeMap<Vec<Transform>, BTreeMap<(String, bool), BTreeSet<u32>>>;
+
+/// Production Hyperscan backend. Compiled once per process and shared via the
+/// cached [`Prefilter`]. Empty when compilation failed; callers fall back to
+/// the pure-Rust Aho-Corasick groups.
+#[cfg(feature = "hyperscan-eval")]
+struct HyperscanBackend {
+    chains: Vec<HsChain>,
+    patterns: usize,
+    database_bytes: usize,
+}
+
+#[cfg(feature = "hyperscan-eval")]
+impl std::fmt::Debug for HyperscanBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HyperscanBackend")
+            .field("chains", &self.chains.len())
+            .field("patterns", &self.patterns)
+            .field("database_bytes", &self.database_bytes)
+            .finish()
+    }
+}
+
 /// A loaded prefilter.
 pub struct Prefilter {
     groups: Vec<CompiledGroup>,
@@ -184,16 +221,28 @@ pub struct Prefilter {
     ungated_body_rule_ids: Vec<u32>,
     all_body_rules_gated: bool,
     coverage: Coverage,
+    /// Production Hyperscan backend. `None` when the feature is disabled or
+    /// compilation failed; the Aho-Corasick groups are the bounded fallback.
+    #[cfg(feature = "hyperscan-eval")]
+    hyperscan: Option<HyperscanBackend>,
+    /// Why Hyperscan is unavailable, for diagnostics and benchmarking.
+    #[cfg(feature = "hyperscan-eval")]
+    hyperscan_error: Option<String>,
 }
 
 impl std::fmt::Debug for Prefilter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Prefilter")
+        let mut debug = f.debug_struct("Prefilter");
+        debug
             .field("groups", &self.groups.len())
             .field("gated_rules", &self.gated_rule_ids.len())
             .field("ungated_body_rules", &self.ungated_body_rule_ids.len())
-            .field("all_body_rules_gated", &self.all_body_rules_gated)
-            .finish()
+            .field("all_body_rules_gated", &self.all_body_rules_gated);
+        #[cfg(feature = "hyperscan-eval")]
+        debug
+            .field("hyperscan", &self.hyperscan)
+            .field("hyperscan_error", &self.hyperscan_error);
+        debug.finish()
     }
 }
 
@@ -215,8 +264,24 @@ impl Prefilter {
         Self::from_artifact(artifact)
     }
 
+    /// Parses an artifact and compiles only the pure-Rust Aho-Corasick
+    /// automata. Used by the benchmark to measure the bounded fallback without
+    /// paying the Hyperscan compile cost.
+    #[cfg(feature = "hyperscan-eval")]
+    pub fn from_json_aho(json: &str) -> Result<Self, PrefilterError> {
+        let artifact: PrefilterArtifact = serde_json::from_str(json)?;
+        Self::from_artifact_inner(artifact, false)
+    }
+
     /// Compiles a parsed artifact.
     pub fn from_artifact(artifact: PrefilterArtifact) -> Result<Self, PrefilterError> {
+        Self::from_artifact_inner(artifact, true)
+    }
+
+    fn from_artifact_inner(
+        artifact: PrefilterArtifact,
+        _use_hyperscan: bool,
+    ) -> Result<Self, PrefilterError> {
         if artifact.schema_version != SCHEMA_VERSION {
             return Err(PrefilterError::Schema {
                 found: artifact.schema_version,
@@ -320,6 +385,16 @@ impl Prefilter {
         let sensitive = build_union(sensitive_map, false)?;
         let insensitive = build_union(insensitive_map, true)?;
 
+        #[cfg(feature = "hyperscan-eval")]
+        let (hyperscan, hyperscan_error) = if _use_hyperscan {
+            match build_hyperscan_backend(&artifact) {
+                Ok(backend) => (Some(backend), None),
+                Err(err) => (None, Some(err)),
+            }
+        } else {
+            (None, None)
+        };
+
         let all_body_rules_gated =
             artifact.coverage.all_body_rules_gated && ungated_body.is_empty();
         Ok(Self {
@@ -331,6 +406,10 @@ impl Prefilter {
             ungated_body_rule_ids: ungated_body,
             all_body_rules_gated,
             coverage: artifact.coverage,
+            #[cfg(feature = "hyperscan-eval")]
+            hyperscan,
+            #[cfg(feature = "hyperscan-eval")]
+            hyperscan_error,
         })
     }
 
@@ -366,6 +445,14 @@ impl Prefilter {
             || contains_ascii_case_insensitive(body, b"<!ENTITY")
         {
             return PrefilterHit::forced("body contains an XML DTD/entity declaration");
+        }
+        #[cfg(feature = "hyperscan-eval")]
+        if let Some(backend) = &self.hyperscan {
+            // Bounded fallback: a runtime error or unavailable platform falls
+            // through to the pure-Rust automata below.
+            if let Ok(Some(hit)) = evaluate_hyperscan(backend, body, true) {
+                return hit;
+            }
         }
         with_transform_cache(|cache| self.evaluate_with_cache(body, cache))
     }
@@ -539,6 +626,69 @@ impl Prefilter {
         self.prefixes.len()
     }
 
+    /// True when the production Hyperscan backend compiled and is in use.
+    #[cfg(feature = "hyperscan-eval")]
+    pub fn hyperscan_active(&self) -> bool {
+        self.hyperscan.is_some()
+    }
+
+    /// Why Hyperscan is unavailable, if compilation failed.
+    #[cfg(feature = "hyperscan-eval")]
+    pub fn hyperscan_error(&self) -> Option<&str> {
+        self.hyperscan_error.as_deref()
+    }
+
+    /// Number of literal patterns compiled into Hyperscan databases.
+    #[cfg(feature = "hyperscan-eval")]
+    pub fn hyperscan_pattern_count(&self) -> usize {
+        self.hyperscan
+            .as_ref()
+            .map_or(0, |backend| backend.patterns)
+    }
+
+    /// Total size of the compiled Hyperscan databases in bytes.
+    #[cfg(feature = "hyperscan-eval")]
+    pub fn hyperscan_database_bytes(&self) -> usize {
+        self.hyperscan
+            .as_ref()
+            .map_or(0, |backend| backend.database_bytes)
+    }
+
+    /// Number of compiled Hyperscan transform-chain databases.
+    #[cfg(feature = "hyperscan-eval")]
+    pub fn hyperscan_chain_count(&self) -> usize {
+        self.hyperscan
+            .as_ref()
+            .map_or(0, |backend| backend.chains.len())
+    }
+
+    /// Test-only: drop the Hyperscan backend to exercise the pure-Rust
+    /// fallback path.
+    #[cfg(all(test, feature = "hyperscan-eval"))]
+    pub(crate) fn without_hyperscan(mut self) -> Self {
+        self.hyperscan = None;
+        self
+    }
+
+    fn gate_from_matched(&self, matched: Vec<u32>, scanned: usize) -> RuleGate {
+        let mut removable_rule_ids =
+            Vec::with_capacity(self.gated_rule_ids.len().min(MAX_REMOVE_RULE_IDS));
+        removable_rule_ids.extend(
+            self.gated_rule_ids
+                .iter()
+                .copied()
+                .filter(|id| !matched.contains(id))
+                .filter(|id| self.ungated_body_rule_ids.binary_search(id).is_err())
+                .take(MAX_REMOVE_RULE_IDS),
+        );
+        RuleGate {
+            forced_reason: None,
+            scanned_bytes: scanned,
+            matched_rules: matched,
+            removable_rule_ids,
+        }
+    }
+
     /// Scans every request representation and returns the gated rules that
     /// provably cannot match.
     ///
@@ -564,6 +714,12 @@ impl Prefilter {
                     forced_reason: Some("request contains an XML DTD/entity declaration"),
                     ..RuleGate::default()
                 };
+            }
+        }
+        #[cfg(feature = "hyperscan-eval")]
+        if let Some(backend) = &self.hyperscan {
+            if let Ok((matched, scanned)) = evaluate_inputs_hyperscan(backend, inputs) {
+                return self.gate_from_matched(matched, scanned);
             }
         }
         with_transform_cache(|cache| self.evaluate_inputs_with_cache(inputs, cache))
@@ -691,6 +847,16 @@ impl Extract {
         Extract::HtmlEntityDecode,
     ];
 
+    pub(crate) fn is_identity_for(self, input: &[u8]) -> bool {
+        let step = match self {
+            Extract::Identity => Transform::Identity,
+            Extract::UrlDecode => Transform::UrlDecode,
+            Extract::JsonUnescape => Transform::JsonUnescape,
+            Extract::HtmlEntityDecode => Transform::HtmlEntityDecode,
+        };
+        step.is_identity_on(input)
+    }
+
     pub(crate) fn apply(self, input: &[u8]) -> Cow<'_, [u8]> {
         let step = match self {
             Extract::Identity => Transform::Identity,
@@ -755,6 +921,215 @@ fn parse_transforms(names: &[String]) -> Result<Vec<Transform>, PrefilterError> 
         }
     }
     Ok(out)
+}
+
+/// Applies a transform chain to an already-extracted view, skipping transforms
+/// that are provably the identity on this input. This is the production fast
+/// path used by both backends.
+fn apply_transforms_view<'a>(transforms: &[Transform], input: &'a [u8]) -> Cow<'a, [u8]> {
+    let mut current = Cow::Borrowed(input);
+    for transform in transforms {
+        if transform.is_identity_on(&current) {
+            continue;
+        }
+        let mut output = Vec::new();
+        transform.apply_into(&current, &mut output);
+        current = Cow::Owned(output);
+    }
+    current
+}
+
+/// Computes a byte that every literal in a group must contain.
+///
+/// For case-insensitive groups each ASCII character contributes both cases, so
+/// the returned byte may be checked case-insensitively. A `None` result means
+/// the literals share no byte and no cheap skip is possible. The test is
+/// conservative: a hit only means the group *might* match.
+fn required_byte_for<'a>(patterns: impl Iterator<Item = &'a str>, caseless: bool) -> Option<u8> {
+    let mut intersection: Option<[bool; 256]> = None;
+    for literal in patterns {
+        let mut set = [false; 256];
+        for &byte in literal.as_bytes() {
+            set[byte as usize] = true;
+            if caseless && byte.is_ascii_alphabetic() {
+                set[byte.to_ascii_lowercase() as usize] = true;
+                set[byte.to_ascii_uppercase() as usize] = true;
+            }
+        }
+        intersection = Some(match intersection {
+            None => set,
+            Some(previous) => {
+                let mut next = [false; 256];
+                for ((value, previous), current) in
+                    next.iter_mut().zip(previous.iter()).zip(set.iter())
+                {
+                    *value = *previous && *current;
+                }
+                next
+            }
+        });
+    }
+    intersection.and_then(|set| (0..256).find(|&index| set[index]).map(|index| index as u8))
+}
+
+/// True when a representation contains the required byte, allowing for ASCII
+/// case folding (safe over-approximation for case-insensitive groups).
+fn representation_has_byte(haystack: &[u8], byte: u8) -> bool {
+    haystack.contains(&byte)
+        || (byte.is_ascii_alphabetic()
+            && (haystack.contains(&byte.to_ascii_lowercase())
+                || haystack.contains(&byte.to_ascii_uppercase())))
+}
+
+/// Builds the production Hyperscan backend from the artifact.
+///
+/// Databases are keyed by transform chain only: extraction is applied once per
+/// representation and every chain is scanned against that view. This is the
+/// same soundness contract as the Aho-Corasick groups, but the expensive
+/// extraction and transform work is not repeated per group.
+#[cfg(feature = "hyperscan-eval")]
+fn build_hyperscan_backend(artifact: &PrefilterArtifact) -> Result<HyperscanBackend, String> {
+    let mut pending: HsPendingGroups = BTreeMap::new();
+    for gate in artifact.rules.iter().filter(|gate| gate.gated) {
+        for literal_group in &gate.literal_groups {
+            let transforms = parse_transforms(&literal_group.transforms)
+                .map_err(|err| format!("hyperscan transform chain: {err}"))?;
+            let entry = pending.entry(transforms).or_default();
+            for literal in &literal_group.literals {
+                if literal.is_empty() {
+                    continue;
+                }
+                entry
+                    .entry((literal.clone(), literal_group.case_insensitive))
+                    .or_default()
+                    .insert(gate.id);
+            }
+        }
+    }
+
+    let mut chains = Vec::with_capacity(pending.len());
+    let mut patterns = 0usize;
+    let mut database_bytes = 0usize;
+    for (transforms, literals) in pending {
+        let literal_patterns: Vec<LiteralPattern> = literals
+            .into_iter()
+            .map(|((literal, caseless), ids)| LiteralPattern {
+                literal,
+                caseless,
+                rule_ids: ids.into_iter().collect(),
+            })
+            .collect();
+        if literal_patterns.is_empty() {
+            continue;
+        }
+        patterns += literal_patterns.len();
+        let database = SharedHsDatabase::compile(&literal_patterns)
+            .map_err(|err| format!("hyperscan compile failed: {err}"))?;
+        database_bytes += database.database_size().unwrap_or(0);
+        let required_byte = required_byte_for(
+            literal_patterns
+                .iter()
+                .map(|pattern| pattern.literal.as_str()),
+            literal_patterns.iter().any(|pattern| pattern.caseless),
+        );
+        chains.push(HsChain {
+            transforms,
+            database,
+            required_byte,
+        });
+    }
+    Ok(HyperscanBackend {
+        chains,
+        patterns,
+        database_bytes,
+    })
+}
+
+/// Scans one body with the production Hyperscan backend. Returns `Ok(None)` when
+/// Hyperscan is unavailable or a scan error occurred; callers fall back to the
+/// pure-Rust Aho-Corasick path.
+#[cfg(feature = "hyperscan-eval")]
+fn evaluate_hyperscan(
+    backend: &HyperscanBackend,
+    body: &[u8],
+    first_only: bool,
+) -> Result<Option<PrefilterHit>, HsError> {
+    let mut scanned = 0usize;
+    let mut representations = 0usize;
+    for extract in Extract::ALL {
+        let extracted = extract.apply(body);
+        if extracted.is_empty() {
+            continue;
+        }
+        representations += 1;
+        for chain in &backend.chains {
+            let view = apply_transforms_view(&chain.transforms, &extracted);
+            scanned += view.len();
+            if chain
+                .required_byte
+                .is_some_and(|byte| !representation_has_byte(&view, byte))
+            {
+                continue;
+            }
+            let matched = chain.database.scan(&view, first_only)?;
+            if matched.hit {
+                return Ok(Some(PrefilterHit {
+                    hit: true,
+                    forced_reason: None,
+                    scanned_bytes: scanned,
+                    representations,
+                    matched_rules: matched.matched_rule_ids,
+                }));
+            }
+        }
+    }
+    Ok(Some(PrefilterHit {
+        hit: false,
+        forced_reason: None,
+        scanned_bytes: scanned,
+        representations,
+        matched_rules: Vec::new(),
+    }))
+}
+
+/// Collects every matching rule id across all inputs, extractions and chains.
+/// Unlike the boolean path this never terminates early, so per-rule removal
+/// stays sound.
+#[cfg(feature = "hyperscan-eval")]
+fn evaluate_inputs_hyperscan(
+    backend: &HyperscanBackend,
+    inputs: &[&[u8]],
+) -> Result<(Vec<u32>, usize), HsError> {
+    let mut scanned = 0usize;
+    let mut matched: Vec<u32> = Vec::new();
+    for input in inputs {
+        if input.is_empty() {
+            continue;
+        }
+        for extract in Extract::ALL {
+            let extracted = extract.apply(input);
+            if extracted.is_empty() {
+                continue;
+            }
+            for chain in &backend.chains {
+                let view = apply_transforms_view(&chain.transforms, &extracted);
+                scanned += view.len();
+                if chain
+                    .required_byte
+                    .is_some_and(|byte| !representation_has_byte(&view, byte))
+                {
+                    continue;
+                }
+                let result = chain.database.scan(&view, false)?;
+                if result.hit {
+                    matched.extend(result.matched_rule_ids);
+                }
+            }
+        }
+    }
+    matched.sort_unstable();
+    matched.dedup();
+    Ok((matched, scanned))
 }
 
 /// Number of body extraction variants a CRS body processor can produce.
@@ -1231,5 +1606,148 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn required_byte_is_intersection_of_literals() {
+        assert_eq!(
+            required_byte_for(["select", "script"].into_iter(), false),
+            Some(b'c')
+        );
+        assert_eq!(required_byte_for(["abc", "def"].into_iter(), false), None);
+        // Case-insensitive groups expand both cases, so a shared letter is
+        // still a valid skip byte.
+        assert!(required_byte_for(["Select", "SCRIPT"].into_iter(), true).is_some());
+    }
+
+    #[test]
+    fn required_byte_check_is_case_insensitive_for_letters() {
+        assert!(representation_has_byte(b"SELECT", b's'));
+        assert!(representation_has_byte(b"select", b'S'));
+        assert!(!representation_has_byte(b"select", b'z'));
+    }
+
+    #[test]
+    fn extract_identity_predicate_is_conservative() {
+        let samples: &[&[u8]] = &[
+            b"",
+            b"plain",
+            b"%41",
+            b"a+b",
+            b"a\\b",
+            b"a&b",
+            "café".as_bytes(),
+        ];
+        for extract in Extract::ALL {
+            for sample in samples {
+                if extract.is_identity_for(sample) {
+                    assert_eq!(
+                        extract.apply(sample).as_ref(),
+                        *sample,
+                        "{extract:?} claimed identity on {sample:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_input_does_not_hit() {
+        let prefilter = simple(&["union", "select"], true, &["none"]);
+        let hit = prefilter.evaluate(b"");
+        assert!(!hit.hit);
+        assert_eq!(hit.matched_rules, Vec::<u32>::new());
+    }
+
+    #[test]
+    fn very_large_benign_input_does_not_hit() {
+        let prefilter = simple(&["union", "select"], true, &["none"]);
+        let body = vec![b'z'; 1024 * 1024];
+        let hit = prefilter.evaluate(&body);
+        // The pure-Rust transform arena may force full evaluation on a body
+        // this large; that is safe. It must never report a literal hit.
+        assert!(!hit.hit || hit.forced_reason.is_some());
+    }
+
+    #[test]
+    fn unicode_literal_matches_utf8_bytes() {
+        let prefilter = simple(&["café"], false, &["none"]);
+        assert!(prefilter.evaluate("café".as_bytes()).hit);
+        assert!(!prefilter.evaluate("cafe".as_bytes()).hit);
+    }
+
+    #[test]
+    fn anchored_and_unanchored_literals_both_match() {
+        let prefilter = simple(&["select"], false, &["none"]);
+        assert!(prefilter.evaluate(b"select * from users").hit);
+        assert!(prefilter.evaluate(b"q=1 select * from users").hit);
+        assert!(!prefilter.evaluate(b"selec").hit);
+    }
+
+    #[test]
+    fn case_insensitive_literal_matches_mixed_case() {
+        let prefilter = simple(&["select"], true, &["none"]);
+        assert!(prefilter.evaluate(b"SeLeCt").hit);
+    }
+
+    #[cfg(feature = "hyperscan-eval")]
+    #[test]
+    fn hyperscan_backend_is_active_for_embedded_artifact() {
+        let prefilter = Prefilter::embedded().expect("embedded artifact is valid");
+        assert!(
+            prefilter.hyperscan_active(),
+            "hyperscan unavailable: {:?}",
+            prefilter.hyperscan_error()
+        );
+        assert!(prefilter.hyperscan_pattern_count() > 0);
+        assert!(prefilter.hyperscan_chain_count() > 0);
+    }
+
+    #[cfg(feature = "hyperscan-eval")]
+    #[test]
+    fn hyperscan_matches_aho_on_edge_cases() {
+        let prefilter = simple(&["union", "select", "café"], true, &["none"]);
+        let fallback = simple(&["union", "select", "café"], true, &["none"]).without_hyperscan();
+        assert!(prefilter.hyperscan_active());
+        assert!(!fallback.hyperscan_active());
+
+        let large = vec![b'z'; 256 * 1024];
+        let cases: &[&[u8]] = &[
+            b"",
+            b"name=alice&city=paris",
+            b"q=1%20UNION%20SELECT%20password",
+            b"SeLeCt",
+            "café".as_bytes(),
+            b"selec",
+            &large,
+        ];
+        for body in cases {
+            let hs = prefilter.evaluate(body);
+            let ac = fallback.evaluate(body);
+            assert_eq!(hs.hit, ac.hit, "hit mismatch on {body:?}");
+            assert_eq!(
+                hs.matched_rules, ac.matched_rules,
+                "rule mismatch on {body:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "hyperscan-eval")]
+    #[test]
+    fn hyperscan_fallback_keeps_removal_sound() {
+        let prefilter = simple(&["union", "select"], true, &["none"]);
+        let fallback = simple(&["union", "select"], true, &["none"]).without_hyperscan();
+        let clean = prefilter.evaluate_inputs(&[b"name=alice"]);
+        let clean_fallback = fallback.evaluate_inputs(&[b"name=alice"]);
+        assert_eq!(clean.removable_rule_ids, clean_fallback.removable_rule_ids);
+        assert_eq!(clean.matched_rules, clean_fallback.matched_rules);
+
+        let attack = prefilter.evaluate_inputs(&[b"q=1 UNION SELECT password"]);
+        let attack_fallback = fallback.evaluate_inputs(&[b"q=1 UNION SELECT password"]);
+        assert_eq!(attack.matched_rules, attack_fallback.matched_rules);
+        assert_eq!(
+            attack.removable_rule_ids,
+            attack_fallback.removable_rule_ids
+        );
     }
 }

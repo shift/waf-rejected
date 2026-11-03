@@ -266,8 +266,22 @@ fn main() {
     let artifact: PrefilterArtifact =
         serde_json::from_str(EMBEDDED_ARTIFACT).expect("embedded prefilter artifact parses");
     let load_started = Instant::now();
-    let prefilter = Prefilter::from_json(EMBEDDED_ARTIFACT).expect("aho-corasick prefilter loads");
+    let prefilter =
+        Prefilter::from_json_aho(EMBEDDED_ARTIFACT).expect("aho-corasick prefilter loads");
     let ac_load = load_started.elapsed();
+
+    let hs_prefilter_started = Instant::now();
+    let prefilter_hs = Prefilter::from_json(EMBEDDED_ARTIFACT).expect("hyperscan prefilter loads");
+    let hs_prefilter_load = hs_prefilter_started.elapsed();
+
+    let embedded_started = Instant::now();
+    let embedded = Prefilter::embedded().expect("embedded prefilter loads");
+    let embedded_cold = embedded_started.elapsed();
+    let warm_started = Instant::now();
+    for _ in 0..1_000 {
+        std::hint::black_box(Prefilter::embedded().expect("embedded prefilter loads"));
+    }
+    let embedded_warm = warm_started.elapsed() / 1_000;
 
     let compile_started = Instant::now();
     let (groups, raw, pattern_count) = load_groups(&artifact);
@@ -302,6 +316,23 @@ fn main() {
         prefilter.automaton_count(),
         ac_load.as_secs_f64() * 1e3
     );
+    println!(
+        "- integrated hyperscan prefilter: active={} chains={} patterns={} db={} KiB, load {:.1} ms ({})",
+        prefilter_hs.hyperscan_active(),
+        prefilter_hs.hyperscan_chain_count(),
+        prefilter_hs.hyperscan_pattern_count(),
+        prefilter_hs.hyperscan_database_bytes() / 1024,
+        hs_prefilter_load.as_secs_f64() * 1e3,
+        prefilter_hs
+            .hyperscan_error()
+            .unwrap_or("no fallback")
+    );
+    println!(
+        "- embedded prefilter cache: cold {:.1} ms, warm {:.0} ns/call",
+        embedded_cold.as_secs_f64() * 1e3,
+        embedded_warm.as_secs_f64() * 1e9
+    );
+    println!("- embedded backend active: {}", embedded.hyperscan_active());
     println!("- content-type: {content_type} (extraction {extraction} of {EXTRACTION_VARIANTS})");
     println!("- reps: {reps}, warmup: {warmup}");
     println!();
@@ -374,6 +405,33 @@ fn main() {
             "hs_all_extractions": {"mb_s": all_stats.throughput_mb_s(size), "p50_us": all_stats.p50.as_secs_f64()*1e6, "p95_us": all_stats.p95.as_secs_f64()*1e6},
             "aho_corasick": {"mb_s": ac_stats.throughput_mb_s(size), "p50_us": ac_stats.p50.as_secs_f64()*1e6, "p95_us": ac_stats.p95.as_secs_f64()*1e6},
         }));
+    }
+    println!();
+
+    println!("## Production prefilter backend (Arc-shared Hyperscan vs Aho-Corasick fallback)");
+    println!();
+    println!("- `hs-prefilter`: `Prefilter::evaluate` with the process-shared Hyperscan backend.");
+    println!("- `aho`: `Prefilter::from_json_aho`, the pure-Rust bounded fallback.");
+    println!();
+    println!("| size | hs-prefilter p50 | hs-prefilter p95 | aho p50 | aho p95 | aho/hs |");
+    println!("|---:|---:|---:|---:|---:|---:|");
+    for &size in &[1024usize, 4 * 1024, 8 * 1024] {
+        let body = fill_to(size, clean_unit);
+        let (hs_stats, hs_hit) = measure(&body, reps, warmup, |b| prefilter_hs.evaluate(b).hit);
+        let (ac_stats, ac_hit) = measure(&body, reps, warmup, |b| prefilter.evaluate(b).hit);
+        if hs_hit || ac_hit {
+            eprintln!("warning: production clean body at {size} produced a hit");
+        }
+        let speedup = ac_stats.p50.as_secs_f64() / hs_stats.p50.as_secs_f64().max(f64::EPSILON);
+        println!(
+            "| {} KiB | {:.1} µs | {:.1} µs | {:.1} µs | {:.1} µs | {:.1}× |",
+            size / 1024,
+            hs_stats.p50.as_secs_f64() * 1e6,
+            hs_stats.p95.as_secs_f64() * 1e6,
+            ac_stats.p50.as_secs_f64() * 1e6,
+            ac_stats.p95.as_secs_f64() * 1e6,
+            speedup,
+        );
     }
     println!();
 
