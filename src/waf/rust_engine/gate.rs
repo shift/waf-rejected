@@ -115,7 +115,13 @@ pub fn attach(program: &mut Program) -> Result<Option<Arc<GateSet>>, String> {
 
     // Only positive regex operators that exist in this program are eligible.
     let mut eligible = BTreeSet::new();
-    for items in [&program.phase1, &program.phase2] {
+    for items in [
+        &program.phase1,
+        &program.phase2,
+        &program.phase3,
+        &program.phase4,
+        &program.phase5,
+    ] {
         for item in items {
             let ProgramItem::Rule(group) = item else {
                 continue;
@@ -232,7 +238,13 @@ pub fn attach(program: &mut Program) -> Result<Option<Arc<GateSet>>, String> {
     }
 
     let mut attached = 0usize;
-    for items in [&mut program.phase1, &mut program.phase2] {
+    for items in [
+        &mut program.phase1,
+        &mut program.phase2,
+        &mut program.phase3,
+        &mut program.phase4,
+        &mut program.phase5,
+    ] {
         for item in items.iter_mut() {
             let ProgramItem::Rule(group) = item else {
                 continue;
@@ -268,7 +280,6 @@ fn parse_pipeline(names: &[String]) -> Option<Vec<Transform>> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::waf::rust_engine::{CompilePolicy, RustEngine};
 
     #[test]

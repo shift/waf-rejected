@@ -9,13 +9,19 @@ use regex::Regex as TextRegex;
 
 use super::transforms::Transform;
 
-/// Request phases this slice implements.
+/// Engine phases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Phase {
     /// `phase:1` — request headers are available.
     RequestHeaders,
     /// `phase:2` — the request body has been processed.
     RequestBody,
+    /// `phase:3` — response headers are available.
+    ResponseHeaders,
+    /// `phase:4` — the response body has been processed.
+    ResponseBody,
+    /// `phase:5` — logging, after the response.
+    Logging,
 }
 
 impl Phase {
@@ -24,16 +30,27 @@ impl Phase {
         match self {
             Self::RequestHeaders => 1,
             Self::RequestBody => 2,
+            Self::ResponseHeaders => 3,
+            Self::ResponseBody => 4,
+            Self::Logging => 5,
         }
     }
 
-    /// Parses a SecLang phase number. Outbound phases are unsupported here.
+    /// Parses a SecLang phase number.
     pub fn from_number(value: u8) -> Option<Self> {
         match value {
             1 => Some(Self::RequestHeaders),
             2 => Some(Self::RequestBody),
+            3 => Some(Self::ResponseHeaders),
+            4 => Some(Self::ResponseBody),
+            5 => Some(Self::Logging),
             _ => None,
         }
+    }
+
+    /// True for phases that inspect the upstream response.
+    pub fn is_response(self) -> bool {
+        matches!(self, Self::ResponseHeaders | Self::ResponseBody)
     }
 }
 
@@ -76,6 +93,17 @@ pub enum Collection {
     Rule,
     Global,
     Ip,
+    ResponseStatus,
+    ResponseProtocol,
+    ResponseHeaders,
+    ResponseHeadersNames,
+    ResponseBody,
+    ResponseBodyLength,
+    ResponseContentType,
+    ResponseContentLength,
+    ResponseArgs,
+    ResponseXml,
+    OutboundDataError,
 }
 
 impl Collection {
@@ -118,6 +146,17 @@ impl Collection {
             Self::Rule => "RULE",
             Self::Global => "GLOBAL",
             Self::Ip => "IP",
+            Self::ResponseStatus => "RESPONSE_STATUS",
+            Self::ResponseProtocol => "RESPONSE_PROTOCOL",
+            Self::ResponseHeaders => "RESPONSE_HEADERS",
+            Self::ResponseHeadersNames => "RESPONSE_HEADERS_NAMES",
+            Self::ResponseBody => "RESPONSE_BODY",
+            Self::ResponseBodyLength => "RESPONSE_BODY_LENGTH",
+            Self::ResponseContentType => "RESPONSE_CONTENT_TYPE",
+            Self::ResponseContentLength => "RESPONSE_CONTENT_LENGTH",
+            Self::ResponseArgs => "RESPONSE_ARGS",
+            Self::ResponseXml => "RESPONSE_XML",
+            Self::OutboundDataError => "OUTBOUND_DATA_ERROR",
         }
     }
 
@@ -161,6 +200,17 @@ impl Collection {
             "RULE" => Self::Rule,
             "GLOBAL" => Self::Global,
             "IP" => Self::Ip,
+            "RESPONSE_STATUS" => Self::ResponseStatus,
+            "RESPONSE_PROTOCOL" => Self::ResponseProtocol,
+            "RESPONSE_HEADERS" => Self::ResponseHeaders,
+            "RESPONSE_HEADERS_NAMES" => Self::ResponseHeadersNames,
+            "RESPONSE_BODY" => Self::ResponseBody,
+            "RESPONSE_BODY_LENGTH" => Self::ResponseBodyLength,
+            "RESPONSE_CONTENT_TYPE" => Self::ResponseContentType,
+            "RESPONSE_CONTENT_LENGTH" => Self::ResponseContentLength,
+            "RESPONSE_ARGS" => Self::ResponseArgs,
+            "RESPONSE_XML" => Self::ResponseXml,
+            "OUTBOUND_DATA_ERROR" => Self::OutboundDataError,
             _ => return None,
         })
     }
@@ -409,6 +459,12 @@ pub enum ProgramItem {
 pub struct Program {
     pub phase1: Vec<ProgramItem>,
     pub phase2: Vec<ProgramItem>,
+    /// `phase:3` response-header rules (opt-in response inspection).
+    pub phase3: Vec<ProgramItem>,
+    /// `phase:4` response-body rules.
+    pub phase4: Vec<ProgramItem>,
+    /// `phase:5` logging rules.
+    pub phase5: Vec<ProgramItem>,
     /// Interned transform pipelines. `CompiledRule::pipeline` indexes this.
     pub pipelines: Vec<TransformChain>,
     /// Deduplicated prefix DAG over every interned pipeline, built once at load
@@ -425,6 +481,9 @@ impl Program {
         match phase {
             Phase::RequestHeaders => &self.phase1,
             Phase::RequestBody => &self.phase2,
+            Phase::ResponseHeaders => &self.phase3,
+            Phase::ResponseBody => &self.phase4,
+            Phase::Logging => &self.phase5,
         }
     }
 
@@ -435,7 +494,13 @@ impl Program {
     /// transform cache effective.
     pub fn intern_pipelines(&mut self) {
         let mut pipelines: Vec<TransformChain> = Vec::new();
-        for items in [&mut self.phase1, &mut self.phase2] {
+        for items in [
+            &mut self.phase1,
+            &mut self.phase2,
+            &mut self.phase3,
+            &mut self.phase4,
+            &mut self.phase5,
+        ] {
             for item in items.iter_mut() {
                 if let ProgramItem::Rule(group) = item {
                     for rule in &mut group.rules {

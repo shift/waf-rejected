@@ -40,6 +40,9 @@ use crate::waf::Decision;
 /// Default CRS inbound anomaly threshold.
 const DEFAULT_ANOMALY_THRESHOLD: i64 = 5;
 
+/// Default CRS outbound anomaly threshold (`tx.outbound_anomaly_score_threshold`).
+const DEFAULT_OUTBOUND_ANOMALY_THRESHOLD: i64 = 4;
+
 /// Default status used by the CRS blocking rules.
 const DEFAULT_BLOCK_STATUS: u16 = 403;
 
@@ -54,6 +57,10 @@ pub struct Outcome {
     pub blocking_inbound_anomaly_score: i64,
     /// `tx.inbound_anomaly_score_pl1`.
     pub inbound_anomaly_score_pl1: i64,
+    /// `tx.blocking_outbound_anomaly_score` after the response phases.
+    pub blocking_outbound_anomaly_score: i64,
+    /// `tx.outbound_anomaly_score_pl1`.
+    pub outbound_anomaly_score_pl1: i64,
     /// Configured `tx.inbound_anomaly_score_threshold`.
     pub threshold: i64,
     /// `tx.early_blocking`.
@@ -306,6 +313,171 @@ impl RustEngine {
         })
     }
 
+    /// True when the compiled program contains response/logging rules.
+    ///
+    /// The response path is opt-in: it only runs when the caller invokes
+    /// [`Self::evaluate_response`], and the default CRS request bundle has no
+    /// phases 3–5 rules so this returns `false` for the shipped bundle.
+    pub fn response_inspection_enabled(&self) -> bool {
+        !(self.program.phase3.is_empty()
+            && self.program.phase4.is_empty()
+            && self.program.phase5.is_empty())
+    }
+
+    /// Evaluates request phases followed by response phases 3–5 and always
+    /// returns a decision. Internal failures are converted to a block.
+    pub fn evaluate_response(
+        &self,
+        request: &EngineRequest<'_>,
+        response: &super::response::EngineResponse<'_>,
+        config: &super::response::ResponseConfig,
+    ) -> Decision {
+        match self.evaluate_response_detailed(request, response, config) {
+            Ok(outcome) => outcome.decision,
+            Err(err) => Decision::Block {
+                status: 500,
+                reason: format!("rust-engine response fail-closed: {err}"),
+            },
+        }
+    }
+
+    /// Evaluates request phases followed by response phases, returning
+    /// diagnostics. The request phases must be replayed because the response
+    /// rules depend on the request collections and `TX` state.
+    pub fn evaluate_response_detailed(
+        &self,
+        request: &EngineRequest<'_>,
+        response: &super::response::EngineResponse<'_>,
+        config: &super::response::ResponseConfig,
+    ) -> Result<Outcome, EngineError> {
+        let mut budget = Budget::new(self.limits);
+        let mut tx_state = SCRATCH
+            .with(|cell| cell.borrow_mut().tx_state.take())
+            .unwrap_or_default();
+        tx_state.reset();
+        let mut tx = Collections::new_with_state(request, &mut budget, tx_state)?;
+        let mut state = EvalState::default();
+        let mut matched_rules = Vec::new();
+        let mut captures: Captures = std::array::from_fn(|_| Vec::new());
+
+        SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            let scratch = &mut *scratch;
+            if scratch.capture_locations.is_none() {
+                scratch.capture_locations = self
+                    .capture_template
+                    .as_ref()
+                    .map(regex::bytes::Regex::capture_locations);
+            }
+
+            let phase1 = self.run_phase(
+                Phase::RequestHeaders,
+                &mut tx,
+                &mut budget,
+                &mut state,
+                &mut matched_rules,
+                &mut captures,
+                scratch,
+            )?;
+            if let Some(decision) = phase1 {
+                return Ok(self.outcome(tx, matched_rules, decision, None, &state, scratch));
+            }
+            if let Some(decision) = self.check_anomaly(&tx, Phase::RequestHeaders) {
+                return Ok(self.outcome(tx, matched_rules, decision, None, &state, scratch));
+            }
+            if state.allow {
+                return Ok(self.outcome(tx, matched_rules, Decision::Allow, None, &state, scratch));
+            }
+
+            tx.process_body(request, &mut budget)?;
+            let phase2 = self.run_phase(
+                Phase::RequestBody,
+                &mut tx,
+                &mut budget,
+                &mut state,
+                &mut matched_rules,
+                &mut captures,
+                scratch,
+            )?;
+            if let Some(decision) = phase2 {
+                return Ok(self.outcome(tx, matched_rules, decision, None, &state, scratch));
+            }
+            if let Some(decision) = self.check_anomaly(&tx, Phase::RequestBody) {
+                return Ok(self.outcome(tx, matched_rules, decision, None, &state, scratch));
+            }
+            if state.allow {
+                return Ok(self.outcome(tx, matched_rules, Decision::Allow, None, &state, scratch));
+            }
+
+            tx.attach_response(response, config);
+            let phase3 = self.run_phase(
+                Phase::ResponseHeaders,
+                &mut tx,
+                &mut budget,
+                &mut state,
+                &mut matched_rules,
+                &mut captures,
+                scratch,
+            )?;
+            if let Some(decision) = phase3 {
+                return Ok(self.outcome(tx, matched_rules, decision, None, &state, scratch));
+            }
+
+            let phase4 = self.run_phase(
+                Phase::ResponseBody,
+                &mut tx,
+                &mut budget,
+                &mut state,
+                &mut matched_rules,
+                &mut captures,
+                scratch,
+            )?;
+            if let Some(decision) = phase4 {
+                return Ok(self.outcome(tx, matched_rules, decision, None, &state, scratch));
+            }
+            if let Some(decision) = self.check_outbound_anomaly(&tx) {
+                return Ok(self.outcome(tx, matched_rules, decision, None, &state, scratch));
+            }
+
+            // Phase 5 rules may update scores and log data but cannot disrupt
+            // the already-delivered response.
+            let _ = self.run_phase(
+                Phase::Logging,
+                &mut tx,
+                &mut budget,
+                &mut state,
+                &mut matched_rules,
+                &mut captures,
+                scratch,
+            )?;
+
+            Ok(self.outcome(tx, matched_rules, Decision::Allow, None, &state, scratch))
+        })
+    }
+
+    fn check_outbound_anomaly(&self, tx: &Collections<'_>) -> Option<Decision> {
+        if self.program.phase4.is_empty() {
+            return None;
+        }
+        let threshold = tx_i64(tx, "outbound_anomaly_score_threshold");
+        let threshold = if threshold == 0 {
+            DEFAULT_OUTBOUND_ANOMALY_THRESHOLD
+        } else {
+            threshold
+        };
+        let score = tx_i64(tx, "blocking_outbound_anomaly_score");
+        if score >= threshold {
+            Some(Decision::Block {
+                status: DEFAULT_BLOCK_STATUS,
+                reason: format!(
+                    "Outbound Anomaly Score Exceeded (Total Score: {score}, threshold: {threshold})"
+                ),
+            })
+        } else {
+            None
+        }
+    }
+
     fn outcome(
         &self,
         tx: Collections<'_>,
@@ -320,6 +492,8 @@ impl RustEngine {
             matched_rules,
             blocking_inbound_anomaly_score: tx_i64(&tx, "blocking_inbound_anomaly_score"),
             inbound_anomaly_score_pl1: tx_i64(&tx, "inbound_anomaly_score_pl1"),
+            blocking_outbound_anomaly_score: tx_i64(&tx, "blocking_outbound_anomaly_score"),
+            outbound_anomaly_score_pl1: tx_i64(&tx, "outbound_anomaly_score_pl1"),
             threshold: {
                 let threshold = tx_i64(&tx, "inbound_anomaly_score_threshold");
                 if threshold == 0 {
@@ -1560,7 +1734,13 @@ fn target_removed_parts(
 /// `CaptureLocations` covers every rule in the program.
 fn capture_template(program: &Program) -> Option<regex::bytes::Regex> {
     let mut best: Option<&regex::bytes::Regex> = None;
-    for items in [&program.phase1, &program.phase2] {
+    for items in [
+        &program.phase1,
+        &program.phase2,
+        &program.phase3,
+        &program.phase4,
+        &program.phase5,
+    ] {
         for item in items {
             let ProgramItem::Rule(group) = item else {
                 continue;
@@ -1846,6 +2026,7 @@ enum GroupResult {
 
 #[cfg(test)]
 mod tests {
+    use super::super::response::{EngineResponse, ResponseConfig};
     use super::*;
 
     fn engine() -> RustEngine {
@@ -1969,5 +2150,241 @@ SecRule ARGS "@rx evil" "id:1002,phase:2,pass,t:lowercase"
             .evaluate_detailed(&request("/?q=EVIL"))
             .expect("evaluate");
         assert_eq!(outcome.matched_rules, vec![1001, 1002]);
+    }
+
+    fn post(uri: &'static str, content_type: &str, body: &'static [u8]) -> EngineRequest<'static> {
+        let headers = Box::leak(Box::new(vec![(
+            "Content-Type".to_string(),
+            content_type.to_string(),
+        )]));
+        EngineRequest {
+            method: "POST",
+            uri,
+            http_version: "HTTP/1.1",
+            headers,
+            body: Some(body),
+        }
+    }
+
+    #[test]
+    fn json_body_processor_populates_args_post_like_coraza() {
+        let text = r#"
+SecAction "id:900,phase:1,pass,nolog,ctl:requestBodyProcessor=JSON"
+SecRule ARGS_POST:json.data.name "@rx evil" "id:1001,phase:2,deny,status:403"
+SecRule ARGS_NAMES "@rx json\.items\.1" "id:1002,phase:2,pass"
+"#;
+        let engine = RustEngine::from_conf_str(text, ".", CompilePolicy::Strict).expect("engine");
+        let attack = post(
+            "/",
+            "application/json",
+            br#"{"data":{"name":"evil"},"items":[1,2]}"#,
+        );
+        assert!(matches!(
+            engine.evaluate(&attack),
+            Decision::Block { status: 403, .. }
+        ));
+        let benign = post(
+            "/",
+            "application/json",
+            br#"{"data":{"name":"good"},"items":[1,2]}"#,
+        );
+        assert_eq!(engine.evaluate(&benign), Decision::Allow);
+    }
+
+    #[test]
+    fn json_processor_is_not_selected_by_content_type() {
+        let text = r#"
+SecRule ARGS_POST "@rx evil" "id:1001,phase:2,deny,status:403"
+"#;
+        let engine = RustEngine::from_conf_str(text, ".", CompilePolicy::Strict).expect("engine");
+        let request = post("/", "application/json", br#"{"data":"evil"}"#);
+        assert_eq!(engine.evaluate(&request), Decision::Allow);
+    }
+
+    #[test]
+    fn xml_body_processor_populates_both_xpath_collections() {
+        let text = r#"
+SecAction "id:900,phase:1,pass,nolog,ctl:requestBodyProcessor=XML"
+SecRule XML:/* "@rx evil" "id:1001,phase:2,deny,status:403"
+SecRule XML://@* "@rx onload" "id:1002,phase:2,deny,status:403"
+"#;
+        let engine = RustEngine::from_conf_str(text, ".", CompilePolicy::Strict).expect("engine");
+        let content = post("/", "text/xml", b"<a><b>evil</b></a>");
+        assert!(matches!(
+            engine.evaluate(&content),
+            Decision::Block { status: 403, .. }
+        ));
+        let attribute = post("/", "text/xml", b"<a x=\"onload=evil\"/>");
+        assert!(matches!(
+            engine.evaluate(&attribute),
+            Decision::Block { status: 403, .. }
+        ));
+        let malformed = post("/", "text/xml", b"<a><b></a>");
+        assert_eq!(engine.evaluate(&malformed), Decision::Allow);
+    }
+
+    #[test]
+    fn unsupported_xpath_selector_aborts_strict_load() {
+        let text = r#"SecRule XML:/root/child "@rx x" "id:1001,phase:2,deny""#;
+        let err = RustEngine::from_conf_str(text, ".", CompilePolicy::Strict).expect_err("xpath");
+        match err {
+            LoadError::Unsupported(unsupported) => {
+                assert_eq!(unsupported.construct, "collection:XML:/root/child");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn response_phases_inspect_status_headers_and_body() {
+        let text = r#"
+SecRule RESPONSE_STATUS "@streq 500" "id:1001,phase:3,deny,status:503"
+SecRule RESPONSE_HEADERS:X-Secret "@contains leak" "id:1002,phase:3,deny,status:502"
+SecRule RESPONSE_BODY "@contains evil" "id:1003,phase:4,deny,status:403"
+SecAction "id:1004,phase:5,pass,nolog,setvar:tx.logged=1"
+"#;
+        let engine = RustEngine::from_conf_str(text, ".", CompilePolicy::Strict).expect("engine");
+        assert!(engine.response_inspection_enabled());
+        let request = request("/");
+        let headers = vec![("X-Secret".to_string(), "leak".to_string())];
+        let status = EngineResponse {
+            status: 500,
+            protocol: "HTTP/1.1",
+            headers: &headers,
+            body: Some(b"clean"),
+        };
+        assert!(matches!(
+            engine.evaluate_response(&request, &status, &ResponseConfig::headers_only()),
+            Decision::Block { status: 503, .. }
+        ));
+
+        let header = EngineResponse {
+            status: 200,
+            protocol: "HTTP/1.1",
+            headers: &headers,
+            body: Some(b"clean"),
+        };
+        assert!(matches!(
+            engine.evaluate_response(&request, &header, &ResponseConfig::headers_only()),
+            Decision::Block { status: 502, .. }
+        ));
+
+        let body = EngineResponse {
+            status: 200,
+            protocol: "HTTP/1.1",
+            headers: &[],
+            body: Some(b"evil"),
+        };
+        // Body inspection is off by default: the phase-4 rule must not run.
+        assert_eq!(
+            engine.evaluate_response(&request, &body, &ResponseConfig::headers_only()),
+            Decision::Allow
+        );
+        assert!(matches!(
+            engine.evaluate_response(&request, &body, &ResponseConfig::raw_body()),
+            Decision::Block { status: 403, .. }
+        ));
+    }
+
+    #[test]
+    fn outbound_anomaly_score_blocks_in_phase_four() {
+        let text = r#"
+SecAction "id:900,phase:1,pass,nolog,setvar:tx.outbound_anomaly_score_threshold=4"
+SecRule RESPONSE_BODY "@contains evil" "id:1001,phase:4,pass,setvar:tx.outbound_anomaly_score_pl1=+5,setvar:tx.blocking_outbound_anomaly_score=+5"
+"#;
+        let engine = RustEngine::from_conf_str(text, ".", CompilePolicy::Strict).expect("engine");
+        let headers = vec![("Content-Type".to_string(), "text/plain".to_string())];
+        let response = EngineResponse {
+            status: 200,
+            protocol: "HTTP/1.1",
+            headers: &headers,
+            body: Some(b"evil"),
+        };
+        let outcome = engine
+            .evaluate_response_detailed(&request("/"), &response, &ResponseConfig::raw_body())
+            .expect("response");
+        assert_eq!(outcome.outbound_anomaly_score_pl1, 5);
+        assert_eq!(outcome.blocking_outbound_anomaly_score, 5);
+        assert!(matches!(
+            outcome.decision,
+            Decision::Block { status: 403, .. }
+        ));
+    }
+
+    /// Differential check against the Coraza WASI reactor for the body
+    /// processors that must *not* be auto-selected from `Content-Type`.
+    ///
+    /// Coraza only selects URIENCODED/MULTIPART from `Content-Type`; JSON and
+    /// XML require `ctl:requestBodyProcessor`. A JSON/XML body must therefore
+    /// produce exactly the same decision in both engines, even when it carries
+    /// SQLi/XSS payloads, because neither exposes the body to `ARGS`.
+    #[cfg(feature = "wasm-reactor")]
+    #[test]
+    fn json_and_xml_content_type_selection_matches_coraza_reactor() {
+        use crate::waf::wasm_reactor::{ReactorDecision, WasmReactor, EMBEDDED_CORAZA_REACTOR};
+
+        let path = crate::waf::rust_engine::default_crs_conf_path();
+        if !path.exists() {
+            return;
+        }
+        let engine =
+            RustEngine::from_conf_path_with_policy(&path, CompilePolicy::Report).expect("CRS");
+        let reactor = match WasmReactor::from_coraza_bytes(EMBEDDED_CORAZA_REACTOR) {
+            Ok(reactor) => reactor,
+            Err(_) => return,
+        };
+
+        let cases: [(&str, &str); 6] = [
+            ("application/json", r#"{"name":"benign","n":1}"#),
+            (
+                "application/json",
+                r#"{"q":"' OR 1=1 --","x":"<script>alert(1)</script>"}"#,
+            ),
+            ("application/json", r#"{"nested":{"a":[1,2,{"b":"x"}]}}"#),
+            ("text/xml", r#"<root><a>benign</a></root>"#),
+            (
+                "text/xml",
+                r#"<root q="' OR 1=1 --"><a><script>alert(1)</script></a></root>"#,
+            ),
+            (
+                "application/xml",
+                r#"<root q="&lt;script&gt;">onload=alert(1)</root>"#,
+            ),
+        ];
+
+        for (content_type, body) in cases {
+            let headers = vec![
+                ("Host".to_string(), "localhost".to_string()),
+                ("Content-Type".to_string(), content_type.to_string()),
+                ("Content-Length".to_string(), body.len().to_string()),
+            ];
+            let request = EngineRequest {
+                method: "POST",
+                uri: "/",
+                http_version: "HTTP/1.1",
+                headers: &headers,
+                body: Some(body.as_bytes()),
+            };
+            let native = matches!(engine.evaluate(&request), Decision::Block { .. });
+            let payload = serde_json::to_vec(&serde_json::json!({
+                "method": "POST",
+                "uri": "/",
+                "http_version": "HTTP/1.1",
+                "headers": headers,
+                "body_size": body.len(),
+                "body_original_size": body.len(),
+                "body_encoding": "utf8",
+                "body": body,
+            }))
+            .expect("payload");
+            let coraza = matches!(
+                reactor.evaluate(&payload),
+                Ok(ReactorDecision::Block { .. })
+            );
+            assert_eq!(
+                native, coraza,
+                "decision differs for {content_type}: {body}"
+            );
+        }
     }
 }

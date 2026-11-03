@@ -160,7 +160,12 @@ impl Compiler {
             self.finish_group(chain)?;
         }
         self.resolve_skip_after()?;
-        if self.program.phase1.is_empty() && self.program.phase2.is_empty() {
+        if self.program.phase1.is_empty()
+            && self.program.phase2.is_empty()
+            && self.program.phase3.is_empty()
+            && self.program.phase4.is_empty()
+            && self.program.phase5.is_empty()
+        {
             return Err(LoadError::Empty);
         }
         self.program.intern_pipelines();
@@ -248,14 +253,16 @@ impl Compiler {
                     });
                 }
                 // Markers are phase-independent in SecLang. Add the marker to
-                // both request-phase programs so a `skipAfter` in either phase
-                // can resolve it.
-                self.program
-                    .phase1
-                    .push(ProgramItem::Marker(marker.clone()));
-                self.program
-                    .phase2
-                    .push(ProgramItem::Marker(marker.clone()));
+                // every phase program so a `skipAfter` can resolve it.
+                for items in [
+                    &mut self.program.phase1,
+                    &mut self.program.phase2,
+                    &mut self.program.phase3,
+                    &mut self.program.phase4,
+                    &mut self.program.phase5,
+                ] {
+                    items.push(ProgramItem::Marker(marker.clone()));
+                }
                 Ok(())
             }
             "SecComponentSignature" | "SecServerSignature" | "SecRuleEngine" => {
@@ -372,6 +379,9 @@ impl Compiler {
         match parent_phase {
             Phase::RequestHeaders => self.program.phase1.push(ProgramItem::Rule(Box::new(group))),
             Phase::RequestBody => self.program.phase2.push(ProgramItem::Rule(Box::new(group))),
+            Phase::ResponseHeaders => self.program.phase3.push(ProgramItem::Rule(Box::new(group))),
+            Phase::ResponseBody => self.program.phase4.push(ProgramItem::Rule(Box::new(group))),
+            Phase::Logging => self.program.phase5.push(ProgramItem::Rule(Box::new(group))),
         }
         Ok(())
     }
@@ -499,7 +509,7 @@ impl Compiler {
                             parsed.id,
                             line,
                             format!("action:phase:{number}"),
-                            "only request phases 1 and 2 are implemented",
+                            "phase must be between 1 and 5",
                         ))
                     })?;
                     parsed.phase = Some(phase);
@@ -780,9 +790,23 @@ impl Compiler {
                 .note(format!("collection:{}", collection.name()), true);
             let selector = match selector_text.as_deref() {
                 None => Selector::All,
+                Some(selector) if collection == Collection::Xml => {
+                    // The only XPath expressions CRS uses are the two
+                    // synthetic keys the XML processor populates. Anything
+                    // else is reported as unsupported instead of silently
+                    // resolving to an empty collection.
+                    if selector == "/*" || selector == "//@*" {
+                        Selector::Key(selector.to_string())
+                    } else {
+                        return Err(LoadError::Unsupported(UnsupportedConstruct::new(
+                            None,
+                            line,
+                            format!("collection:XML:{selector}"),
+                            "only XML:/* and XML://@* XPath selectors are implemented",
+                        )));
+                    }
+                }
                 Some(selector) if selector.starts_with("/*") || selector.starts_with("//") => {
-                    // XML/JSON XPath selectors are accepted but the reactor never
-                    // enables the XML processor, so the collection is empty.
                     Selector::All
                 }
                 Some(selector)
@@ -1038,6 +1062,9 @@ impl Compiler {
     fn resolve_skip_after(&mut self) -> Result<(), LoadError> {
         Self::resolve_skip_after_phase(&mut self.program.phase1)?;
         Self::resolve_skip_after_phase(&mut self.program.phase2)?;
+        Self::resolve_skip_after_phase(&mut self.program.phase3)?;
+        Self::resolve_skip_after_phase(&mut self.program.phase4)?;
+        Self::resolve_skip_after_phase(&mut self.program.phase5)?;
         Ok(())
     }
 

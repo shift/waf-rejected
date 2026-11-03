@@ -6,6 +6,15 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Added
 
+- **Native Rust engine body processors and response phases:** Coraza-compatible
+  JSON (`gjson`-style `json.` flattening into `ARGS_POST`) and XML
+  (`XML:/*`/`XML://@*`, no external DTD/entity access) request body processors,
+  `ctl:requestBodyProcessor` selection parity, Go-compatible `REQUEST_URI`
+  normalisation/percent-decoding, and opt-in phases 3–5 with response
+  headers/body collections and outbound anomaly scoring. XPath selectors other
+  than `XML:/*` and `XML://@*` fail the strict load explicitly. Non-default
+  (`rust-engine`); defaults and the Coraza path are unchanged. See
+  `docs/suggestions_from_agents/rust-engine.md`.
 - **Experimental (non-default) `parallel-args` feature:** a deterministic
   candidate-level parallel model for the native Rust CRS engine, with a
   serial-vs-parallel differential test over the 2,112-case corpus and generated

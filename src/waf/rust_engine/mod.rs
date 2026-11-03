@@ -33,9 +33,11 @@ pub mod operators;
 #[cfg(feature = "parallel-args")]
 pub mod parallel_args;
 pub mod parser;
+pub mod processors;
 #[cfg(feature = "engine-profile")]
 pub mod profile;
 pub mod request;
+pub mod response;
 pub mod transforms;
 
 pub use budget::{Budget, Limits};
@@ -47,6 +49,7 @@ pub use parser::{parse_conf_path, parse_conf_str, CompilePolicy, ConstructUse, S
 pub use request::{
     expand_macros, Candidate, Collections, EngineRequest, RequestData, ResolvedValue, TxState,
 };
+pub use response::{EngineResponse, ResponseConfig};
 
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -8,19 +8,24 @@ default**.
 
 ## TL;DR
 
-This slice replaces the Coraza *request* engine with a native Rust parser,
-compiled IR and evaluator. It compiles **501 of 505** `SecRule`/`SecAction`
-directives from the pinned bundle. The only unsupported rules are the four
-libinjection operators (`941100`, `941101`, `942100`, `942101`); strict loading
-aborts with the rule id and construct rather than dropping them.
+This slice replaces the Coraza *request and response* engine with a native Rust
+parser, compiled IR and evaluator. It compiles **505 of 505**
+`SecRule`/`SecAction` directives from the pinned bundle; with the non-default
+`native-detect` feature the four libinjection operators are provided by the
+native detector and strict loading succeeds. Without that feature those four
+rules are reported as unsupported and strict loading aborts with the rule id and
+construct rather than dropping them.
 
 On the 2,112-case pinned CRS corpus the native engine agrees with the Coraza
-oracle on **2,099 / 2,112 (99.38 %)** cases. The remaining oracle differences
-are the four libinjection rules (8 cases) plus 5 cases where the native decision
-matches the corpus and Coraza does not. See [Parity](#differential-parity).
+oracle on **2,110 / 2,112 (99.91 %)** cases. Both remaining differences are
+`crs-921250-1/2`, where the native engine blocks and Coraza allows (the native
+decision matches the corpus); see [Parity](#differential-parity).
 
 The decision path is deterministic (no wall clock, randomness or GC) and
 fail-closed (any internal error or budget overflow returns `Block`).
+Request body processors now cover URLENCODED, MULTIPART, JSON and XML, and
+phases 3–5 (response headers/body/logging) are implemented behind an explicit
+opt-in response API.
 
 ## Design rules
 
@@ -40,7 +45,7 @@ fail-closed (any internal error or budget overflow returns `Block`).
 ## Architecture
 
 ```
-crs.conf ──► parser (SecLang) ──► IR ──► Program (phase 1 / phase 2)
+crs.conf ──► parser (SecLang) ──► IR ──► Program (phases 1–5)
                                      │
                     ┌────────────────┴────────────────┐
                     │                                 │
@@ -49,7 +54,8 @@ crs.conf ──► parser (SecLang) ──► IR ──► Program (phase 1 / ph
                     └──────────────┬──────────────────┘
                                    ▼
                      Collections + TX anomaly scores
-                     (URLENCODED / MULTIPART bodies)
+        (URLENCODED / MULTIPART / JSON / XML request bodies,
+         response headers/body for opt-in phases 3–5)
                                    ▼
                         Decision + Outcome diagnostics
 ```
@@ -59,7 +65,10 @@ crs.conf ──► parser (SecLang) ──► IR ──► Program (phase 1 / ph
 | `src/waf/rust_engine/parser.rs` | SecLang logical-line/token parser, actions, variables, strict/report compilation, support matrix |
 | `src/waf/rust_engine/ir.rs` | Compiled rules, operators, selectors, actions, phases, program |
 | `src/waf/rust_engine/engine.rs` | Phase ordering, chains, `skipAfter`, `setvar`, `ctl`, anomaly checks, fail-closed wrapper |
-| `src/waf/rust_engine/request.rs` | Coraza-compatible collections, URI parsing, URLENCODED/MULTIPART processors, macros |
+| `src/waf/rust_engine/request.rs` | Coraza-compatible collections, Go-compatible URI parsing, URLENCODED/MULTIPART processors, macros |
+| `src/waf/rust_engine/processors/json.rs` | Coraza/gjson-compatible JSON flattening into `ARGS_POST` |
+| `src/waf/rust_engine/processors/xml.rs` | Non-validating XML scanner for `XML:/*` and `XML://@*` (no external DTD/entity access) |
+| `src/waf/rust_engine/response.rs` | `EngineResponse`/`ResponseConfig` and the opt-in response body-processor hooks |
 | `src/waf/rust_engine/transforms.rs` | CRS transform implementations |
 | `src/waf/rust_engine/operators.rs` | Operator implementations and phrase/regex compilation |
 | `src/waf/rust_engine/budget.rs` | Fixed per-request accounting |
@@ -76,12 +85,42 @@ Counts are from the pinned bundle in `CompilePolicy::Report` mode.
 | Category | Supported |
 |---|---|
 | Directives | `SecRule`, `SecAction`, `SecDefaultAction`, `SecMarker`, `SecComponentSignature`, `Include` |
+| Phases | `phase:1`–`phase:5` (request headers/body, response headers/body, logging) |
+| Body processors | `URLENCODED`, `MULTIPART`, `JSON` (gjson-compatible), `XML` (`/*` and `//@*`) — JSON/XML are only selected by `ctl:requestBodyProcessor`, exactly like Coraza |
+| XPath | `XML:/*` and `XML://@*`. Any other `XML:<xpath>` selector is an explicit unsupported construct at load time (strict load aborts; report mode records it) |
 | Operators | `@rx`, `@pm`, `@pmFromFile`, `@contains`, `@beginsWith`, `@endsWith`, `@within`, `@streq`, `@eq`, `@lt`, `@gt`, `@ge`, `@le`, `@validateByteRange`, `@validateUrlEncoding`, `@validateUtf8Encoding`, `@unconditionalMatch`, `@ipMatch` |
 | Transforms | `none`, `lowercase`, `uppercase`, `urlDecode`, `urlDecodeUni`, `htmlEntityDecode`, `jsDecode`, `cssDecode`, `cmdLine`, `replaceComments`, `escapeSeqDecode`, `removeWhitespace`, `normalizePath`, `normalizePathWin`, `compressWhitespace`, `removeNulls`, `base64Decode`, `sha1`, `hexEncode`, `removeCommentsChar`, `length`, `utf8toUnicode`, `trim`, `trimLeft`, `trimRight` |
 | Actions | `id`, `phase`, `block`, `pass`, `deny`, `drop`, `allow`, `status`, `chain`, `capture`, `multiMatch`, `setvar`, `ctl`, `skipAfter`, `initcol`, `msg`, `tag`, `logdata`, `severity`, `rev`, `ver`, `log`, `nolog`, `auditlog`, `noauditlog`, `t:` |
-| Collections | `ARGS`, `ARGS_GET`, `ARGS_POST`, `ARGS_NAMES`, `ARGS_GET_NAMES`, `ARGS_POST_NAMES`, `ARGS_COMBINED_SIZE`, `REQUEST_HEADERS`, `REQUEST_HEADERS_NAMES`, `REQUEST_COOKIES`, `REQUEST_COOKIES_NAMES`, `REQUEST_URI`, `REQUEST_URI_RAW`, `REQUEST_METHOD`, `REQUEST_BODY`, `REQUEST_BODY_LENGTH`, `REQUEST_FILENAME`, `REQUEST_BASENAME`, `REQUEST_LINE`, `REQUEST_PROTOCOL`, `QUERY_STRING`, `TX`, `MATCHED_VARS`, `MATCHED_VARS_NAMES`, `XML`, `FILES`, `FILES_NAMES`, `FILES_SIZES`, `FILES_COMBINED_SIZE`, `MULTIPART_PART_HEADERS`, `REQBODY_PROCESSOR`, `REMOTE_ADDR`, `UNIQUE_ID`, `RULE`, `GLOBAL`, `IP` |
+| Collections | `ARGS`, `ARGS_GET`, `ARGS_POST`, `ARGS_NAMES`, `ARGS_GET_NAMES`, `ARGS_POST_NAMES`, `ARGS_COMBINED_SIZE`, `REQUEST_HEADERS`, `REQUEST_HEADERS_NAMES`, `REQUEST_COOKIES`, `REQUEST_COOKIES_NAMES`, `REQUEST_URI`, `REQUEST_URI_RAW`, `REQUEST_METHOD`, `REQUEST_BODY`, `REQUEST_BODY_LENGTH`, `REQUEST_FILENAME`, `REQUEST_BASENAME`, `REQUEST_LINE`, `REQUEST_PROTOCOL`, `QUERY_STRING`, `TX`, `MATCHED_VARS`, `MATCHED_VARS_NAMES`, `XML`, `FILES`, `FILES_NAMES`, `FILES_SIZES`, `FILES_COMBINED_SIZE`, `MULTIPART_PART_HEADERS`, `REQBODY_PROCESSOR`, `REMOTE_ADDR`, `UNIQUE_ID`, `RULE`, `GLOBAL`, `IP`, `RESPONSE_STATUS`, `RESPONSE_PROTOCOL`, `RESPONSE_HEADERS`, `RESPONSE_HEADERS_NAMES`, `RESPONSE_BODY`, `RESPONSE_BODY_LENGTH`, `RESPONSE_CONTENT_TYPE`, `RESPONSE_CONTENT_LENGTH`, `RESPONSE_ARGS`, `RESPONSE_XML`, `OUTBOUND_DATA_ERROR` |
+
+### Body processors and URI parity
+
+* **JSON** follows `internal/bodyprocessors/json.go`: keys are flattened with a
+  `json.` prefix, array indices are numeric, an array also writes its length at
+  the array path, `null` becomes `""`, numbers/booleans keep their raw spelling,
+  duplicate keys are last-wins and malformed input yields no arguments. The
+  native parser adds a depth/value bound (`ProcessorLimits`, 64 levels /
+  16,384 values) that Coraza's `TODO add some anti DOS protection` does not
+  have; overflow leaves the collection empty.
+* **XML** follows `internal/bodyprocessors/xml.go`: attribute values populate
+  `XML://@*`, trimmed character data (including CDATA) populates `XML:/*`.
+  Declarations (including `DOCTYPE`) are skipped and **no external DTD,
+  network or entity resolution is ever attempted**. Deviations from Go's
+  decoder are documented in `processors/xml.rs`: only predefined/numeric and a
+  small HTML entity subset are decoded (unknown entities are preserved),
+  mismatched/unclosed tags are processor errors (XML stays empty), and the
+  HTML auto-close rules are a compact subset.
+* **URI** now mirrors Go `net/url.ParseRequestURI` + `URL.String()`:
+  `REQUEST_URI` re-encodes a raw space/backslash/non-ASCII path with uppercase
+  `%XX` while preserving an already valid `RawPath`; `REQUEST_FILENAME` is the
+  percent-decoded path; opaque/authority-only URIs (`www.coreruleset.org:80`,
+  `http://localhost`) and `//host/path` follow Go. `REQUEST_URI_RAW` remains the
+  untouched wire value.
 
 ### Unsupported in this slice
+
+Without the non-default `native-detect` feature, strict loading still aborts on
+the four libinjection rules:
 
 | Rule | Construct | Why |
 |---:|---|---|
@@ -90,14 +129,16 @@ Counts are from the pinned bundle in `CompilePolicy::Report` mode.
 | 942100 | `@detectSQLi` | libinjection SQLi port not started |
 | 942101 | `@detectSQLi` | libinjection SQLi port not started |
 
-Strict mode aborts on the first of these with the rule id and construct. Report
-mode records them and skips only those rules, which is why the parity harness
-can still measure the rest of the bundle.
+With `native-detect` these four rules compile and the pinned bundle is 505/505.
+Report mode records any unsupported construct and skips only those rules, which
+is why the parity harness can still measure the rest of the bundle.
 
-The `XML` collection is accepted and empty: the WASI reactor never enables the
-XML body processor, so `XML:/*` is empty for every corpus request. The
-`REMOTE_ADDR` and `UNIQUE_ID` singles are empty for the same reason
-(`ProcessConnection` is not called by the reactor).
+Unsupported beyond the pinned request bundle: arbitrary XPath selectors,
+`SecRuleUpdateActionById`, `SecRuleRemoveById` directives, `@geoLookup`, `@rbl`,
+`@inspectFile`, `@validateNid`, and response-side `ctl:responseBodyAccess` /
+`ctl:responseBodyProcessor` (response inspection is configured through
+`ResponseConfig` instead). `REMOTE_ADDR` and `UNIQUE_ID` remain empty because
+the WASI reactor never calls `ProcessConnection`.
 
 ## Differential parity
 
@@ -113,28 +154,37 @@ allow), pinned CRS 4.14.0, PL1.
 
 | Comparison | Result |
 |---|---|
-| Native vs Coraza | **2,099 / 2,112 agree (99.38 %)** |
-| Native vs expected | 11 false negatives, 88 false positives |
+| Native vs Coraza | **2,110 / 2,112 agree (99.91 %)** |
+| Native vs expected | 3 false negatives, 91 false positives |
 | Coraza vs expected | 5 false negatives, 91 false positives |
 
 The corpus itself contains 91 cases where the full CRS blocks a request the
 upstream regression test marks `allow`; those are corpus/oracle false positives,
-not native-engine regressions. The native engine has three fewer false
-positives than the oracle on this corpus (88 vs 91).
+not native-engine regressions.
 
 Remaining native-vs-oracle differences:
 
-* **8 cases** exercise the four libinjection rules (`941100`, `942100`), which
-  this slice reports as unsupported.
 * **2 cases** (`crs-921250-1/2`) are old-cookie `$Version` detection where the
   native engine matches the corpus and Coraza does not.
-* **3 cases** (`crs-934160-1`, `crs-942151-13/14`) are oracle false positives;
-  the native engine correctly allows them.
 
-Both engines also miss **3 cases** (`crs-944150-12/13/14`) that the corpus
-expects to block: a JSON Log4Shell body whose raw representation is not exposed
-by the reactor's URLENCODED projection. JSON body processing is shared
-follow-up work, not a native-vs-oracle difference.
+Both engines miss **3 cases** (`crs-944150-12/13/14`) that the corpus expects to
+block: a JSON Log4Shell body. Coraza never selects the JSON processor from
+`Content-Type` (JSON/XML require `ctl:requestBodyProcessor`), so its
+`ARGS_POST` is empty and the reactor's `REQUEST_BODY` projection misses the
+body. The native JSON processor is available, but enabling it automatically
+would diverge from Coraza; these three remain shared false negatives of the
+pinned request rules.
+
+Per-category differential status:
+
+| Category | Result |
+|---|---|
+| CRS request corpus (2,112) | 2,110/2,112 agree; 2 known oracle differences |
+| JSON `Content-Type` selection | 6/6 differential cases agree with the reactor (`engine::tests::json_and_xml_content_type_selection_matches_coraza_reactor`) |
+| XML `Content-Type` selection | same 6/6 differential cases |
+| `ctl`-forced JSON flattening | unit vectors copied from `internal/bodyprocessors/json.go` (nested objects, arrays/length, duplicates, raw scalars, malformed) |
+| `ctl`-forced XML collections | unit vectors for attributes, character data, CDATA, entities, DOCTYPE, malformed input |
+| Response phases 3–5 | no live oracle: the WASI reactor never calls `ProcessResponseHeaders`/`ProcessResponseBody`. Verified with native unit tests for status/headers/body gating and outbound anomaly scoring |
 
 ## Performance
 
@@ -166,24 +216,25 @@ idle host are ~2.3 ms / 39 ms / 168 ms / 351 ms (bodyless / 1 / 4 / 8 KiB).
 ## Remaining work to full replacement
 
 1. **Port libinjection** (`@detectSQLi`, `@detectXSS`) or vendor a Rust
-   implementation, then compile rules 941100/941101/942100/942101. This is the
-   only strict-load blocker.
-2. **JSON and XML body processors.** The reactor only selects URLENCODED and
-   MULTIPART today; full replacement needs the JSON/XML processors, XPath
-   (`XML:/*`, `XML://@*`) and the corresponding `ctl:requestBodyProcessor`.
-3. **URI `String()` encoding.** Coraza exposes `REQUEST_URI` as Go's
-   `url.URL.String()`, which percent-encodes spaces/backslashes. The slice keeps
-   the raw form; `REQUEST_URI_RAW` is exact.
-4. **Selector and macro edge cases.** Regex selectors are lowercased for
-   case-insensitive collections like Coraza; more work is needed for XPath
-   selectors, `@pmFromDataset`, and dynamic collections.
-5. **Response phases.** Only request phases 1 and 2 are implemented. Phases
-   3–5, response body processors and outbound anomaly scoring are out of scope.
-6. **Coraza feature parity.** `@geoLookup`, `@rbl`, `@inspectFile`,
-   `@validateNid`, `SecRuleUpdateActionById`, `SecRuleRemoveById` and the
-   response-side directives still need implementations or explicit unsupported
-   reporting.
-7. **Wire the engine into the proxy.** `RustEngineRule` implements `WafRule`,
+   implementation with the same detection quality as the `native-detect`
+   feature. `native-detect` closes the strict-load blocker behind a non-default
+   feature; the default build still reports these four rules as unsupported.
+2. **XPath coverage.** Only `XML:/*` and `XML://@*` are implemented. Broader
+   XPath is reported as an unsupported construct; no rule is silently skipped.
+3. **XML fidelity.** The non-validating scanner intentionally omits Go's full
+   `HTMLEntity` table and complete HTML auto-close map. Add them only if a
+   deployment rule depends on those entities; external DTD/entity resolution
+   will stay disabled by design.
+4. **Response wiring.** Phases 3–5 compile and evaluate, and `ResponseConfig`
+   gates body inspection, but the proxy does not call
+   `RustEngine::evaluate_response` yet and `ctl:responseBodyAccess` /
+   `ctl:responseBodyProcessor` are unsupported. Wire response capture and the
+   outbound blocking rules before enabling outbound CRS rules by default.
+5. **Coraza feature parity.** `@geoLookup`, `@rbl`, `@inspectFile`,
+   `@validateNid`, `@pmFromDataset`, `SecRuleUpdateActionById`,
+   `SecRuleRemoveById` and dynamic collections still need implementations or
+   explicit unsupported reporting.
+6. **Wire the engine into the proxy.** `RustEngineRule` implements `WafRule`,
    but the default backend remains Coraza until parity is proven on the
    deployment corpus and the remaining items above are closed.
 
@@ -191,8 +242,10 @@ idle host are ~2.3 ms / 39 ms / 168 ms / 351 ms (bodyless / 1 / 4 / 8 KiB).
 
 ```sh
 nix develop -c cargo fmt -- --check
-nix develop -c cargo test --lib --features rust-engine
-nix develop -c cargo clippy --lib --features rust-engine -- --deny warnings
+nix develop -c cargo test --lib --features rust-engine,native-detect,engine-kernel
+nix develop -c cargo clippy --lib --features rust-engine,native-detect,engine-kernel -- --deny warnings
 nix develop -c cargo run --features rust-engine --bin rust-engine-parity -- --report-only
-nix develop -c cargo run --features rust-engine --bin rust-engine-parity -- --engine both
+nix develop -c cargo run --features rust-engine,wasm-reactor --bin rust-engine-parity -- --engine both
+nix develop -c cargo test --lib --features rust-engine,native-detect,engine-kernel,wasm-reactor \
+  json_and_xml_content_type_selection
 ```

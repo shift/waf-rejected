@@ -13,6 +13,7 @@ use super::budget::Budget;
 use super::error::EngineError;
 use super::ir::{Collection, Selector, VariableSpec};
 use super::operators::MacroResolver;
+use super::processors::{self, ProcessorLimits};
 
 /// One key/value pair in a keyed collection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +70,20 @@ pub struct RequestData<'a> {
     files_names: Vec<Entry<'a>>,
     files_sizes: Vec<Entry<'a>>,
     multipart_part_headers: Vec<Entry<'a>>,
+    xml: Vec<Entry<'a>>,
+
+    // Response phases (3–5). Populated only by `attach_response`.
+    response_attached: bool,
+    response_status: String,
+    response_protocol: String,
+    response_headers: Vec<Entry<'a>>,
+    response_body: Option<Vec<u8>>,
+    response_body_length: usize,
+    response_content_type: String,
+    response_content_length: String,
+    response_args: Vec<Entry<'a>>,
+    response_xml: Vec<Entry<'a>>,
+    outbound_data_error: bool,
 
     request_uri: Cow<'a, [u8]>,
     request_uri_raw: Cow<'a, [u8]>,
@@ -190,7 +205,13 @@ impl<'a> Collections<'a> {
         }
 
         let args_get = if parsed.valid {
-            parse_query(parsed.query, b'&')
+            parse_query(parsed.query.as_ref(), b'&')
+                .into_iter()
+                .map(|entry| Entry {
+                    key: Cow::Owned(entry.key.into_owned()),
+                    value: Cow::Owned(entry.value.into_owned()),
+                })
+                .collect()
         } else {
             Vec::new()
         };
@@ -204,7 +225,19 @@ impl<'a> Collections<'a> {
             files_names: Vec::new(),
             files_sizes: Vec::new(),
             multipart_part_headers: Vec::new(),
-            request_uri: Cow::Borrowed(parsed.request_uri),
+            xml: Vec::new(),
+            response_attached: false,
+            response_status: String::new(),
+            response_protocol: String::new(),
+            response_headers: Vec::new(),
+            response_body: None,
+            response_body_length: 0,
+            response_content_type: String::new(),
+            response_content_length: String::new(),
+            response_args: Vec::new(),
+            response_xml: Vec::new(),
+            outbound_data_error: false,
+            request_uri: parsed.request_uri,
             request_uri_raw: Cow::Borrowed(request.uri.as_bytes()),
             request_method: Cow::Borrowed(request.method.as_bytes()),
             request_body: None,
@@ -218,7 +251,7 @@ impl<'a> Collections<'a> {
                 .into_bytes(),
             ),
             request_protocol: Cow::Borrowed(request.http_version.as_bytes()),
-            query_string: Cow::Borrowed(parsed.query),
+            query_string: parsed.query,
             files_combined_size: 0,
             reqbody_processor,
         };
@@ -288,6 +321,8 @@ impl<'a> Collections<'a> {
         let processor_name = processor.as_deref().unwrap_or(&self.data.reqbody_processor);
         let urlencoded = processor_name.eq_ignore_ascii_case("urlencoded");
         let multipart = processor_name.eq_ignore_ascii_case("multipart");
+        let json = processor_name.eq_ignore_ascii_case("json");
+        let xml = processor_name.eq_ignore_ascii_case("xml");
         budget.bytes(body.len())?;
 
         if let Some(processor) = processor {
@@ -298,6 +333,34 @@ impl<'a> Collections<'a> {
             self.data.request_body = Some(Cow::Borrowed(body));
         } else if multipart {
             self.parse_multipart(body, budget)?;
+        } else if json {
+            // Coraza's JSON processor writes only ARGS_POST; it does not set
+            // REQUEST_BODY. Malformed input produces no arguments.
+            if let Ok(values) = processors::json::process(body, &ProcessorLimits::default()) {
+                for (key, value) in values {
+                    self.data.args_post.push(Entry {
+                        key: Cow::Owned(key),
+                        value: Cow::Owned(value),
+                    });
+                }
+            }
+        } else if xml {
+            // `XML://@*` holds attributes, `XML:/*` character data. No
+            // external DTD/entity resolution happens in the processor.
+            if let Ok(values) = processors::xml::process(body) {
+                for value in values.attributes {
+                    self.data.xml.push(Entry {
+                        key: Cow::Borrowed("//@*"),
+                        value: Cow::Owned(value),
+                    });
+                }
+                for value in values.content {
+                    self.data.xml.push(Entry {
+                        key: Cow::Borrowed("/*"),
+                        value: Cow::Owned(value),
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -432,6 +495,60 @@ impl<'a> Collections<'a> {
     /// Applies `ctl:forceRequestBodyVariable=...`.
     pub fn set_force_request_body_variable(&mut self, force: bool) {
         self.state.force_request_body_variable = force;
+    }
+
+    /// Attaches the upstream response for phases 3–5.
+    ///
+    /// Header values are exposed as `RESPONSE_HEADERS`, the status as
+    /// `RESPONSE_STATUS`, and (when [`ResponseConfig::inspect_body`] is set)
+    /// the body as `RESPONSE_BODY` or through the configured body processor.
+    pub fn attach_response(
+        &mut self,
+        response: &super::response::EngineResponse<'_>,
+        config: &super::response::ResponseConfig,
+    ) {
+        self.data.response_attached = true;
+        self.data.response_status = response.status.to_string();
+        self.data.response_protocol = response.protocol.to_string();
+        self.data.response_headers.clear();
+        for (name, value) in response.headers {
+            if name.eq_ignore_ascii_case("content-type") {
+                self.data.response_content_type =
+                    value.split(';').next().unwrap_or(value).trim().to_string();
+            }
+            if name.eq_ignore_ascii_case("content-length") {
+                self.data.response_content_length = value.trim().to_string();
+            }
+            self.data.response_headers.push(Entry {
+                key: Cow::Owned(name.clone()),
+                value: Cow::Owned(value.as_bytes().to_vec()),
+            });
+        }
+        if self.data.response_content_length.is_empty() {
+            if let Some(body) = response.body {
+                self.data.response_content_length = body.len().to_string();
+            }
+        }
+
+        let values = super::response::process_body(response, config);
+        self.data.response_body = values.raw;
+        self.data.response_body_length = response.body.map_or(0, <[u8]>::len);
+        self.data.response_args.clear();
+        for (key, value) in values.entries {
+            let entry = Entry {
+                key: Cow::Owned(key),
+                value: Cow::Owned(value),
+            };
+            if config
+                .body_processor
+                .as_deref()
+                .is_some_and(|processor| processor.eq_ignore_ascii_case("xml"))
+            {
+                self.data.response_xml.push(entry);
+            } else {
+                self.data.response_args.push(entry);
+            }
+        }
     }
 
     /// Resolves one variable spec into values.
@@ -626,7 +743,9 @@ impl<'a> RequestData<'a> {
             Collection::Tx => state.tx_values(&spec.selector, budget, out)?,
             Collection::MatchedVars => state.matched_values(false, budget, out)?,
             Collection::MatchedVarsNames => state.matched_values(true, budget, out)?,
-            Collection::Xml => {}
+            Collection::Xml => {
+                self.keyed(Collection::Xml, &self.xml, &[], &spec.selector, budget, out)?
+            }
             Collection::Files => self.keyed(
                 Collection::Files,
                 &self.files,
@@ -677,6 +796,87 @@ impl<'a> RequestData<'a> {
             Collection::UniqueId => {
                 self.single(Collection::UniqueId, Cow::Borrowed(&[]), budget, out)?
             }
+            Collection::OutboundDataError => self.single(
+                Collection::OutboundDataError,
+                Cow::Owned(if self.outbound_data_error { b"1" } else { b"0" }.to_vec()),
+                budget,
+                out,
+            )?,
+            Collection::ResponseStatus => self.single(
+                Collection::ResponseStatus,
+                Cow::Owned(self.response_status.clone().into_bytes()),
+                budget,
+                out,
+            )?,
+            Collection::ResponseProtocol => self.single(
+                Collection::ResponseProtocol,
+                Cow::Owned(self.response_protocol.clone().into_bytes()),
+                budget,
+                out,
+            )?,
+            Collection::ResponseHeaders => self.keyed(
+                Collection::ResponseHeaders,
+                &self.response_headers,
+                &[],
+                &spec.selector,
+                budget,
+                out,
+            )?,
+            Collection::ResponseHeadersNames => self.names(
+                Collection::ResponseHeadersNames,
+                &self.response_headers,
+                &[],
+                &spec.selector,
+                budget,
+                out,
+            )?,
+            Collection::ResponseBody => self.single(
+                Collection::ResponseBody,
+                Cow::Owned(self.response_body.clone().unwrap_or_default()),
+                budget,
+                out,
+            )?,
+            Collection::ResponseBodyLength => self.single(
+                Collection::ResponseBodyLength,
+                Cow::Owned(
+                    if self.response_body_length > 0 {
+                        self.response_body_length.to_string()
+                    } else {
+                        self.response_content_length.clone()
+                    }
+                    .into_bytes(),
+                ),
+                budget,
+                out,
+            )?,
+            Collection::ResponseContentType => self.single(
+                Collection::ResponseContentType,
+                Cow::Owned(self.response_content_type.clone().into_bytes()),
+                budget,
+                out,
+            )?,
+            Collection::ResponseContentLength => self.single(
+                Collection::ResponseContentLength,
+                Cow::Owned(self.response_content_length.clone().into_bytes()),
+                budget,
+                out,
+            )?,
+            Collection::ResponseArgs => self.keyed(
+                Collection::ResponseArgs,
+                &self.response_args,
+                &[],
+                &spec.selector,
+                budget,
+                out,
+            )?,
+            Collection::ResponseXml => self.keyed(
+                Collection::ResponseXml,
+                &self.response_xml,
+                &[],
+                &spec.selector,
+                budget,
+                out,
+            )?,
             Collection::Rule | Collection::Global | Collection::Ip => {}
         }
 
@@ -1124,6 +1324,11 @@ fn expand_macro_name<'r, 'a>(
         "request_protocol" => Cow::Borrowed(data.request_protocol.as_ref()),
         "query_string" => Cow::Borrowed(data.query_string.as_ref()),
         "remote_addr" | "unique_id" => Cow::Borrowed(&[]),
+        "response_status" => Cow::Owned(data.response_status.clone().into_bytes()),
+        "response_protocol" => Cow::Owned(data.response_protocol.clone().into_bytes()),
+        "response_body" => Cow::Owned(data.response_body.clone().unwrap_or_default()),
+        "response_content_type" => Cow::Owned(data.response_content_type.clone().into_bytes()),
+        "response_content_length" => Cow::Owned(data.response_content_length.clone().into_bytes()),
         _ => Cow::Borrowed(&[]),
     }
 }
@@ -1388,113 +1593,242 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 struct ParsedUri<'a> {
-    request_uri: &'a [u8],
+    request_uri: Cow<'a, [u8]>,
     path: Cow<'a, [u8]>,
     basename: Cow<'a, [u8]>,
-    query: &'a [u8],
+    query: Cow<'a, [u8]>,
     valid: bool,
 }
 
 impl<'a> ParsedUri<'a> {
+    /// Mirrors `net/url.ParseRequestURI` + `(*url.URL).String()` for the parts
+    /// Coraza exposes as `REQUEST_URI`, `REQUEST_FILENAME` and `QUERY_STRING`.
     fn parse(uri: &'a str) -> Self {
         let without_fragment = match uri.find('#') {
             Some(index) => &uri[..index],
             None => uri,
         };
-        if !is_valid_request_uri(without_fragment) {
+        if without_fragment.is_empty()
+            || without_fragment
+                .bytes()
+                .any(|byte| byte < 0x20 || byte == 0x7f)
+        {
+            return Self::invalid(without_fragment);
+        }
+        if without_fragment == "*" {
             return Self {
-                request_uri: without_fragment.as_bytes(),
-                path: Cow::Borrowed(without_fragment.as_bytes()),
-                basename: basename(without_fragment.as_bytes()),
-                query: &[],
-                valid: false,
+                request_uri: Cow::Borrowed(b"*"),
+                path: Cow::Borrowed(b"*"),
+                basename: Cow::Borrowed(b"*"),
+                query: Cow::Borrowed(&[]),
+                valid: true,
             };
         }
-        let target = request_target(without_fragment);
-        let (path_raw, query_raw) = match target.find('?') {
-            Some(index) => (&target[..index], &target[index + 1..]),
-            None => (target, ""),
+
+        let (scheme, rest) = split_scheme(without_fragment);
+        let scheme = scheme.to_ascii_lowercase();
+        let (rest, query, force_query) = split_query(rest);
+
+        if !rest.starts_with('/') {
+            if !scheme.is_empty() {
+                // RFC 3986 opaque path, e.g. `mailto:x` / `host:80`.
+                let mut request_uri = String::with_capacity(scheme.len() + 1 + rest.len());
+                request_uri.push_str(&scheme);
+                request_uri.push(':');
+                request_uri.push_str(rest);
+                append_query(&mut request_uri, query, force_query);
+                return Self {
+                    request_uri: Cow::Owned(request_uri.into_bytes()),
+                    path: Cow::Borrowed(&[]),
+                    basename: Cow::Borrowed(&[]),
+                    query: Cow::Borrowed(query.as_bytes()),
+                    valid: true,
+                };
+            }
+            return Self::invalid(without_fragment);
+        }
+
+        // A scheme plus `//` is an authority; without a scheme, `//foo` is a
+        // path for request URIs (`viaRequest` in net/url).
+        let (host, path_raw) = if !scheme.is_empty() && rest.starts_with("//") {
+            let rest = &rest[2..];
+            match rest.find('/') {
+                Some(index) => (&rest[..index], &rest[index..]),
+                None => (rest, ""),
+            }
+        } else {
+            ("", rest)
         };
-        let path = percent_decode(path_raw.as_bytes(), false);
+
+        let Some(path) = decode_path(path_raw.as_bytes()) else {
+            return Self::invalid(without_fragment);
+        };
+        let escaped = if encoded_path_is_valid(path_raw.as_bytes()) {
+            path_raw.to_string()
+        } else {
+            escape_path(&path)
+        };
+
+        let path: Cow<'a, [u8]> = Cow::Owned(path);
+        let basename = basename_cow(path.clone());
+        let request_uri = if scheme.is_empty() && escaped == path_raw && !force_query {
+            // The common origin-form case: Go's String() is byte-identical to
+            // the wire request target, so keep it zero-copy.
+            Cow::Borrowed(without_fragment.as_bytes())
+        } else {
+            let mut request_uri =
+                String::with_capacity(scheme.len() + host.len() + escaped.len() + 2);
+            if !scheme.is_empty() {
+                request_uri.push_str(&scheme);
+                request_uri.push_str("://");
+                request_uri.push_str(host);
+            }
+            request_uri.push_str(&escaped);
+            append_query(&mut request_uri, query, force_query);
+            Cow::Owned(request_uri.into_bytes())
+        };
         Self {
-            request_uri: without_fragment.as_bytes(),
-            basename: basename_cow(path.clone()),
+            request_uri,
             path,
-            query: query_raw.as_bytes(),
+            basename,
+            query: Cow::Borrowed(query.as_bytes()),
             valid: true,
         }
     }
+
+    fn invalid(raw: &'a str) -> Self {
+        let bytes = raw.as_bytes();
+        Self {
+            request_uri: Cow::Borrowed(bytes),
+            path: Cow::Borrowed(bytes),
+            basename: basename(bytes),
+            query: Cow::Borrowed(&[]),
+            valid: false,
+        }
+    }
 }
 
-/// Mirrors the parts of `net/url.ParseRequestURI` that change Coraza's
-/// collection values: control bytes and invalid path escapes are rejected;
-/// spaces, backslashes and invalid query escapes are accepted.
-fn is_valid_request_uri(uri: &str) -> bool {
-    if uri.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
-        return false;
+/// Splits the leading RFC 3986 scheme (`alpha *( alpha / digit / "+" / "-" /
+/// "." )`) when it is followed by `:`. Returns `("", uri)` otherwise.
+fn split_scheme(uri: &str) -> (&str, &str) {
+    let bytes = uri.as_bytes();
+    if !bytes.first().is_some_and(u8::is_ascii_alphabetic) {
+        return ("", uri);
     }
-    if uri.is_empty() {
-        return false;
+    let mut index = 1;
+    while index < bytes.len()
+        && (bytes[index].is_ascii_alphanumeric() || matches!(bytes[index], b'+' | b'-' | b'.'))
+    {
+        index += 1;
     }
-    if !(uri.starts_with('/') || uri == "*" || uri.starts_with("//") || has_scheme(uri)) {
-        return false;
+    if bytes.get(index) == Some(&b':') {
+        (&uri[..index], &uri[index + 1..])
+    } else {
+        ("", uri)
     }
-    let target = request_target(uri);
-    let path = target.split('?').next().unwrap_or(target);
-    valid_percent_escapes(path.as_bytes())
 }
 
-/// Returns the request target after a leading scheme+authority or `//`
-/// authority. A `://` later in the query is not a scheme.
-fn request_target(uri: &str) -> &str {
-    if let Some(rest) = uri.strip_prefix("//") {
-        return match rest.find('/') {
-            Some(slash) => &rest[slash..],
-            None => "/",
-        };
+/// Go splits a lone trailing `?` into `ForceQuery`.
+fn split_query(rest: &str) -> (&str, &str, bool) {
+    if rest.ends_with('?') && rest.bytes().filter(|byte| *byte == b'?').count() == 1 {
+        return (&rest[..rest.len() - 1], "", true);
     }
-    if has_scheme(uri) {
-        let index = uri.find("://").unwrap_or(0);
-        let after_scheme = &uri[index + 3..];
-        return match after_scheme.find('/') {
-            Some(slash) => &after_scheme[slash..],
-            None => "/",
-        };
+    match rest.find('?') {
+        Some(index) => (&rest[..index], &rest[index + 1..], false),
+        None => (rest, "", false),
     }
-    uri
 }
 
-fn has_scheme(uri: &str) -> bool {
-    let Some(index) = uri.find("://") else {
-        return false;
-    };
-    let scheme = &uri[..index];
-    !scheme.is_empty()
-        && scheme
-            .chars()
-            .next()
-            .is_some_and(|ch| ch.is_ascii_alphabetic())
-        && scheme
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+fn append_query(out: &mut String, query: &str, force: bool) {
+    if force || !query.is_empty() {
+        out.push('?');
+        out.push_str(query);
+    }
 }
 
-fn valid_percent_escapes(value: &[u8]) -> bool {
-    let mut i = 0;
-    while i < value.len() {
-        if value[i] == b'%' {
-            if i + 2 >= value.len()
-                || !value[i + 1].is_ascii_hexdigit()
-                || !value[i + 2].is_ascii_hexdigit()
+/// Strict path unescape: invalid `%` escapes make `ParseRequestURI` fail.
+fn decode_path(raw: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut index = 0;
+    while index < raw.len() {
+        if raw[index] == b'%' {
+            let high = *raw.get(index + 1)?;
+            let low = *raw.get(index + 2)?;
+            if !high.is_ascii_hexdigit() || !low.is_ascii_hexdigit() {
+                return None;
+            }
+            out.push((hex_value(high) << 4) | hex_value(low));
+            index += 3;
+            continue;
+        }
+        out.push(raw[index]);
+        index += 1;
+    }
+    Some(out)
+}
+
+/// True when `raw` is already a valid `encodePath` encoding: every byte is
+/// permitted and every `%` is followed by two hex digits. This is the
+/// condition under which Go's `URL.String()` keeps `RawPath` verbatim.
+fn encoded_path_is_valid(raw: &[u8]) -> bool {
+    let mut index = 0;
+    while index < raw.len() {
+        if raw[index] == b'%' {
+            if index + 2 >= raw.len()
+                || !raw[index + 1].is_ascii_hexdigit()
+                || !raw[index + 2].is_ascii_hexdigit()
             {
                 return false;
             }
-            i += 3;
-        } else {
-            i += 1;
+            index += 3;
+            continue;
         }
+        if !path_byte_allowed(raw[index]) {
+            return false;
+        }
+        index += 1;
     }
     true
+}
+
+/// Bytes Go leaves unescaped under `encodePath`.
+fn path_byte_allowed(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'-' | b'_'
+                | b'.'
+                | b'~'
+                | b'!'
+                | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b'/'
+                | b':'
+                | b';'
+                | b'='
+                | b'@'
+        )
+}
+
+fn escape_path(path: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(path.len());
+    for byte in path {
+        if path_byte_allowed(*byte) {
+            out.push(*byte as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    out
 }
 
 fn basename(path: &[u8]) -> Cow<'_, [u8]> {
@@ -1535,21 +1869,52 @@ mod tests {
     }
 
     #[test]
-    fn uri_parsing_matches_reactor_shape() {
+    fn uri_parsing_matches_coraza_url_string() {
         let parsed = ParsedUri::parse("/get/demo.php?x=1");
         assert!(parsed.valid);
         assert_eq!(parsed.path.as_ref(), b"/get/demo.php");
         assert_eq!(parsed.basename.as_ref(), b"demo.php");
-        assert_eq!(parsed.query, b"x=1");
+        assert_eq!(parsed.query.as_ref(), b"x=1");
+        assert_eq!(parsed.request_uri.as_ref(), b"/get/demo.php?x=1");
 
-        let invalid = ParsedUri::parse("/get with space?x=1");
-        assert!(invalid.valid);
-        assert_eq!(invalid.path.as_ref(), b"/get with space");
-        assert_eq!(invalid.query, b"x=1");
+        let spaced = ParsedUri::parse("/get with space?x=1");
+        assert!(spaced.valid);
+        assert_eq!(spaced.path.as_ref(), b"/get with space");
+        assert_eq!(spaced.query.as_ref(), b"x=1");
+        // Go's URL.String() re-encodes a raw space in the path.
+        assert_eq!(spaced.request_uri.as_ref(), b"/get%20with%20space?x=1");
+
+        let escaped = ParsedUri::parse("/get/%41%2f%5c?x=1");
+        assert_eq!(escaped.path.as_ref(), b"/get/A/\\");
+        // A valid RawPath is preserved verbatim.
+        assert_eq!(escaped.request_uri.as_ref(), b"/get/%41%2f%5c?x=1");
 
         let invalid = ParsedUri::parse("CONNECT");
         assert!(!invalid.valid);
         assert_eq!(invalid.path.as_ref(), b"CONNECT");
+
+        let absolute = ParsedUri::parse("http://Example.COM/a%20b?q=1");
+        assert_eq!(absolute.path.as_ref(), b"/a b");
+        assert_eq!(
+            absolute.request_uri.as_ref(),
+            b"http://Example.COM/a%20b?q=1"
+        );
+
+        let opaque = ParsedUri::parse("www.coreruleset.org:80");
+        assert!(opaque.valid);
+        assert_eq!(opaque.path.as_ref(), b"");
+        assert_eq!(opaque.request_uri.as_ref(), b"www.coreruleset.org:80");
+
+        let authority = ParsedUri::parse("http://localhost");
+        assert_eq!(authority.path.as_ref(), b"");
+        assert_eq!(authority.request_uri.as_ref(), b"http://localhost");
+
+        let double_slash = ParsedUri::parse("//host/path");
+        assert_eq!(double_slash.path.as_ref(), b"//host/path");
+
+        let broken_escape = ParsedUri::parse("/a%zz");
+        assert!(!broken_escape.valid);
+        assert_eq!(broken_escape.path.as_ref(), b"/a%zz");
     }
 
     #[test]
