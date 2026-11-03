@@ -163,6 +163,7 @@ impl Compiler {
         if self.program.phase1.is_empty() && self.program.phase2.is_empty() {
             return Err(LoadError::Empty);
         }
+        self.program.intern_pipelines();
         Ok((self.program, self.report))
     }
 
@@ -444,6 +445,7 @@ impl Compiler {
             variables,
             operator,
             transforms: parsed.transforms,
+            pipeline: 0,
             actions,
             metadata,
             file: raw.file.clone(),
@@ -863,13 +865,35 @@ impl Compiler {
             "validateutf8encoding" => OperatorKind::ValidateUtf8Encoding,
             "unconditionalmatch" => OperatorKind::UnconditionalMatch,
             "ipmatch" => OperatorKind::IpMatch(parse_ip_match(argument)),
-            "detectsqli" | "detectxss" => {
-                return Err(LoadError::Unsupported(UnsupportedConstruct::new(
-                    id,
-                    line,
-                    format!("operator:@{}", lower),
-                    "libinjection-based operator is not ported yet",
-                )));
+            "detectsqli" => {
+                #[cfg(feature = "native-detect")]
+                {
+                    OperatorKind::DetectSqlInjection
+                }
+                #[cfg(not(feature = "native-detect"))]
+                {
+                    return Err(LoadError::Unsupported(UnsupportedConstruct::new(
+                        id,
+                        line,
+                        format!("operator:@{}", lower),
+                        "requires the `native-detect` feature",
+                    )));
+                }
+            }
+            "detectxss" => {
+                #[cfg(feature = "native-detect")]
+                {
+                    OperatorKind::DetectXss
+                }
+                #[cfg(not(feature = "native-detect"))]
+                {
+                    return Err(LoadError::Unsupported(UnsupportedConstruct::new(
+                        id,
+                        line,
+                        format!("operator:@{}", lower),
+                        "requires the `native-detect` feature",
+                    )));
+                }
             }
             other => {
                 return Err(LoadError::Unsupported(UnsupportedConstruct::new(

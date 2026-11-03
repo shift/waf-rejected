@@ -599,6 +599,21 @@ impl WafEngine {
                 "waf.coraza.backend = \"native\" requires a Unix build with the `coraza-native` feature"
                     .to_string(),
             ),
+            #[cfg(feature = "rust-engine")]
+            crate::config::CorazaBackend::Rust => {
+                let path = rust_engine::default_crs_conf_path();
+                rust_engine::RustEngine::from_conf_path(&path)
+                    .map(|engine| {
+                        let rule = rust_engine::RustEngineRule::new(Arc::new(engine));
+                        (Box::new(rule) as Box<dyn WafRule>, None)
+                    })
+                    .map_err(|err| err.to_string())
+            }
+            #[cfg(not(feature = "rust-engine"))]
+            crate::config::CorazaBackend::Rust => Err(
+                "waf.coraza.backend = \"rust\" requires a build with the `rust-engine` feature"
+                    .to_string(),
+            ),
         };
 
         match result {
@@ -615,6 +630,9 @@ impl WafEngine {
                     }
                     crate::config::CorazaBackend::Native => {
                         format!("Coraza native sidecar failed to initialise: {err}")
+                    }
+                    crate::config::CorazaBackend::Rust => {
+                        format!("Rust engine failed to initialise: {err}")
                     }
                 };
                 self.record_init_error(reason.clone());

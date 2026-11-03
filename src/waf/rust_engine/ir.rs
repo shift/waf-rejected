@@ -243,6 +243,10 @@ pub enum OperatorKind {
     UnconditionalMatch,
     /// `@ipMatch`.
     IpMatch(Vec<IpMatch>),
+    /// `@detectSQLi` — native libinjection port (`native-detect` feature).
+    DetectSqlInjection,
+    /// `@detectXSS` — native libinjection port (`native-detect` feature).
+    DetectXss,
 }
 
 /// One `@ipMatch` entry.
@@ -349,6 +353,10 @@ pub struct CompiledRule {
     /// `None` for `SecAction`.
     pub operator: Option<CompiledOperator>,
     pub transforms: TransformChain,
+    /// Index into [`Program::pipelines`]. Rules with identical transform chains
+    /// share one pipeline id, so the per-value transform cache is keyed by
+    /// `(value, pipeline)` rather than by rule.
+    pub pipeline: u16,
     pub actions: Vec<Action>,
     pub metadata: RuleMetadata,
     pub file: String,
@@ -397,6 +405,8 @@ pub enum ProgramItem {
 pub struct Program {
     pub phase1: Vec<ProgramItem>,
     pub phase2: Vec<ProgramItem>,
+    /// Interned transform pipelines. `CompiledRule::pipeline` indexes this.
+    pub pipelines: Vec<TransformChain>,
 }
 
 impl Program {
@@ -406,5 +416,34 @@ impl Program {
             Phase::RequestHeaders => &self.phase1,
             Phase::RequestBody => &self.phase2,
         }
+    }
+
+    /// Interns every rule's transform chain and assigns pipeline ids.
+    ///
+    /// Identical chains (the common case in CRS: `t:lowercase,t:urlDecodeUni`
+    /// and friends) collapse to one id, which is what makes the per-value
+    /// transform cache effective.
+    pub fn intern_pipelines(&mut self) {
+        let mut pipelines: Vec<TransformChain> = Vec::new();
+        for items in [&mut self.phase1, &mut self.phase2] {
+            for item in items.iter_mut() {
+                if let ProgramItem::Rule(group) = item {
+                    for rule in &mut group.rules {
+                        let id = match pipelines
+                            .iter()
+                            .position(|pipeline| *pipeline == rule.transforms)
+                        {
+                            Some(id) => id,
+                            None => {
+                                pipelines.push(rule.transforms.clone());
+                                pipelines.len() - 1
+                            }
+                        };
+                        rule.pipeline = u16::try_from(id).unwrap_or(u16::MAX);
+                    }
+                }
+            }
+        }
+        self.pipelines = pipelines;
     }
 }

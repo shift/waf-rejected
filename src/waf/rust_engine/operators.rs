@@ -117,6 +117,36 @@ impl CompiledOperator {
                 };
                 entries.iter().any(|entry| ip_match(entry, address))
             }
+            OperatorKind::DetectSqlInjection => {
+                #[cfg(feature = "native-detect")]
+                {
+                    if !crate::waf::native_detect::sqli::is_sqli(value) {
+                        return false;
+                    }
+                    if capture {
+                        if let Some(fingerprint) =
+                            crate::waf::native_detect::sqli::sqli_fingerprint(value)
+                        {
+                            captures[0] = fingerprint;
+                        }
+                    }
+                    true
+                }
+                #[cfg(not(feature = "native-detect"))]
+                {
+                    false
+                }
+            }
+            OperatorKind::DetectXss => {
+                #[cfg(feature = "native-detect")]
+                {
+                    crate::waf::native_detect::xss::is_xss_detect(value)
+                }
+                #[cfg(not(feature = "native-detect"))]
+                {
+                    false
+                }
+            }
         }
     }
 }

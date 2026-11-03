@@ -6,7 +6,8 @@
 //! `UNIQUE_ID` are intentionally empty because the reactor never calls
 //! `ProcessConnection` and the host does not supply them.
 
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::HashMap;
 
 use super::budget::Budget;
 use super::error::EngineError;
@@ -15,9 +16,9 @@ use super::operators::MacroResolver;
 
 /// One key/value pair in a keyed collection.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Entry {
-    pub key: String,
-    pub value: Vec<u8>,
+pub struct Entry<'a> {
+    pub key: Cow<'a, str>,
+    pub value: Cow<'a, [u8]>,
 }
 
 /// A request as seen by the engine.
@@ -31,22 +32,20 @@ pub struct EngineRequest<'a> {
 }
 
 /// A resolved variable value.
+///
+/// Values from the immutable request data are borrowed (zero-copy); values
+/// that only exist in the mutable transaction state (TX, MATCHED_VARS) are
+/// owned. `cache_id` is a stable identity for the transform cache and is
+/// `None` for values that can change during a phase.
 #[derive(Debug, Clone)]
-pub struct ResolvedValue {
+pub struct Candidate<'a> {
     pub collection: Collection,
-    pub key: Option<String>,
-    pub value: Vec<u8>,
+    pub key: Option<Cow<'a, str>>,
+    pub value: Cow<'a, [u8]>,
+    pub cache_id: Option<u32>,
 }
 
-impl ResolvedValue {
-    fn new(collection: Collection, key: Option<String>, value: Vec<u8>) -> Self {
-        Self {
-            collection,
-            key,
-            value,
-        }
-    }
-
+impl<'a> Candidate<'a> {
     /// Name used by `MATCHED_VAR_NAME`, e.g. `ARGS:id` or `REQUEST_URI`.
     pub fn matched_name(&self) -> String {
         match &self.key {
@@ -56,33 +55,41 @@ impl ResolvedValue {
     }
 }
 
-/// Request state for one transaction.
-#[derive(Debug, Clone)]
-pub struct Collections {
-    tx: BTreeMap<String, (String, Vec<u8>)>,
-    args_get: Vec<Entry>,
-    args_post: Vec<Entry>,
-    headers: Vec<Entry>,
-    cookies: Vec<Entry>,
-    files: Vec<Entry>,
-    files_names: Vec<Entry>,
-    files_sizes: Vec<Entry>,
-    multipart_part_headers: Vec<Entry>,
+/// Backwards-compatible alias for the old owned resolved value.
+pub type ResolvedValue<'a> = Candidate<'a>;
 
-    request_uri: Vec<u8>,
-    request_uri_raw: Vec<u8>,
-    request_method: Vec<u8>,
-    request_body: Option<Vec<u8>>,
-    request_filename: Vec<u8>,
-    request_basename: Vec<u8>,
-    request_line: Vec<u8>,
-    request_protocol: Vec<u8>,
-    query_string: Vec<u8>,
+/// Immutable request data, parsed once per transaction.
+#[derive(Debug, Clone)]
+pub struct RequestData<'a> {
+    args_get: Vec<Entry<'a>>,
+    args_post: Vec<Entry<'a>>,
+    headers: Vec<Entry<'a>>,
+    cookies: Vec<Entry<'a>>,
+    files: Vec<Entry<'a>>,
+    files_names: Vec<Entry<'a>>,
+    files_sizes: Vec<Entry<'a>>,
+    multipart_part_headers: Vec<Entry<'a>>,
+
+    request_uri: Cow<'a, [u8]>,
+    request_uri_raw: Cow<'a, [u8]>,
+    request_method: Cow<'a, [u8]>,
+    request_body: Option<Cow<'a, [u8]>>,
+    request_filename: Cow<'a, [u8]>,
+    request_basename: Cow<'a, [u8]>,
+    request_line: Cow<'a, [u8]>,
+    request_protocol: Cow<'a, [u8]>,
+    query_string: Cow<'a, [u8]>,
     files_combined_size: usize,
 
     reqbody_processor: String,
-    request_body_processor_override: Option<String>,
-    force_request_body_variable: bool,
+}
+
+/// Mutable per-transaction state.
+#[derive(Debug, Clone)]
+pub struct TxState {
+    tx: HashMap<String, (String, Vec<u8>)>,
+    pub(crate) request_body_processor_override: Option<String>,
+    pub(crate) force_request_body_variable: bool,
     body_processed: bool,
 
     captures: [Vec<u8>; super::operators::MAX_CAPTURES],
@@ -91,16 +98,38 @@ pub struct Collections {
     matched_vars: Vec<(String, Vec<u8>)>,
 }
 
-impl Collections {
+impl Default for TxState {
+    fn default() -> Self {
+        Self {
+            tx: HashMap::new(),
+            request_body_processor_override: None,
+            force_request_body_variable: false,
+            body_processed: false,
+            captures: std::array::from_fn(|_| Vec::new()),
+            matched_var: Vec::new(),
+            matched_var_name: Vec::new(),
+            matched_vars: Vec::new(),
+        }
+    }
+}
+
+/// Request state for one transaction.
+#[derive(Debug, Clone)]
+pub struct Collections<'a> {
+    data: RequestData<'a>,
+    state: TxState,
+}
+
+impl<'a> Collections<'a> {
     /// Builds the phase-1 collection view from the request line and headers.
-    pub fn new(request: &EngineRequest<'_>, budget: &mut Budget) -> Result<Self, EngineError> {
+    pub fn new(request: &EngineRequest<'a>, budget: &mut Budget) -> Result<Self, EngineError> {
         let parsed = ParsedUri::parse(request.uri);
         let mut headers = Vec::with_capacity(request.headers.len());
         let mut reqbody_processor = String::new();
         for (name, value) in request.headers {
             headers.push(Entry {
-                key: name.clone(),
-                value: value.as_bytes().to_vec(),
+                key: Cow::Borrowed(name.as_str()),
+                value: Cow::Borrowed(value.as_bytes()),
             });
             if name.eq_ignore_ascii_case("content-type") {
                 let lower = value.to_ascii_lowercase();
@@ -123,13 +152,12 @@ impl Collections {
         }
 
         let args_get = if parsed.valid {
-            parse_query(&parsed.query, b'&')
+            parse_query(parsed.query, b'&')
         } else {
             Vec::new()
         };
 
-        let collections = Self {
-            tx: BTreeMap::new(),
+        let data = RequestData {
             args_get,
             args_post: Vec::new(),
             headers,
@@ -138,53 +166,69 @@ impl Collections {
             files_names: Vec::new(),
             files_sizes: Vec::new(),
             multipart_part_headers: Vec::new(),
-            request_uri: parsed.request_uri,
-            request_uri_raw: request.uri.as_bytes().to_vec(),
-            request_method: request.method.as_bytes().to_vec(),
+            request_uri: Cow::Borrowed(parsed.request_uri),
+            request_uri_raw: Cow::Borrowed(request.uri.as_bytes()),
+            request_method: Cow::Borrowed(request.method.as_bytes()),
             request_body: None,
             request_filename: parsed.path,
             request_basename: parsed.basename,
-            request_line: format!(
-                "{} {} {}",
-                request.method, request.uri, request.http_version
-            )
-            .into_bytes(),
-            request_protocol: request.http_version.as_bytes().to_vec(),
-            query_string: parsed.query,
+            request_line: Cow::Owned(
+                format!(
+                    "{} {} {}",
+                    request.method, request.uri, request.http_version
+                )
+                .into_bytes(),
+            ),
+            request_protocol: Cow::Borrowed(request.http_version.as_bytes()),
+            query_string: Cow::Borrowed(parsed.query),
             files_combined_size: 0,
             reqbody_processor,
-            request_body_processor_override: None,
-            force_request_body_variable: false,
-            body_processed: false,
-            captures: std::array::from_fn(|_| Vec::new()),
-            matched_var: Vec::new(),
-            matched_var_name: Vec::new(),
-            matched_vars: Vec::new(),
         };
         budget.bytes(
-            collections.request_uri.len()
-                + collections.request_uri_raw.len()
-                + collections.request_method.len()
-                + collections.request_filename.len()
-                + collections.request_basename.len()
-                + collections.request_line.len()
-                + collections.request_protocol.len()
-                + collections.query_string.len(),
+            data.request_uri.len()
+                + data.request_uri_raw.len()
+                + data.request_method.len()
+                + data.request_filename.len()
+                + data.request_basename.len()
+                + data.request_line.len()
+                + data.request_protocol.len()
+                + data.query_string.len(),
         )?;
-        Ok(collections)
+        Ok(Self {
+            data,
+            state: TxState::default(),
+        })
+    }
+
+    /// Splits the immutable request data from the mutable transaction state.
+    ///
+    /// This is what lets the engine hold zero-copy candidate spans while it
+    /// mutates TX scores and captures.
+    pub fn split(&mut self) -> (&RequestData<'a>, &mut TxState) {
+        (&self.data, &mut self.state)
+    }
+
+    /// Immutable request data.
+    pub fn data(&self) -> &RequestData<'a> {
+        &self.data
+    }
+
+    /// Mutable transaction state.
+    pub fn state_mut(&mut self) -> &mut TxState {
+        &mut self.state
     }
 
     /// Runs the body processor selected by `Content-Type` (and by `ctl` during
     /// phase 1), exactly like `Transaction::ProcessRequestBody`.
     pub fn process_body(
         &mut self,
-        request: &EngineRequest<'_>,
+        request: &EngineRequest<'a>,
         budget: &mut Budget,
     ) -> Result<(), EngineError> {
-        if self.body_processed {
+        if self.state.body_processed {
             return Ok(());
         }
-        self.body_processed = true;
+        self.state.body_processed = true;
         let Some(body) = request.body else {
             return Ok(());
         };
@@ -193,19 +237,20 @@ impl Collections {
         }
 
         let mut processor = self
+            .state
             .request_body_processor_override
             .take()
-            .unwrap_or_else(|| self.reqbody_processor.clone());
-        if self.force_request_body_variable && processor.is_empty() {
+            .unwrap_or_else(|| self.data.reqbody_processor.clone());
+        if self.state.force_request_body_variable && processor.is_empty() {
             processor = "URLENCODED".to_string();
         }
-        self.reqbody_processor = processor.clone();
+        self.data.reqbody_processor = processor.clone();
         budget.bytes(body.len())?;
 
         match processor.to_ascii_lowercase().as_str() {
             "urlencoded" => {
-                self.args_post = parse_query(body, b'&');
-                self.request_body = Some(body.to_vec());
+                self.data.args_post = parse_query(body, b'&');
+                self.data.request_body = Some(Cow::Borrowed(body));
             }
             "multipart" => {
                 self.parse_multipart(body, budget)?;
@@ -215,8 +260,9 @@ impl Collections {
         Ok(())
     }
 
-    fn parse_multipart(&mut self, body: &[u8], budget: &mut Budget) -> Result<(), EngineError> {
+    fn parse_multipart(&mut self, body: &'a [u8], budget: &mut Budget) -> Result<(), EngineError> {
         let boundary = self
+            .data
             .headers
             .iter()
             .find(|header| header.key.eq_ignore_ascii_case("content-type"))
@@ -255,29 +301,29 @@ impl Collections {
                 continue;
             };
             for (header_name, header_value) in &headers {
-                self.multipart_part_headers.push(Entry {
-                    key: name.clone(),
-                    value: format!("{header_name}: {header_value}").into_bytes(),
+                self.data.multipart_part_headers.push(Entry {
+                    key: Cow::Owned(name.clone()),
+                    value: Cow::Owned(format!("{header_name}: {header_value}").into_bytes()),
                 });
             }
             if let Some(filename) = filename {
-                self.files.push(Entry {
-                    key: String::new(),
-                    value: filename.clone().into_bytes(),
+                self.data.files.push(Entry {
+                    key: Cow::Borrowed(""),
+                    value: Cow::Owned(filename.clone().into_bytes()),
                 });
-                self.files_names.push(Entry {
-                    key: String::new(),
-                    value: name.clone().into_bytes(),
+                self.data.files_names.push(Entry {
+                    key: Cow::Borrowed(""),
+                    value: Cow::Owned(name.clone().into_bytes()),
                 });
-                self.files_sizes.push(Entry {
-                    key: filename,
-                    value: value.len().to_string().into_bytes(),
+                self.data.files_sizes.push(Entry {
+                    key: Cow::Owned(filename),
+                    value: Cow::Owned(value.len().to_string().into_bytes()),
                 });
-                self.files_combined_size += value.len();
+                self.data.files_combined_size += value.len();
             } else {
-                self.args_post.push(Entry {
-                    key: name,
-                    value: value.to_vec(),
+                self.data.args_post.push(Entry {
+                    key: Cow::Owned(name),
+                    value: Cow::Owned(value.to_vec()),
                 });
             }
             budget.bytes(value.len())?;
@@ -287,15 +333,412 @@ impl Collections {
 
     /// Returns the TX value, case-insensitive.
     pub fn tx_get(&self, name: &str) -> Option<&[u8]> {
+        self.state.tx_get(name)
+    }
+
+    /// Sets a TX value.
+    pub fn tx_set(&mut self, name: &str, value: Vec<u8>) {
+        self.state.tx_set(name, value);
+    }
+
+    /// Adds to a TX value. Numeric values are added numerically; otherwise the
+    /// new value is appended, matching ModSecurity's `+` setvar semantics.
+    pub fn tx_add(&mut self, name: &str, value: &[u8]) {
+        self.state.tx_add(name, value);
+    }
+
+    /// Subtracts from a TX value.
+    pub fn tx_sub(&mut self, name: &str, value: &[u8]) {
+        self.state.tx_sub(name, value);
+    }
+
+    /// Removes a TX value.
+    pub fn tx_remove(&mut self, name: &str) {
+        self.state.tx_remove(name);
+    }
+
+    /// Stores a regex capture in `TX:n` and the capture array.
+    pub fn set_capture(&mut self, index: usize, value: Vec<u8>) {
+        self.state.set_capture(index, value);
+    }
+
+    /// Clears capture slots.
+    pub fn clear_captures(&mut self) {
+        self.state.clear_captures();
+    }
+
+    /// Records a matched variable for `MATCHED_VAR*`.
+    pub fn record_match(&mut self, name: String, value: &[u8]) {
+        self.state.record_match(name, value);
+    }
+
+    /// Clears the per-rule matched-variable state.
+    pub fn clear_matches(&mut self) {
+        self.state.clear_matches();
+    }
+
+    /// Returns the body processor name exposed as `REQBODY_PROCESSOR`.
+    pub fn reqbody_processor(&self) -> &str {
+        &self.data.reqbody_processor
+    }
+
+    /// Applies a `ctl:requestBodyProcessor=...` override.
+    pub fn set_request_body_processor(&mut self, processor: String) {
+        self.state.request_body_processor_override = Some(processor);
+    }
+
+    /// Applies `ctl:forceRequestBodyVariable=...`.
+    pub fn set_force_request_body_variable(&mut self, force: bool) {
+        self.state.force_request_body_variable = force;
+    }
+
+    /// Resolves one variable spec into values.
+    pub fn resolve<'r>(
+        &'r self,
+        spec: &VariableSpec,
+        budget: &mut Budget,
+    ) -> Result<Vec<Candidate<'r>>, EngineError> {
+        let mut values = Vec::new();
+        self.resolve_into(spec, budget, &mut values)?;
+        Ok(values)
+    }
+
+    /// Resolves one variable spec, appending to a reusable candidate buffer.
+    pub fn resolve_into<'r>(
+        &'r self,
+        spec: &VariableSpec,
+        budget: &mut Budget,
+        out: &mut Vec<Candidate<'r>>,
+    ) -> Result<(), EngineError> {
+        self.data.resolve_into(spec, &self.state, budget, out)
+    }
+}
+
+impl<'a> RequestData<'a> {
+    pub(crate) fn resolve_into<'r>(
+        &'r self,
+        spec: &VariableSpec,
+        state: &TxState,
+        budget: &mut Budget,
+        out: &mut Vec<Candidate<'r>>,
+    ) -> Result<(), EngineError> {
+        let start = out.len();
+        match spec.collection {
+            Collection::Args => self.keyed(
+                Collection::Args,
+                &self.args_get,
+                &self.args_post,
+                &spec.selector,
+                budget,
+                out,
+            )?,
+            Collection::ArgsGet => self.keyed(
+                Collection::ArgsGet,
+                &self.args_get,
+                &[],
+                &spec.selector,
+                budget,
+                out,
+            )?,
+            Collection::ArgsPost => self.keyed(
+                Collection::ArgsPost,
+                &self.args_post,
+                &[],
+                &spec.selector,
+                budget,
+                out,
+            )?,
+            Collection::ArgsNames => self.names(
+                Collection::ArgsNames,
+                &self.args_get,
+                &self.args_post,
+                &spec.selector,
+                budget,
+                out,
+            )?,
+            Collection::ArgsGetNames => self.names(
+                Collection::ArgsGetNames,
+                &self.args_get,
+                &[],
+                &spec.selector,
+                budget,
+                out,
+            )?,
+            Collection::ArgsPostNames => self.names(
+                Collection::ArgsPostNames,
+                &self.args_post,
+                &[],
+                &spec.selector,
+                budget,
+                out,
+            )?,
+            Collection::ArgsCombinedSize => {
+                let size = self
+                    .args_get
+                    .iter()
+                    .chain(self.args_post.iter())
+                    .map(|entry| entry.key.len() + entry.value.len())
+                    .sum::<usize>();
+                self.single(
+                    Collection::ArgsCombinedSize,
+                    Cow::Owned(size.to_string().into_bytes()),
+                    budget,
+                    out,
+                )?;
+            }
+            Collection::RequestHeaders => self.keyed(
+                Collection::RequestHeaders,
+                &self.headers,
+                &[],
+                &spec.selector,
+                budget,
+                out,
+            )?,
+            Collection::RequestHeadersNames => self.names(
+                Collection::RequestHeadersNames,
+                &self.headers,
+                &[],
+                &spec.selector,
+                budget,
+                out,
+            )?,
+            Collection::RequestCookies => self.keyed(
+                Collection::RequestCookies,
+                &self.cookies,
+                &[],
+                &spec.selector,
+                budget,
+                out,
+            )?,
+            Collection::RequestCookiesNames => self.names(
+                Collection::RequestCookiesNames,
+                &self.cookies,
+                &[],
+                &spec.selector,
+                budget,
+                out,
+            )?,
+            Collection::RequestUri => self.single(
+                Collection::RequestUri,
+                self.request_uri.clone(),
+                budget,
+                out,
+            )?,
+            Collection::RequestUriRaw => self.single(
+                Collection::RequestUriRaw,
+                self.request_uri_raw.clone(),
+                budget,
+                out,
+            )?,
+            Collection::RequestMethod => self.single(
+                Collection::RequestMethod,
+                self.request_method.clone(),
+                budget,
+                out,
+            )?,
+            Collection::RequestBody => self.single(
+                Collection::RequestBody,
+                self.request_body.clone().unwrap_or(Cow::Borrowed(&[])),
+                budget,
+                out,
+            )?,
+            Collection::RequestBodyLength => {
+                let length = self.request_body.as_ref().map_or(0, |body| body.len());
+                self.single(
+                    Collection::RequestBodyLength,
+                    Cow::Owned(length.to_string().into_bytes()),
+                    budget,
+                    out,
+                )?;
+            }
+            Collection::RequestFilename => self.single(
+                Collection::RequestFilename,
+                self.request_filename.clone(),
+                budget,
+                out,
+            )?,
+            Collection::RequestBasename => self.single(
+                Collection::RequestBasename,
+                self.request_basename.clone(),
+                budget,
+                out,
+            )?,
+            Collection::RequestLine => self.single(
+                Collection::RequestLine,
+                self.request_line.clone(),
+                budget,
+                out,
+            )?,
+            Collection::RequestProtocol => self.single(
+                Collection::RequestProtocol,
+                self.request_protocol.clone(),
+                budget,
+                out,
+            )?,
+            Collection::QueryString => self.single(
+                Collection::QueryString,
+                self.query_string.clone(),
+                budget,
+                out,
+            )?,
+            Collection::Tx => state.tx_values(&spec.selector, budget, out)?,
+            Collection::MatchedVars => state.matched_values(false, budget, out)?,
+            Collection::MatchedVarsNames => state.matched_values(true, budget, out)?,
+            Collection::Xml => {}
+            Collection::Files => self.keyed(
+                Collection::Files,
+                &self.files,
+                &[],
+                &spec.selector,
+                budget,
+                out,
+            )?,
+            Collection::FilesNames => self.keyed(
+                Collection::FilesNames,
+                &self.files_names,
+                &[],
+                &spec.selector,
+                budget,
+                out,
+            )?,
+            Collection::FilesSizes => self.keyed(
+                Collection::FilesSizes,
+                &self.files_sizes,
+                &[],
+                &spec.selector,
+                budget,
+                out,
+            )?,
+            Collection::FilesCombinedSize => self.single(
+                Collection::FilesCombinedSize,
+                Cow::Owned(self.files_combined_size.to_string().into_bytes()),
+                budget,
+                out,
+            )?,
+            Collection::MultipartPartHeaders => self.keyed(
+                Collection::MultipartPartHeaders,
+                &self.multipart_part_headers,
+                &[],
+                &spec.selector,
+                budget,
+                out,
+            )?,
+            Collection::ReqbodyProcessor => self.single(
+                Collection::ReqbodyProcessor,
+                Cow::Owned(self.reqbody_processor.clone().into_bytes()),
+                budget,
+                out,
+            )?,
+            Collection::RemoteAddr => {
+                self.single(Collection::RemoteAddr, Cow::Borrowed(&[]), budget, out)?
+            }
+            Collection::UniqueId => {
+                self.single(Collection::UniqueId, Cow::Borrowed(&[]), budget, out)?
+            }
+            Collection::Rule | Collection::Global | Collection::Ip => {}
+        }
+
+        if spec.count {
+            let count = (out.len() - start).to_string().into_bytes();
+            out.truncate(start);
+            budget.value()?;
+            budget.bytes(count.len())?;
+            out.push(Candidate {
+                collection: spec.collection,
+                key: None,
+                value: Cow::Owned(count),
+                cache_id: None,
+            });
+        }
+        Ok(())
+    }
+
+    fn single<'r>(
+        &'r self,
+        collection: Collection,
+        value: Cow<'a, [u8]>,
+        budget: &mut Budget,
+        out: &mut Vec<Candidate<'r>>,
+    ) -> Result<(), EngineError> {
+        budget.value()?;
+        budget.bytes(value.len())?;
+        out.push(Candidate {
+            collection,
+            key: None,
+            value,
+            cache_id: None,
+        });
+        Ok(())
+    }
+
+    fn keyed<'r>(
+        &'r self,
+        collection: Collection,
+        first: &'r [Entry<'a>],
+        second: &'r [Entry<'a>],
+        selector: &Selector,
+        budget: &mut Budget,
+        out: &mut Vec<Candidate<'r>>,
+    ) -> Result<(), EngineError> {
+        for (index, entry) in first.iter().chain(second.iter()).enumerate() {
+            if !selector_matches(selector, &entry.key) {
+                continue;
+            }
+            budget.value()?;
+            budget.bytes(entry.value.len())?;
+            out.push(Candidate {
+                collection,
+                key: Some(Cow::Borrowed(entry.key.as_ref())),
+                value: Cow::Borrowed(entry.value.as_ref()),
+                cache_id: Some(entry_cache_id(collection, index)),
+            });
+        }
+        Ok(())
+    }
+
+    fn names<'r>(
+        &'r self,
+        collection: Collection,
+        first: &'r [Entry<'a>],
+        second: &'r [Entry<'a>],
+        selector: &Selector,
+        budget: &mut Budget,
+        out: &mut Vec<Candidate<'r>>,
+    ) -> Result<(), EngineError> {
+        for (index, entry) in first.iter().chain(second.iter()).enumerate() {
+            if !selector_matches(selector, &entry.key) {
+                continue;
+            }
+            budget.value()?;
+            budget.bytes(entry.key.len())?;
+            out.push(Candidate {
+                collection,
+                key: Some(Cow::Borrowed(entry.key.as_ref())),
+                value: Cow::Borrowed(entry.key.as_ref().as_bytes()),
+                cache_id: Some(entry_cache_id(collection, index)),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl TxState {
+    /// Returns the TX value, case-insensitive.
+    pub fn tx_get(&self, name: &str) -> Option<&[u8]> {
         self.tx
-            .get(&name.to_ascii_lowercase())
+            .get(lower_name(name).as_ref())
             .map(|(_, value)| value.as_slice())
     }
 
     /// Sets a TX value.
     pub fn tx_set(&mut self, name: &str, value: Vec<u8>) {
-        let lower = name.to_ascii_lowercase();
-        self.tx.insert(lower, (name.to_string(), value));
+        let lower = lower_name(name).into_owned();
+        match self.tx.get_mut(&lower) {
+            Some((_, slot)) => *slot = value,
+            None => {
+                self.tx.insert(lower, (name.to_string(), value));
+            }
+        }
     }
 
     /// Adds to a TX value. Numeric values are added numerically; otherwise the
@@ -327,7 +770,7 @@ impl Collections {
 
     /// Removes a TX value.
     pub fn tx_remove(&mut self, name: &str) {
-        self.tx.remove(&name.to_ascii_lowercase());
+        self.tx.remove(lower_name(name).as_ref());
     }
 
     /// Stores a regex capture in `TX:n` and the capture array.
@@ -346,10 +789,12 @@ impl Collections {
     }
 
     /// Records a matched variable for `MATCHED_VAR*`.
-    pub fn record_match(&mut self, name: String, value: Vec<u8>) {
-        self.matched_var = value.clone();
-        self.matched_var_name = name.as_bytes().to_vec();
-        self.matched_vars.push((name, value));
+    pub fn record_match(&mut self, name: String, value: &[u8]) {
+        self.matched_var.clear();
+        self.matched_var.extend_from_slice(value);
+        self.matched_var_name.clear();
+        self.matched_var_name.extend_from_slice(name.as_bytes());
+        self.matched_vars.push((name, value.to_vec()));
     }
 
     /// Clears the per-rule matched-variable state.
@@ -359,301 +804,39 @@ impl Collections {
         self.matched_vars.clear();
     }
 
-    /// Returns the body processor name exposed as `REQBODY_PROCESSOR`.
-    pub fn reqbody_processor(&self) -> &str {
-        &self.reqbody_processor
-    }
-
-    /// Applies a `ctl:requestBodyProcessor=...` override.
-    pub fn set_request_body_processor(&mut self, processor: String) {
-        self.request_body_processor_override = Some(processor);
-    }
-
-    /// Applies `ctl:forceRequestBodyVariable=...`.
-    pub fn set_force_request_body_variable(&mut self, force: bool) {
-        self.force_request_body_variable = force;
-    }
-
-    /// Resolves one variable spec into values.
-    pub fn resolve(
-        &self,
-        spec: &VariableSpec,
-        budget: &mut Budget,
-    ) -> Result<Vec<ResolvedValue>, EngineError> {
-        let mut values = match spec.collection {
-            Collection::Args => self.keyed(
-                Collection::Args,
-                &self.args_get,
-                &self.args_post,
-                &spec.selector,
-                budget,
-            )?,
-            Collection::ArgsGet => self.keyed(
-                Collection::ArgsGet,
-                &self.args_get,
-                &[],
-                &spec.selector,
-                budget,
-            )?,
-            Collection::ArgsPost => self.keyed(
-                Collection::ArgsPost,
-                &self.args_post,
-                &[],
-                &spec.selector,
-                budget,
-            )?,
-            Collection::ArgsNames => self.names(
-                Collection::ArgsNames,
-                &self.args_get,
-                &self.args_post,
-                &spec.selector,
-                budget,
-            )?,
-            Collection::ArgsGetNames => self.names(
-                Collection::ArgsGetNames,
-                &self.args_get,
-                &[],
-                &spec.selector,
-                budget,
-            )?,
-            Collection::ArgsPostNames => self.names(
-                Collection::ArgsPostNames,
-                &self.args_post,
-                &[],
-                &spec.selector,
-                budget,
-            )?,
-            Collection::ArgsCombinedSize => {
-                let size = self
-                    .args_get
-                    .iter()
-                    .chain(self.args_post.iter())
-                    .map(|entry| entry.key.len() + entry.value.len())
-                    .sum::<usize>();
-                self.single(
-                    Collection::ArgsCombinedSize,
-                    size.to_string().into_bytes(),
-                    budget,
-                )?
-            }
-            Collection::RequestHeaders => self.keyed(
-                Collection::RequestHeaders,
-                &self.headers,
-                &[],
-                &spec.selector,
-                budget,
-            )?,
-            Collection::RequestHeadersNames => self.names(
-                Collection::RequestHeadersNames,
-                &self.headers,
-                &[],
-                &spec.selector,
-                budget,
-            )?,
-            Collection::RequestCookies => self.keyed(
-                Collection::RequestCookies,
-                &self.cookies,
-                &[],
-                &spec.selector,
-                budget,
-            )?,
-            Collection::RequestCookiesNames => self.names(
-                Collection::RequestCookiesNames,
-                &self.cookies,
-                &[],
-                &spec.selector,
-                budget,
-            )?,
-            Collection::RequestUri => {
-                self.single(Collection::RequestUri, self.request_uri.clone(), budget)?
-            }
-            Collection::RequestUriRaw => self.single(
-                Collection::RequestUriRaw,
-                self.request_uri_raw.clone(),
-                budget,
-            )?,
-            Collection::RequestMethod => self.single(
-                Collection::RequestMethod,
-                self.request_method.clone(),
-                budget,
-            )?,
-            Collection::RequestBody => self.single(
-                Collection::RequestBody,
-                self.request_body.clone().unwrap_or_default(),
-                budget,
-            )?,
-            Collection::RequestBodyLength => {
-                let length = self.request_body.as_ref().map_or(0, Vec::len);
-                self.single(
-                    Collection::RequestBodyLength,
-                    length.to_string().into_bytes(),
-                    budget,
-                )?
-            }
-            Collection::RequestFilename => self.single(
-                Collection::RequestFilename,
-                self.request_filename.clone(),
-                budget,
-            )?,
-            Collection::RequestBasename => self.single(
-                Collection::RequestBasename,
-                self.request_basename.clone(),
-                budget,
-            )?,
-            Collection::RequestLine => {
-                self.single(Collection::RequestLine, self.request_line.clone(), budget)?
-            }
-            Collection::RequestProtocol => self.single(
-                Collection::RequestProtocol,
-                self.request_protocol.clone(),
-                budget,
-            )?,
-            Collection::QueryString => {
-                self.single(Collection::QueryString, self.query_string.clone(), budget)?
-            }
-            Collection::Tx => self.tx_values(&spec.selector, budget)?,
-            Collection::MatchedVars => self.matched_values(false, budget)?,
-            Collection::MatchedVarsNames => self.matched_values(true, budget)?,
-            Collection::Xml => Vec::new(),
-            Collection::Files => {
-                self.keyed(Collection::Files, &self.files, &[], &spec.selector, budget)?
-            }
-            Collection::FilesNames => self.keyed(
-                Collection::FilesNames,
-                &self.files_names,
-                &[],
-                &spec.selector,
-                budget,
-            )?,
-            Collection::FilesSizes => self.keyed(
-                Collection::FilesSizes,
-                &self.files_sizes,
-                &[],
-                &spec.selector,
-                budget,
-            )?,
-            Collection::FilesCombinedSize => self.single(
-                Collection::FilesCombinedSize,
-                self.files_combined_size.to_string().into_bytes(),
-                budget,
-            )?,
-            Collection::MultipartPartHeaders => self.keyed(
-                Collection::MultipartPartHeaders,
-                &self.multipart_part_headers,
-                &[],
-                &spec.selector,
-                budget,
-            )?,
-            Collection::ReqbodyProcessor => self.single(
-                Collection::ReqbodyProcessor,
-                self.reqbody_processor.clone().into_bytes(),
-                budget,
-            )?,
-            Collection::RemoteAddr => self.single(Collection::RemoteAddr, Vec::new(), budget)?,
-            Collection::UniqueId => self.single(Collection::UniqueId, Vec::new(), budget)?,
-            Collection::Rule | Collection::Global | Collection::Ip => Vec::new(),
-        };
-
-        if spec.count {
-            let count = values.len().to_string().into_bytes();
-            budget.value()?;
-            budget.bytes(count.len())?;
-            values = vec![ResolvedValue::new(spec.collection, None, count)];
-        }
-        Ok(values)
-    }
-
-    fn single(
-        &self,
-        collection: Collection,
-        value: Vec<u8>,
-        budget: &mut Budget,
-    ) -> Result<Vec<ResolvedValue>, EngineError> {
-        budget.value()?;
-        budget.bytes(value.len())?;
-        Ok(vec![ResolvedValue::new(collection, None, value)])
-    }
-
-    fn keyed(
-        &self,
-        collection: Collection,
-        first: &[Entry],
-        second: &[Entry],
-        selector: &Selector,
-        budget: &mut Budget,
-    ) -> Result<Vec<ResolvedValue>, EngineError> {
-        let mut values = Vec::new();
-        for entry in first.iter().chain(second.iter()) {
-            if !selector_matches(selector, &entry.key) {
-                continue;
-            }
-            budget.value()?;
-            budget.bytes(entry.value.len())?;
-            values.push(ResolvedValue::new(
-                collection,
-                Some(entry.key.clone()),
-                entry.value.clone(),
-            ));
-        }
-        Ok(values)
-    }
-
-    fn names(
-        &self,
-        collection: Collection,
-        first: &[Entry],
-        second: &[Entry],
-        selector: &Selector,
-        budget: &mut Budget,
-    ) -> Result<Vec<ResolvedValue>, EngineError> {
-        let mut values = Vec::new();
-        for entry in first.iter().chain(second.iter()) {
-            if !selector_matches(selector, &entry.key) {
-                continue;
-            }
-            budget.value()?;
-            budget.bytes(entry.key.len())?;
-            values.push(ResolvedValue::new(
-                collection,
-                Some(entry.key.clone()),
-                entry.key.as_bytes().to_vec(),
-            ));
-        }
-        Ok(values)
-    }
-
-    fn tx_values(
+    fn tx_values<'a>(
         &self,
         selector: &Selector,
         budget: &mut Budget,
-    ) -> Result<Vec<ResolvedValue>, EngineError> {
-        let mut values = Vec::new();
+        out: &mut Vec<Candidate<'a>>,
+    ) -> Result<(), EngineError> {
         for (original, value) in self.tx.values() {
             if !selector_matches(selector, original) {
                 continue;
             }
             budget.value()?;
             budget.bytes(value.len())?;
-            values.push(ResolvedValue::new(
-                Collection::Tx,
-                Some(original.clone()),
-                value.clone(),
-            ));
+            out.push(Candidate {
+                collection: Collection::Tx,
+                key: Some(Cow::Owned(original.clone())),
+                value: Cow::Owned(value.clone()),
+                cache_id: None,
+            });
         }
-        Ok(values)
+        Ok(())
     }
 
-    fn matched_values(
+    fn matched_values<'a>(
         &self,
         names_only: bool,
         budget: &mut Budget,
-    ) -> Result<Vec<ResolvedValue>, EngineError> {
+        out: &mut Vec<Candidate<'a>>,
+    ) -> Result<(), EngineError> {
         let collection = if names_only {
             Collection::MatchedVarsNames
         } else {
             Collection::MatchedVars
         };
-        let mut values = Vec::new();
         for (name, value) in &self.matched_vars {
             let value = if names_only {
                 name.as_bytes().to_vec()
@@ -662,99 +845,145 @@ impl Collections {
             };
             budget.value()?;
             budget.bytes(value.len())?;
-            values.push(ResolvedValue::new(collection, Some(name.clone()), value));
+            out.push(Candidate {
+                collection,
+                key: Some(Cow::Owned(name.clone())),
+                value: Cow::Owned(value),
+                cache_id: None,
+            });
         }
-        Ok(values)
+        Ok(())
     }
 }
 
-impl MacroResolver for Collections {
+/// Stable cache id for an entry in a keyed collection.
+fn entry_cache_id(collection: Collection, index: usize) -> u32 {
+    let base = match collection {
+        Collection::Args | Collection::ArgsGet => 0,
+        Collection::ArgsPost => 1_000,
+        Collection::RequestHeaders => 2_000,
+        Collection::RequestCookies => 3_000,
+        Collection::Files => 4_000,
+        Collection::FilesNames => 4_100,
+        Collection::FilesSizes => 4_200,
+        Collection::MultipartPartHeaders => 4_300,
+        _ => 5_000,
+    };
+    base + index as u32
+}
+
+fn lower_name(name: &str) -> Cow<'_, str> {
+    if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(name.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(name)
+    }
+}
+
+/// Expands `%{...}` macros against immutable request data and TX state.
+pub fn expand_macros(data: &RequestData<'_>, state: &TxState, template: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(template.len());
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            if let Some(end) = template[i + 2..].find('}') {
+                let name = &template[i + 2..i + 2 + end];
+                out.extend_from_slice(&expand_macro_name(data, state, name));
+                i += 2 + end + 1;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+impl MacroResolver for Collections<'_> {
     fn expand(&self, template: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(template.len());
-        let bytes = template.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'%' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-                if let Some(end) = template[i + 2..].find('}') {
-                    let name = &template[i + 2..i + 2 + end];
-                    out.extend_from_slice(&self.expand_macro_name(name));
-                    i += 2 + end + 1;
-                    continue;
-                }
-            }
-            out.push(bytes[i]);
-            i += 1;
-        }
-        out
+        expand_macros(&self.data, &self.state, template)
     }
 }
 
-impl Collections {
-    fn expand_macro_name(&self, name: &str) -> Vec<u8> {
-        let lower = name.to_ascii_lowercase();
-        if let Some(key) = lower.strip_prefix("tx.") {
-            return self.tx_get(key).map(ToOwned::to_owned).unwrap_or_default();
-        }
-        if lower == "matched_var" {
-            return self.matched_var.clone();
-        }
-        if lower == "matched_var_name" {
-            return self.matched_var_name.clone();
-        }
-        if let Some((collection, key)) = name.split_once('.') {
-            match collection.to_ascii_lowercase().as_str() {
-                "args" => {
-                    return find_entry(&self.args_get, key)
-                        .or_else(|| find_entry(&self.args_post, key))
-                        .map(|entry| entry.value.clone())
-                        .unwrap_or_default();
-                }
-                "args_get" => {
-                    return find_entry(&self.args_get, key)
-                        .map(|entry| entry.value.clone())
-                        .unwrap_or_default();
-                }
-                "args_post" => {
-                    return find_entry(&self.args_post, key)
-                        .map(|entry| entry.value.clone())
-                        .unwrap_or_default();
-                }
-                "request_headers" => {
-                    return self
-                        .headers
-                        .iter()
-                        .find(|header| header.key.eq_ignore_ascii_case(key))
-                        .map(|header| header.value.clone())
-                        .unwrap_or_default();
-                }
-                "request_cookies" => {
-                    return find_entry(&self.cookies, key)
-                        .map(|entry| entry.value.clone())
-                        .unwrap_or_default();
-                }
-                "rule" => {
-                    return Vec::new();
-                }
-                _ => {}
-            }
-        }
-        match lower.as_str() {
-            "request_uri" => self.request_uri.clone(),
-            "request_uri_raw" => self.request_uri_raw.clone(),
-            "request_method" => self.request_method.clone(),
-            "request_body" => self.request_body.clone().unwrap_or_default(),
-            "request_filename" => self.request_filename.clone(),
-            "request_basename" => self.request_basename.clone(),
-            "request_line" => self.request_line.clone(),
-            "request_protocol" => self.request_protocol.clone(),
-            "query_string" => self.query_string.clone(),
-            "remote_addr" | "unique_id" => Vec::new(),
-            _ => Vec::new(),
-        }
+impl MacroResolver for (&RequestData<'_>, &TxState) {
+    fn expand(&self, template: &str) -> Vec<u8> {
+        expand_macros(self.0, self.1, template)
     }
 }
 
-fn find_entry<'a>(entries: &'a [Entry], key: &str) -> Option<&'a Entry> {
+fn expand_macro_name<'r, 'a>(
+    data: &'r RequestData<'a>,
+    state: &'r TxState,
+    name: &str,
+) -> Cow<'r, [u8]> {
+    let lower = name.to_ascii_lowercase();
+    if let Some(key) = lower.strip_prefix("tx.") {
+        return state.tx_get(key).map(Cow::Borrowed).unwrap_or_default();
+    }
+    if lower == "matched_var" {
+        return Cow::Borrowed(state.matched_var.as_slice());
+    }
+    if lower == "matched_var_name" {
+        return Cow::Borrowed(state.matched_var_name.as_slice());
+    }
+    if let Some((collection, key)) = name.split_once('.') {
+        match collection.to_ascii_lowercase().as_str() {
+            "args" => {
+                return find_entry(&data.args_get, key)
+                    .or_else(|| find_entry(&data.args_post, key))
+                    .map(|entry| Cow::Borrowed(entry.value.as_ref()))
+                    .unwrap_or_default();
+            }
+            "args_get" => {
+                return find_entry(&data.args_get, key)
+                    .map(|entry| Cow::Borrowed(entry.value.as_ref()))
+                    .unwrap_or_default();
+            }
+            "args_post" => {
+                return find_entry(&data.args_post, key)
+                    .map(|entry| Cow::Borrowed(entry.value.as_ref()))
+                    .unwrap_or_default();
+            }
+            "request_headers" => {
+                return data
+                    .headers
+                    .iter()
+                    .find(|header| header.key.eq_ignore_ascii_case(key))
+                    .map(|header| Cow::Borrowed(header.value.as_ref()))
+                    .unwrap_or_default();
+            }
+            "request_cookies" => {
+                return find_entry(&data.cookies, key)
+                    .map(|entry| Cow::Borrowed(entry.value.as_ref()))
+                    .unwrap_or_default();
+            }
+            "rule" => {
+                return Cow::Borrowed(&[]);
+            }
+            _ => {}
+        }
+    }
+    match lower.as_str() {
+        "request_uri" => Cow::Borrowed(data.request_uri.as_ref()),
+        "request_uri_raw" => Cow::Borrowed(data.request_uri_raw.as_ref()),
+        "request_method" => Cow::Borrowed(data.request_method.as_ref()),
+        "request_body" => data
+            .request_body
+            .as_ref()
+            .map(|body| Cow::Borrowed(body.as_ref()))
+            .unwrap_or_default(),
+        "request_filename" => Cow::Borrowed(data.request_filename.as_ref()),
+        "request_basename" => Cow::Borrowed(data.request_basename.as_ref()),
+        "request_line" => Cow::Borrowed(data.request_line.as_ref()),
+        "request_protocol" => Cow::Borrowed(data.request_protocol.as_ref()),
+        "query_string" => Cow::Borrowed(data.query_string.as_ref()),
+        "remote_addr" | "unique_id" => Cow::Borrowed(&[]),
+        _ => Cow::Borrowed(&[]),
+    }
+}
+
+fn find_entry<'r, 'a>(entries: &'r [Entry<'a>], key: &str) -> Option<&'r Entry<'a>> {
     entries
         .iter()
         .find(|entry| entry.key.eq_ignore_ascii_case(key))
@@ -772,7 +1001,7 @@ fn parse_i64(value: &[u8]) -> Option<i64> {
     std::str::from_utf8(value).ok()?.trim().parse().ok()
 }
 
-fn parse_cookies(value: &[u8], out: &mut Vec<Entry>) {
+fn parse_cookies<'a>(value: &[u8], out: &mut Vec<Entry<'a>>) {
     let text = String::from_utf8_lossy(value);
     for part in split_quoted(&text, ';') {
         let part = part.trim();
@@ -781,15 +1010,16 @@ fn parse_cookies(value: &[u8], out: &mut Vec<Entry>) {
         }
         let (key, value) = part.split_once('=').unwrap_or((part, ""));
         out.push(Entry {
-            key: key.trim().to_string(),
-            value: value.trim().as_bytes().to_vec(),
+            key: Cow::Owned(key.trim().to_string()),
+            value: Cow::Owned(value.trim().as_bytes().to_vec()),
         });
     }
 }
 
 /// Parses `application/x-www-form-urlencoded` data with Coraza's forgiving
-/// rules (invalid escapes are preserved).
-pub fn parse_query(query: &[u8], separator: u8) -> Vec<Entry> {
+/// rules (invalid escapes are preserved). Values borrow from `query` when no
+/// percent-decoding is needed.
+pub fn parse_query<'a>(query: &'a [u8], separator: u8) -> Vec<Entry<'a>> {
     let mut out = Vec::new();
     for field in query.split(|byte| *byte == separator) {
         if field.is_empty() {
@@ -804,15 +1034,27 @@ pub fn parse_query(query: &[u8], separator: u8) -> Vec<Entry> {
         if key.is_empty() {
             continue;
         }
-        out.push(Entry {
-            key: String::from_utf8_lossy(&key).into_owned(),
-            value,
-        });
+        let key = match key {
+            Cow::Borrowed(bytes) => match std::str::from_utf8(bytes) {
+                Ok(text) => Cow::Borrowed(text),
+                Err(_) => Cow::Owned(String::from_utf8_lossy(bytes).into_owned()),
+            },
+            Cow::Owned(bytes) => Cow::Owned(String::from_utf8_lossy(&bytes).into_owned()),
+        };
+        out.push(Entry { key, value });
     }
     out
 }
 
-fn percent_decode(input: &[u8], plus_as_space: bool) -> Vec<u8> {
+/// Percent-decodes `input`, borrowing the original bytes when no escape or
+/// plus-sign rewrite is required.
+fn percent_decode(input: &[u8], plus_as_space: bool) -> Cow<'_, [u8]> {
+    let needs_decode = input
+        .iter()
+        .any(|byte| *byte == b'%' || (plus_as_space && *byte == b'+'));
+    if !needs_decode {
+        return Cow::Borrowed(input);
+    }
     let mut out = Vec::with_capacity(input.len());
     let mut i = 0;
     while i < input.len() {
@@ -837,7 +1079,7 @@ fn percent_decode(input: &[u8], plus_as_space: bool) -> Vec<u8> {
         }
         i += 1;
     }
-    out
+    Cow::Owned(out)
 }
 
 fn hex_value(byte: u8) -> u8 {
@@ -974,26 +1216,26 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-struct ParsedUri {
-    request_uri: Vec<u8>,
-    path: Vec<u8>,
-    basename: Vec<u8>,
-    query: Vec<u8>,
+struct ParsedUri<'a> {
+    request_uri: &'a [u8],
+    path: Cow<'a, [u8]>,
+    basename: Cow<'a, [u8]>,
+    query: &'a [u8],
     valid: bool,
 }
 
-impl ParsedUri {
-    fn parse(uri: &str) -> Self {
+impl<'a> ParsedUri<'a> {
+    fn parse(uri: &'a str) -> Self {
         let without_fragment = match uri.find('#') {
             Some(index) => &uri[..index],
             None => uri,
         };
         if !is_valid_request_uri(without_fragment) {
             return Self {
-                request_uri: without_fragment.as_bytes().to_vec(),
-                path: without_fragment.as_bytes().to_vec(),
+                request_uri: without_fragment.as_bytes(),
+                path: Cow::Borrowed(without_fragment.as_bytes()),
                 basename: basename(without_fragment.as_bytes()),
-                query: Vec::new(),
+                query: &[],
                 valid: false,
             };
         }
@@ -1004,10 +1246,10 @@ impl ParsedUri {
         };
         let path = percent_decode(path_raw.as_bytes(), false);
         Self {
-            request_uri: without_fragment.as_bytes().to_vec(),
-            basename: basename(&path),
+            request_uri: without_fragment.as_bytes(),
+            basename: basename_cow(path.clone()),
             path,
-            query: query_raw.as_bytes().to_vec(),
+            query: query_raw.as_bytes(),
             valid: true,
         }
     }
@@ -1084,13 +1326,27 @@ fn valid_percent_escapes(value: &[u8]) -> bool {
     true
 }
 
-fn basename(path: &[u8]) -> Vec<u8> {
+fn basename(path: &[u8]) -> Cow<'_, [u8]> {
     let index = path
         .iter()
         .rposition(|byte| *byte == b'/' || *byte == b'\\');
     match index {
-        Some(index) if index + 1 < path.len() => path[index + 1..].to_vec(),
-        _ => path.to_vec(),
+        Some(index) if index + 1 < path.len() => Cow::Borrowed(&path[index + 1..]),
+        _ => Cow::Borrowed(path),
+    }
+}
+
+fn basename_cow<'a>(path: Cow<'a, [u8]>) -> Cow<'a, [u8]> {
+    let index = path
+        .iter()
+        .rposition(|byte| *byte == b'/' || *byte == b'\\');
+    let start = match index {
+        Some(index) if index + 1 < path.len() => index + 1,
+        _ => 0,
+    };
+    match path {
+        Cow::Borrowed(bytes) => Cow::Borrowed(&bytes[start..]),
+        Cow::Owned(bytes) => Cow::Owned(bytes[start..].to_vec()),
     }
 }
 
@@ -1102,27 +1358,27 @@ mod tests {
     fn query_parsing_is_forgiving() {
         let entries = parse_query(b"a=1&b=hello+world&c=%zz", b'&');
         assert_eq!(entries[0].key, "a");
-        assert_eq!(entries[0].value, b"1");
-        assert_eq!(entries[1].value, b"hello world");
-        assert_eq!(entries[2].value, b"%zz");
+        assert_eq!(entries[0].value.as_ref(), b"1");
+        assert_eq!(entries[1].value.as_ref(), b"hello world");
+        assert_eq!(entries[2].value.as_ref(), b"%zz");
     }
 
     #[test]
     fn uri_parsing_matches_reactor_shape() {
         let parsed = ParsedUri::parse("/get/demo.php?x=1");
         assert!(parsed.valid);
-        assert_eq!(parsed.path, b"/get/demo.php");
-        assert_eq!(parsed.basename, b"demo.php");
+        assert_eq!(parsed.path.as_ref(), b"/get/demo.php");
+        assert_eq!(parsed.basename.as_ref(), b"demo.php");
         assert_eq!(parsed.query, b"x=1");
 
         let invalid = ParsedUri::parse("/get with space?x=1");
         assert!(invalid.valid);
-        assert_eq!(invalid.path, b"/get with space");
+        assert_eq!(invalid.path.as_ref(), b"/get with space");
         assert_eq!(invalid.query, b"x=1");
 
         let invalid = ParsedUri::parse("CONNECT");
         assert!(!invalid.valid);
-        assert_eq!(invalid.path, b"CONNECT");
+        assert_eq!(invalid.path.as_ref(), b"CONNECT");
     }
 
     #[test]
@@ -1137,9 +1393,12 @@ mod tests {
         let mut budget = Budget::new(super::super::budget::Limits::default());
         let mut collections = Collections::new(&request, &mut budget).expect("collections");
         collections.tx_set("foo", b"bar".to_vec());
-        collections.record_match("ARGS:x".to_string(), b"value".to_vec());
-        assert_eq!(collections.expand("%{tx.foo}"), b"bar");
-        assert_eq!(collections.expand("%{MATCHED_VAR}"), b"value");
-        assert_eq!(collections.expand("%{matched_var_name}"), b"ARGS:x");
+        collections.record_match("ARGS:x".to_string(), b"value");
+        assert_eq!(collections.expand("%{tx.foo}").as_slice(), b"bar");
+        assert_eq!(collections.expand("%{MATCHED_VAR}").as_slice(), b"value");
+        assert_eq!(
+            collections.expand("%{matched_var_name}").as_slice(),
+            b"ARGS:x"
+        );
     }
 }

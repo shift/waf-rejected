@@ -905,6 +905,8 @@ pub enum CorazaBackend {
     Wasm,
     /// Native Go sidecar over a Unix domain socket (`coraza-native` feature).
     Native,
+    /// In-process native Rust CRS engine (`rust-engine` feature).
+    Rust,
 }
 
 /// What the reactor does when a request body is larger than
@@ -2428,6 +2430,17 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
 
         config.waf.coraza.native_socket_path = Some("/run/waf/coraza.sock".to_string());
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rust_coraza_backend_does_not_require_a_socket() {
+        let mut config = Config::default();
+        config.waf.coraza.backend = CorazaBackend::Rust;
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            serde_json::to_string(&CorazaBackend::Rust).expect("serialize"),
+            "\"rust\""
+        );
     }
 
     #[test]

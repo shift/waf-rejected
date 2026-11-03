@@ -916,3 +916,25 @@ verification done, not pushed.
 - `rule_accounting --support` with the full-support template — pass.
 - `crs_corpus --engine wasm --limit 1` — 1/1 passed (baseline smoke; the shared host is heavily loaded, so the full 100-iteration Coraza determinism run was not executed locally).
 - `crs_corpus --engine rust --limit 1 --generated 10 --determinism 2` — reports skipped because the `native-engine` backend is the unimplemented scaffold; `--require-engine` fails as designed.
+
+---
+
+# feat/engine-integration: native operators + kernel execution model
+
+Branch `feat/engine-integration` (not pushed, not merged, defaults unchanged).
+
+- [x] Compile `@detectSQLi`/`@detectXSS` into the IR and evaluate them with
+      `native_detect`; strict load is now 505/505 with 0 unsupported.
+- [x] Intern transform pipelines and cache each `(value, pipeline)` once per
+      request; borrow request spans; reuse candidate/capture/transform buffers;
+      keep phase early exit.
+- [x] Wire `waf.coraza.backend = "rust"` (strict load, fail-closed startup);
+      default remains `wasm`.
+- [x] Parity: 2,110/2,112 vs Coraza; the 2 disagreements are Coraza false
+      negatives (921250), 3 shared JSON-Log4Shell FNs, zero native-only FNs.
+- [x] Verification: fmt, 451 lib tests, clippy lib+parity bin, corpus harness.
+- [ ] Targets: bodyless 183 µs and 1 KiB 479 µs pass; 4 KiB 1.13 ms and
+      8 KiB 2.03 ms miss on a quiet run (host heavily shared). See
+      `docs/suggestions_from_agents/engine-integration.md`.
+- [ ] Remaining for default: JSON/XML processors, XPath, URI parity, response
+      phases, per-rule literal prefilter, allocation reduction.

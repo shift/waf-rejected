@@ -38,7 +38,9 @@ pub use engine::{Outcome, RustEngine};
 pub use error::{EngineError, LoadError, UnsupportedConstruct};
 pub use ir::{CompiledRule, Phase, Program, ProgramItem, RuleGroup};
 pub use parser::{parse_conf_path, parse_conf_str, CompilePolicy, ConstructUse, SupportReport};
-pub use request::{Collections, EngineRequest, ResolvedValue};
+pub use request::{
+    expand_macros, Candidate, Collections, EngineRequest, RequestData, ResolvedValue, TxState,
+};
 
 use std::path::PathBuf;
 use std::sync::Arc;

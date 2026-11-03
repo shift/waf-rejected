@@ -10,13 +10,40 @@
 //! cargo run --features rust-engine --bin rust-engine-parity -- --bench
 //! ```
 
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
+
+struct CountingAllocator;
+
+static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+
+// SAFETY: delegates every operation to the system allocator and only adds a
+// counter, which cannot affect pointer validity or layout.
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        System.alloc(layout)
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        System.dealloc(ptr, layout)
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        System.realloc(ptr, layout, new_size)
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
 
 use waf_ingress::waf::coraza_corpus::{Corpus, CorpusCase, Expected, Observed};
 use waf_ingress::waf::rust_engine::{
@@ -110,7 +137,7 @@ fn run(args: &Args) -> Result<(), String> {
     let engine = RustEngine::from_conf_path_with_policy(&args.conf, policy)
         .map_err(|err| format!("failed to load `{}`: {err}", args.conf.display()))?;
 
-    print_support(&engine.support_report());
+    print_support(engine.support_report());
     if args.report_only {
         return Ok(());
     }
@@ -150,10 +177,12 @@ fn run(args: &Args) -> Result<(), String> {
         return Err("the Coraza comparison requires the `wasm-reactor` feature".to_string());
     }
 
-    let mut report = Report::default();
-    report.unsupported = engine.support_report().unsupported.len();
-    report.rules_compiled = engine.support_report().rules_compiled;
-    report.rules_skipped = engine.support_report().rules_skipped;
+    let mut report = Report {
+        unsupported: engine.support_report().unsupported.len(),
+        rules_compiled: engine.support_report().rules_compiled,
+        rules_skipped: engine.support_report().rules_skipped,
+        ..Report::default()
+    };
 
     for case in &cases {
         let mut row = CaseRow {
@@ -193,16 +222,13 @@ fn run(args: &Args) -> Result<(), String> {
         }
         report.total += 1;
         report.cases.push(row.clone());
-        match (row.rust, row.coraza) {
-            (Some(rust), Some(coraza)) => {
-                if rust == coraza {
-                    report.agree += 1;
-                } else {
-                    report.disagree += 1;
-                    report.disagreements.push(row.clone());
-                }
+        if let (Some(rust), Some(coraza)) = (row.rust, row.coraza) {
+            if rust == coraza {
+                report.agree += 1;
+            } else {
+                report.disagree += 1;
+                report.disagreements.push(row.clone());
             }
-            _ => {}
         }
         match (case.expected, row.rust) {
             (Expected::Block, Some(Observed::Allow)) => report.rust_false_negatives += 1,
@@ -428,8 +454,15 @@ fn bench(args: &Args, engine: &RustEngine) -> Result<(), String> {
         ("8KiB", 8192),
     ];
     println!(
-        "{:<10} {:>12} {:>12} {:>12} {:>12}",
-        "body", "rust p50", "rust p95", "coraza p50", "coraza p95"
+        "{:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>10}",
+        "body",
+        "rust p50",
+        "rust p99",
+        "coraza p50",
+        "coraza p99",
+        "rust p95",
+        "coraza p95",
+        "alloc/req"
     );
     for (label, size) in rows {
         let (headers, body) = bench_request(size);
@@ -441,20 +474,25 @@ fn bench(args: &Args, engine: &RustEngine) -> Result<(), String> {
             headers: &header_pairs,
             body: if size == 0 { None } else { Some(&body) },
         };
+        ALLOCATIONS.store(0, Ordering::Relaxed);
         let rust_samples = measure(args.reps, || {
             let _ = engine.evaluate(&request);
         });
+        let rust_allocs = ALLOCATIONS.load(Ordering::Relaxed) as f64 / args.reps as f64;
         let payload = bench_payload(&headers, if size == 0 { None } else { Some(&body) });
         let coraza_samples = measure(args.reps, || {
             let _ = reactor.evaluate(&payload);
         });
         println!(
-            "{:<10} {:>10.2}µs {:>10.2}µs {:>10.2}µs {:>10.2}µs",
+            "{:<10} {:>9.2}µs {:>9.2}µs {:>9.2}µs {:>9.2}µs {:>9.2}µs {:>9.2}µs {:>10.1}",
             label,
             percentile(&rust_samples, 50.0),
-            percentile(&rust_samples, 95.0),
+            percentile(&rust_samples, 99.0),
             percentile(&coraza_samples, 50.0),
-            percentile(&coraza_samples, 95.0)
+            percentile(&coraza_samples, 99.0),
+            percentile(&rust_samples, 95.0),
+            percentile(&coraza_samples, 95.0),
+            rust_allocs
         );
     }
     Ok(())
@@ -468,7 +506,10 @@ fn bench(args: &Args, engine: &RustEngine) -> Result<(), String> {
         ("4KiB", 4096),
         ("8KiB", 8192),
     ];
-    println!("{:<10} {:>12} {:>12}", "body", "rust p50", "rust p95");
+    println!(
+        "{:<10} {:>11} {:>11} {:>11} {:>10}",
+        "body", "rust p50", "rust p99", "rust p95", "alloc/req"
+    );
     for (label, size) in rows {
         let (headers, body) = bench_request(size);
         let request = EngineRequest {
@@ -478,14 +519,18 @@ fn bench(args: &Args, engine: &RustEngine) -> Result<(), String> {
             headers: &headers,
             body: if size == 0 { None } else { Some(&body) },
         };
+        ALLOCATIONS.store(0, Ordering::Relaxed);
         let samples = measure(args.reps, || {
             let _ = engine.evaluate(&request);
         });
+        let allocs = ALLOCATIONS.load(Ordering::Relaxed) as f64 / args.reps as f64;
         println!(
-            "{:<10} {:>10.2}µs {:>10.2}µs",
+            "{:<10} {:>9.2}µs {:>9.2}µs {:>9.2}µs {:>10.1}",
             label,
             percentile(&samples, 50.0),
-            percentile(&samples, 95.0)
+            percentile(&samples, 99.0),
+            percentile(&samples, 95.0),
+            allocs
         );
     }
     println!("coraza: rebuild with the `wasm-reactor` feature for the A/B table");
