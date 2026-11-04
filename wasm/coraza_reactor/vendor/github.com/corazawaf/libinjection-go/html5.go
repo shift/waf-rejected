@@ -79,6 +79,8 @@ func (h *h5State) stateBogusComment2() bool {
 //	1) EOF
 //	2) ending in -->
 //	3) ending in -!>
+//
+//nolint:gocyclo // complexity 11, reduction tracked in #122
 func (h *h5State) stateComment() bool {
 	pos := h.pos
 
@@ -147,7 +149,7 @@ func (h *h5State) stateCData() bool {
 
 		// did not find anything or has less 3 chars left
 		switch {
-		case index == -1 || h.pos+index+3 > h.len:
+		case index == -1 || pos+index+3 > h.len:
 			h.state = h.stateEOF
 			h.tokenStart = h.s[h.pos:]
 			h.tokenLen = h.len - h.pos
@@ -164,7 +166,6 @@ func (h *h5State) stateCData() bool {
 			pos = pos + index + 1
 		}
 	}
-
 }
 
 func (h *h5State) stateDoctype() bool {
@@ -188,7 +189,7 @@ func (h *h5State) stateMarkupDeclarationOpen() bool {
 	remaining := h.len - h.pos
 	switch {
 	case remaining >= 7 &&
-		strings.ToLower(h.s[h.pos:h.pos+7]) == "doctype":
+		asciiEqualFold(h.s[h.pos:h.pos+7], "doctype"):
 		return h.stateDoctype()
 	case remaining >= 7 &&
 		h.s[h.pos:h.pos+7] == "[CDATA[":
@@ -305,6 +306,7 @@ func (h *h5State) stateEndTagOpen() bool {
 	return h.stateBogusComment()
 }
 
+//nolint:gocyclo // complexity 12, reduction tracked in #122
 func (h *h5State) stateTagOpen() bool {
 	if h.pos >= h.len {
 		return false
@@ -411,7 +413,10 @@ func (h *h5State) stateBeforeAttributeValue() bool {
 		return false
 	}
 
-	switch uint8(ch) {
+	// ch is guaranteed to be in range 0-255 here (not EOF).
+	// Mask to 8 bits to satisfy gosec G115 (int -> byte overflow check).
+	chByte := byte(ch & 0xFF)
+	switch chByte {
 	case byteDouble:
 		return h.stateAttributeValueDoubleQuote()
 	case byteSingle:
@@ -496,7 +501,11 @@ func (h *h5State) stateAttributeName() bool {
 }
 
 func (h *h5State) stateBeforeAttributeName() bool {
-	for h.pos < h.len {
+	// The loop is intentionally unbounded: skipWhite advances h.pos and returns
+	// byteEOF when h.pos >= h.len, which is handled by case byteEOF below.
+	// Every other switch branch either returns or continues back to skipWhite,
+	// ensuring the loop always terminates.
+	for {
 		ch := h.skipWhite()
 		switch ch {
 		case byteEOF:
@@ -524,7 +533,6 @@ func (h *h5State) stateBeforeAttributeName() bool {
 			return h.stateAttributeName()
 		}
 	}
-	return false
 }
 
 // 12.2.4.41
@@ -591,6 +599,7 @@ func (h *h5State) stateAttributeValueBackQuote() bool {
 }
 
 func (h *h5State) init(input string, flags int) {
+	*h = h5State{} // full reset so pooled instances carry no stale state
 	h.s = input
 	h.len = len(input)
 

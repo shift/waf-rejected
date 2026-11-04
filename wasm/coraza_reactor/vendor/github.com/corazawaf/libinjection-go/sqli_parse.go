@@ -5,8 +5,10 @@ import (
 	"strings"
 )
 
-var wordAcceptTable = buildAcceptTable(" []{}<>:\\?=@!#~+-*/&|^%(),';\t\n\v\f\r\"\240\000")
-var varAcceptTable = buildAcceptTable(" <>:\\?=@!#~+-*/&|^%(),';\t\n\v\f\r'`\"")
+var (
+	wordAcceptTable = buildAcceptTable(" []{}<>:\\?=@!#~+-*/&|^%(),';\t\n\v\f\r\"\240\000")
+	varAcceptTable  = buildAcceptTable(" <>:\\?=@!#~+-*/&|^%(),';\t\n\v\f\r'`\"")
+)
 
 func parseEolComment(s *sqliState) int {
 	index := strings.IndexByte(s.input[s.pos:], '\n')
@@ -19,6 +21,7 @@ func parseEolComment(s *sqliState) int {
 	return s.pos + index + 1
 }
 
+//nolint:gocyclo // complexity 11, reduction tracked in #122
 func parseMoney(s *sqliState) int {
 	if s.pos+1 == s.length {
 		s.current.assign(sqliTokenTypeBareWord, s.pos, 1, "$")
@@ -111,6 +114,7 @@ func parseHash(s *sqliState) int {
 	return s.pos + 1
 }
 
+//nolint:gocyclo // complexity 9, reduction tracked in #122
 func parseDash(s *sqliState) int {
 	// five cases
 	// 1) --[white] this is always a SQL comment
@@ -280,6 +284,7 @@ func parseVar(s *sqliState) int {
 	return pos + length
 }
 
+//nolint:gocyclo // complexity 36, reduction tracked in #126
 func parseNumber(s *sqliState) int {
 	var (
 		digits  string
@@ -361,14 +366,21 @@ func parseNumber(s *sqliState) int {
 		}
 	}
 
-	if haveE == 1 && haveExp == 0 {
-		// very special form of
-		// "1234.e" "10.10E" ".E" "1e+"
-		// this is a WORD not a number
-		s.current.assign(sqliTokenTypeBareWord, start, pos-start, s.input[start:])
-	} else {
+	// very special form of
+	// "1234.e" "10.10E" ".E" "1e+"
+	//
+	// https://gosecure.ai/blog/2021/10/19/a-scientific-notation-bug-in-mysql-left-aws-waf-clients-vulnerable-to-sql-injection/
+	// From this blog, we could see 1.e or 1.E is a risk SQLi. The SQL parser will
+	// ignore it during parsing. Like "1.e(1)" => (1), 1 1.e/1 => 1/1 etc.
+	// So, if a payload such as "1' or 1.e(1)" bypasses SQLi detection, which is really
+	// risky, we should detect such SQLi injection to prevent WAF bypass.
+	//
+	// The fix: don't assign any token when haveE == 1 && haveExp == 0,
+	// effectively ignoring it like MySQL does.
+	if !(haveE == 1 && haveExp == 0) {
 		s.current.assign(sqliTokenTypeNumber, start, pos-start, s.input[start:])
 	}
+
 	return pos
 }
 
@@ -489,8 +501,9 @@ func parseBWord(s *sqliState) int {
 func buildAcceptTable(acceptStr string) []byte {
 	accept := []byte(acceptStr)
 	acceptTable := make([]byte, 256)
-	for i := 0; i < 256; i++ {
-		if bytes.IndexByte(accept, byte(i)) != -1 {
+	for i := range acceptTable {
+		if i < len(acceptTable) && bytes.IndexByte(accept, byte(i)) != -1 {
+			// #nosec G602 -- i is guaranteed to be in range by the range loop
 			acceptTable[i] = 1
 		}
 	}

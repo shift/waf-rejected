@@ -23,7 +23,7 @@ import (
 // - Using with parameter `request`: engine will stop processing the current phase, and the next phase to be processed will be phase `types.PhaseResponseHeaders`.
 //
 // Example:
-// ```
+// ```seclang
 // # Allow unrestricted access from 192.168.1.100
 // SecRule REMOTE_ADDR "^192\.168\.1\.100$" phase:1,id:95,nolog,allow
 //
@@ -56,7 +56,7 @@ func (a *allowFn) Init(_ plugintypes.RuleMetadata, data string) error {
 
 func (a *allowFn) Evaluate(r plugintypes.RuleMetadata, txS plugintypes.TransactionState) {
 	tx := txS.(*corazawaf.Transaction)
-	tx.AllowType = a.allow
+	tx.Allow(a.allow)
 }
 
 func (a *allowFn) Type() plugintypes.ActionType {

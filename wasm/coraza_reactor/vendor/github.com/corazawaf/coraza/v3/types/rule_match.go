@@ -6,7 +6,7 @@ package types
 import "github.com/corazawaf/coraza/v3/types/variables"
 
 // MatchData works like VariableKey but is used for logging,
-// so it contains the collection as a string, and it's value
+// so it contains the collection as a string, and its value
 type MatchData interface {
 	// Variable
 	Variable() variables.RuleVariable
@@ -47,4 +47,6 @@ type MatchedRule interface {
 	AuditLog() string
 
 	ErrorLog() string
+
+	// TODO(4.x): Add Log()
 }
