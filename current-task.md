@@ -1104,3 +1104,44 @@ updated. No defaults, versions, transforms, prefilter, proxy or Coraza changes.
   loader silently ignores (documented); historical perf reports in
   `docs/operations/performance-*.md` keep their original wasm-era numbers with
   scope notes rather than being rewritten.
+
+## perf: ordered-subsequence gate for RCE regexes (`perf/rce-gate`)
+
+Branch `perf/rce-gate` (worktree `.worktrees/rce-gate`, base `02497de`). The
+filler-tolerant RCE command rules 932125/230/235/250/260/370/380 have no
+>=2-byte mandatory literal, so the literal artifact leaves them ungated and
+they dominate the residual regex cost. Goal: prove an ordered character
+subsequence prerequisite and gate on it without any false negative.
+
+- [x] Model regex prerequisites as OR-of-AND-of-OR of ordered byte sequences
+      (`src/waf/rust_engine/subsequence.rs`), with per-step byte sets, ASCII
+      case folding and a bounded-gap matcher (unbounded where the CRS filler
+      uses `*`).
+- [x] Conservative extractor: ASCII-only patterns, no Unicode classes/scoped
+      flags; unknown atoms are ignored (weaker, never wrong); alternation is a
+      disjunction; optional atoms contribute nothing; overflow drops a conjunct
+      (sound weakening).
+- [x] Attach gates for identity-transform family-932 `@rx` rules that the
+      literal artifact did not gate; keep `GateMask` ids/order and the
+      Vectorscan candidate pass (subsequence gates are not literal gates).
+- [x] Evaluate subsequences from one byte-presence bitmap per value; cache
+      with the existing `GateMask`.
+- [x] Tests: extraction parser, bounded gaps, filler-separated match,
+      alternation, optional atoms, 5-pattern exhaustive no-false-negative
+      property, RCE gate count, engine block/allow adversarial cases.
+- [x] Measurements: 4 KiB 603.7 → 573.5 µs p50, 8 KiB 1 006.9 → 943.2 µs;
+      151 vs 137 regex evaluations skipped. Targets 480/850 µs not met (the
+      RCE families only account for ~75 µs of regex time; the gate is ~16 µs).
+- [x] Soundness regression fixed: small values (<256 B) must set every
+      subsequence bit, otherwise the cached zero mask skips the rule. Corpus
+      back to 2,110/2,112 with 0 native-only FNs; adversarial test covers it.
+- [x] Docs `docs/suggestions_from_agents/rce-subsequence-gate.md`,
+      CHANGELOG, task log.
+- [x] Verified: fmt, `cargo test --lib --features
+      rust-engine,native-detect,engine-kernel,crs-prefilter` (582 passed),
+      clippy lib + parity bin, 2,110/2,112 corpus parity with 0 native-only
+      FNs, 151/282 regex skips at 4 KiB.
+- Blocker: latency targets 4 KiB < 480 µs and 8 KiB < 850 µs are not met
+      (573 µs / 943 µs). The RCE families account for only ~75 µs of regex
+      time; the remaining gate cost is the existing literal transform + AC
+      pipeline. Details in the doc.

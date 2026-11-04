@@ -46,6 +46,11 @@ const DEFAULT_OUTBOUND_ANOMALY_THRESHOLD: i64 = 4;
 /// Default status used by the CRS blocking rules.
 const DEFAULT_BLOCK_STATUS: u16 = 403;
 
+/// Only evaluate ordered-subsequence gates on values at least this large.
+/// Small header/name values cost less to regex-match than to walk the
+/// prerequisite alternatives; leaving them ungated is sound.
+const MIN_SUBSEQUENCE_BYTES: usize = 256;
+
 /// Result of one request evaluation.
 #[derive(Debug, Clone)]
 pub struct Outcome {
@@ -1307,7 +1312,9 @@ impl RustEngine {
     /// scanned at most once: duplicate byte representations (the common case
     /// for benign values whose transforms are identity) are collapsed before
     /// the Aho-Corasick scan. `is_match` is the fast clean path; the
-    /// overlapping iterator only runs when a literal is present.
+    /// overlapping iterator only runs when a literal is present. The same
+    /// mask carries the ordered-subsequence bits, evaluated from one byte
+    /// presence bitmap per value.
     fn gate_mask(
         &self,
         candidate: &Candidate<'_>,
@@ -1342,6 +1349,41 @@ impl RustEngine {
             for found in group.automaton.find_overlapping_iter(bytes) {
                 if let Some(bits) = group.pattern_rules.get(found.pattern().as_usize()) {
                     mask.insert(*bits);
+                }
+            }
+        }
+        // Ordered-subsequence gates. All groups in the common case share the
+        // identity representation, so the presence bitmap is built once per
+        // value and reused across every rule. Small values are left ungated:
+        // their regexes are cheaper than walking the prerequisite
+        // alternatives, so every subsequence bit is set (the rule runs).
+        if candidate.value.len() >= MIN_SUBSEQUENCE_BYTES {
+            for group in gates.subsequence_groups() {
+                let range = resolve_cached(
+                    &mut scratch.cache,
+                    &mut scratch.value_ids,
+                    &self.program.transform_prefixes,
+                    &group.plan,
+                    value_id,
+                    &candidate.value,
+                    &mut scratch.charged_transform_bytes,
+                    budget,
+                )?;
+                let bytes = scratch.cache.bytes(range);
+                let mut present = [0u64; 4];
+                for &byte in bytes {
+                    present[usize::from(byte) >> 6] |= 1u64 << (byte & 63);
+                }
+                for rule in &group.rules {
+                    if rule.requirement.satisfied(bytes, &present) {
+                        mask.set(rule.gate);
+                    }
+                }
+            }
+        } else {
+            for group in gates.subsequence_groups() {
+                for rule in &group.rules {
+                    mask.set(rule.gate);
                 }
             }
         }

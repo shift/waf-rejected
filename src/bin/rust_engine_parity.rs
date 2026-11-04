@@ -146,6 +146,21 @@ fn run(args: &Args) -> Result<(), String> {
         .map_err(|err| format!("failed to load `{}`: {err}", args.conf.display()))?;
 
     print_support(engine.support_report());
+    if args.profile || args.bench {
+        if let Some(gates) = engine.gate_set() {
+            let mut stats = gates.subsequence_stats();
+            stats.sort_unstable();
+            let total: usize = stats.iter().map(|(_, alts, _)| *alts).sum();
+            eprintln!(
+                "subsequence gates: {} rules, {} alternatives total",
+                stats.len(),
+                total
+            );
+            for (id, alts, steps) in stats {
+                eprintln!("  {id}: {alts} alternatives, {steps} steps");
+            }
+        }
+    }
     if args.report_only {
         return Ok(());
     }

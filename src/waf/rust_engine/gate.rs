@@ -102,9 +102,27 @@ pub(crate) struct GateGroup {
     pub(crate) pattern_rules: Vec<GateMask>,
 }
 
+/// One rule whose ordered-subsequence prerequisite was proven from its regex.
+pub(crate) struct SubsequenceRule {
+    pub(crate) id: u32,
+    pub(crate) gate: u16,
+    pub(crate) requirement: super::subsequence::Req,
+}
+
+/// Rules sharing one transform pipeline, scanned for subsequence presence with
+/// a single byte-presence bitmap per value.
+pub(crate) struct SubsequenceGroup {
+    pub(crate) plan: Vec<u32>,
+    pub(crate) rules: Vec<SubsequenceRule>,
+}
+
 /// Compiled per-rule gates shared by every request on an engine.
 pub struct GateSet {
     groups: Vec<GateGroup>,
+    subsequence_groups: Vec<SubsequenceGroup>,
+    /// Gate ids below this bound come from the literal artifact; the rest are
+    /// ordered-subsequence gates.
+    literal_gates: usize,
     /// Number of compiled gates; gate ids are dense indexes below this.
     gated_rules: usize,
 }
@@ -113,7 +131,9 @@ impl std::fmt::Debug for GateSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GateSet")
             .field("gated_rules", &self.gated_rules)
+            .field("literal_gates", &self.literal_gates)
             .field("groups", &self.groups.len())
+            .field("subsequence_groups", &self.subsequence_groups.len())
             .finish()
     }
 }
@@ -129,6 +149,22 @@ impl GateSet {
         self.gated_rules == 0
     }
 
+    /// Number of rules gated by an ordered-subsequence prerequisite.
+    pub fn subsequence_len(&self) -> usize {
+        self.subsequence_groups
+            .iter()
+            .map(|group| group.rules.len())
+            .sum()
+    }
+
+    /// True when `gate` was proven by the literal artifact rather than the
+    /// ordered-subsequence extractor. The multi-pattern candidate pass targets
+    /// rules with no literal gate, so it must still see these.
+    #[cfg(feature = "hyperscan-eval")]
+    pub(crate) fn is_literal(&self, gate: u16) -> bool {
+        usize::from(gate) < self.literal_gates
+    }
+
     /// True when `mask` contains a required literal for `gate`.
     #[inline]
     pub fn allows(&self, gate: u16, mask: GateMask) -> bool {
@@ -137,6 +173,26 @@ impl GateSet {
 
     pub(crate) fn groups(&self) -> &[GateGroup] {
         &self.groups
+    }
+
+    pub(crate) fn subsequence_groups(&self) -> &[SubsequenceGroup] {
+        &self.subsequence_groups
+    }
+
+    /// `(rule id, alternatives, steps)` for every subsequence-gated rule.
+    /// Diagnostics only; used by the parity/profiling harness.
+    pub fn subsequence_stats(&self) -> Vec<(u32, usize, usize)> {
+        self.subsequence_groups
+            .iter()
+            .flat_map(|group| &group.rules)
+            .map(|rule| {
+                (
+                    rule.id,
+                    rule.requirement.alternatives(),
+                    rule.requirement.steps(),
+                )
+            })
+            .collect()
     }
 }
 
@@ -148,6 +204,11 @@ pub fn attach(program: &mut Program) -> Result<Option<Arc<GateSet>>, String> {
 
     // Only positive regex operators that exist in this program are eligible.
     let mut eligible = BTreeSet::new();
+    // Regex-only rules that are candidates for an ordered-subsequence gate.
+    // They use no transforms, so the extracted prerequisite applies directly
+    // to the candidate bytes; the analysis is restricted to the named RCE
+    // rules, where the filler-heavy command regexes live.
+    let mut subsequence_sources: BTreeMap<u32, &str> = BTreeMap::new();
     for items in [
         &program.phase1,
         &program.phase2,
@@ -168,6 +229,9 @@ pub fn attach(program: &mut Program) -> Result<Option<Arc<GateSet>>, String> {
                 };
                 if !operator.negated && matches!(operator.kind, OperatorKind::Rx(_)) {
                     eligible.insert(id);
+                    if super::subsequence::is_target_rule(id) && rule.transforms.is_empty() {
+                        subsequence_sources.insert(id, operator.argument.as_str());
+                    }
                 }
             }
         }
@@ -268,6 +332,24 @@ pub fn attach(program: &mut Program) -> Result<Option<Arc<GateSet>>, String> {
         }
         gate_for_rule.insert(id, gate_for_rule.len() as u16);
     }
+
+    // Ordered-subsequence gates for regexes whose commands may be separated by
+    // filler characters. They are only considered when the literal extractor
+    // did not already prove a gate and the rule is not a multi-match rule.
+    let literal_gates = gate_for_rule.len();
+    let mut subsequence_requirements: BTreeMap<u32, super::subsequence::Req> = BTreeMap::new();
+    for (id, pattern) in subsequence_sources {
+        if gate_for_rule.len() >= MAX_GATED_RULES {
+            break;
+        }
+        if gate_for_rule.contains_key(&id) || multi_match.contains(&id) {
+            continue;
+        }
+        if let Some(requirement) = super::subsequence::extract(pattern) {
+            gate_for_rule.insert(id, gate_for_rule.len() as u16);
+            subsequence_requirements.insert(id, requirement);
+        }
+    }
     if gate_for_rule.is_empty() {
         return Ok(None);
     }
@@ -302,7 +384,32 @@ pub fn attach(program: &mut Program) -> Result<Option<Arc<GateSet>>, String> {
             pattern_rules: masks,
         });
     }
-    if groups.is_empty() {
+
+    let mut subsequence_groups: BTreeMap<Vec<u32>, Vec<SubsequenceRule>> = BTreeMap::new();
+    let empty_pipeline: Vec<Transform> = Vec::new();
+    if !subsequence_requirements.is_empty() {
+        if let Some(plan) = resolve_plan(program, &empty_pipeline) {
+            for (id, requirement) in subsequence_requirements {
+                let Some(&gate) = gate_for_rule.get(&id) else {
+                    continue;
+                };
+                subsequence_groups
+                    .entry(plan.clone())
+                    .or_default()
+                    .push(SubsequenceRule {
+                        id,
+                        gate,
+                        requirement,
+                    });
+            }
+        }
+    }
+    let subsequence_groups: Vec<SubsequenceGroup> = subsequence_groups
+        .into_iter()
+        .filter(|(_, rules)| !rules.is_empty())
+        .map(|(plan, rules)| SubsequenceGroup { plan, rules })
+        .collect();
+    if groups.is_empty() && subsequence_groups.is_empty() {
         return Ok(None);
     }
 
@@ -335,6 +442,8 @@ pub fn attach(program: &mut Program) -> Result<Option<Arc<GateSet>>, String> {
     }
     Ok(Some(Arc::new(GateSet {
         groups,
+        subsequence_groups,
+        literal_gates,
         gated_rules: gate_for_rule.len(),
     })))
 }
@@ -388,6 +497,56 @@ mod tests {
         let gates = engine.gate_set().expect("gates compiled");
         assert!(gates.len() > 30, "expected a useful gate set");
         assert_eq!(engine.gated_rule_count(), gates.len());
+        // The filler-heavy RCE command regexes cannot produce a mandatory
+        // literal, so they must be covered by the subsequence model instead.
+        assert!(
+            gates.subsequence_len() >= 7,
+            "expected subsequence gates for the RCE family, got {}",
+            gates.subsequence_len()
+        );
+    }
+
+    #[test]
+    fn filler_separated_command_still_blocks() {
+        let path = crate::waf::rust_engine::default_crs_conf_path();
+        if !path.exists() {
+            return;
+        }
+        let engine =
+            RustEngine::from_conf_path_with_policy(&path, CompilePolicy::Report).expect("engine");
+        let headers = vec![
+            ("Host".to_string(), "localhost".to_string()),
+            ("User-Agent".to_string(), "OWASP CRS test agent".to_string()),
+        ];
+        // `ti''me sh -c whoami` matches 932230 only after shell filler is
+        // removed: the contiguous literal "time" is not present, so a
+        // literal-only gate could never cover this rule.
+        let attack = crate::waf::rust_engine::EngineRequest {
+            method: "GET",
+            uri: "/get?foo=ti''me+sh+-c+whoami",
+            http_version: "HTTP/1.1",
+            headers: &headers,
+            body: None,
+        };
+        let outcome = engine.evaluate_detailed(&attack).expect("evaluate");
+        assert!(
+            matches!(outcome.decision, crate::waf::Decision::Block { .. }),
+            "filler-separated command must still block: {:?}",
+            outcome.decision
+        );
+
+        // Subsequence present but not a command: the gate may pass, and the
+        // regex simply runs. The overall decision must remain Allow, proving a
+        // gate pass never changes semantics.
+        let benign = crate::waf::rust_engine::EngineRequest {
+            method: "GET",
+            uri: "/get?foo=time+is+precious+to+me",
+            http_version: "HTTP/1.1",
+            headers: &headers,
+            body: None,
+        };
+        let outcome = engine.evaluate_detailed(&benign).expect("evaluate");
+        assert!(matches!(outcome.decision, crate::waf::Decision::Allow));
     }
 
     #[test]
@@ -397,6 +556,8 @@ mod tests {
         // property that makes a missing literal impossible to skip.
         let gates = GateSet {
             groups: Vec::new(),
+            subsequence_groups: Vec::new(),
+            literal_gates: 0,
             gated_rules: 2,
         };
         let mut mask = GateMask::default();

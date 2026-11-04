@@ -371,8 +371,16 @@ fn collect(program: &Program) -> Pending {
                 }
                 // Rules that already carry a mandatory-literal gate are the
                 // cheap path; the residual subset is what this pass targets.
-                if rule.gate.is_some() {
-                    continue;
+                // Ordered-subsequence gates are not literal gates: this pass
+                // can still add an independent candidate miss for them.
+                if let Some(gate) = rule.gate {
+                    let literal = program
+                        .gates
+                        .as_deref()
+                        .is_some_and(|gates| gates.is_literal(gate));
+                    if literal {
+                        continue;
+                    }
                 }
                 let expression = super::parser::normalize_pattern(&operator.argument);
                 if !representable(&expression) {

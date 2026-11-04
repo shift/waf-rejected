@@ -6,7 +6,13 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Added
 
-- Nothing yet.
+- Ordered-subsequence gates for the filler-tolerant RCE rules
+  (`932125/230/235/250/260/370/380`). The native engine derives a sound
+  `c…a…t`-style prerequisite from each regex (conservatively; unprovable
+  patterns stay ungated) and skips the rule when the subsequence is absent.
+  4 KiB: 573 µs p50 (604 µs before), 151 vs 137 regex evaluations skipped;
+  8 KiB: 943 µs (1 007 µs before). See
+  `docs/suggestions_from_agents/rce-subsequence-gate.md`.
 
 ## [0.1.0-beta.13] - 2026-11-03
 

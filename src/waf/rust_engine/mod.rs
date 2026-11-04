@@ -41,6 +41,7 @@ pub mod processors;
 pub mod profile;
 pub mod request;
 pub mod response;
+pub(crate) mod subsequence;
 pub mod transforms;
 
 pub use budget::{Budget, Limits};
