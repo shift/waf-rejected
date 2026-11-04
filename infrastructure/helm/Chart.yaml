@@ -14,7 +14,7 @@ keywords:
 
 maintainers:
   - name: WAF-Rejected Team
-    email: security@waf-rejected.com
+    email: shift+security-waf-r@someone.section.me
 
 # Prometheus/Grafana are installed separately; keeping undeclared subchart
 # dependencies here would make `helm upgrade` fail without `helm dependency build`.

@@ -304,7 +304,7 @@ impl ComplianceReporter {
              - Security rule updates\n\
              \n\
              7. Contact details of the data protection officer:\n\
-             security@waf-rejected.com",
+             shift+security-waf-r@someone.section.me",
             Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
             breaches.len(),
             breaches
@@ -354,7 +354,7 @@ impl ComplianceReporter {
              - Security monitoring enhancement\n\
              - Incident response procedures initiated\n\
              \n\
-             Contact: privacy@waf-rejected.com",
+             Contact: shift+security-waf-r@someone.section.me",
             Utc::now().format("%Y-%m-%d"),
             breaches.len(),
             breaches.len() // Simplified - would need actual PHI correlation

@@ -32,7 +32,7 @@ Preferred channel: GitHub private vulnerability reporting
 (`Security` tab -> `Report a vulnerability`) on
 `https://github.com/shift/waf-rejected/security/advisories/new`.
 
-Fallback channel: `security@waf-rejected.com` (monitored security mailbox).
+Fallback channel: `shift+security-waf-r@someone.section.me` (monitored security mailbox).
 
 Encrypt sensitive material if the fallback mailbox publishes a PGP key. Never
 send production credentials, customer payloads or full packet captures; redact
