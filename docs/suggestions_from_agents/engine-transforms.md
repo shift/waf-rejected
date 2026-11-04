@@ -1,5 +1,10 @@
 # Native engine: shared batched transform pipeline
 
+> **Historical research report.** This records the state of the branch/commit
+> below. `rust-engine` is now in the default feature set and selected by
+> default; "non-default" below is the research baseline only. For current
+> behaviour see [engine selection](../user-guide/engine-selection.md).
+
 **Branch:** `perf/engine-transforms` (worktree `.worktrees/engine-transforms`)
 **Base:** `22de3e9`
 **Modules:** `src/waf/rust_engine/{transforms,engine,ir,error,budget}.rs`,

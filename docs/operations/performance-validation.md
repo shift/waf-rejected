@@ -1,5 +1,11 @@
 # Performance Validation (Beta Load Harness)
 
+> **Scope note.** The capacity tables in this document were produced with the
+> Coraza WASI reactor (`waf.coraza.backend = "wasm"`), not the current default
+> native Rust engine. They remain valid for the wasm reference path. For the
+> default engine, see the [support matrix](support-matrix.md) and
+> [engine selection](../user-guide/engine-selection.md).
+
 This document defines how the beta is load-validated end to end, the acceptance
 gates a build must meet, and the measured capacity of the reference laptop.
 The numbers below are **capacity floors**, not ceilings: the load generator,

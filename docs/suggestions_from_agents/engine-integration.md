@@ -1,5 +1,11 @@
 # Engine integration: native operators + kernel execution model
 
+> **Historical research report.** This records the state of the branch/commit
+> below, not current operator defaults. Since 0.1.0-beta.13 the native Rust
+> engine is the default request-inspection backend; Coraza remains the reference
+> oracle and the explicit `waf.coraza.backend = "wasm"` switch-back. For current
+> behaviour see [engine selection](../user-guide/engine-selection.md).
+
 Branch: `feat/engine-integration` (not pushed, not merged).
 Feature set: `rust-engine,native-detect,engine-kernel` (defaults unchanged; Coraza
 remains the default backend).

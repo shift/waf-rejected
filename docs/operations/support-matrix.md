@@ -9,6 +9,11 @@ This document states what the beta release supports, which paths are on by
 default, and what latency and coverage to expect from each one. It is the
 long-form companion to the release summary in `CHANGELOG.md`.
 
+For the operational choice between the three backends, including switch-back
+and fail-closed/fallback semantics, see
+[engine selection](../user-guide/engine-selection.md). Ready-to-run
+configurations are in [`config/examples/`](../../config/examples/).
+
 > **Headline caveat.** The sub-millisecond claims apply to **bodyless
 > requests, early-blocked requests, allow-cache hits and prefilter fast paths**,
 > and to the Rust engine's request path. They do **not** apply to a request that
@@ -75,7 +80,8 @@ separate transport cap and does not change WAF inspection depth.
   `waf.fast_allow.routes` list (`"METHOD /path"`).
 - **What it does:** skips inspection for **bodyless, query-free** requests on
   the listed routes.
-- **When it helps:** health/readiness and static endpoints.
+- **When it helps:** static endpoints and other exact, bodyless, query-free
+  routes on the proxy listener.
 - **Limits:** only exact configured routes; request-size, method, rate-limit
   and geographic gates still run. It cannot allow a request with a body or a
   query string.

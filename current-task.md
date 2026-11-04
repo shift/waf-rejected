@@ -1084,3 +1084,23 @@ updated. No defaults, versions, transforms, prefilter, proxy or Coraza changes.
       Coraza tests, 2,110/2,112 parity, reactor size check, `nix build`.
 - [x] Package binary/sidecar/Coraza/artifacts, isolated-storage image, smoke
       tests (Rust default and `backend = "wasm"`).
+
+## Docs/config audit (`docs/config-audit`)
+
+- [x] Audited README, operations docs, config files and engine docs for
+      stale wasm-default claims and old latency numbers (8–10 ms / ~2 ms).
+- [x] Added `docs/user-guide/{README,quickstart,engine-selection,configuration}.md`
+      and `docs/guides/demo.md`.
+- [x] Updated README, support matrix, release checklist, container, deployment,
+      monitoring, Coraza/engine docs and historical suggestion banners.
+- [x] Filled `config.toml` and `config.docker.toml`; added
+      `config/examples/{minimal,coraza-reference,native-sidecar,grpc-allowlist,graphql-persisted,high-throughput}.toml`
+      plus the GraphQL allowlist artifact.
+- [x] Added `tests/config_files.rs`, `scripts/validate-configs.sh`, wired the
+      test into `scripts/ci-feature-matrix.sh`; all 14 shipped configs load.
+- [x] Added and ran `scripts/demo.sh` (200 benign/gRPC, 403 SQLi/XSS).
+- [x] fmt, clippy `--lib`, `cargo test --lib` (499 passed), config validation.
+- Remaining stale items: `config/test.toml` contains obsolete keys that the
+  loader silently ignores (documented); historical perf reports in
+  `docs/operations/performance-*.md` keep their original wasm-era numbers with
+  scope notes rather than being rewritten.

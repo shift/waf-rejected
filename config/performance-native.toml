@@ -1,7 +1,9 @@
 # WAF-Rejected high-throughput profile: native Coraza sidecar.
 #
 # This is an opt-in deployment profile. It does NOT change the default backend:
-# a plain `config.toml` still selects `waf.coraza.backend = "wasm"`.
+# a plain `config.toml` selects the native Rust engine
+# (`waf.coraza.backend = "rust"`) in default builds and only switches here
+# because this file sets `backend = "native"` explicitly.
 #
 # Requirements:
 #   * waf-ingress built with `--features wasm-reactor,coraza-native`

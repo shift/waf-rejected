@@ -1,5 +1,10 @@
 # Native engine rule loop: profile, empty-target gating and allocation cut
 
+> **Historical research report.** This records the state of the branch/commit
+> below. `rust-engine` is now in the default feature set and selected by
+> default; "non-default" below is the research baseline only. For current
+> behaviour see [engine selection](../user-guide/engine-selection.md).
+
 **Branch:** `perf/engine-ruleloop`
 **Engine:** `src/waf/rust_engine` (non-default `rust-engine` feature)
 **Baseline:** `ad7e7ea`

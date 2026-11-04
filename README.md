@@ -11,6 +11,10 @@ the reference oracle and an explicit `waf.coraza.backend = "wasm"` switch-back.
 ## What works
 
 - Reverse proxy with HTTP/1.1, HTTP/2 over TLS, and feature-gated HTTP/3 (QUIC).
+- Default native Rust CRS engine with 505/505 OWASP CRS rules, plus the Coraza
+  WASI reference engine as an explicit switch-back (`waf.coraza.backend = "wasm"`)
+  and an opt-in native sidecar (`"native"`). See
+  [`docs/user-guide/engine-selection.md`](docs/user-guide/engine-selection.md).
 - HTTP and HTTPS upstreams over HTTP/1.1 and HTTP/2. HTTPS upstreams are
   verified against `webpki-roots`, with an optional private CA bundle via
   `proxy.upstream_ca_path`. Upstream mutual TLS is enabled by setting both
@@ -19,6 +23,8 @@ the reference oracle and an explicit `waf.coraza.backend = "wasm"` switch-back.
 - TLS WebSocket upstreams (`https://`) verified against `webpki-roots`, with an
   optional private CA bundle via `proxy.upstream_ca_path`.
 - URI, query-string, header and **request-body** inspection.
+- Protocol-aware gRPC (frame/field validation, method allowlists, bounded
+  decoded-field content scan) and GraphQL-over-HTTP inspection.
 - Bounded `gzip`, `deflate` and `br` request decompression before WAF
   inspection, capped at `server.max_body_size`.
 - Percent-encoded payload decoding (`%20`, `%27`, `%3C`, ...).
@@ -51,6 +57,12 @@ Configuration errors are fatal; the server will not silently run with defaults.
 WAF_CONFIG_FILE=./config.toml cargo run --bin waf-ingress
 ```
 
+For a minimal configuration and a manual walkthrough (health check and a
+verified block), see
+[`docs/user-guide/quickstart.md`](docs/user-guide/quickstart.md). For a
+one-command run, execute [`scripts/demo.sh`](scripts/demo.sh) — see
+[`docs/guides/demo.md`](docs/guides/demo.md).
+
 ### Endpoints
 
 | Endpoint | Purpose |
@@ -75,7 +87,17 @@ curl -i -X POST --data "id=1 UNION SELECT * FROM users" http://127.0.0.1:8080/lo
 
 ## Configuration
 
-See [`config.toml`](config.toml) for a complete example. Key sections:
+See [`config.toml`](config.toml) for the complete annotated configuration and
+[`docs/user-guide/configuration.md`](docs/user-guide/configuration.md) for every
+section. Focused examples live in [`config/examples/`](config/examples/):
+minimal, Coraza switch-back, native sidecar, gRPC allowlist, GraphQL persisted
+queries and high-throughput tuning. Validate edits with:
+
+```bash
+./scripts/validate-configs.sh
+```
+
+Key sections:
 
 ```toml
 bind_addr = "0.0.0.0:8080"
@@ -96,12 +118,21 @@ enabled = true
 inspect_body = true
 threat_patterns = ["sql_injection", "xss", "command_injection", "path_traversal"]
 
+[waf.coraza]
+# backend = "rust"        # compiled default in default builds
+# fallback = "none"       # fail closed; "wasm" re-evaluates with Coraza
+# max_inspect_bytes = 0   # 0 = inspect the whole body
+# oversize_action = "inspect-all"  # or "reject" / "forward-uninspected"
+
 [security.auth]
 enabled = true
 api_keys = ["replace-me"]      # prefer injecting from a secret
 header_name = "X-API-Key"
 require_https = true
 ```
+
+Unknown keys are silently ignored by the loader (the config structs do not deny
+unknown fields), so run the validation script after editing a file.
 
 ### Request decompression
 
@@ -136,6 +167,8 @@ nix develop -c cargo clippy --lib -- --deny warnings
 nix develop -c cargo test --lib
 nix develop -c cargo test --test integration
 nix develop -c cargo check --all-targets
+./scripts/validate-configs.sh
+./scripts/demo.sh
 nix build .#waf-ingress
 ```
 
@@ -248,6 +281,19 @@ Key points:
   Response inspection is plumbed in the engine but not proxy-wired yet, and
   io_uring/Hyperscan remain opt-in. See
   [`docs/suggestions_from_agents/rust-engine.md`](docs/suggestions_from_agents/rust-engine.md).
+- **Body inspection is bounded by policy, not silently truncated.** The wasm
+  payload contract is 64 KiB. `waf.coraza.max_inspect_bytes = 0` (default)
+  inspects the whole body up to `max_payload_bytes` and fails closed above it;
+  `oversize_action = "reject"` returns `413`; `forward-uninspected` leaves an
+  explicit tail gap. `waf.admission` bounds concurrent heavy scans and returns
+  `503 + Retry-After` when saturated, never a silent allow.
+- **Protocol-aware inspection is enabled for gRPC and GraphQL.** gRPC frames
+  are structurally validated and withheld from CRS body rules; an empty method
+  allowlist is monitor-only. GraphQL defaults to the full CRS JSON scan;
+  `graphql-only` is an opt-in coverage trade-off that requires a non-empty
+  operation allowlist. See
+  [`docs/grpc-inspection.md`](docs/grpc-inspection.md) and
+  [`docs/graphql-inspection.md`](docs/graphql-inspection.md).
 - **ModSecurity/Coraza WASM execution remains available and unchanged.** The
   bundled `rules/coraza.wasm` is a Go-JS demo module; the live Coraza engine is
   a WASI reactor on wasmtime 49 compiled by the default `wasm-reactor` feature.
@@ -255,8 +301,11 @@ Key points:
   built-in heuristic rules when selected or used as the fallback.
   `waf.coraza.enabled = false` (or `--no-default-features`) disables it.
   Start-up compiles the ~20 MiB module once (~4.5 s) and warms the reactor pool
-  (~1.1 s) before readiness; measured steady-state cost is ~8–10 ms p50 per
-  request with full CRS. The host is built with Rust 1.99.1. See
+  (~1.1 s) before readiness. When selected, end-to-end proxy p50 is 4.47 / 40.13
+  / 169.56 / 354.09 ms for bodyless / 1 / 4 / 8 KiB bodies on the reference
+  host. The reactor is not instantiated when the default Rust engine is selected
+  with `fallback = "none"`, so its memory footprint does not apply to the
+  default path. See
   [`docs/coraza-wasi-reactor.md`](docs/coraza-wasi-reactor.md) and
   [`docs/wasm-integration-status.md`](docs/wasm-integration-status.md).
 - **A native Coraza sidecar profile is available for high-throughput body

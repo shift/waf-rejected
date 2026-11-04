@@ -103,6 +103,7 @@ STAGES=(
   "fmt|cargo fmt -- --check|fmt -- --check"
   "clippy-default|cargo clippy --lib (default features)|clippy --lib -- --deny warnings"
   "test-default|cargo test --lib (default features)|test --lib"
+  "config-files|shipped configs load through Config::load|test --test config_files"
   "test-wasm-reactor|cargo test --lib --features wasm-reactor|test --lib --features wasm-reactor"
   "test-wasm-reactor+coraza-native|cargo test --lib --features wasm-reactor,coraza-native|test --lib --features wasm-reactor,coraza-native"
   "test-no-default-features|cargo test --lib --no-default-features|test --lib --no-default-features"

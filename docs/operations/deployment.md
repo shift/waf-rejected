@@ -4,6 +4,13 @@
 
 This guide covers the production deployment of WAF-Rejected using Kubernetes and Helm.
 
+The default image runs the native Rust CRS engine
+(`waf.coraza.backend = "rust"`). Coraza remains the reference implementation and
+the explicit `"wasm"` switch-back; see
+[engine selection](../user-guide/engine-selection.md) before choosing a backend.
+Configuration sections are documented in
+[configuration](../user-guide/configuration.md).
+
 ## Prerequisites
 
 - Kubernetes cluster (v1.24+)
@@ -14,10 +21,14 @@ This guide covers the production deployment of WAF-Rejected using Kubernetes and
 
 ## Quick Start
 
-### 1. Add Helm Repository
+### 1. Install from the chart in this repository
+
+The Helm chart lives in [`infrastructure/helm`](../../infrastructure/helm). If
+your organisation publishes it to a chart repository, add that repository and
+use `waf-rejected/waf-rejected` instead of the local path.
 
 ```bash
-helm repo add waf-rejected https://charts.waf-rejected.com
+helm repo add waf-rejected https://charts.example.com
 helm repo update
 ```
 
@@ -27,14 +38,10 @@ helm repo update
 # Create namespace
 kubectl create namespace security
 
-# Install with default values
-helm install waf-rejected waf-rejected/waf-rejected \
+# Install the chart shipped with this repository
+helm install waf-rejected ./infrastructure/helm \
   --namespace security \
   --set upstream.url="http://your-backend-service"
-
-# Or install from local chart
-helm install waf-rejected ./infrastructure/helm \
-  --namespace security
 ```
 
 ### 3. Verify Installation
@@ -75,7 +82,7 @@ security:
 ```yaml
 # Production values.yaml
 image:
-  tag: "v0.1.0-beta.3"
+  tag: "v0.1.0-beta.13"
 
 resources:
   requests:
@@ -96,6 +103,63 @@ persistence:
   size: "50Gi"
   storageClass: "fast-ssd"
 ```
+
+## Engine and configuration
+
+The chart passes `upstream.url` and the container image loads
+`/etc/waf/config.toml`. For anything beyond the chart values, mount a ConfigMap
+with a full TOML file:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: waf-config
+  namespace: security
+data:
+  config.toml: |
+    bind_addr = "0.0.0.0:8080"
+    health_bind_addr = "0.0.0.0:8081"
+    upstream_uri = "http://backend-service:8080"
+
+    [waf]
+    enabled = true
+    fail_mode = "closed"
+
+    [waf.coraza]
+    # Default in default builds: native Rust CRS engine.
+    # backend = "rust"
+    # Explicit switch-back to the Coraza reference reactor:
+    # backend = "wasm"
+    # Opt-in native sidecar (also deploy the sidecar and shared socket):
+    # backend = "native"
+    # native_socket_path = "/run/waf/coraza.sock"
+    fallback = "none"
+    max_payload_bytes = 65536
+    max_inspect_bytes = 0
+    oversize_action = "inspect-all"
+```
+
+```bash
+kubectl create configmap waf-config -n security \
+  --from-file=config.toml=./config.toml
+
+# Mount it at /etc/waf/config.toml in the Deployment, or use the chart's
+# extraVolumes/extraVolumeMounts values if present.
+```
+
+Validate the file before deploying:
+
+```bash
+./scripts/validate-configs.sh
+```
+
+Unknown keys are silently ignored by the loader, so review the list of loaded
+files rather than relying only on the exit status. Keep `fail_mode = "closed"`;
+a backend outage or runtime error must block, not silently allow. See
+[engine selection](../user-guide/engine-selection.md) and the
+[container guide](container.md) for backend-specific memory and start-up
+guidance.
 
 ## Security Configuration
 
@@ -265,7 +329,7 @@ curl -f http://waf-service/health
 curl -f http://waf-service:8081/health/ready
 
 # Metrics check
-curl -f http://waf-service/metrics
+curl -f http://waf-service:8081/metrics
 ```
 
 ## Maintenance
@@ -297,6 +361,6 @@ config:
 ```bash
 # Update to latest security patch
 helm upgrade waf-rejected waf-rejected/waf-rejected \
-  --set image.tag=v0.1.0-beta.3 \
+  --set image.tag=v0.1.0-beta.13 \
   -n security
 ```

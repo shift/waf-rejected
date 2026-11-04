@@ -12,7 +12,7 @@ The image is a Debian slim runtime with the `waf-ingress` binary, the bundled
 | Item | Value |
 |---|---|
 | Registry image | `ghcr.io/shift/waf-rejected` |
-| Tag convention | `v<version>`, for example `v0.1.0-beta.6` |
+| Tag convention | `v<version>`, for example `v0.1.0-beta.13` |
 | Tarball convention | `waf-rejected-<version>-image.tar.gz` |
 | Checksum asset | `waf-rejected-<version>-image.tar.gz.sha256` |
 | Proxy port | `8080` (`bind_addr`) |
@@ -33,13 +33,13 @@ build provenance attestation.
 
 ```bash
 # Verify the asset against the checksum published with the release
-sha256sum --check waf-rejected-0.1.0-beta.6-image.tar.gz.sha256
+sha256sum --check waf-rejected-0.1.0-beta.13-image.tar.gz.sha256
 
 # Verify the tarball was built by this repository's Release workflow
-gh attestation verify waf-rejected-0.1.0-beta.6-image.tar.gz --repo shift/waf-rejected
+gh attestation verify waf-rejected-0.1.0-beta.13-image.tar.gz --repo shift/waf-rejected
 
-docker load -i waf-rejected-0.1.0-beta.6-image.tar.gz
-# Loaded image: ghcr.io/shift/waf-rejected:v0.1.0-beta.6
+docker load -i waf-rejected-0.1.0-beta.13-image.tar.gz
+# Loaded image: ghcr.io/shift/waf-rejected:v0.1.0-beta.13
 ```
 
 The provenance attestation is published for the image tarball, the binary
@@ -51,20 +51,20 @@ Use the asset name shown on the release page if it differs from the convention
 above. Podman uses the same archive:
 
 ```bash
-podman load -i waf-rejected-0.1.0-beta.6-image.tar.gz
+podman load -i waf-rejected-0.1.0-beta.13-image.tar.gz
 ```
 
 Alternatively pull from the registry:
 
 ```bash
-docker pull ghcr.io/shift/waf-rejected:v0.1.0-beta.6
+docker pull ghcr.io/shift/waf-rejected:v0.1.0-beta.13
 ```
 
 If the release notes list a digest, confirm the loaded image matches it:
 
 ```bash
 docker image inspect --format '{{index .RepoDigests 0}}' \
-  ghcr.io/shift/waf-rejected:v0.1.0-beta.6
+  ghcr.io/shift/waf-rejected:v0.1.0-beta.13
 ```
 
 An image loaded from a local tarball may not carry a `RepoDigests` entry until
@@ -87,7 +87,11 @@ Notes:
 
 - `WAF_CONFIG_FILE` already defaults to `/etc/waf/config.toml`. Any `WAF_*`
   environment variable overrides the file, using `__` for nesting, for example
-  `WAF_SERVER__MAX_BODY_SIZE=10485760`.
+  `WAF_SERVER__MAX_BODY_SIZE=10485760` or
+  `WAF_WAF__CORAZA__BACKEND=wasm`.
+- The default backend is the native Rust CRS engine. Select the Coraza reference
+  reactor with `WAF_WAF__CORAZA__BACKEND=wasm` or the opt-in sidecar with
+  `"native"`; see [engine selection](../user-guide/engine-selection.md).
 - The bundled `config.docker.toml` has **authentication disabled**. Enable
   `security.auth` with keys injected from a secret before exposing the proxy.
 - Mount the config read-only. The container needs write access only to
@@ -105,14 +109,20 @@ The image bundles the Coraza WASI reactor at
 enables the default `wasm-reactor` feature explicitly, verifies the digest and
 checks that the module is at most 32 MiB (the current build is about 18 MiB).
 
-The reactor is enabled by default and validates the module at startup, failing
-closed if it is missing, malformed, over budget, missing required exports or
-fails pool warm-up. Start-up pays about 4.5 s to compile the module and about
-1.1 s to warm the pool before readiness; steady-state cost is about 8–10 ms
-p50 per request with the full CRS. Set `waf.coraza.enabled = false` in the
-configuration file/environment to skip validation and warm-up entirely.
-`waf.coraza.module_path` selects an alternate module file;
-the embedded module is used when it is unset.
+The request-inspection backend is the native Rust CRS engine
+(`waf.coraza.backend = "rust"`) in the default image. With the default
+`fallback = "none"`, the wasm reactor is **not instantiated**, so start-up is
+~276 ms with ~30 MiB RSS and the ~801 MiB reactor footprint does not apply.
+
+The reactor remains available as the reference implementation and explicit
+switch-back. Set `[waf.coraza] backend = "wasm"` to select it. When selected,
+start-up pays about 4.5 s to compile the module and about 1.1 s to warm the
+pool before readiness, and end-to-end proxy p50 is 4.47 / 40.13 / 169.56 /
+354.09 ms for bodyless / 1 / 4 / 8 KiB bodies on the reference host.
+`waf.coraza.module_path` selects an alternate module file; the embedded module
+is used when it is unset. `waf.coraza.enabled = false` disables request
+inspection entirely. See
+[engine selection](../user-guide/engine-selection.md).
 
 ```bash
 docker run --rm --entrypoint sha256sum \
@@ -136,9 +146,9 @@ curl -o /dev/null -w '%{http_code}\n' \
 ## Pin by digest
 
 ```bash
-docker pull ghcr.io/shift/waf-rejected:v0.1.0-beta.6
+docker pull ghcr.io/shift/waf-rejected:v0.1.0-beta.13
 docker image inspect --format '{{index .RepoDigests 0}}' \
-  ghcr.io/shift/waf-rejected:v0.1.0-beta.6
+  ghcr.io/shift/waf-rejected:v0.1.0-beta.13
 # ghcr.io/shift/waf-rejected@sha256:...
 ```
 
@@ -185,7 +195,7 @@ Service should expose only `8080`.
 5. Record the new digest in your inventory.
 
 ```bash
-docker pull ghcr.io/shift/waf-rejected:v0.1.0-beta.7
+docker pull ghcr.io/shift/waf-rejected:v0.1.0-beta.13
 docker stop waf-rejected && docker rm waf-rejected
 docker run -d --name waf-rejected ... ghcr.io/shift/waf-rejected@sha256:<new-digest>
 ```

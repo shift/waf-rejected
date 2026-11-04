@@ -1,5 +1,10 @@
 # Native Rust fast path: architecture, soundness and measured gap to sub-millisecond
 
+> **Historical research report.** This records the state of the branch/commit
+> below, not current operator defaults. Since 0.1.0-beta.13 the Rust engine is
+> the default backend; `fastpath`/fast-allow remain opt-in. For current
+> behaviour see [engine selection](../user-guide/engine-selection.md).
+
 **Status:** research prototype, **non-default feature `fastpath`**.
 **Branch:** `research/fastpath` (worktree `.worktrees/fastpath`), based on
 `main` @ `24388c5`.

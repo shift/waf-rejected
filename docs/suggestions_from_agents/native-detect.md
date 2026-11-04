@@ -1,5 +1,11 @@
 # Native `@detectSQLi` / `@detectXSS`: parity, cost and integration
 
+> **Historical research report.** This records the state of the branch/commit
+> below. `native-detect` is now pulled in by the default `rust-engine` feature;
+> statements about Coraza staying the default request path describe the
+> research baseline. For current behaviour see
+> [engine selection](../user-guide/engine-selection.md).
+
 **Status:** experimental implementation, **not enabled by default**.
 **Branch:** `feat/native-detect` (worktree `.worktrees/native-detect`), based on
 `main` @ `8b6a4ec`.

@@ -1,6 +1,9 @@
 # Coraza WASI Reactor
 
-**Status:** enabled by default (`wasm-reactor` feature, `waf.coraza.enabled = true`)
+**Status:** reference implementation; available in default builds. Since
+`0.1.0-beta.13` the default request-inspection backend is the native Rust CRS
+engine (`waf.coraza.backend = "rust"`); set `waf.coraza.backend = "wasm"` to use
+this reactor.
 **Module:** `wasm/coraza_reactor/coraza_reactor.wasm`
 **Source:** `wasm/coraza_reactor/main.go`
 
@@ -11,17 +14,22 @@ WASI reactor. It has no `syscall/js` imports and no runtime dependency on
 the binary. The host embeds [wasmtime](https://wasmtime.dev) 49 (Cranelift)
 and uses wasmtime-wasi's preview1 imports for the Go runtime.
 
-The reactor is **enabled by default**: the `wasm-reactor` Cargo feature is part
-of `default`, and `WafCorazaConfig::default().enabled` is `true`. It runs
-before the built-in heuristic rules, which remain as defence in depth. It ships
-the full **request-side** CRS 4.14.0 rule set (anomaly scoring, paranoia level
-1); response inspection is disabled because the host does not forward response
-bodies. To opt out, set `waf.coraza.enabled = false` (the documented switch)
-or build with `--no-default-features`.
+The reactor is **available in default builds**: the `wasm-reactor` Cargo
+feature is part of `default`, and `WafCorazaConfig::default().enabled` is
+`true`. It is **not** the default request-inspection backend: the Rust engine is
+selected when compiled (`backend = "rust"`), and the reactor is only
+instantiated when `backend = "wasm"` or when `fallback = "wasm"` needs it. When
+selected it runs before the built-in heuristic rules, which remain as defence in
+depth. It ships the full **request-side** CRS 4.14.0 rule set (anomaly scoring,
+paranoia level 1); response inspection is disabled because the host does not
+forward response bodies. To opt out, set `waf.coraza.enabled = false` (the
+documented switch) or build with `--no-default-features`.
 
-Measured production cost: about **4.5 s** to compile the ~20 MiB module once at
-start-up, about **1.1 s** to warm the reactor pool before readiness, and about
-**8–10 ms p50** added per request with the full CRS.
+Measured cost when selected: about **4.5 s** to compile the ~20 MiB module once
+at start-up, about **1.1 s** to warm the reactor pool before readiness, and
+end-to-end proxy p50 **4.47 / 40.13 / 169.56 / 354.09 ms** for bodyless / 1 / 4
+/ 8 KiB bodies on the reference host (versus 0.414 / 0.642 / 1.091 / 1.614 ms
+for the default Rust engine).
 
 ## Packaging and stable path
 
@@ -63,7 +71,10 @@ plain Go build (see [Runtime and module tuning](#runtime-and-module-tuning-measu
 ## Startup validation (fail closed)
 
 With the `wasm-reactor` feature compiled in (the default), `waf-ingress`
-validates the reactor during startup, before it starts listening:
+validates the reactor module during startup, before it starts listening. This
+happens even when the Rust engine is the selected backend, so a broken bundled
+artifact is caught early; the reactor itself is only compiled and warmed when
+`backend = "wasm"` (or `fallback = "wasm"` is armed):
 
 1. `validate_startup(&config)` returns immediately when `waf.enabled` or
    `waf.coraza.enabled` is false;
@@ -71,7 +82,8 @@ validates the reactor during startup, before it starts listening:
    `waf.coraza.module_path` file when set, or the embedded reactor when
    `None`. It rejects a missing/unreadable file or a module over the 32 MiB
    budget;
-3. `WafEngine::with_config` compiles that module once, requires
+3. When the wasm backend (or wasm fallback) is selected,
+   `WafEngine::with_config` compiles that module once, requires
    `memory`, `_initialize`, `input_base`, `init`, `eval` and `free`, and warms
    the worker pool (`_initialize`/`init` on every worker);
 4. `WafProxyService::new` treats any reactor compile, export-validation or
@@ -476,10 +488,13 @@ out of scope.
 
 ## Live WAF integration
 
-The reactor is wired into the live rule chain only when both the
-`wasm-reactor` feature is compiled and `waf.coraza.enabled` is true. Both are
-true by default. It is registered **before** the heuristic rules so a Coraza
-block wins even if a later rule would allow the request.
+The reactor is wired into the live rule chain only when the `wasm-reactor`
+feature is compiled, `waf.coraza.enabled` is true **and**
+`waf.coraza.backend = "wasm"` (or it is used as the `fallback = "wasm"`
+engine). The feature and `enabled` are true by default, but the Rust engine is
+the default backend. When selected, the reactor is registered **before** the
+heuristic rules so a Coraza block wins even if a later rule would allow the
+request.
 
 ```toml
 [waf]
@@ -962,9 +977,11 @@ measured memory-pressure signal.
   latency change, so neither is wired into the build. Splitting unused Coraza
   features or a lighter CRS profile remains the way to shrink the 20 MiB
   artifact.
-- **Default enablement:** `wasm-reactor` is now default-on. Watch the
+- **Availability:** `wasm-reactor` is default-on, but the Rust engine is the
+  default request backend. When `backend = "wasm"` is selected, watch the
   ~4.5 s compile + ~1.1 s pool warm at start-up and the body-size-dependent
-  per-request cost (~2 ms bodyless, ~350 ms per 8 KiB body); provide a
+  per-request cost (4.47 ms bodyless, 169.56 ms at 4 KiB, 354.09 ms at 8 KiB on
+  the reference host); provide a
   lighter CRS profile or a body-size policy if that is too expensive for edge
   deployments.
 - **Body fidelity:** binary bodies are now carried losslessly as base64 in the

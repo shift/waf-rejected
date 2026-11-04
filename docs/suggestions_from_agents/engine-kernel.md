@@ -1,5 +1,11 @@
 # Native Rust engine kernel: execution model and prototype measurements
 
+> **Historical research report.** This records the state of the branch/commit
+> below, not current operator defaults. The Rust engine is now the default
+> request-inspection backend; statements here about a non-default feature and
+> Coraza remaining the default describe the research baseline. For current
+> behaviour see [engine selection](../user-guide/engine-selection.md).
+
 **Status:** experimental prototype, non-default feature `engine-kernel`.
 **Branch:** `perf/engine-kernel` (worktree `.worktrees/engine-kernel`).
 **Scope:** demonstrate the execution model for a future Coraza replacement.

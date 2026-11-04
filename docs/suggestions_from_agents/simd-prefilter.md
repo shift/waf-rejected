@@ -1,5 +1,10 @@
 # Production CRS prefilter and Hyperscan backend
 
+> **Historical research report.** This records the state of the branch/commit
+> below. The prefilter remains opt-in, but the default request-inspection
+> backend is now the native Rust engine, not Coraza. For current behaviour see
+> [engine selection](../user-guide/engine-selection.md).
+
 **Status:** production-ready within the non-default `hyperscan-eval` feature.
 **Worktree:** `.worktrees/simd-prefilter`.
 **Artifact:** `rules/crs/prefilter.json` (schema v1), unchanged.

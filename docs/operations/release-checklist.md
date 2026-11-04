@@ -1,6 +1,6 @@
 # Release Checklist
 
-## Beta 0.1.0-beta.9
+## Beta 0.1.0-beta.13
 
 ### Verification
 
@@ -11,6 +11,11 @@
 - [ ] `cargo check --all-targets`
 - [ ] `cargo test --lib`
 - [ ] `cargo test --test integration`
+- [ ] `./scripts/validate-configs.sh` passes (loads every `config/*.toml`,
+      `config/examples/*.toml`, `config.toml` and `config.docker.toml` through
+      `Config::load`; unknown keys are ignored by the loader, so review the list
+      of loaded files as well as the exit status)
+- [ ] `./scripts/demo.sh` passes (benign 200, SQLi/XSS 403, gRPC forwarded)
 - [ ] `nix build .#waf-ingress`
 - [ ] `nix build .#coraza-native-sidecar`
 - [ ] `./scripts/run-native-profile.sh` passes (benign 200, SQLi/XSS 403,
@@ -21,16 +26,22 @@
       package, alongside `LICENSE-CRS`, `PROVENANCE.md` and `SHA256SUMS`
 - [ ] Container image contains `/usr/share/waf/wasm/coraza_reactor.wasm` and
       the module digest matches `SHA256SUMS`
-- [ ] The default release build includes `wasm-reactor` and a default
-      `Config` has `waf.coraza.enabled = true`
+- [ ] The default release build includes `rust-engine` and `wasm-reactor`, and
+      a default `Config` resolves `waf.coraza.enabled = true` with
+      `waf.coraza.backend = "rust"`
 - [ ] The release build also includes `coraza-native`, but the default
-      `Config` still resolves `waf.coraza.backend = "wasm"` (the native profile
-      is opt-in via `config/performance-native.toml`)
+      `Config` does **not** select it (the native profile is opt-in via
+      `config/performance-native.toml`)
+- [ ] Switching `waf.coraza.backend = "wasm"` still starts, compiles/warms the
+      reactor and serves (`config/examples/coraza-reference.toml`)
 - [ ] A `wasm-reactor` build fails closed when the module is missing or has
       broken exports (see `docs/coraza-wasi-reactor.md`)
-- [ ] Startup smoke test: with default config the binary compiles/warms the
-      reactor before readiness (~5.6 s) and serves; setting
-      `waf.coraza.enabled = false` skips the warm-up
+- [ ] Startup smoke test: with the default config the binary compiles the Rust
+      engine bundle before readiness (~276 ms) and serves; setting
+      `waf.coraza.enabled = false` skips inspection. With `backend = "wasm"` the
+      reactor warm-up is paid before readiness (~5.6 s)
+- [ ] `waf.coraza.fallback = "wasm"` re-evaluates only after a Rust-engine
+      runtime error and still fails closed if Coraza also errors
 - [ ] Container image starts and answers `/health` on port 8081
 
 ### Verify provenance
@@ -65,7 +76,7 @@ curl -o /dev/null -w '%{http_code}\n' -X POST --data '<script>alert(1)</script>'
 ### Publishing
 
 - [ ] Commit release version and changelog.
-- [ ] Tag `v0.1.0-beta.9`.
+- [ ] Tag `v0.1.0-beta.13`.
 - [ ] Push branch and tag.
 - [ ] Confirm the Release workflow built and attached every asset:
       - `waf-rejected-v<version>-x86_64-linux.tar.gz` (binary tarball,

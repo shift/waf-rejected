@@ -1,9 +1,11 @@
 # Native Coraza sidecar
 
-**Status:** supported, opt-in backend. `wasm-reactor` remains the default and
-`waf.coraza.enabled` / existing wasm behaviour are unchanged. For the curated,
-tested high-throughput deployment (Compose, Kubernetes, measured capacity and
-operational requirements), see
+**Status:** supported, opt-in backend. The default request-inspection backend is
+the native Rust CRS engine (`waf.coraza.backend = "rust"`); the Coraza WASI
+reactor remains the reference implementation and explicit switch-back
+(`backend = "wasm"`). `waf.coraza.enabled` / existing wasm behaviour are
+unchanged. For the curated, tested high-throughput deployment (Compose,
+Kubernetes, measured capacity and operational requirements), see
 [`docs/operations/native-performance-profile.md`](operations/native-performance-profile.md).
 **Feature:** `coraza-native` (not in `default`).
 **Wire protocol:** binary v1 with a negotiated JSON fallback (see
@@ -74,13 +76,21 @@ proxy process (Rust)                              sidecar process (Go)
 
 ## Configuration
 
-Default (unchanged):
+Default build (native Rust engine):
 
 ```toml
 [waf.coraza]
 enabled = true
-backend = "wasm"          # default
+# backend = "rust"        # compiled default in default builds
 # module_path = "/usr/share/waf/wasm/coraza_reactor.wasm"
+```
+
+Reference wasm switch-back:
+
+```toml
+[waf.coraza]
+enabled = true
+backend = "wasm"
 ```
 
 Native backend:
