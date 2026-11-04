@@ -78,7 +78,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Nix
         uses: cachix/install-nix-action@v25
       - name: Check formatting
@@ -105,7 +105,7 @@ jobs:
           - name: no-default-features,wasm-reactor
             args: "--no-default-features --features wasm-reactor"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Nix
         uses: cachix/install-nix-action@v25
       - name: Run library tests
@@ -128,7 +128,7 @@ jobs:
           - name: bin grpc-allowlist + wasm-reactor
             args: "--bin grpc-allowlist --features wasm-reactor"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Nix
         uses: cachix/install-nix-action@v25
       - name: Check target compilation
@@ -142,7 +142,7 @@ jobs:
     timeout-minutes: 60
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Nix
         uses: cachix/install-nix-action@v25
       - name: Run CRS corpus (wasm + native parity)
@@ -166,7 +166,7 @@ jobs:
     env:
       ENGINE_FEATURE: ${{ github.event.inputs.engine_feature == 'true' && '1' || '0' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Nix
         uses: cachix/install-nix-action@v25
       - name: Run engine guarantees
