@@ -1,0 +1,266 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push release image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          load: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+      - name: Export image tarball
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_REF_NAME}"
+          docker save "${IMAGE}" | gzip -9 > "waf-rejected-${VERSION}-image.tar.gz"
+          test -s "waf-rejected-${VERSION}-image.tar.gz"
+          ls -l "waf-rejected-${VERSION}-image.tar.gz"
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: image
+          path: waf-rejected-*-image.tar.gz
+          if-no-files-found: error
+
+  sbom:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-cyclonedx
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-cyclonedx
+      - name: Generate CycloneDX SBOM
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          cargo cyclonedx \
+            --format json \
+            --spec-version 1.5 \
+            --all \
+            --override-filename "waf-rejected-${VERSION}"
+          # cargo-cyclonedx only inventories Rust crates. Record the shipped
+          # WASI reactor explicitly so the SBOM names the module digest and
+          # the Apache-2.0 Coraza/CRS licensing obligation.
+          REACTOR_SHA="$(sha256sum wasm/coraza_reactor/coraza_reactor.wasm | awk '{print $1}')"
+          jq --arg sha "$REACTOR_SHA" \
+            '.components += [{
+              "type": "file",
+              "name": "coraza_reactor.wasm",
+              "version": "coraza-3.3.3",
+              "hashes": [{"alg": "SHA-256", "content": $sha}],
+              "licenses": [{"license": {"id": "Apache-2.0"}}],
+              "properties": [
+                {"name": "waf:component", "value": "Coraza WASI reactor built with Go 1.24 and Coraza v3.3.3"},
+                {"name": "waf:license-note", "value": "Coraza and referenced OWASP CRS material are Apache-2.0; see wasm/coraza_reactor/LICENSE-CRS"},
+                {"name": "waf:source", "value": "wasm/coraza_reactor/main.go"}
+              ]
+            }]' "waf-rejected-${VERSION}.cdx.json" > "waf-rejected-${VERSION}.cdx.json.tmp"
+          mv "waf-rejected-${VERSION}.cdx.json.tmp" "waf-rejected-${VERSION}.cdx.json"
+          test -s "waf-rejected-${VERSION}.cdx.json"
+          ls -l "waf-rejected-${VERSION}.cdx.json"
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: waf-rejected-*.cdx.json
+          if-no-files-found: error
+
+  trivy-filesystem:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan filesystem and dependency manifests (Trivy)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-fs.sarif
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: false
+      - name: Upload filesystem SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-filesystem
+
+  trivy-image:
+    needs: build-image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Download image tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: image
+          path: image
+      - name: Resolve image tarball
+        run: |
+          set -euo pipefail
+          tarball="$(find image -maxdepth 1 -name 'waf-rejected-*-image.tar.gz' -print -quit)"
+          test -n "${tarball}"
+          echo "IMAGE_TARBALL=${tarball}" >> "${GITHUB_ENV}"
+      - name: Scan release image (Trivy)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          input: ${{ env.IMAGE_TARBALL }}
+          format: sarif
+          output: trivy-image.sarif
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: false
+      - name: Upload image SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+  build-release:
+    needs:
+      - sbom
+      - build-image
+      - trivy-filesystem
+      - trivy-image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: sbom
+      - name: Download image tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: image
+          path: image
+      - name: Install Nix
+        uses: cachix/install-nix-action@v25
+      - name: Build release binary
+        run: nix build .#waf-ingress
+      - name: Build native Coraza sidecar
+        run: nix build .#coraza-native-sidecar --out-link result-sidecar
+      - name: Verify Coraza reactor digest and size budget
+        run: ./scripts/check-coraza-reactor-size.sh
+      - name: Verify native sidecar executable
+        run: |
+          set -euo pipefail
+          test -x result-sidecar/bin/coraza-sidecar
+          # A probe of a missing socket must exit 1, proving the binary runs in
+          # this environment without starting an engine.
+          if result-sidecar/bin/coraza-sidecar --probe --socket /nonexistent/coraza.sock; then
+            echo "probe unexpectedly succeeded" >&2
+            exit 1
+          else
+            test "$?" -eq 1
+          fi
+      - name: Package artifacts
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist "waf-rejected-v${VERSION}"
+          cp result/bin/waf-ingress "waf-rejected-v${VERSION}/"
+          cp README.md CHANGELOG.md SECURITY.md LICENSE-* "waf-rejected-v${VERSION}/"
+          cp "sbom/waf-rejected-${VERSION}.cdx.json" "waf-rejected-v${VERSION}/"
+          cp -r rules "waf-rejected-v${VERSION}/"
+          install -Dm644 wasm/coraza_reactor/coraza_reactor.wasm \
+            "waf-rejected-v${VERSION}/wasm/coraza_reactor.wasm"
+          install -Dm644 wasm/coraza_reactor/LICENSE-CRS \
+            "waf-rejected-v${VERSION}/wasm/LICENSE-CRS"
+          install -Dm644 wasm/coraza_reactor/PROVENANCE.md \
+            "waf-rejected-v${VERSION}/wasm/PROVENANCE.md"
+          install -Dm644 wasm/coraza_reactor/SHA256SUMS \
+            "waf-rejected-v${VERSION}/wasm/SHA256SUMS"
+          # Native Coraza sidecar: binary plus the same read-only CRS bundle.
+          install -Dm755 result-sidecar/bin/coraza-sidecar \
+            "waf-rejected-v${VERSION}/native/coraza-sidecar"
+          cp -r result-sidecar/share/waf/coraza \
+            "waf-rejected-v${VERSION}/native/coraza"
+          tar -czf "dist/waf-rejected-v${VERSION}-x86_64-linux.tar.gz" "waf-rejected-v${VERSION}"
+          tar -czf "dist/waf-rejected-v${VERSION}-coraza-sidecar-x86_64-linux.tar.gz" \
+            -C result-sidecar bin share
+          cp "image/waf-rejected-${VERSION}-image.tar.gz" dist/
+          cp "sbom/waf-rejected-${VERSION}.cdx.json" dist/
+          cp wasm/coraza_reactor/coraza_reactor.wasm \
+            "dist/waf-rejected-${VERSION}-coraza_reactor.wasm"
+          cp wasm/coraza_reactor/LICENSE-CRS \
+            "dist/waf-rejected-${VERSION}-coraza-LICENSE"
+          cp wasm/coraza_reactor/PROVENANCE.md \
+            "dist/waf-rejected-${VERSION}-coraza-PROVENANCE.md"
+          cd dist
+          for asset in \
+            "waf-rejected-v${VERSION}-x86_64-linux.tar.gz" \
+            "waf-rejected-v${VERSION}-coraza-sidecar-x86_64-linux.tar.gz" \
+            "waf-rejected-${VERSION}-image.tar.gz" \
+            "waf-rejected-${VERSION}.cdx.json" \
+            "waf-rejected-${VERSION}-coraza_reactor.wasm" \
+            "waf-rejected-${VERSION}-coraza-LICENSE" \
+            "waf-rejected-${VERSION}-coraza-PROVENANCE.md"; do
+            test -s "${asset}"
+            sha256sum "${asset}" > "${asset}.sha256"
+          done
+          sha256sum --check ./*.sha256
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/waf-rejected-v*-x86_64-linux.tar.gz
+            dist/waf-rejected-v*-coraza-sidecar-x86_64-linux.tar.gz
+            dist/waf-rejected-*-image.tar.gz
+            dist/waf-rejected-*.cdx.json
+            dist/waf-rejected-*-coraza_reactor.wasm
+            dist/waf-rejected-*-coraza-LICENSE
+            dist/waf-rejected-*-coraza-PROVENANCE.md
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          generate_release_notes: true
+          files: |
+            dist/waf-rejected-v*-x86_64-linux.tar.gz
+            dist/waf-rejected-v*-coraza-sidecar-x86_64-linux.tar.gz
+            dist/waf-rejected-*-image.tar.gz
+            dist/waf-rejected-*.cdx.json
+            dist/waf-rejected-*-coraza_reactor.wasm
+            dist/waf-rejected-*-coraza-LICENSE
+            dist/waf-rejected-*-coraza-PROVENANCE.md
+            dist/*.sha256

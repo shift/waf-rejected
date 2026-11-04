@@ -1,0 +1,162 @@
+name: Production Deployment Pipeline
+
+on:
+  push:
+    branches: [ main, production ]
+  pull_request:
+    branches: [ main, production ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Security and quality checks
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install cargo-audit
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-audit
+    - name: Run cargo audit
+      run: cargo audit
+    - name: Install cargo-deny
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-deny
+    - name: Supply-chain policy (cargo deny)
+      run: cargo deny check
+    - name: Security scan with Trivy
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v3
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  # Build and test
+  test:
+    runs-on: ubuntu-latest
+    needs: security-scan
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Nix
+      uses: cachix/install-nix-action@v25
+    - name: Cache Nix store
+      uses: cachix/cachix-action@v14
+      with:
+        name: waf-rejected
+        authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+    - name: Check formatting
+      run: nix develop -c cargo fmt -- --check
+    - name: Clippy
+      run: nix develop -c cargo clippy --lib -- --deny warnings
+    - name: Build with Nix
+      run: nix build .#waf-ingress
+    - name: Check all targets compile
+      run: nix develop -c cargo check --all-targets
+    - name: Run unit tests
+      run: nix develop -c cargo test --lib --release
+    - name: Run integration tests
+      run: nix develop -c cargo test --test integration --release
+
+  # Build container images
+  build-image:
+    runs-on: ubuntu-latest
+    needs: test
+    permissions:
+      contents: read
+      packages: write
+    steps:
+    - uses: actions/checkout@v4
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: |
+          ghcr.io/${{ github.repository }}:latest
+          ghcr.io/${{ github.repository }}:${{ github.sha }}
+          ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+
+  # Deploy to staging
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: build-image
+    if: github.ref == 'refs/heads/main'
+    environment: staging
+    steps:
+    - uses: actions/checkout@v4
+    - name: Configure kubectl for staging
+      run: |
+        echo "${{ secrets.STAGING_KUBE_CONFIG }}" | base64 -d > $HOME/.kube/config
+    - name: Deploy to staging
+      run: |
+        kubectl config use-context staging
+        helm upgrade --install waf-rejected ./infrastructure/helm \
+          --namespace security \
+          --set image.tag=${{ github.sha }} \
+          --wait \
+          --timeout 10m
+    - name: Run staging tests
+      run: |
+        # Wait for deployment to be ready
+        kubectl wait --for=condition=available --timeout=300s deployment/waf-rejected -n security
+        # Run smoke tests against staging
+        curl -f http://staging-waf.example.com/health
+
+  # Deploy to production
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+    - uses: actions/checkout@v4
+    - name: Configure kubectl for production
+      run: |
+        echo "${{ secrets.PRODUCTION_KUBE_CONFIG }}" | base64 -d > $HOME/.kube/config
+    - name: Deploy to production
+      run: |
+        kubectl config use-context production
+        helm upgrade --install waf-rejected ./infrastructure/helm \
+          --namespace security \
+          --set image.tag=${{ github.sha }} \
+          --wait \
+          --timeout 15m
+    - name: Run production validation
+      run: |
+        # Wait for deployment to be ready
+        kubectl wait --for=condition=available --timeout=600s deployment/waf-rejected -n security
+        # Run health checks
+        curl -f https://waf.example.com/health
+        # Run security validation
+        # (Additional validation steps would go here)
+
+  # Rollback on failure
+  rollback:
+    runs-on: ubuntu-latest
+    needs: deploy-production
+    if: failure() && github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+    - name: Configure kubectl for production
+      run: |
+        echo "${{ secrets.PRODUCTION_KUBE_CONFIG }}" | base64 -d > $HOME/.kube/config
+    - name: Rollback deployment
+      run: |
+        kubectl rollout undo deployment/waf-rejected -n security
+        kubectl rollout status deployment/waf-rejected -n security

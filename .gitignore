@@ -1,0 +1,92 @@
+# Rust Build Artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+
+# IDE and Editor Files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Logs and Databases
+*.log
+*.db
+*.sqlite
+logs/
+clickhouse_logs/
+clickhouse_data/
+
+# Certificates and Keys
+certs/*.key
+certs/*.pem
+certs/*.crt
+certs/*.ts.net.*
+*.key
+*.pem
+*.crt
+
+# Test Results and Outputs
+result*
+test_results/
+benchmark_results/
+*.json.bak
+multi_protocol_waf_results.json
+phase4_demo
+
+# Temporary Files
+tmp/
+temp/
+*.tmp
+*.temp
+.cache/
+
+# OS Generated Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Backup Files
+*.backup
+*.bak
+*.orig
+
+# Runtime Files
+*.pid
+*.sock
+
+# Coverage Reports
+target/debug/deps/
+target/llvm-cov-target/
+*.profraw
+
+# Nix
+result
+result-*
+
+# Documentation Build
+book/
+target/doc/
+.docs-cache/
+
+# Phase 4 Demo Files (generated)
+phase4_demo
+phase4_demo.rs
+distri-kv/
+
+.tmp
+target
+
+# Local development / agent worktrees and release staging
+.worktrees/
+.release-assets/
+.container-storage*/
+.nix-build/
