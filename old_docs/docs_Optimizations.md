@@ -245,7 +245,7 @@ Practical approach to read consistency in high-performance scenarios:
 
 ### Configuration Examples
 - **Development**: `config/development-production.toml`
-- **Performance**: `config/performance_testing.toml`
+- **Performance**: `benchmarks/performance_testing.toml`
 - **Enterprise**: `config/enterprise.toml`
 
 ## Future Considerations

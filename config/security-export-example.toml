@@ -1,18 +1,23 @@
-# WAF Configuration with Security Event Exporters
-# This example shows how to configure OpenTelemetry and CEF export for security events
+# WAF configuration with security event exporters.
+#
+# This example shows how to configure OpenTelemetry and CEF export for security
+# events. Migrated from the historical schema (server.host/port/workers,
+# proxy.upstream_host, top-level [rate_limit], logging.format) to the current
+# loader schema.
+
+bind_addr = "0.0.0.0:8080"
+health_bind_addr = "0.0.0.0:8081"
+upstream_uri = "http://127.0.0.1:3000"
 
 [server]
-host = "0.0.0.0"
-port = 8080
-workers = 4
 max_connections = 10000
-max_request_size = "10MB"
+max_body_size = 10485760
 
 [proxy]
-upstream_host = "127.0.0.1"
-upstream_port = 3000
-timeout_ms = 30000
-keepalive = true
+upstream_url = "http://127.0.0.1:3000"
+bind_addr = "0.0.0.0:8080"
+timeout_seconds = 30
+max_request_size = 10485760
 
 [waf]
 enabled = true
@@ -53,21 +58,21 @@ threat_patterns = [
     "(?i)(union|select|insert|update|delete|drop|create|alter|exec|declare)\\s+",
     "(?i)'\\s*(or|and)\\s+'.*=.*",
     "(?i)\\b(@@version|information_schema|sysobjects)\\b",
-    
-    # XSS Patterns  
+
+    # XSS Patterns
     "(?i)<script[^>]*>.*</script>",
     "(?i)javascript\\s*:",
     "(?i)on(load|error|click|mouseover)\\s*=",
-    
+
     # Command Injection
     "(?i)\\b(system|exec|shell_exec|passthru|eval)\\s*\\(",
     "(?i)[;&|`]\\s*(ls|cat|pwd|whoami|id|uname|ps|netstat)\\b",
-    
+
     # Path Traversal
     "(?i)\\.\\.\\/",
     "(?i)\\.\\.\\\\",
     "(?i)%2e%2e%2f",
-    
+
     # LFI/RFI Patterns
     "(?i)(file|php|data|http|ftp|jar)\\s*:",
     "(?i)\\b(etc\\/passwd|boot\\.ini|web\\.config)\\b",
@@ -81,17 +86,17 @@ block_tor = true
 block_vpn = false
 block_datacenter = true
 
-[rate_limit]
+[waf.rate_limit]
 per_ip_enabled = true
 per_ip_max_requests = 100
 per_ip_window_secs = 60
-global_enabled = true  
+global_enabled = true
 global_max_requests = 1000
 global_window_secs = 60
 
 [logging]
 level = "info"
-format = "json"
+json_format = true
 
 # OpenTelemetry Configuration
 # Set these environment variables to configure OTel endpoints:
@@ -104,7 +109,7 @@ format = "json"
 # OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:14268/api/traces
 
 # Example: Export to Elastic APM
-# OTEL_EXPORTER_OTLP_ENDPOINT=https://your-elastic-apm.elastic-cloud.com:443
+# OTEL_EXPORTER_OTLP_ENDPOINT=https://your-elastic-apm.elastic.co:443
 # OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer your-secret-token
 
 # Example: Export to Honeycomb

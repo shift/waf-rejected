@@ -372,16 +372,17 @@ pub enum ReadConsistency {
 ```toml
 [storage]
 backend = "redb"  # "redb", "sled", or "memory"
-path = "/var/lib/waf/storage"
-ttl_cleanup_interval_seconds = 300
+path = "/var/lib/waf/storage/waf.redb"
+ttl_cleanup_interval = { secs = 300, nanos = 0 }
 enable_follower_reads = true
-default_consistency = "strong"
-
-[io]
-enable_io_uring = true  # Linux only
-network_buffer_size = 65536
-zero_copy_threshold = 4096
+enable_compression = false
+cache_size = 16777216
+# max_memory_entries = 100000   # backend = "memory"
 ```
+
+The Linux io_uring listener is selected with `[server] io_backend = "io_uring"`
+(requires the non-default `io-uring` build feature). The storage example above
+uses only current keys; unknown keys are rejected at start-up.
 
 ### Runtime Backend Selection
 ```rust
@@ -474,7 +475,7 @@ Practical approach to read consistency in high-performance scenarios:
 
 ### Configuration Examples
 - **Development**: `config/development-production.toml`
-- **Performance**: `config/performance_testing.toml`
+- **Performance**: `benchmarks/performance_testing.toml`
 - **Enterprise**: `config/enterprise.toml`
 
 ## Future Considerations

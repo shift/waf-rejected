@@ -14,6 +14,21 @@ All notable changes to WAF-Rejected are documented here.
   8 KiB: 943 µs (1 007 µs before). See
   `docs/suggestions_from_agents/rce-subsequence-gate.md`.
 
+- Strict configuration loading: unknown top-level and nested keys are rejected
+  before any listener binds. Errors include the config file path, section/key
+  path and line/column, and cover misspelled security settings such as
+  `waf.coraza.backedn`.
+
+### Changed
+
+- Migrated `config/test.toml` and `config/security-export-example.toml` to the
+  current schema; obsolete keys such as `[server] host/port/workers`,
+  `[proxy] upstream`, `[security]` and `[health]`/`[metrics]`/`[export]` are no
+  longer accepted. The benchmark configuration moved to
+  `benchmarks/performance_testing.toml` because it is not a WAF config.
+- `tests/config_files.rs` and `scripts/validate-configs.sh` now also validate
+  the root test configs, unknown-key rejection, and `WAF_*` env overrides.
+
 ## [0.1.0-beta.13] - 2026-11-03
 
 ### Release summary

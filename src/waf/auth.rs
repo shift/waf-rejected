@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock};
 
 /// Rate limiting configuration per API key
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RateLimitConfig {
     /// Requests per minute per key
     pub requests_per_minute: u32,
@@ -21,7 +21,7 @@ impl Default for RateLimitConfig {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AuthConfig {
     pub enabled: bool,
     pub api_keys: Vec<String>,

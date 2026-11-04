@@ -1,5 +1,19 @@
 # P0-09: Beta Release (current: 0.1.0-beta.13) (NORTH STAR)
 
+## Config strictness (`fix/config-strictness`)
+
+- [x] `serde(deny_unknown_fields)` on all config structs; strict TOML
+      pre-validation reports file, section/key path and line/column.
+- [x] Filter `WAF_CONFIG_FILE`/`WAF_CONFIG_PATH` from the env source; other
+      `WAF_*` overrides still apply and unknown ones are rejected.
+- [x] Migrated `config/test.toml`, `config/security-export-example.toml` and
+      the `docs/Optimizations.md` example; moved the benchmark config to
+      `benchmarks/performance_testing.toml`.
+- [x] Tests cover unknown top-level/nested keys, a `waf.coraza.backend` typo,
+      env overrides, and all shipped/root/deploy configs.
+- [x] fmt, clippy `--lib`, `cargo test --lib` (501), config tests (18 files),
+      `scripts/validate-configs.sh`, `nix build .#waf-ingress`.
+
 ## Perf: Vectorscan multi-pattern candidate pass (`perf/hyperscan-candidates`)
 
 - [x] Compile residual positive `@rx` rules (no literal gate, no multiMatch)

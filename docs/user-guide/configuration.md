@@ -18,8 +18,17 @@ A configured file that is missing or malformed is fatal, as is any value that
 fails validation. The server never silently runs with defaults when a file was
 requested.
 
-Unknown keys are **not rejected**. The configuration structs do not use serde's
-`deny_unknown_fields`, so a misspelled or obsolete key is silently ignored.
+Configuration is **strict**. Unknown keys in the file or in a `WAF_*`
+environment override are a hard error. This includes misspelled security
+settings: a typo such as `[waf.coraza] backedn = "wasm"` stops start-up before
+any listener is bound instead of silently continuing with the default backend.
+The error names the file, the section/key path and the line/column, for example:
+
+```text
+configuration file 'config/config.toml' is invalid: unknown key
+'waf.coraza.backedn' (line 214, column 1): unknown field `backedn`, expected ...
+```
+
 Validate edits with:
 
 ```bash
@@ -27,8 +36,31 @@ Validate edits with:
 ```
 
 The script loads every shipped config through the real loader and fails on
-malformed TOML, wrong types, invalid enum values, cross-field limit violations
-and unreadable allowlist artifacts.
+unknown keys, malformed TOML, wrong types, invalid enum values, cross-field
+limit violations and unreadable allowlist artifacts.
+
+### Migrating from permissive configs
+
+Historical keys from the pre-1.0 schema are **not** accepted or allowlisted.
+Remove or migrate them; the loader will reject them until you do. Common
+migrations:
+
+| Obsolete key | Current key |
+| --- | --- |
+| `[server] host` / `port` | top-level `bind_addr` |
+| `[server] workers` | `[runtime] worker_threads` |
+| `[proxy] upstream` | top-level `upstream_uri` (and `[proxy] upstream_url`) |
+| `[proxy] retry_attempts` | no equivalent; remove (retries are not configurable) |
+| `[security] max_request_size` | `[server] max_body_size` |
+| `[security] rate_limit_requests` | `[waf.rate_limit] per_ip_max_requests` |
+| `[logging] format` | `[logging] json_format` |
+| `[health]`, `[metrics]` | use `health_bind_addr`; health/metrics are always served there |
+| `[export]` | `[waf.security_events]` exporter keys |
+| top-level `[rate_limit]` | `[waf.rate_limit]` |
+
+The legacy `[waf.wasm]` section is still parsed on every build so shipped
+configs remain loadable; it only has an effect in `wasm-waf` builds. Prefer
+`[waf.coraza]` for request inspection.
 
 ## Top level
 
@@ -411,9 +443,10 @@ Requires at least one route; duplicate or malformed routes abort start-up.
 
 ### `[waf.wasm]` — legacy, feature-gated
 
-Only present in builds with the non-default `wasm-waf` feature. The component
-ABI is not wired up; enabling this uses the built-in heuristic fallback, not the
-Coraza module. Use `[waf.coraza]` instead.
+Parsed on every build for compatibility, but only effective in builds with the
+non-default `wasm-waf` feature. The component ABI is not wired up; enabling this
+uses the built-in heuristic fallback, not the Coraza module. Use `[waf.coraza]`
+instead.
 
 ## `[security]`
 

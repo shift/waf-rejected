@@ -131,8 +131,9 @@ header_name = "X-API-Key"
 require_https = true
 ```
 
-Unknown keys are silently ignored by the loader (the config structs do not deny
-unknown fields), so run the validation script after editing a file.
+Unknown keys are hard errors, including misspelled security settings and
+`WAF_*` overrides. The loader names the file, section/key path and line before
+binding any listener; run the validation script after editing a file.
 
 ### Request decompression
 

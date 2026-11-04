@@ -149,7 +149,7 @@ cat > "$RELEASE_DIR/QUICKSTART.md" << EOF
 
 - **Basic setup**: Use \`config/development-production.toml\`
 - **Enterprise**: Use \`config/enterprise.toml\`
-- **High performance**: Use \`config/performance_testing.toml\`
+- **High performance**: Use \`benchmarks/performance_testing.toml\`
 
 See \`docs/CONFIGURATION.md\` for detailed configuration options.
 

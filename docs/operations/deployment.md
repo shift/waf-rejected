@@ -154,8 +154,8 @@ Validate the file before deploying:
 ./scripts/validate-configs.sh
 ```
 
-Unknown keys are silently ignored by the loader, so review the list of loaded
-files rather than relying only on the exit status. Keep `fail_mode = "closed"`;
+Unknown top-level or nested keys are hard errors, reported with the file,
+section/key path and line before any listener binds. Keep `fail_mode = "closed"`;
 a backend outage or runtime error must block, not silently allow. See
 [engine selection](../user-guide/engine-selection.md) and the
 [container guide](container.md) for backend-specific memory and start-up

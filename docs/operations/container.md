@@ -85,10 +85,10 @@ docker run -d --name waf-rejected \
 
 Notes:
 
-- `WAF_CONFIG_FILE` already defaults to `/etc/waf/config.toml`. Any `WAF_*`
-  environment variable overrides the file, using `__` for nesting, for example
+- `WAF_CONFIG_FILE` already defaults to `/etc/waf/config.toml`. Known `WAF_*`
+  environment variables override the file, using `__` for nesting, for example
   `WAF_SERVER__MAX_BODY_SIZE=10485760` or
-  `WAF_WAF__CORAZA__BACKEND=wasm`.
+  `WAF_WAF__CORAZA__BACKEND=wasm`. Unknown keys are rejected at start-up.
 - The default backend is the native Rust CRS engine. Select the Coraza reference
   reactor with `WAF_WAF__CORAZA__BACKEND=wasm` or the opt-in sidecar with
   `"native"`; see [engine selection](../user-guide/engine-selection.md).

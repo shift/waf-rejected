@@ -12,9 +12,9 @@
 - [ ] `cargo test --lib`
 - [ ] `cargo test --test integration`
 - [ ] `./scripts/validate-configs.sh` passes (loads every `config/*.toml`,
-      `config/examples/*.toml`, `config.toml` and `config.docker.toml` through
-      `Config::load`; unknown keys are ignored by the loader, so review the list
-      of loaded files as well as the exit status)
+      `config/examples/*.toml`, `config.toml`, `config.docker.toml`, the root
+      test configs and `deploy/compose/config.native.toml` through
+      `Config::load`; unknown keys are hard errors with file/key locations)
 - [ ] `./scripts/demo.sh` passes (benign 200, SQLi/XSS 403, gRPC forwarded)
 - [ ] `nix build .#waf-ingress`
 - [ ] `nix build .#coraza-native-sidecar`

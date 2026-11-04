@@ -1,12 +1,13 @@
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::info;
 
 use crate::waf::storage::StorageConfig as WafStorageConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Address to bind the server to
     pub bind_addr: SocketAddr,
@@ -41,7 +42,7 @@ pub struct Config {
 /// to the previous behaviour (Tokio defaults, no pinning) so existing
 /// deployments are unaffected.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RuntimeConfig {
     /// Number of Tokio worker threads. `None` uses Tokio's default
     /// (number of logical CPUs).
@@ -119,7 +120,7 @@ impl RuntimeConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct StorageConfig {
     pub backend: String,
     pub path: String,
@@ -172,7 +173,7 @@ impl StorageConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ProxyConfig {
     /// Upstream server URL
     pub upstream_url: String,
@@ -218,7 +219,7 @@ pub struct ProxyConfig {
 /// keeps its built-in behaviour (unbounded idle connections, its default idle
 /// timeout, no out-of-band health probes).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct UpstreamPoolConfig {
     /// Enable bounded idle reuse and (optionally) upstream health checks.
     pub enabled: bool,
@@ -245,7 +246,7 @@ pub struct UpstreamPoolConfig {
 /// `response_threshold_bytes` are relayed frame by frame under the same byte
 /// cap and a deadline, instead of being collected in memory first.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct StreamingConfig {
     /// Enable streaming of large upstream response bodies.
     pub enabled: bool,
@@ -260,7 +261,7 @@ pub struct StreamingConfig {
 /// keep-alive policy (30s interval / 10s timeout) and hyper's HTTP/2 defaults
 /// are left untouched.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Http2TuningConfig {
     /// Apply this tuning block to ingress and upstream HTTP/2 connections.
     pub enabled: bool,
@@ -293,7 +294,7 @@ pub struct Http2TuningConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     /// Maximum number of concurrent connections
     pub max_connections: usize,
@@ -369,7 +370,7 @@ pub enum ListenerIoBackend {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct TlsConfig {
     /// Enable TLS/SSL
     pub enabled: bool,
@@ -427,7 +428,7 @@ pub struct TlsConfig {
 /// never proxied to the upstream. An empty `allowed_origins` or `allowed_paths`
 /// list denies every session (secure by default).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct WebTransportConfig {
     /// Enable the WebTransport UDP listener
     pub enabled: bool,
@@ -640,7 +641,7 @@ fn normalize_origin(value: &str) -> Option<String> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LoggingConfig {
     /// Log level (trace, debug, info, warn, error)
     pub level: String,
@@ -650,7 +651,7 @@ pub struct LoggingConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct WafConfig {
     /// Enable WAF functionality
     pub enabled: bool,
@@ -673,8 +674,10 @@ pub struct WafConfig {
     /// Geographic blocking configuration
     pub geo_blocking: GeoBlockingConfig,
 
-    /// WASM ModSecurity configuration
-    #[cfg(feature = "wasm-waf")]
+    /// Legacy component-ABI WASM ModSecurity configuration.
+    ///
+    /// Parsed in every build so the shipped configs remain valid; it is only
+    /// applied when the `wasm-waf` feature is compiled in.
     pub wasm: WasmConfig,
 
     /// Real Coraza WASI reactor configuration (`wasm-reactor` feature).
@@ -708,7 +711,7 @@ pub struct WafConfig {
 /// size checks) are always evaluated, including on a hit. Blocks are never
 /// cached.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AllowCacheConfig {
     /// Enable the cache. Off by default; this is a research prototype.
     pub enabled: bool,
@@ -754,7 +757,7 @@ impl Default for AllowCacheConfig {
 /// is not listed. A request with a query string, a body, a body framing
 /// header, a content encoding or an upgrade is never fast-allowed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct WafFastAllowConfig {
     /// Enable the compiled allowlist. Requires at least one route.
     pub enabled: bool,
@@ -815,7 +818,7 @@ impl WafFastAllowConfig {
 /// are rejected with `503 + Retry-After` when the queue is full or the wait
 /// expires. Admission never skips or reduces inspection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct WafAdmissionConfig {
     /// Enable heavy-inspection admission control. Enabling this does not
     /// weaken inspection: heavy requests are still fully evaluated or
@@ -863,7 +866,7 @@ impl WafAdmissionConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RateLimitConfig {
     /// Enable per-IP rate limiting
     pub per_ip_enabled: bool,
@@ -885,7 +888,7 @@ pub struct RateLimitConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SecurityEventsConfig {
     /// Enable security event logging
     pub enabled: bool,
@@ -922,7 +925,7 @@ pub struct SecurityEventsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ContentInspectionConfig {
     /// Enable content inspection
     pub enabled: bool,
@@ -941,7 +944,7 @@ pub struct ContentInspectionConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GeoBlockingConfig {
     /// Enable geographic blocking
     pub enabled: bool,
@@ -968,10 +971,11 @@ pub struct GeoBlockingConfig {
     pub block_datacenter: bool,
 }
 
-/// WASM ModSecurity configuration
-#[cfg(feature = "wasm-waf")]
+/// Legacy component-ABI WASM ModSecurity configuration.
+///
+/// Parsed unconditionally; only used by builds with the `wasm-waf` feature.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct WasmConfig {
     /// Enable WASM ModSecurity engine
     pub enabled: bool,
@@ -1091,7 +1095,7 @@ impl CorazaPrefilterMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct WafCorazaConfig {
     /// Enable the real Coraza WASI reactor.
     pub enabled: bool,
@@ -1185,7 +1189,7 @@ impl Default for WafCorazaConfig {
 /// protocol level before Coraza runs and their bodies are withheld from CRS
 /// body rules (header and URI rules still apply).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct WafGrpcConfig {
     /// Enable gRPC protocol-aware inspection. Effective only when the WAF and
     /// the Coraza reactor are enabled as well.
@@ -1405,7 +1409,7 @@ impl WafGraphqlScanMode {
 /// the request can instead be validated at the GraphQL level and its raw body
 /// withheld from CRS. That trade-off is opt-in through `body_scan`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct WafGraphqlConfig {
     /// Enable GraphQL-aware inspection. Effective only when the WAF is
     /// enabled and `body_scan` is not `off`.
@@ -1568,7 +1572,7 @@ fn is_valid_graphql_name(value: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AiConfig {
     /// Enable AI threat detection
     pub enabled: bool,
@@ -1584,7 +1588,7 @@ pub struct AiConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AiModelConfig {
     /// Path to ML model file
     pub model_path: Option<String>,
@@ -1612,7 +1616,7 @@ impl Default for AiConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ComplianceConfig {
     /// Enable compliance features
     pub enabled: bool,
@@ -1628,7 +1632,7 @@ pub struct ComplianceConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AuditConfig {
     /// Enable tamper-evident audit logging
     pub tamper_evident: bool,
@@ -1641,7 +1645,7 @@ pub struct AuditConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RegulatoryConfig {
     /// Enable GDPR compliance features
     pub gdpr: bool,
@@ -1669,7 +1673,7 @@ pub struct RegulatoryConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RetentionConfig {
     /// Security event retention in days
     pub security_events_days: u32,
@@ -1753,7 +1757,7 @@ impl Default for ComplianceConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SecurityConfig {
     /// Authentication configuration
     pub auth: crate::waf::auth::AuthConfig,
@@ -1902,7 +1906,6 @@ impl Default for WafConfig {
             security_events: SecurityEventsConfig::default(),
             content_inspection: ContentInspectionConfig::default(),
             geo_blocking: GeoBlockingConfig::default(),
-            #[cfg(feature = "wasm-waf")]
             wasm: WasmConfig::default(),
             coraza: WafCorazaConfig::default(),
             grpc: WafGrpcConfig::default(),
@@ -1993,7 +1996,6 @@ impl Default for SecurityConfig {
     }
 }
 
-#[cfg(feature = "wasm-waf")]
 impl Default for WasmConfig {
     fn default() -> Self {
         Self {
@@ -2011,6 +2013,147 @@ impl Default for WasmConfig {
     }
 }
 
+/// Resolve the TOML file that `config::File::with_name` will load.
+///
+/// `WAF_CONFIG_FILE` may omit the `.toml` extension, in which case the config
+/// crate searches for a supported format. Strict pre-validation only applies to
+/// files we can identify as TOML.
+fn resolve_toml_path(config_file: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(config_file);
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some(extension) if extension.eq_ignore_ascii_case("toml") => path.is_file().then_some(path),
+        Some(_) => None,
+        None if path.is_file() => Some(path),
+        None => {
+            let candidate = path.with_extension("toml");
+            candidate.is_file().then_some(candidate)
+        }
+    }
+}
+
+/// Parse the TOML file with the real config schema so unknown keys are fatal.
+fn validate_toml_file(path: &Path) -> anyhow::Result<()> {
+    let contents = std::fs::read_to_string(path).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to read configuration file '{}': {error}",
+            path.display()
+        )
+    })?;
+
+    toml::from_str::<Config>(&contents)
+        .map(|_| ())
+        .map_err(|error| anyhow::anyhow!("{}", format_config_error(path, &contents, &error)))
+}
+
+/// Human-readable strict-config error with file, section, key and location.
+fn format_config_error(path: &Path, contents: &str, error: &toml::de::Error) -> String {
+    let (line, column) = error
+        .span()
+        .map(|span| position_in_source(contents, span.start))
+        .unwrap_or((1, 1));
+    let message = error.message();
+    let key = unknown_field_name(message)
+        .map(str::to_string)
+        .or_else(|| key_on_line(contents, line));
+    let section = section_at_line(contents, line);
+
+    let key_path = match (section.as_deref(), key.as_deref()) {
+        (Some(section), Some(key)) => format!("{section}.{key}"),
+        (Some(section), None) => section.to_string(),
+        (None, Some(key)) => format!("top-level.{key}"),
+        (None, None) => "unknown".to_string(),
+    };
+    let kind = if message.starts_with("unknown field")
+        || message.starts_with("unknown variant")
+        || message.starts_with("duplicate field")
+    {
+        "unknown key"
+    } else {
+        "invalid key value"
+    };
+
+    format!(
+        "configuration file '{}' is invalid: {kind} '{key_path}' (line {line}, column {column}): {message}",
+        path.display()
+    )
+}
+
+fn position_in_source(contents: &str, offset: usize) -> (usize, usize) {
+    let before = contents.get(..offset).unwrap_or(contents);
+    let line = before.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = before
+        .rsplit('\n')
+        .next()
+        .map(|line| line.chars().count() + 1)
+        .unwrap_or(1);
+    (line, column)
+}
+
+fn section_at_line(contents: &str, line: usize) -> Option<String> {
+    let mut section = None;
+    for (index, text) in contents.lines().enumerate() {
+        if index + 1 >= line {
+            break;
+        }
+        if let Some(header) = table_header(text) {
+            section = Some(header);
+        }
+    }
+    section
+}
+
+fn table_header(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let inner = trimmed.strip_prefix('[')?;
+    let inner = inner.strip_prefix('[').unwrap_or(inner);
+    let end = inner.find(']')?;
+    let header = inner[..end].trim();
+    (!header.is_empty()).then(|| header.to_string())
+}
+
+fn unknown_field_name(message: &str) -> Option<&str> {
+    let message = message
+        .strip_prefix("unknown field `")
+        .or_else(|| message.strip_prefix("duplicate field `"))
+        .or_else(|| message.strip_prefix("unknown field '"))
+        .or_else(|| message.strip_prefix("duplicate field '"))?;
+    let end = message.find(['`', '\''])?;
+    Some(&message[..end])
+}
+
+fn key_on_line(contents: &str, line: usize) -> Option<String> {
+    let text = contents.lines().nth(line.saturating_sub(1))?.trim();
+    if text.starts_with('[') {
+        return None;
+    }
+    let (key, _) = text.split_once('=')?;
+    let key = key.trim().trim_matches(['"', '\'']);
+    (!key.is_empty()).then(|| key.to_string())
+}
+
+/// Build the `WAF_*` environment source used for overrides.
+///
+/// The prefix itself is stripped here rather than by `config::Environment` so
+/// the selector variables (`WAF_CONFIG_FILE`, `WAF_CONFIG_PATH`) never become
+/// configuration keys. Unknown `WAF_*` variables are still rejected by the
+/// strict deserializer below.
+fn environment_source() -> config::Environment {
+    let variables: config::Map<String, String> = std::env::vars()
+        .filter_map(|(key, value)| {
+            let key = key.to_ascii_lowercase();
+            let key = key.strip_prefix("waf_")?;
+            if key.is_empty() || key == "config_file" || key == "config_path" {
+                return None;
+            }
+            Some((key.to_string(), value))
+        })
+        .collect();
+
+    config::Environment::default()
+        .separator("__")
+        .source(Some(variables))
+}
+
 impl Config {
     /// Load configuration from environment variables and config file
     pub fn load() -> anyhow::Result<Self> {
@@ -2022,18 +2165,32 @@ impl Config {
         let config_file = std::env::var("WAF_CONFIG_FILE")
             .or_else(|_| std::env::var("CONFIG_PATH"))
             .ok();
-        if let Some(config_file) = config_file {
+        if let Some(config_file) = config_file.as_deref() {
             info!("Loading configuration from file: {}", config_file);
-            settings = settings.add_source(config::File::with_name(&config_file).required(true));
+            // Validate the file with a strict TOML parse first so unknown keys
+            // are reported with the file path, section and key location. The
+            // config crate below still applies environment overrides.
+            if let Some(path) = resolve_toml_path(config_file) {
+                validate_toml_file(&path)?;
+            }
+            settings = settings.add_source(config::File::with_name(config_file).required(true));
         }
 
-        settings = settings.add_source(
-            config::Environment::with_prefix("WAF")
-                .prefix_separator("_")
-                .separator("__"),
-        );
+        settings = settings.add_source(environment_source());
 
-        let config: Config = settings.build()?.try_deserialize()?;
+        let source_context = match config_file.as_deref() {
+            Some(file) => format!("file '{file}' and WAF_* environment overrides"),
+            None => "WAF_* environment overrides".to_string(),
+        };
+        let config: Config = settings
+            .build()
+            .map_err(|error| {
+                anyhow::anyhow!("failed to build configuration from {source_context}: {error}")
+            })?
+            .try_deserialize()
+            .map_err(|error| {
+                anyhow::anyhow!("invalid configuration from {source_context}: {error}")
+            })?;
         config.validate()?;
 
         Ok(config)
@@ -2041,6 +2198,12 @@ impl Config {
 
     /// Reject configurations that would make the proxy unsafe or unusable.
     pub fn validate(&self) -> anyhow::Result<()> {
+        if self.waf.wasm.enabled && !cfg!(feature = "wasm-waf") {
+            tracing::warn!(
+                "waf.wasm is the legacy component-ABI integration and is ignored by this \
+                 build; rebuild with the `wasm-waf` feature or use [waf.coraza]"
+            );
+        }
         if self.server.max_body_size == 0 {
             anyhow::bail!("server.max_body_size must be greater than zero");
         }
@@ -2293,6 +2456,28 @@ mod tests {
         assert_eq!(uring.server.io_backend, ListenerIoBackend::IoUring);
 
         assert!(toml::from_str::<Config>("[server]\nio_backend = \"epoll\"\n").is_err());
+    }
+
+    #[test]
+    fn unknown_top_level_and_nested_keys_are_rejected() {
+        let top_level = toml::from_str::<Config>("bind_addr_typo = \"0.0.0.0:8080\"\n")
+            .expect_err("unknown top-level key must be rejected");
+        assert!(top_level.message().contains("unknown field"));
+
+        let nested = toml::from_str::<Config>("[waf.coraza]\nbackedn = \"wasm\"\n")
+            .expect_err("unknown nested key must be rejected");
+        assert!(nested.message().contains("backedn"));
+    }
+
+    #[test]
+    fn strict_config_error_names_file_section_and_key() {
+        let contents = "[waf.coraza]\nbackedn = \"wasm\"\n";
+        let error = toml::from_str::<Config>(contents).expect_err("typo must be rejected");
+        let message = format_config_error(Path::new("config/bad.toml"), contents, &error);
+
+        assert!(message.contains("config/bad.toml"), "{message}");
+        assert!(message.contains("waf.coraza.backedn"), "{message}");
+        assert!(message.contains("unknown key"), "{message}");
     }
 
     #[test]

@@ -48,7 +48,7 @@ Comprehensive Rust benchmarks using Criterion.rs for:
 ### 3. Performance Test Scripts
 - **`scripts/performance_test.sh`**: Complete testing suite with system profiling
 - **`scripts/quick_perf_test.sh`**: Fast validation for CI/CD pipelines
-- **`config/performance_testing.toml`**: Configuration and requirements
+- **`benchmarks/performance_testing.toml`**: Configuration and requirements
 
 ### 4. Load Testing Integration
 - **wrk Integration**: HTTP load testing for realistic traffic simulation
@@ -140,7 +140,7 @@ Full WAF Pipeline/enterprise_load_test
 ## 🔧 Configuration
 
 ### Performance Requirements
-Edit `config/performance_testing.toml` to adjust performance requirements:
+Edit `benchmarks/performance_testing.toml` to adjust performance requirements:
 ```toml
 [requirements.security_event_logging]
 event_generation_latency_us = 100      # Adjust latency requirement
@@ -298,7 +298,7 @@ fn custom_benchmark(c: &mut Criterion) {
 
 For performance testing questions or issues:
 1. Check existing benchmark results in `benchmark_results.txt`
-2. Review the performance requirements in `config/performance_testing.toml`
+2. Review the performance requirements in `benchmarks/performance_testing.toml`
 3. Examine system resource usage during testing
 4. Create issue with benchmark output and system information
 
