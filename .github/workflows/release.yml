@@ -240,7 +240,7 @@ jobs:
           done
           sha256sum --check ./*.sha256
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             dist/waf-rejected-v*-x86_64-linux.tar.gz
