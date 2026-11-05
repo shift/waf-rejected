@@ -22,6 +22,12 @@ pub struct SecurityEventLogger {
     events_processed: std::sync::atomic::AtomicU64,
 }
 
+impl Default for SecurityEventLogger {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SecurityEventLogger {
     pub fn new() -> Self {
         Self {
@@ -29,7 +35,7 @@ impl SecurityEventLogger {
         }
     }
 
-    pub async fn log_event(&self, event: SecurityEvent) -> Result<(), String> {
+    pub async fn log_event(&self, _event: SecurityEvent) -> Result<(), String> {
         // Fast in-memory logging without unnecessary yields
         // In a real implementation, this would write to a circular buffer or channel
 
@@ -42,6 +48,12 @@ impl SecurityEventLogger {
 /// Mock content inspection rule for benchmarking
 pub struct ContentInspectionRule {
     patterns: Vec<regex::Regex>,
+}
+
+impl Default for ContentInspectionRule {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ContentInspectionRule {
@@ -73,6 +85,12 @@ impl ContentInspectionRule {
 /// Mock geographic IP blocking for benchmarking
 pub struct GeoBlockingRule {
     blocked_countries: std::collections::HashSet<String>,
+}
+
+impl Default for GeoBlockingRule {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl GeoBlockingRule {
@@ -190,9 +208,9 @@ fn bench_content_inspection(c: &mut Criterion) {
 
     // Test SQL injection detection on different payload sizes
     for (name, payload) in [
-        ("small", small_payload.as_ref()),
-        ("medium", medium_payload.as_ref()),
-        ("large", large_payload.as_ref()),
+        ("small", small_payload),
+        ("medium", medium_payload.as_str()),
+        ("large", large_payload.as_str()),
     ]
     .iter()
     {

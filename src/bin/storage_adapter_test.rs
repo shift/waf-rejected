@@ -3,7 +3,6 @@
 //! Simple test to validate storage adapter functionality
 
 use std::time::Duration;
-use tokio;
 use waf_ingress::waf::storage::{
     MemoryStorageAdapter, ReadConsistency, StorageAdapter, StorageAdapterFactory, StorageBackend,
     StorageConfig,

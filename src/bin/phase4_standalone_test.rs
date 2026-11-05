@@ -2,6 +2,8 @@
 // This standalone test demonstrates Phase 4 AI optimization capabilities
 // without full library dependencies
 
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -393,7 +395,7 @@ impl Phase4TestRunner {
             .optimization_engine
             .optimize_inference(&test_request)
             .await;
-        let total_time = start.elapsed().as_millis();
+        let _total_time = start.elapsed().as_millis();
 
         println!("   Inference latency: {}ms", analysis.processing_time_ms);
         println!("   Risk score: {:.3}", analysis.overall_risk_score);
@@ -600,7 +602,7 @@ impl Phase4TestRunner {
             .await;
 
         // Step 2: Explainable AI
-        let explanation = self.explainable_ai.explain_decision(&analysis).await;
+        let _explanation = self.explainable_ai.explain_decision(&analysis).await;
 
         // Step 3: Dashboard update
         self.dashboard.update_metrics(&analysis);

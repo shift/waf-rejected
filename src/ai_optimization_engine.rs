@@ -1408,7 +1408,7 @@ mod tests {
         assert!(result.is_ok());
 
         let nodes = engine.cluster_nodes.lock().unwrap();
-        assert!(nodes.len() > 0); // Should have created nodes
+        assert!(!nodes.is_empty()); // Should have created nodes
     }
 
     #[tokio::test]

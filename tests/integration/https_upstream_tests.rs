@@ -233,8 +233,10 @@ async fn spawn_proxy(
     ca_path: Option<&Path>,
     client_identity: Option<(&Path, &Path)>,
 ) -> String {
-    let mut config = Config::default();
-    config.upstream_uri = upstream_uri;
+    let mut config = Config {
+        upstream_uri,
+        ..Config::default()
+    };
     config.proxy.upstream_ca_path = ca_path.map(|path| path.to_string_lossy().into_owned());
     if let Some((cert_path, key_path)) = client_identity {
         config.proxy.upstream_client_cert_path = Some(cert_path.to_string_lossy().into_owned());

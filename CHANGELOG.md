@@ -83,6 +83,22 @@ All notable changes to WAF-Rejected are documented here.
   only the bad entry. Multi-proxy chain behaviour is documented in
   `docs/developer-guide/request-framing-and-telemetry.md`.
 
+### Fixed
+
+- `--no-default-features` now compiles and passes the library tests. gRPC
+  envelope inspection no longer depends on `wasm-reactor`; the shared
+  `coraza_payload` and `protobuf` modules are unconditional, and the
+  `rust-engine`-only config test is gated correctly.
+- Cleared the pre-existing warnings in `src/bin/*`, benches, examples and
+  integration tests so `cargo clippy --all-targets --features
+  wasm-reactor,coraza-native -- --deny warnings` passes.
+- Added `required-features` to examples that import optional modules, so
+  `cargo check --all-targets` works with the default feature set.
+- `scripts/ci-local.sh` now runs the full local gate: fmt, all-targets clippy,
+  tests, the cross-feature matrix, shipped-config validation, the CRS smoke
+  corpus and `nix build .#waf-ingress`. GitHub Actions remains billing-blocked;
+  the workflows document their local equivalents.
+
 ## [0.1.0-beta.13] - 2026-11-03
 
 ### Release summary

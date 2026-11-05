@@ -441,7 +441,7 @@ impl ComprehensiveWAFTestHarness {
                         was_blocked,
                         reached_backend,
                         attack_type.as_deref(),
-                        &http_version,
+                        http_version,
                         &response_body,
                     );
                 }
@@ -453,7 +453,7 @@ impl ComprehensiveWAFTestHarness {
                         true,
                         false,
                         attack_type.as_deref(),
-                        &http_version,
+                        http_version,
                         "",
                     );
                 }
@@ -465,7 +465,7 @@ impl ComprehensiveWAFTestHarness {
                         true,
                         false,
                         attack_type.as_deref(),
-                        &http_version,
+                        http_version,
                         "",
                     );
                 }
@@ -1277,7 +1277,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build services
     println!("🔨 Building comprehensive test services...");
     let build_output = Command::new("cargo")
-        .args(&[
+        .args([
             "build",
             "--release",
             "--bin",

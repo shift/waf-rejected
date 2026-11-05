@@ -225,7 +225,7 @@ async fn test_realistic_workload_simulation() -> Result<(), Box<dyn std::error::
             }
 
             // Simulate occasional failures in high-load scenarios
-            let success = (key_count < 800) || (keys.len() % 20) != 0; // Deterministic "failure" pattern
+            let success = (key_count < 800) || !keys.len().is_multiple_of(20); // Deterministic "failure" pattern
 
             Ok(TransactionResult {
                 keys_count: keys.len(),
@@ -405,7 +405,7 @@ async fn test_stress_testing() -> Result<(), Box<dyn std::error::Error>> {
     let stress_duration = stress_start.elapsed().unwrap();
 
     // Validate stress test results
-    let stress_ttl_stats = ttl_manager.get_stats().await;
+    let _stress_ttl_stats = ttl_manager.get_stats().await;
     let stress_bulk_stats = bulk_optimizer.get_stats().await;
 
     info!("Stress test results:");
@@ -615,12 +615,14 @@ fn create_test_keys(count: usize, priority: u8) -> Vec<DeletionKey> {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct SimpleCleanupResult {
     keys_deleted: u64,
     processing_time_ms: u64,
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct EnhancedCleanupResult {
     keys_deleted: u64,
     processing_time_ms: u64,

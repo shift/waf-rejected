@@ -2,11 +2,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
+#[cfg(feature = "websocket")]
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::Full;
 use hyper::body::Incoming;
+#[cfg(feature = "websocket")]
 use hyper::upgrade::Upgraded;
 use hyper::{HeaderMap, Request, Response, StatusCode};
+#[cfg(feature = "websocket")]
 use hyper_util::rt::TokioIo;
 use tracing::{error, info, warn};
 

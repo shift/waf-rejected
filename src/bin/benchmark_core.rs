@@ -207,7 +207,7 @@ impl CoreBenchmarkSuite {
         for thread_id in 0..self.config.concurrent_threads {
             let engine = Arc::clone(&self.engine);
             let counter = Arc::clone(&counter);
-            let error_counter = Arc::clone(&error_counter);
+            let _error_counter = Arc::clone(&error_counter);
 
             let handle = tokio::spawn(async move {
                 let mut local_count = 0;
@@ -362,7 +362,7 @@ impl CoreBenchmarkSuite {
     }
 
     fn create_test_context_static(iteration: usize) -> RequestContext {
-        let method = if iteration % 3 == 0 {
+        let method = if iteration.is_multiple_of(3) {
             Method::POST
         } else {
             Method::GET

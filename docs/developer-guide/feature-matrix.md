@@ -11,6 +11,13 @@ with `cargo test --features coraza-native`.
 `scripts/ci-feature-matrix.sh` and `.github/workflows/feature-matrix.yml` run
 the same combinations so the gap cannot reopen.
 
+GitHub Actions is currently billing-blocked. The local gate is
+`./scripts/ci-local.sh`; it runs fmt, clippy (including all targets), tests,
+this feature matrix, shipped-config validation, the 16-case CRS smoke corpus
+and `nix build .#waf-ingress`. The `workflow_dispatch` inputs in
+`.github/workflows/feature-matrix.yml` map to the optional local scripts
+`scripts/run-crs-corpus.sh` and `scripts/check-engine-guarantees.sh`.
+
 ## Running locally
 
 ```bash
@@ -44,10 +51,44 @@ the failing combination plus the exact command to rerun it.
 | `test-no-default-features+wasm-reactor` | `cargo test --lib --no-default-features --features wasm-reactor` | The minimal supported deployment: reactor only, no sled/websocket/export stack. |
 | `check-all-targets+coraza-native` | `cargo check --all-targets --features wasm-reactor,coraza-native` | Tests, benches and binaries with the native backend; catches test-only imports and `required-features` mistakes. |
 | `check-all-targets+http3+webtransport` | `cargo check --all-targets --features http3,webtransport,wasm-reactor` | QUIC/HTTP3 and WebTransport listeners together with the reactor, across all targets. |
+| `check-all-targets+ai-threat-detection` | `cargo check --all-targets --features ai-threat-detection` | The heuristic AI threat-detection module across all targets. |
 | `check-bin-graphql-allowlist` | `cargo check --bin graphql-allowlist --features wasm-reactor` | The GraphQL allowlist tool that requires `wasm-reactor`. |
 | `check-bin-grpc-allowlist` | `cargo check --bin grpc-allowlist --features wasm-reactor` | The gRPC allowlist tool compiled against the reactor feature set. |
 
 `--quick` skips both `check-all-targets` rows. The binary checks still run.
+
+## All-targets clippy
+
+The blocking lint gate is:
+
+```bash
+nix develop -c cargo clippy --all-targets \
+  --features wasm-reactor,coraza-native -- --deny warnings
+```
+
+This covers the library, every binary, tests, benches and examples. It is a
+stage in `scripts/ci-local.sh`.
+
+`cargo clippy --all-targets --all-features -- --deny warnings` is **not** a
+supported gate. Two features are mutually exclusive or environment-specific:
+
+| Feature | Why it is excluded from `--all-features` |
+| --- | --- |
+| `alloc-jemalloc` | `tikv-jemalloc-sys`'s configure step cannot determine `strerror_r` in the sandboxed Nix dev shell. It also defines a second `#[global_allocator]` alongside `alloc-mimalloc`. |
+| `alloc-mimalloc` | Defines a second `#[global_allocator]` when combined with `alloc-jemalloc`. |
+
+Use one allocator feature at a time, for example
+`--features wasm-reactor,coraza-native,alloc-mimalloc`. The `hyperscan-eval`
+feature additionally links the system `libhs` provided by the dev shell; it is
+covered by its own benchmark/test targets rather than the default matrix.
+
+## Feature status
+
+`wasm-waf` is a legacy, intentionally empty feature retained for older
+configuration files. It is **not supported and does not compile** (the
+historical `wasm` module is not built); it is not part of the advertised
+matrix. The live WASM path is `wasm-reactor`. `ai-threat-detection` is a
+heuristic module that compiles and is exercised by the library tests.
 
 ## gRPC transport support
 

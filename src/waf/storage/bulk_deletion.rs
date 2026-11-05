@@ -605,7 +605,7 @@ mod tests {
         let groups = optimizer.optimize_key_grouping(keys).await;
 
         // Should create groups based on max transaction size
-        assert!(groups.len() >= 1);
+        assert!(!groups.is_empty());
 
         // Verify priority ordering (key4 should be first due to highest priority)
         assert_eq!(groups[0][0].key, b"key4");

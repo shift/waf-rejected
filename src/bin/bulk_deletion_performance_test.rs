@@ -8,8 +8,7 @@ use tokio::time::sleep;
 use tracing::{debug, info};
 
 use waf_ingress::waf::storage::{
-    BulkDeletionConfig, BulkDeletionOptimizer, BulkDeletionResult, BulkDeletionStats, DeletionKey,
-    TransactionResult,
+    BulkDeletionConfig, BulkDeletionOptimizer, DeletionKey, TransactionResult,
 };
 
 #[tokio::main]
@@ -144,7 +143,7 @@ async fn test_key_grouping_optimization() -> Result<(), Box<dyn std::error::Erro
     let groups = optimizer.optimize_key_grouping(keys).await;
 
     // Verify grouping
-    assert!(groups.len() >= 1);
+    assert!(!groups.is_empty());
     debug!("Created {} groups from 5 keys", groups.len());
 
     // Verify priority ordering (highest priority should come first)
@@ -207,7 +206,7 @@ async fn test_parallel_vs_sequential() -> Result<(), Box<dyn std::error::Error>>
     // Time sequential execution
     let sequential_start = SystemTime::now();
     let sequential_result = sequential_optimizer
-        .execute_bulk_deletion(key_groups_sequential, deletion_fn.clone())
+        .execute_bulk_deletion(key_groups_sequential, deletion_fn)
         .await?;
     let sequential_duration = sequential_start.elapsed().unwrap();
 

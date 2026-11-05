@@ -106,7 +106,7 @@ pub struct ProtocolTestResult {
     pub protocol_specific_metrics: ProtocolMetrics,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ProtocolMetrics {
     pub connection_establishment_ms: u64,
     pub tls_handshake_ms: Option<u64>,
@@ -116,21 +116,6 @@ pub struct ProtocolMetrics {
     pub quic_rtt_ms: Option<u64>,      // HTTP/3 specific
     pub packet_loss_rate: Option<f64>, // HTTP/3 specific
     pub migration_events: Option<u32>, // HTTP/3 specific
-}
-
-impl Default for ProtocolMetrics {
-    fn default() -> Self {
-        Self {
-            connection_establishment_ms: 0,
-            tls_handshake_ms: None,
-            stream_count: None,
-            frames_sent: None,
-            frames_received: None,
-            quic_rtt_ms: None,
-            packet_loss_rate: None,
-            migration_events: None,
-        }
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -728,7 +713,7 @@ impl MultiProtocolWafTester {
         for attack_type in &attack_types {
             let mut detection_rates = Vec::new();
 
-            for (protocol, result) in results {
+            for result in results.values() {
                 let detection_rate = result.attacks_blocked as f64 / result.total_tests as f64;
                 detection_rates.push(detection_rate);
             }
@@ -774,7 +759,7 @@ impl MultiProtocolWafTester {
             );
         }
 
-        if protocol_bypasses.len() > 0 {
+        if !protocol_bypasses.is_empty() {
             security_recommendations
                 .push("Conduct protocol-specific penetration testing".to_string());
             security_recommendations.push(
@@ -1270,7 +1255,7 @@ impl Http11Client {
 #[async_trait::async_trait]
 impl HttpClient for Http11Client {
     async fn execute_request(&self, test_case: &ProtocolTestCase) -> Result<HttpResponse> {
-        let start_time = Instant::now();
+        let _start_time = Instant::now();
 
         let url = format!("{}{}", self.base_url, test_case.path);
         let method = reqwest::Method::from_bytes(test_case.method.as_bytes())?;
@@ -1336,7 +1321,7 @@ impl Http2Client {
 #[async_trait::async_trait]
 impl HttpClient for Http2Client {
     async fn execute_request(&self, test_case: &ProtocolTestCase) -> Result<HttpResponse> {
-        let start_time = Instant::now();
+        let _start_time = Instant::now();
 
         let url = format!("{}{}", self.base_url, test_case.path);
         let method = reqwest::Method::from_bytes(test_case.method.as_bytes())?;
@@ -1410,7 +1395,7 @@ impl HttpClient for Http3Client {
             .timeout(Duration::from_secs(self.config.timeout_seconds))
             .build()?;
 
-        let start_time = Instant::now();
+        let _start_time = Instant::now();
         let url = format!("{}{}", self.base_url, test_case.path);
         let method = reqwest::Method::from_bytes(test_case.method.as_bytes())?;
 

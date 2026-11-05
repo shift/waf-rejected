@@ -4,6 +4,7 @@
 //! provides performance benefits over traditional regex-only approaches.
 
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod performance_validation {
     use crate::waf::simd_ops::{SimdStringOps, WafPatternMatcher};
     use std::time::Instant;

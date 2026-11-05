@@ -1,5 +1,13 @@
 name: Feature Matrix
 
+# GitHub Actions is currently billing-blocked. The local equivalent of this
+# workflow (including the `workflow_dispatch` opt-in jobs) is:
+#   ./scripts/ci-local.sh
+#   ./scripts/ci-feature-matrix.sh
+#   ./scripts/run-crs-corpus.sh --engine both
+#   ./scripts/check-engine-guarantees.sh
+# `workflow_dispatch` remains the manual trigger for when Actions is re-enabled.
+#
 # Guards against feature-combination regressions (for example a test module
 # that only compiles with `coraza-native`, which the default feature set did
 # not catch). Mirrors scripts/ci-feature-matrix.sh so the same combinations
@@ -123,6 +131,8 @@ jobs:
             args: "--all-targets --features wasm-reactor,coraza-native"
           - name: all-targets + http3,webtransport,wasm-reactor
             args: "--all-targets --features http3,webtransport,wasm-reactor"
+          - name: all-targets + ai-threat-detection
+            args: "--all-targets --features ai-threat-detection"
           - name: bin graphql-allowlist + wasm-reactor
             args: "--bin graphql-allowlist --features wasm-reactor"
           - name: bin grpc-allowlist + wasm-reactor

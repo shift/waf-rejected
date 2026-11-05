@@ -7,11 +7,11 @@
 /// It measures file operations latency and throughput to validate
 /// the P2-02 I/O optimization implementation.
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::{info, warn};
-use waf_ingress::waf::io::{create_io_handler, IoBackend, IoConfig, IoHandler};
+use waf_ingress::waf::io::{create_io_handler, IoBackend, IoConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -83,7 +83,7 @@ async fn main() -> Result<()> {
 
 async fn test_io_backend(
     config: &IoConfig,
-    test_dir: &PathBuf,
+    test_dir: &Path,
 ) -> Result<waf_ingress::waf::io::IoStats> {
     let handler = create_io_handler(config)?;
 

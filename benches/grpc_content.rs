@@ -116,9 +116,11 @@ fn context(body: Vec<u8>) -> RequestContext {
 
 fn inspector(mode: &str, reactor: Arc<WasmReactor>) -> (tempfile::TempDir, GrpcInspector) {
     let (dir, path) = allowlist_file();
-    let mut config = WafGrpcConfig::default();
-    config.allowlist_file = Some(path);
-    config.content_scan = mode.to_string();
+    let config = WafGrpcConfig {
+        allowlist_file: Some(path),
+        content_scan: mode.to_string(),
+        ..WafGrpcConfig::default()
+    };
     let inspector = GrpcInspector::try_from_config(&config)
         .unwrap()
         .with_content_scanner(reactor);

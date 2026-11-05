@@ -403,7 +403,7 @@ impl ComprehensiveWAFTestHarness {
                         was_blocked,
                         reached_backend,
                         attack_type.as_deref(),
-                        &http_version,
+                        http_version,
                         &response_body,
                     );
                 }
@@ -415,7 +415,7 @@ impl ComprehensiveWAFTestHarness {
                         true,
                         false,
                         attack_type.as_deref(),
-                        &http_version,
+                        http_version,
                         "",
                     );
                 }
@@ -427,7 +427,7 @@ impl ComprehensiveWAFTestHarness {
                         true,
                         false,
                         attack_type.as_deref(),
-                        &http_version,
+                        http_version,
                         "",
                     );
                 }
@@ -944,7 +944,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build services using Nix
     println!("🔨 Building enterprise test services with Nix...");
     let build_output = Command::new("nix")
-        .args(&[
+        .args([
             "develop",
             "--command",
             "cargo",

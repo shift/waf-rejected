@@ -240,7 +240,7 @@ fn validate_transfer_encoding(headers: &HeaderMap) -> Result<(), FramingError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http::header::{HeaderName, HeaderValue, CONTENT_LENGTH, TRANSFER_ENCODING};
+    use http::header::{HeaderName, HeaderValue};
     use http::HeaderMap;
 
     fn headers(values: &[(&str, &str)]) -> HeaderMap {

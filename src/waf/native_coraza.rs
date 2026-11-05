@@ -1175,7 +1175,7 @@ mod tests {
             headers,
             body.map(<[u8]>::len),
         )
-        .with_body(body.map(|b| Bytes::copy_from_slice(b)))
+        .with_body(body.map(Bytes::copy_from_slice))
     }
 
     fn client(path: &Path, timeout: Duration) -> NativeCorazaClient {

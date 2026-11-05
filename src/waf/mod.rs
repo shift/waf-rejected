@@ -76,7 +76,8 @@ pub mod rust_engine;
 pub mod request_view;
 
 /// Shared JSON payload envelope for the wasm reactor and native sidecar.
-#[cfg(any(feature = "wasm-reactor", feature = "coraza-native"))]
+/// Kept unconditional so gRPC envelope inspection also builds with
+/// `--no-default-features`.
 pub mod coraza_payload;
 #[cfg(all(feature = "coraza-native", unix))]
 pub mod coraza_wire;
@@ -86,8 +87,8 @@ pub mod coraza_wire;
 pub mod native_coraza;
 
 /// Protocol-aware gRPC inspection (protobuf frames are not sent to CRS body
-/// rules).
-#[cfg(feature = "wasm-reactor")]
+/// rules). The envelope/frame handling is independent of the WASM reactor, so
+/// it stays available with `--no-default-features`.
 pub mod grpc;
 
 /// Protocol-aware GraphQL-over-HTTP inspection (raw JSON bodies can be
@@ -98,7 +99,6 @@ pub mod graphql;
 #[cfg(feature = "wasm-reactor")]
 pub mod graphql_allowlist;
 /// Minimal protobuf wire decoder used by gRPC field-level inspection.
-#[cfg(feature = "wasm-reactor")]
 pub mod protobuf;
 
 use bytes::Bytes;
@@ -1890,14 +1890,14 @@ impl WafEngine {
                     if ai_result.should_block {
                         info!(
                             "Request blocked by AI threat detection (score: {:.3})",
-                            ai_result.analysis.threat_score
+                            ai_result.analysis.overall_risk_score
                         );
                         return CoreOutcome::new(
                             Decision::Block {
                                 status: 403,
                                 reason: format!(
                                     "AI detected threat (score: {:.3})",
-                                    ai_result.analysis.threat_score
+                                    ai_result.analysis.overall_risk_score
                                 ),
                             },
                             vec!["AI-Threat-Detection".to_string()],
@@ -1905,7 +1905,7 @@ impl WafEngine {
                     } else {
                         debug!(
                             "AI analysis passed (score: {:.3})",
-                            ai_result.analysis.threat_score
+                            ai_result.analysis.overall_risk_score
                         );
                     }
                 }

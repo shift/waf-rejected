@@ -3,13 +3,13 @@
 //! This test validates the P2-05 and P2-06 TTL enhancements for
 //! adaptive cleanup strategies and bulk optimization.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::time::{interval, sleep};
+use std::time::{Duration, SystemTime};
+use tokio::time::sleep;
 use tracing::{debug, info};
 
 use waf_ingress::waf::storage::{
-    CleanupResult, EnhancedTtlStats, MemoryStorageAdapter, ReadConsistency, StorageAdapter,
-    TtlCleanupConfig, TtlEnhancementManager,
+    CleanupResult, MemoryStorageAdapter, ReadConsistency, StorageAdapter, TtlCleanupConfig,
+    TtlEnhancementManager,
 };
 
 #[tokio::main]

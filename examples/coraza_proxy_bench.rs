@@ -127,8 +127,10 @@ async fn spawn_upstream() -> SocketAddr {
 }
 
 async fn spawn_proxy(upstream: SocketAddr, backend: CorazaBackend, socket: &str) -> SocketAddr {
-    let mut config = Config::default();
-    config.upstream_uri = format!("http://{upstream}");
+    let mut config = Config {
+        upstream_uri: format!("http://{upstream}"),
+        ..Config::default()
+    };
     config.server.max_body_size = 1024 * 1024;
     config.waf.rate_limit.per_ip_enabled = false;
     config.waf.rate_limit.global_enabled = false;

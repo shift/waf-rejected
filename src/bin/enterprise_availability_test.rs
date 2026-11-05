@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::time::{Duration, Instant};
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
 
 #[derive(Debug)]
 struct AvailabilityMetrics {

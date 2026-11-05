@@ -39,7 +39,7 @@ async fn simulate_progressive_waf_request(request_id: u64, load_level: f64) -> R
     sleep(total_processing).await;
 
     // Simulate very rare failures (0.01% - better than real world)
-    if request_id % 10000 == 0 {
+    if request_id.is_multiple_of(10000) {
         return Err(anyhow::anyhow!("Rare processing failure"));
     }
 
@@ -48,7 +48,7 @@ async fn simulate_progressive_waf_request(request_id: u64, load_level: f64) -> R
 
 fn calculate_safety_metrics(concurrent_users: usize, rps: f64, memory_mb: f64) -> SafetyMetrics {
     // Estimate system impact (very conservative for laptop safety)
-    let cpu_usage_estimate = ((concurrent_users as f64 / 10.0).min(100.0)).max(5.0);
+    let cpu_usage_estimate = (concurrent_users as f64 / 10.0).clamp(5.0, 100.0);
     let temperature_estimate = 35.0 + (cpu_usage_estimate * 0.4); // Conservative temp estimate
     let system_load = (rps / 100000.0).min(10.0); // Load average estimate
 
@@ -146,7 +146,7 @@ async fn run_safe_progressive_load_test(
     let chunk_size = tasks.len() / 10; // Monitor progress in 10% chunks
     let mut completed = 0;
 
-    for (_i, task) in tasks.into_iter().enumerate() {
+    for task in tasks {
         match task.await.unwrap() {
             Ok(latency) => {
                 latencies.push(latency.as_millis() as u64);
@@ -161,7 +161,7 @@ async fn run_safe_progressive_load_test(
         if chunk_size > 0 && completed % chunk_size == 0 {
             let progress = (completed * 100) / total_requests;
             print!("   Progress: {}%... ", progress);
-            if progress % 30 == 0 {
+            if progress.is_multiple_of(30) {
                 println!("💻 (Laptop still alive!)");
             }
         }

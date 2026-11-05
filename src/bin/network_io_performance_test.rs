@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use tracing::{info, warn};
-use waf_ingress::waf::io::{IoBackend, IoConfig, NetworkIo, NetworkIoHandler};
+use waf_ingress::waf::io::{IoBackend, IoConfig, NetworkIoHandler};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -167,7 +167,7 @@ async fn test_network_io(config: &IoConfig) -> Result<waf_ingress::waf::io::Netw
     let mut client_tasks = Vec::new();
 
     for client_id in 0..NUM_CONNECTIONS {
-        let handler = handler.clone();
+        let _handler = handler.clone();
         let data = test_data.clone();
         let addr = server_addr;
 
@@ -233,6 +233,7 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tokio::io::{AsyncRead, AsyncWrite};
+    use waf_ingress::waf::io::NetworkIo;
 
     // Mock stream for testing
     struct MockStream {
@@ -363,6 +364,5 @@ mod tests {
 
         assert_eq!(stats.total_ops(), 2); // 1 read + 1 write
         assert_eq!(stats.total_bytes(), test_data.len() as u64 * 2); // read + write
-        assert!(stats.avg_latency_us() >= 0);
     }
 }

@@ -1,20 +1,17 @@
 // Phase 4: Comprehensive Performance Test with AI Optimizations
 // Enterprise-grade validation of AI optimization engine and advanced features
 
-use anyhow::{anyhow, Result};
+#![allow(dead_code)]
+
+use anyhow::Result;
 use futures::future::join_all;
-use serde_json;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Semaphore;
-use tokio::time::{interval, sleep};
 
 use waf_ingress::advanced_ai_waf_integration::{AdvancedAiWafIntegration, RequestAnalysisData};
-use waf_ingress::ai_optimization_engine::{
-    AiOptimizationEngine, OptimizationLevel, TrainingSample,
-};
+use waf_ingress::ai_optimization_engine::{AiOptimizationEngine, TrainingSample};
 use waf_ingress::ai_threat_detection::RequestFeatures;
 
 /// Phase 4 comprehensive performance testing framework
@@ -187,15 +184,13 @@ impl Phase4TestRunner {
         let mut total_confidence = 0.0;
         let mut total_inference_time = 0u64;
 
-        for result in results {
-            if let Ok(inference_result) = result {
-                latencies.push(inference_result.latency);
-                if inference_result.success {
-                    successes += 1;
-                    total_risk_score += inference_result.risk_score;
-                    total_confidence += inference_result.confidence;
-                    total_inference_time += inference_result.inference_time_ms as u64;
-                }
+        for inference_result in results.into_iter().flatten() {
+            latencies.push(inference_result.latency);
+            if inference_result.success {
+                successes += 1;
+                total_risk_score += inference_result.risk_score;
+                total_confidence += inference_result.confidence;
+                total_inference_time += inference_result.inference_time_ms as u64;
             }
         }
 
@@ -307,14 +302,12 @@ impl Phase4TestRunner {
         let mut total_quality = 0.0;
         let mut total_explanation_length = 0;
 
-        for result in results {
-            if let Ok(explanation_result) = result {
-                explanation_durations.push(explanation_result.explanation_duration);
-                if explanation_result.success {
-                    successes += 1;
-                    total_quality += explanation_result.explanation_quality;
-                    total_explanation_length += explanation_result.natural_language_length;
-                }
+        for explanation_result in results.into_iter().flatten() {
+            explanation_durations.push(explanation_result.explanation_duration);
+            if explanation_result.success {
+                successes += 1;
+                total_quality += explanation_result.explanation_quality;
+                total_explanation_length += explanation_result.natural_language_length;
             }
         }
 
@@ -435,14 +428,12 @@ impl Phase4TestRunner {
         let mut total_mitigation_steps = 0;
         let mut total_effectiveness = 0.0;
 
-        for result in results {
-            if let Ok(response_result) = result {
-                response_durations.push(response_result.response_duration);
-                if response_result.success {
-                    successes += 1;
-                    total_mitigation_steps += response_result.mitigation_steps;
-                    total_effectiveness += response_result.effectiveness_score;
-                }
+        for response_result in results.into_iter().flatten() {
+            response_durations.push(response_result.response_duration);
+            if response_result.success {
+                successes += 1;
+                total_mitigation_steps += response_result.mitigation_steps;
+                total_effectiveness += response_result.effectiveness_score;
             }
         }
 

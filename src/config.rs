@@ -1639,6 +1639,7 @@ impl WafGraphqlConfig {
             }
         }
 
+        #[allow(unused_mut)]
         let mut artifact_entries = 0usize;
         if let Some(path) = self.allowlist_file.as_deref() {
             if path.trim().is_empty() {
@@ -3026,6 +3027,7 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
         assert!(config.validate().is_ok());
     }
 
+    #[cfg(feature = "rust-engine")]
     #[test]
     fn rust_coraza_backend_does_not_require_a_socket() {
         let mut config = Config::default();

@@ -180,7 +180,7 @@ impl CoreBenchmarkSuite {
 
     /// Create standard test request context
     fn create_test_context(&self, iteration: usize) -> RequestContext {
-        let method = if iteration % 3 == 0 {
+        let method = if iteration.is_multiple_of(3) {
             Method::POST
         } else {
             Method::GET

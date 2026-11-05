@@ -1,5 +1,11 @@
 name: Release
 
+# GitHub Actions is currently billing-blocked. The local equivalents of the
+# build/verification steps are `./scripts/ci-local.sh` and
+# `./scripts/check-coraza-reactor-size.sh`; publishing still requires a tag and
+# registry credentials. `workflow_dispatch` is not enabled because the release
+# job derives its version from the pushed tag.
+
 on:
   push:
     tags:

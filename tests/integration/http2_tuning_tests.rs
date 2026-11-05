@@ -64,8 +64,10 @@ async fn spawn_upstream() -> Upstream {
 }
 
 async fn spawn_proxy(upstream: SocketAddr, configure: impl FnOnce(&mut Config)) -> SocketAddr {
-    let mut config = Config::default();
-    config.upstream_uri = format!("http://{}", upstream);
+    let mut config = Config {
+        upstream_uri: format!("http://{}", upstream),
+        ..Config::default()
+    };
     config.server.enable_http3 = false;
     config.waf.coraza.enabled = false;
     config.waf.rate_limit.per_ip_enabled = false;

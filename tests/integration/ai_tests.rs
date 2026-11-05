@@ -67,7 +67,7 @@ mod ai_integration_tests {
     #[tokio::test]
     async fn test_ai_threat_detection_enabled() {
         let config = create_config_with_ai();
-        let engine = WafEngine::with_config(&config);
+        let _engine = WafEngine::with_config(&config);
 
         // Verify AI is configured
         assert!(config.security.ai.enabled);

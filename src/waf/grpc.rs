@@ -2080,7 +2080,6 @@ mod tests {
         );
 
         // Config-only methods fall back to the global limit.
-        let mut config = config;
         config.method_allowlist = vec!["/acme.Service/ConfigOnly".to_string()];
         let config_only = GrpcInspector::try_from_config(&config).unwrap();
         let verdict = config_only

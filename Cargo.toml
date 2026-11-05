@@ -279,6 +279,9 @@ wtransport = { version = "0.7.2", default-features = false, features = ["ring", 
 [features]
 default = ["export-system", "websocket", "wasm-reactor", "rust-engine"]
 integration-tests = []
+# Legacy component-ABI integration. Intentionally empty and NOT supported:
+# the historical `wasm` module is not compiled, so enabling this feature does
+# not build. Use `wasm-reactor` (the live Coraza WASI reactor) instead.
 wasm-waf = []
 # Request-in/decision-out WASM reactor ABI (wasmtime host) that runs the
 # real Coraza/CRS module before the built-in heuristic rules. Enabled by
@@ -409,6 +412,22 @@ required-features = ["wasm-reactor"]
 [[example]]
 name = "allow_cache_bench"
 required-features = ["wasm-reactor", "allow-cache"]
+
+[[example]]
+name = "allow_cache_microbench"
+required-features = ["allow-cache"]
+
+[[example]]
+name = "coraza_backend_bench"
+required-features = ["wasm-reactor", "coraza-native"]
+
+[[example]]
+name = "coraza_ipc_profile"
+required-features = ["coraza-native"]
+
+[[example]]
+name = "graphql_inspection"
+required-features = ["wasm-reactor"]
 
 
 # Native Rust CRS engine microbenchmarks (bodyless / 1 / 4 / 8 KiB).

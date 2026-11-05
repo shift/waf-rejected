@@ -29,7 +29,7 @@ async fn simulate_waf_request(request_id: u64) -> Result<Duration> {
     sleep(processing_time).await;
 
     // Simulate occasional failures (0.1% failure rate)
-    if request_id % 1000 == 0 {
+    if request_id.is_multiple_of(1000) {
         return Err(anyhow::anyhow!("Simulated processing failure"));
     }
 

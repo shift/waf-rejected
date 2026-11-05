@@ -132,8 +132,10 @@ async fn bind() -> (TcpListener, SocketAddr) {
 }
 
 async fn spawn_proxy(upstream: SocketAddr, configure: impl FnOnce(&mut Config)) -> SocketAddr {
-    let mut config = Config::default();
-    config.upstream_uri = format!("http://{}", upstream);
+    let mut config = Config {
+        upstream_uri: format!("http://{}", upstream),
+        ..Config::default()
+    };
     config.waf.rate_limit.per_ip_enabled = false;
     config.waf.rate_limit.global_enabled = false;
     config.waf.coraza.enabled = false;

@@ -71,8 +71,10 @@ async fn spawn_proxy_with_backend(
     upstream: std::net::SocketAddr,
     backend: ListenerIoBackend,
 ) -> String {
-    let mut config = Config::default();
-    config.upstream_uri = format!("http://{}", upstream);
+    let mut config = Config {
+        upstream_uri: format!("http://{}", upstream),
+        ..Config::default()
+    };
     config.server.max_body_size = 512;
     config.server.io_backend = backend;
     config.waf.rate_limit.per_ip_enabled = false;

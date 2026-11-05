@@ -1,8 +1,7 @@
 use anyhow::Result;
-use serde_json::Value;
-use std::collections::HashMap;
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct AttackTest {
     name: String,
     attack_type: String,
@@ -185,7 +184,7 @@ fn run_security_tests(tests: &[AttackTest]) -> SecurityTestResults {
                 test.attack_type,
                 if was_detected { "BLOCKED" } else { "ALLOWED" },
                 payload.chars().take(50).collect::<String>(),
-                if (test.expected_detection == was_detected) {
+                if test.expected_detection == was_detected {
                     "✅"
                 } else {
                     "❌"

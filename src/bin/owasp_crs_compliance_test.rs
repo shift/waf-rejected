@@ -704,7 +704,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build services
     println!("🔨 Building OWASP CRS compliance test services...");
     let build_output = Command::new("cargo")
-        .args(&[
+        .args([
             "build",
             "--release",
             "--bin",

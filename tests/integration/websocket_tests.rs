@@ -28,10 +28,8 @@ async fn spawn_ws_upstream() -> std::net::SocketAddr {
         let (stream, _) = listener.accept().await.unwrap();
         let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
         while let Some(Ok(message)) = ws.next().await {
-            if message.is_text() {
-                if ws.send(message).await.is_err() {
-                    break;
-                }
+            if message.is_text() && ws.send(message).await.is_err() {
+                break;
             }
         }
     });
@@ -40,8 +38,10 @@ async fn spawn_ws_upstream() -> std::net::SocketAddr {
 }
 
 async fn spawn_proxy(upstream: std::net::SocketAddr) -> String {
-    let mut config = Config::default();
-    config.upstream_uri = format!("http://{}", upstream);
+    let mut config = Config {
+        upstream_uri: format!("http://{}", upstream),
+        ..Config::default()
+    };
     config.server.max_body_size = 4096;
     config.waf.rate_limit.per_ip_enabled = false;
     config.waf.rate_limit.global_enabled = false;
@@ -319,8 +319,10 @@ async fn spawn_tls_ws_upstream(dir: &Path) -> (std::net::SocketAddr, PathBuf) {
 }
 
 async fn spawn_proxy_with_upstream_ca(upstream: std::net::SocketAddr, ca_path: &Path) -> String {
-    let mut config = Config::default();
-    config.upstream_uri = format!("https://127.0.0.1:{}", upstream.port());
+    let mut config = Config {
+        upstream_uri: format!("https://127.0.0.1:{}", upstream.port()),
+        ..Config::default()
+    };
     config.proxy.upstream_ca_path = Some(ca_path.to_string_lossy().into_owned());
     config.server.max_body_size = 4096;
     config.waf.rate_limit.per_ip_enabled = false;

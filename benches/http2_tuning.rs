@@ -180,11 +180,13 @@ async fn spawn_proxy(
     cert: &str,
     key: &str,
 ) -> SocketAddr {
-    let mut config = Config::default();
-    config.upstream_uri = if h2_upstream {
-        format!("https://{}", upstream)
-    } else {
-        format!("http://{}", upstream)
+    let mut config = Config {
+        upstream_uri: if h2_upstream {
+            format!("https://{}", upstream)
+        } else {
+            format!("http://{}", upstream)
+        },
+        ..Config::default()
     };
     if h2_upstream {
         config.proxy.upstream_ca_path = Some(ca_path.to_string());

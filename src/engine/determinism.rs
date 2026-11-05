@@ -208,7 +208,7 @@ mod tests {
         }
         fn evaluate(&self, _request: &CorpusRequest) -> Result<EngineOutcome, EngineError> {
             let value = self.counter.fetch_add(1, Ordering::SeqCst);
-            if value % 2 == 0 {
+            if value.is_multiple_of(2) {
                 Ok(EngineOutcome::Allow)
             } else {
                 Ok(EngineOutcome::Block)

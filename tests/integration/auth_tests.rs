@@ -1,11 +1,10 @@
+#![allow(dead_code)]
+
 use std::net::SocketAddr;
 use std::str::FromStr;
-use std::time::Duration;
 
-use hyper::{body::Bytes, HeaderMap, Method, Uri};
-use reqwest::Client;
+use hyper::{HeaderMap, Method, Uri};
 use tokio::net::TcpListener;
-use tokio::time::timeout;
 
 use waf_ingress::config::Config;
 use waf_ingress::proxy::WafProxyService;
@@ -17,14 +16,14 @@ mod auth_integration_tests {
 
     async fn start_test_server(config: Config) -> TestServerHandle {
         let addr = SocketAddr::from_str("127.0.0.1:0").unwrap();
-        let service = WafProxyService::new(config).unwrap();
+        let _service = WafProxyService::new(config).unwrap();
 
         let listener = TcpListener::bind(addr).await.unwrap();
         let actual_addr = listener.local_addr().unwrap();
 
         let handle = tokio::spawn(async move {
             loop {
-                let (stream, _) = listener.accept().await.unwrap();
+                let (_stream, _) = listener.accept().await.unwrap();
                 // In a real test, we'd handle the connection
                 // For now, just accept and close
             }
@@ -62,11 +61,11 @@ mod auth_integration_tests {
     #[tokio::test]
     async fn test_authentication_middleware_integration() {
         let config = create_config_with_auth();
-        let mut engine = waf_ingress::waf::WafEngine::with_config(&config);
+        let engine = waf_ingress::waf::WafEngine::with_config(&config);
 
         // Test 1: Request without API key should be processed but auth should fail
         let request_without_key = create_test_request("test", None);
-        let decision = engine.evaluate(&request_without_key).await;
+        let _decision = engine.evaluate(&request_without_key).await;
 
         // The WAF engine itself doesn't enforce auth - that's done in the proxy
         // This test validates that the auth config is properly loaded

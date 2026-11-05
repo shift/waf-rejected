@@ -350,7 +350,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build services first
     println!("🔨 Building test services...");
     let build_output = Command::new("cargo")
-        .args(&[
+        .args([
             "build",
             "--release",
             "--bin",

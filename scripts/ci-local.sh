@@ -2,20 +2,29 @@
 #
 # Billing-independent local CI runner for WAF-Rejected.
 #
-# Runs the same format, lint, check and test stages as CI, plus optional
-# dependency auditing, supply-chain policy checks (cargo-deny), Helm chart
-# validation and container image build.
+# Runs the full local gate: format, lint (including all targets), checks,
+# tests, the cross-feature matrix, shipped-config validation, the CRS smoke
+# corpus and `nix build`. Optional dependency auditing, supply-chain policy
+# checks (cargo-deny), Helm chart validation and container image build are
+# layered on top.
+#
+# This is the local equivalent of the GitHub Actions workflows. Actions is
+# billing-blocked, so this script (and `scripts/ci-feature-matrix.sh`) is the
+# source of truth for CI.
 #
 # Usage:
 #   ./scripts/ci-local.sh
 #   just ci-local
 #
 # Environment:
-#   SKIP_AUDIT=1         Skip `cargo audit` even when cargo-audit is installed.
-#   SKIP_DENY=1          Skip `cargo deny check` even when cargo-deny is installed.
-#   TRIVY=1              Also run a Trivy filesystem scan (HIGH/CRITICAL fail).
-#   BUILD_IMAGE=1        Also build the container image (docker by default).
-#   CONTAINER_ENGINE=... Container engine for BUILD_IMAGE (default: docker).
+#   SKIP_AUDIT=1            Skip `cargo audit` even when cargo-audit is installed.
+#   SKIP_DENY=1             Skip `cargo deny check` even when cargo-deny is installed.
+#   SKIP_FEATURE_MATRIX=1   Skip the cross-feature matrix stage.
+#   SKIP_CORPUS=1           Skip the CRS smoke-corpus stage.
+#   SKIP_NIX_BUILD=1        Skip the `nix build .#waf-ingress` stage.
+#   TRIVY=1                 Also run a Trivy filesystem scan (HIGH/CRITICAL fail).
+#   BUILD_IMAGE=1           Also build the container image (docker by default).
+#   CONTAINER_ENGINE=...    Container engine for BUILD_IMAGE (default: docker).
 
 set -euo pipefail
 
@@ -24,6 +33,9 @@ cd "$ROOT_DIR"
 
 SKIP_AUDIT="${SKIP_AUDIT:-0}"
 SKIP_DENY="${SKIP_DENY:-0}"
+SKIP_FEATURE_MATRIX="${SKIP_FEATURE_MATRIX:-0}"
+SKIP_CORPUS="${SKIP_CORPUS:-0}"
+SKIP_NIX_BUILD="${SKIP_NIX_BUILD:-0}"
 TRIVY="${TRIVY:-0}"
 BUILD_IMAGE="${BUILD_IMAGE:-0}"
 CONTAINER_ENGINE="${CONTAINER_ENGINE:-docker}"
@@ -119,9 +131,10 @@ if [[ "$SKIP_DENY" != "1" ]] &&
   deny_available=1
 fi
 
-STAGE_TOTAL=13
-# Fixed cargo stages: fmt, 3x clippy, 2x check, 3x lib tests, 2x integration tests,
-# plus cargo audit and cargo deny (either of which may be skipped).
+STAGE_TOTAL=18
+# Fixed stages: fmt, 4x clippy, 2x check, 3x lib tests, 2x integration tests,
+# feature matrix, config validation, corpus smoke, nix build, plus cargo audit
+# and cargo deny (either of which may be skipped).
 if [[ $helm_available -eq 1 ]]; then
   STAGE_TOTAL=$((STAGE_TOTAL + 2))
 fi
@@ -143,6 +156,8 @@ cargo_stage "cargo clippy --lib --features compliance" \
   clippy --lib --features compliance -- --deny warnings
 cargo_stage "cargo clippy --lib --features http3" \
   clippy --lib --features http3 -- --deny warnings
+cargo_stage "cargo clippy --all-targets --features wasm-reactor,coraza-native" \
+  clippy --all-targets --features wasm-reactor,coraza-native -- --deny warnings
 cargo_stage "cargo check --all-targets" check --all-targets
 cargo_stage "cargo check --features http3 --all-targets" \
   check --features http3 --all-targets
@@ -154,6 +169,29 @@ cargo_stage "cargo test --lib --features http3" \
 cargo_stage "cargo test --test integration" test --test integration
 cargo_stage "cargo test --test integration --features http3" \
   test --test integration --features http3
+
+if [[ "$SKIP_FEATURE_MATRIX" == "1" ]]; then
+  skip_stage "feature matrix" "SKIP_FEATURE_MATRIX=1"
+else
+  run_stage "feature matrix (scripts/ci-feature-matrix.sh)" \
+    ./scripts/ci-feature-matrix.sh
+fi
+
+run_stage "shipped config validation (scripts/validate-configs.sh)" \
+  ./scripts/validate-configs.sh
+
+if [[ "$SKIP_CORPUS" == "1" ]]; then
+  skip_stage "CRS smoke corpus" "SKIP_CORPUS=1"
+else
+  cargo_stage "CRS smoke corpus (16 cases)" \
+    run --quiet --bin crs_corpus -- --corpus tests/corpus/crs/smoke.json
+fi
+
+if [[ "$SKIP_NIX_BUILD" == "1" ]]; then
+  skip_stage "nix build .#waf-ingress" "SKIP_NIX_BUILD=1"
+else
+  run_stage "nix build .#waf-ingress" nix build .#waf-ingress
+fi
 
 if [[ "$SKIP_AUDIT" == "1" ]]; then
   skip_stage "cargo audit" "SKIP_AUDIT=1"

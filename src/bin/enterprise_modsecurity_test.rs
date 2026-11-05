@@ -45,6 +45,7 @@ enum TestCase {
 }
 
 impl TestCase {
+    #[allow(dead_code)]
     fn get_attack_payload(&self) -> &'static str {
         match self {
             TestCase::SqlInjection => "' UNION SELECT username, password FROM users--",
@@ -133,7 +134,7 @@ async fn simulate_enterprise_waf_request(
     };
 
     // Simulate occasional processing failures under extreme load (0.02% failure rate)
-    if request_id % 5000 == 0 {
+    if request_id.is_multiple_of(5000) {
         return Err(anyhow::anyhow!(
             "Enterprise processing failure under extreme load"
         ));

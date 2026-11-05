@@ -351,7 +351,7 @@ impl OWASPComprehensiveTestHarness {
                         was_blocked,
                         reached_backend,
                         attack_type.as_deref(),
-                        &http_version,
+                        http_version,
                         &response_body,
                     );
                 }
@@ -363,7 +363,7 @@ impl OWASPComprehensiveTestHarness {
                         true,
                         false,
                         attack_type.as_deref(),
-                        &http_version,
+                        http_version,
                         "",
                     );
                 }
@@ -375,7 +375,7 @@ impl OWASPComprehensiveTestHarness {
                         true,
                         false,
                         attack_type.as_deref(),
-                        &http_version,
+                        http_version,
                         "",
                     );
                 }
@@ -1058,7 +1058,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build services
     println!("🔨 Building OWASP test services...");
     let build_output = Command::new("cargo")
-        .args(&[
+        .args([
             "build",
             "--release",
             "--bin",
