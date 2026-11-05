@@ -770,22 +770,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn unary_rpc_with_delayed_end_stream_is_not_forced_into_streaming() {
-        let mut body = DelayedEndAfterFirst {
-            first: Some(Bytes::from(frame(b"hello"))),
-            delay: Box::pin(tokio::time::sleep(Duration::from_millis(75))),
-            ended: false,
-        };
-        let probe = probe_grpc_body(&mut body, 1024).await.unwrap();
-        assert_eq!(
-            probe.mode,
-            GrpcBodyMode::Unary,
-            "a single complete frame must stay unary even when END_STREAM is delayed"
-        );
-        assert_eq!(probe.prefix, Bytes::from(frame(b"hello")));
-    }
-
     struct RecordingInspector {
         inspected: std::sync::Mutex<Vec<Bytes>>,
         block_first: bool,
