@@ -24,12 +24,18 @@ the reference oracle and an explicit `waf.coraza.backend = "wasm"` switch-back.
   optional private CA bundle via `proxy.upstream_ca_path`.
 - URI, query-string, header and **request-body** inspection.
 - Protocol-aware gRPC (frame/field validation, method allowlists, bounded
-  decoded-field content scan) and GraphQL-over-HTTP inspection.
+  decoded-field content scan) and GraphQL-over-HTTP inspection. Unary RPCs are
+  fully inspected, including bodies without `content-length`; genuinely
+  streaming RPCs follow `server.grpc_streaming_policy` (`transport-only`
+  default, or `reject`).
 - Bounded `gzip`, `deflate` and `br` request decompression before WAF
   inspection, capped at `server.max_body_size`.
+- Request-framing validation (CL/TE ambiguity, duplicate/conflicting lengths)
+  before any body read on HTTP/1.1, HTTP/2 and HTTP/3.
 - Percent-encoded payload decoding (`%20`, `%27`, `%3C`, ...).
 - API-key authentication (`X-API-Key` by default).
-- Per-IP and global token-bucket rate limiting.
+- Per-IP and global token-bucket rate limiting, with a hard
+  `max_tracked_ips` cap and fail-closed capacity policy.
 - Configurable maximum request-body size (enforced while streaming).
 - Trusted-proxy aware client IP resolution (`X-Forwarded-For` is ignored unless
   the peer is listed in `server.trusted_proxies`).
@@ -330,7 +336,14 @@ Key points:
   remain false.
 - **HTTP/3 is feature-gated.** Build with `--features http3`, enable TLS 1.3 and
   `server.enable_http3`, and add `"3"` to `server.supported_http_versions`.
-  HTTP/3 and WebTransport datagrams/streams are not inspected frame-by-frame.
+  HTTP/3 requests reuse the same framing, auth, decompression, WAF and
+  response-cap pipeline as HTTP/1.1 and HTTP/2. There is no cap on concurrent
+  QUIC connections or streams, and no stateless retry.
+- **WebTransport is terminating, not a proxy.** When built with
+  `--features webtransport`, it authenticates, inspects and echoes sessions
+  locally under Origin/path/session/stream/datagram limits. Application
+  WebTransport payloads are **not** forwarded upstream; that bridge is not
+  implemented. HTTP/1.1 `Upgrade: webtransport` remains `501`.
 - The legacy AI/threat-intelligence modules are experimental and are not on the
   request path by default.
 

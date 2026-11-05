@@ -34,7 +34,7 @@ Measured p50 unless stated otherwise. `native` = native Rust engine
 | Medium bodies (8 KiB) | Full CRS body scan | Supported | native end-to-end 1.614 ms (engine request path ~992 µs); wasm 354.09 ms | Byte-linear cost; admission control protects bodyless traffic from starvation. |
 | Large bodies (32–64 KiB) | Full CRS body scan up to the wasm payload contract | Supported with policy | native ~737 ms p50 for 60 KiB at c=1; wasm seconds | The wasm reactor payload contract is 64 KiB. Above that, default behaviour fails closed unless `max_inspect_bytes` and `oversize_action` are configured explicitly. |
 | Bodies above the policy limit | `reject` or `forward-uninspected` | Policy-dependent | Rejection is immediate; forwarding does not inspect the tail | `reject` returns `413` (or `503` on the wasm payload cap). `forward-uninspected` forwards a partially inspected body. Both are opt-in. |
-| gRPC | Protocol-aware envelope + optional descriptor content scan | Supported | native 1 KiB envelope p50 ~3 ms, ~478 RPS at c=4 (zero 503) | Protobuf frames are validated structurally and withheld from CRS body rules. `content_scan = "strings"` adds a bounded content scan using a descriptor artifact. Streaming bodies remain envelope-only. |
+| gRPC | Protocol-aware envelope + optional descriptor content scan | Supported | native 1 KiB envelope p50 ~3 ms, ~478 RPS at c=4 (zero 503) | Unary RPCs are classified from the frame sequence (not `content-length`) and fully inspected, including unary bodies without `content-length`. `content_scan = "strings"` adds a bounded content scan using a descriptor artifact. Genuinely streaming RPCs follow `server.grpc_streaming_policy`: `transport-only` (default) relays without body inspection and logs a start-up warning; `reject` refuses them. Whole-stream bytes/messages/duration and gzip expansion are bounded. |
 | GraphQL | CRS JSON body scan (`body_scan = "crs"`) | Supported | CRS body cost for the JSON payload | `graphql-only` removes the CRS JSON scan at the cost of CRS body-rule coverage and requires a non-empty operation allowlist. `off` disables GraphQL-specific checks but keeps CRS scanning. |
 | Native Coraza sidecar | `waf.coraza.backend = "native"` | Opt-in | ~6× faster body inspection than wasm | Extra process, Unix socket, shared uid/gid and separate upgrade lifecycle. See `native-performance-profile.md`. |
 | Native Rust engine | `waf.coraza.backend = "rust"` | **Default** (compiled with `rust-engine`) | End-to-end proxy p50 0.414 / 0.642 / 1.091 / 1.614 ms for bodyless / 1 / 4 / 8 KiB; start-up 276 ms, ~30 MiB RSS | 505/505 rules, 2,110/2,112 corpus parity, 0 native-only FNs. Coraza remains the reference oracle. Runtime errors fail closed unless `waf.coraza.fallback = "wasm"`. |
@@ -44,6 +44,27 @@ Measured p50 unless stated otherwise. `native` = native Rust engine
 Measured numbers are from the reference 6-core laptop described in
 `performance-validation.md` and `subms-budget.md`. They are **capacity floors**
 on a shared host, not ceilings, and should be re-measured on target hardware.
+
+## Security controls and limits
+
+The authoritative control-by-control status (code, test and introduced-in
+release) is the matrix in
+[`docs/architecture/security-model.md`](../architecture/security-model.md#2-control-status-matrix).
+This table is the operator-facing summary.
+
+| Control | Status | Default / limit | Notes |
+| --- | --- | --- | --- |
+| Request framing validation | Supported | On | Rejects CL+TE, duplicate/conflicting `Content-Length`, invalid lengths and non-`chunked` `Transfer-Encoding` with a generic `400` before any body read, on HTTP/1.1, HTTP/2 and HTTP/3. |
+| Request decompression | Supported | On; `gzip`, `deflate`, `br`, `identity` | One coding per request; expanded output capped at `server.max_body_size` (`413`), malformed `400`, unsupported/stacked `415`. The upstream receives inspected identity bytes. |
+| Trusted-proxy client IP | Supported | `server.trusted_proxies = []` | Forwarding headers are ignored unless the peer is listed; the chain is walked right-to-left. Never use `0.0.0.0/0`. |
+| Per-IP rate limiting | Supported | `max_tracked_ips = 100000`, `capacity_policy = "fail_closed"` | 64 shards, incremental cleanup, hard cap. `evict_oldest` is available but weaker. |
+| Global rate limiting | Supported | Configurable | One process-wide bucket; not shared across replicas. |
+| Heavy-inspection admission | Supported | `waf.admission.enabled = true`, `queue_timeout_ms = 250`, `max_queued = 64` | Saturation returns `503 + Retry-After`; inspection is never skipped. |
+| WebSocket per-message inspection | Supported | `server.max_body_size` per message | Client text/binary messages are inspected; control frames and upstream-to-client traffic are not. No idle timeout or concurrent-tunnel cap. |
+| HTTP/3 admission | Supported (feature-gated) | `http3` feature + `enable_http3` + `"3"` in `supported_http_versions` + TLS 1.3 | No cap on concurrent QUIC connections/streams; no stateless retry. |
+| WebTransport | Supported (feature-gated, terminating) | `webtransport` feature + `server.webtransport` | Origin/path/auth checks, session/stream/datagram caps, local inspection and bounded echo. **No upstream proxying.** |
+| Response inspection | Not implemented | — | Engine phases 3–5 exist but the proxy does not call them. Response bodies are size-capped only. |
+| Header-size / header-count / connection caps | Not implemented | hyper defaults | `server.max_connections` is parsed but not enforced. |
 
 ## Body inspection policy
 
@@ -194,6 +215,12 @@ owns every core**. Leave at least one core for the proxy, TLS and networking.
   Coraza remains available but slower (`backend = "wasm"`).
 - Response inspection is plumbed but **not proxy-wired**; phases 3–5 do not
   run on proxied responses yet.
+- WebTransport is a **terminating** endpoint: it authenticates, inspects and
+  echoes sessions locally. Application-specific upstream proxying is **not
+  implemented**, and HTTP/1.1 `Upgrade: webtransport` remains `501`.
+- Request framing validation and bounded decompression are on by default, but
+  header-size/header-count limits and `server.max_connections` are not
+  enforced; hyper defaults and the OS/container limits apply.
 - io_uring and Hyperscan/Vectorscan are **opt-in** and fall back to portable
   implementations.
 - gRPC streaming bodies are not sent to CRS; descriptor content scanning is

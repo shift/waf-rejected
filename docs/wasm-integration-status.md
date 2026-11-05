@@ -1,6 +1,24 @@
 # WASM / ModSecurity Integration Status
 
-**Validated:** 2026-10-31
+**Validated:** 2026-11-05 (legacy component-ABI status; see the current-engine
+note below)
+
+## Current engine status (Beta 13+)
+
+This page describes the **legacy component-ABI** `rules/coraza.wasm` module and
+the old `src/wasm/` host. It is not the current inspection path.
+
+- The default build compiles the **native Rust CRS engine** (`rust-engine`) and
+  selects `waf.coraza.backend = "rust"`.
+- The **Coraza 3.3.3 WASI reactor** (`wasm-reactor`, wasmtime 49) is compiled by
+  default and is the reference implementation, the differential oracle and the
+  explicit `waf.coraza.backend = "wasm"` switch-back.
+- The legacy `wasm-waf` component-ABI stage is **not** compiled by default and
+  is not the Coraza engine.
+- See [`coraza-wasi-reactor.md`](coraza-wasi-reactor.md),
+  [`user-guide/engine-selection.md`](user-guide/engine-selection.md) and the
+  control matrix in
+  [`architecture/security-model.md`](architecture/security-model.md#2-control-status-matrix).
 
 ## Summary
 
@@ -38,6 +56,10 @@ binary.
 
 ## Beta decision
 
-Beta builds do not compile or ship the WASM runtime. The historical module and
-source remain in-tree for future work. Documentation must not claim Coraza,
-ModSecurity or OWASP CRS support until option 1 is implemented and tested.
+The historical Go-JS module and the old `src/wasm/` host remain in-tree for
+reference only. They are not the Coraza path. Beta builds ship the Coraza WASI
+reactor and the native Rust engine; documentation must not describe
+`rules/coraza.wasm` as a Coraza/ModSecurity engine. Any claim of Coraza/CRS
+coverage must point at the reactor or the Rust engine, their tests and the
+release that introduced them, per the maintenance practice in
+[`architecture/security-model.md`](architecture/security-model.md#111-maintenance-practice-for-security-claims).

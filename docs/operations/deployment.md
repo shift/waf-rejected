@@ -185,6 +185,43 @@ kubectl create secret generic waf-api-keys \
   --namespace security
 ```
 
+### Request framing and decompression
+
+The proxy validates request framing before reading a body and rejects ambiguous
+`Content-Length`/`Transfer-Encoding` combinations with a generic `400`. It also
+decodes one `gzip`, `deflate` or `br` request coding before inspection, capped
+at `server.max_body_size`. Keep both behaviours enabled; do not place a second
+HTTP parser or a recursive decompressor in front of the proxy. Size memory
+limits for the decompressed body, not the compressed one.
+
+### WebTransport (terminating endpoint)
+
+WebTransport is **not** an HTTP upstream proxy. When built with
+`--features http3,webtransport` and enabled under `[server.webtransport]`, it
+accepts QUIC sessions on its own UDP port, validates Origin/path/API key,
+applies session/stream/datagram limits, inspects payloads locally and echoes
+bidirectional streams. It does **not** forward application WebTransport
+payloads to an upstream; that bridge is not implemented. HTTP/1.1
+`Upgrade: webtransport` remains `501`.
+
+```toml
+[server.webtransport]
+enabled = true
+bind_addr = "0.0.0.0:4434"          # must not collide with the HTTP/3 UDP port
+require_origin = true
+allowed_origins = ["https://app.example.com"]
+allowed_paths = ["/echo"]
+max_sessions = 1024
+max_sessions_per_ip = 32
+inspect_streams = true
+inspect_datagrams = true
+```
+
+Expose the UDP port only if the terminating/echo behaviour is intended. If an
+application-specific WebTransport service is required, terminate WebTransport
+outside this proxy until an upstream bridge exists. See
+[`../developer-guide/webtransport.md`](../developer-guide/webtransport.md).
+
 ### TLS Configuration
 
 ```yaml

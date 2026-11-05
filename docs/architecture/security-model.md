@@ -1,10 +1,14 @@
 # Security Architecture and Threat Model
 
-**Status:** Beta (`0.1.0-beta.8`), source-verified on 2026-10-31 against commit
-`0cfd129`. This document describes the controls that are actually implemented in
-the default Beta build. It is not a certification, a CRA conformity assessment
-or a substitute for an operator's own risk analysis. Re-verify the code
-references whenever the request path changes.
+**Status:** Beta (`0.1.0-beta.13` plus Unreleased changes), source-verified on
+2026-11-05 against commit `d354ab1` after an external documentation audit. This
+document describes the controls that are actually implemented in the default
+Beta build. **It is not a certification, a CRA conformity assessment or a
+substitute for an operator's own risk analysis.** The control-status matrix in
+[section 2](#2-control-status-matrix) is the authoritative list of which claims
+are implemented, tested or independently verified; prose elsewhere is
+subordinate to it. Re-verify the code references whenever the request path
+changes.
 
 ## 1. Scope and method
 
@@ -18,7 +22,67 @@ the function that implements it. Where a configuration key exists but is not
 wired into the request path, that is called out explicitly rather than presented
 as a control.
 
-## 2. System context and trust boundaries
+**Status vocabulary used throughout this document and the matrix:**
+
+- **Implemented** — code is compiled into the default feature set (or an
+  explicitly named feature) and is wired into the live request path.
+- **Tested** — implemented and covered by an automated regression test in this
+  repository that exercises the control, not merely the helper function.
+- **Verified** — tested, and the behaviour has been independently reproduced by
+  a party outside the change author, or checked against a separate
+  implementation (the Coraza/CRS differential oracle). Verification is scoped
+  to the cited artefact; it is not a certification of the product.
+- **Unverified** — implemented or configured, but no automated test or
+  independent check establishes the claim. Treat these as design intent.
+- **Not implemented** — absent, or present only as a configuration key that the
+  request path never reads.
+
+## 2. Control status matrix
+
+This matrix is the audit trail requested by the external review: every security
+claim must point at code, at a regression test, and at the release that
+introduced it. Rows are deliberately conservative. A blank test cell means "no
+automated test", not "tested elsewhere".
+
+**Coverage summary:** 27 rows — 24 implemented and tested (the Rust engine's
+CRS parity is additionally checked against the Coraza oracle), 3 **not
+implemented**. GeoIP is tested only when licensed databases are supplied and is
+therefore unverified in a bare deployment. No other row is marked **Verified**
+on the strength of this audit alone; the external review examined documentation,
+not each control. `Tested` means the repository has a regression test, not that
+an independent penetration test passed.
+
+| Control | Status | Code location | Test location | Introduced in |
+|---|---|---|---|---|
+| TLS 1.2/1.3 admission, ALPN `h2`, optional client certs | Tested | `src/waf/tls_config.rs` — `TlsManager::new`, `accept`, `selected_versions` | `src/waf/tls_config.rs` unit tests (`versions_respect_min_and_max`, `alpn_defaults_advertise_h2_then_http1`) | beta.1; hardened in beta.2 |
+| HTTP-version allowlist (`505` for unlisted versions) | Tested | `src/proxy/service.rs` — `detect_http_version`, `is_http_version_supported` | `tests/integration/pipeline_tests.rs` (protocol cases); `src/proxy/service.rs` unit tests | beta.1 |
+| Trusted-proxy client-IP resolution and forwarding-header rewrite | Tested | `src/proxy/service.rs` — `resolve_client_ip`, `build_upstream_request` | `src/proxy/service.rs` unit tests (`test_client_ip_*`, proptest `resolve_client_ip_never_panics_*`) | beta.2 |
+| API-key authentication and HTTPS requirement | Tested | `src/waf/auth.rs` — `ApiKeyValidator::validate_request`, `InMemoryKeyStore::from_raw_keys` | `tests/integration/auth_tests.rs`; `src/waf/auth.rs` unit tests | beta.1 |
+| Ambiguous request-framing rejection (CL/TE smuggling) | Tested | `src/proxy/framing.rs` — `validate_request_framing`; called from `service.rs` and `http3.rs` before body reads | `src/proxy/framing.rs` unit tests; `tests/integration/pipeline_tests.rs` (`pipeline_accepts_chunked_body`, `pipeline_rejects_content_length_mismatch`) | beta.10 |
+| Streaming request-body cap and read timeout | Tested | `src/proxy/buffer_pool.rs` — `read_incoming_body`; `src/proxy/service.rs`; `src/proxy/http3.rs` | `tests/integration/pipeline_tests.rs` (`pipeline_rejects_oversized_body`) | beta.1 |
+| Bounded request decompression (`gzip`, `deflate`, `br`) | Tested | `src/proxy/decompression.rs` — `decompress_request_body`, `strip_encoding_headers` | `src/proxy/decompression.rs` unit tests; `tests/integration/pipeline_tests.rs` (six decompression cases) | beta.10 |
+| Native Rust CRS engine as default backend (505 rules) | Tested; parity **Verified** against the Coraza oracle for the pinned corpus | `src/waf/rust_engine/`; `src/waf/mod.rs` — `add_coraza_rule`, backend selection | `tests/corpus/crs/corpus.json` differential corpus; `tests/integration/native_coraza_tests.rs`; engine unit tests | beta.13 |
+| Coraza 3.3.3 WASI reactor as reference and `fallback = "wasm"` | Tested | `src/waf/wasm_reactor.rs`; `src/waf/mod.rs` — backend/fallback selection | `tests/integration/native_coraza_tests.rs`; `tests/corpus/crs/` differential runs | reactor beta.11; default switch-back beta.13 |
+| Native Coraza sidecar (opt-in `backend = "native"`) | Tested (feature-gated) | `src/waf/native_coraza.rs`; `native/coraza-sidecar/` | `tests/integration/native_coraza_tests.rs` | beta.12 |
+| Traditional content inspection (URI/query/header/body regex, one percent-decode pass) | Tested | `src/waf/content_inspection.rs` — `ContentInspectionRule::evaluate`, `check_with_decoding` | `src/waf/content_inspection.rs` unit tests; fuzz target `fuzz/fuzz_targets/content_inspection.rs` | beta.1 |
+| Dangerous-method blocking (`TRACE`, `CONNECT`) | Tested | `src/waf/rules.rs` — `MethodRule::evaluate` | `src/waf/rules.rs` unit tests; `tests/integration/pipeline_tests.rs` | beta.1 |
+| Per-IP token-bucket rate limiting, 64 shards, bounded tracked IPs | Tested | `src/waf/rate_limit.rs` — `RateLimiter`, `ShardedBuckets`, `CapacityPolicy` | `src/waf/rate_limit.rs` unit tests (`shards_are_independent_*`, `capacity_*`, `concurrent_access_never_exceeds_capacity`); `benches/rate_limit_shard.rs` | beta.1; sharded/bounded in Unreleased |
+| Global token-bucket rate limiting | Tested | `src/waf/rate_limit.rs` — `GlobalRateLimiter` | `src/waf/rate_limit.rs` unit tests | beta.1 |
+| Heavy-inspection admission control (`waf.admission`) | Tested | `src/waf/admission.rs` — `AdmissionController::admit`; `src/waf/mod.rs` — `admit`, `inspection_cost` | `src/waf/mod.rs` unit tests (admission suite); `tests/integration/grpc_h2_e2e.rs` saturation cases | beta.12 |
+| Geo/anonymity blocking (MaxMind City + Anonymous IP) | Tested when databases are supplied; **Unverified** without them | `src/waf/geoip.rs` — `GeoIpService`, `GeoBlockingRule::evaluate` | `tests/integration/maxmind_tests.rs` (skipped without local `.mmdb`) | beta.1; anonymous DB later |
+| gRPC unary body inspection, incl. no `content-length` | Tested | `src/proxy/grpc_body.rs` — `probe_grpc_body`; `src/waf/grpc.rs` — `GrpcInspector::inspect` | `src/proxy/grpc_body.rs` unit tests; `tests/integration/grpc_h2_e2e.rs` (`unary_grpc_without_content_length_is_inspected`) | Unreleased (P0 fix) |
+| gRPC streaming policy (`transport-only` default, `reject`) and whole-stream bounds | Tested | `src/proxy/service.rs` — `forward_grpc_stream`; `GrpcStreamGuard`; `src/config.rs` — `grpc_streaming_policy` | `tests/integration/grpc_h2_e2e.rs` (`streaming_policy_reject_returns_grpc_status`, streaming limit cases) | Unreleased |
+| GraphQL-over-HTTP inspection (`crs`, `graphql-only`, `off`) | Tested | `src/waf/graphql.rs`; `src/waf/mod.rs` — `graphql_precheck` | `tests/integration/waf_features_tests.rs`; `src/waf/graphql.rs` unit tests | beta.12 |
+| WebSocket upgrade validation and per-message WAF inspection | Tested | `src/proxy/service.rs` — `bridge_websocket`, `websocket_message_blocked`; `src/proxy/websocket.rs` | `tests/integration/websocket_tests.rs`; `src/proxy/websocket.rs` unit tests | beta.5 |
+| WebSocket per-message size cap | Tested | `src/proxy/service.rs` — `websocket_message_blocked` (uses `server.max_body_size`) | `tests/integration/websocket_tests.rs`; `src/proxy/service.rs` unit tests | beta.6 |
+| HTTP/3 (QUIC) ingress reusing the same pipeline | Tested | `src/proxy/http3.rs` — `serve`, `handle_request`, `read_body` | `src/proxy/http3.rs` integration tests (feature-gated) | beta.7 |
+| WebTransport terminating endpoint (Origin/path/auth/limits/inspection) | Tested (feature-gated) | `src/proxy/webtransport.rs` — `serve`, session handlers | `tests/integration/webtransport_tests.rs`; `src/proxy/webtransport.rs` unit tests | beta.9 |
+| Upstream response size cap | Tested | `src/proxy/service.rs` — `forward_to_upstream_with_protocol`, `Limited`/`GuardedBody` | `tests/integration/pipeline_tests.rs` (`pipeline_rejects_oversized_upstream_response`) | beta.1 |
+| Response body/header inspection | **Not implemented** (engine phases exist, proxy does not call them) | `src/waf/rust_engine/` response phases; **no call site in `src/proxy/service.rs` or `src/proxy/http3.rs`** | None at the proxy level | Engine phases beta.13; proxy wiring not scheduled |
+| WebTransport upstream proxying | **Not implemented** | `src/proxy/webtransport.rs` is a terminating/echo endpoint; no upstream connector | `tests/integration/webtransport_tests.rs` verifies echo and rejection only | — |
+| Configurable header-size / header-count / concurrent-connection limits | **Not implemented** (hyper defaults only; `server.max_connections` is not read) | `src/config.rs` defines `max_connections`; no enforcement in `src/proxy/listener.rs` or `service.rs` | None | — |
+
+## 3. System context and trust boundaries
 
 ```mermaid
 flowchart LR
@@ -38,12 +102,17 @@ flowchart LR
     subgraph P["Proxy and WAF pipeline - trust boundary 2"]
         VER["is_http_version_supported"]
         IP["resolve_client_ip<br/>server.trusted_proxies"]
+        FRAME["validate_request_framing<br/>CL/TE ambiguity -> 400"]
         AUTH["ApiKeyValidator::validate_request"]
         WSB["WebSocket upgrade branch"]
+        WTP["WebTransport listener<br/>terminating, no upstream"]
+        GRPC["probe_grpc_body<br/>unary vs streaming policy"]
         BODY["BufferPool::read_incoming_body<br/>max_body_size + timeout"]
+        DEC["decompress_request_body<br/>gzip/deflate/br, bounded"]
+        ADM["AdmissionController::admit<br/>heavy-inspection permits"]
         ENG["WafEngine::evaluate"]
-        RULES["ContentInspectionRule<br/>RequestSizeRule / MethodRule<br/>RateLimiter / GlobalRateLimiter<br/>GeoBlockingRule"]
-        FWD["forward_to_upstream_with_protocol<br/>response size cap"]
+        RULES["Coraza/Rust engine rule<br/>ContentInspectionRule<br/>RequestSizeRule / MethodRule<br/>RateLimiter / GlobalRateLimiter<br/>GeoBlockingRule"]
+        FWD["forward_to_upstream_with_protocol<br/>response size cap, no inspection"]
         BR["bridge_websocket<br/>per-message inspection"]
     end
 
@@ -65,14 +134,17 @@ flowchart LR
     CL --> TCP --> TLS --> H1
     TLS --> H2
     CL --> UDP --> H3
+    CL -.-> WTP
     H1 --> VER
     H2 --> VER
     H3 --> VER
-    VER --> IP --> AUTH
+    VER --> IP --> FRAME --> AUTH
     AUTH --> WSB
+    AUTH --> GRPC
     AUTH --> BODY
+    GRPC --> BODY
+    BODY --> DEC --> ADM --> ENG
     WSB --> ENG
-    BODY --> ENG
     ENG --> RULES
     ENG --> FWD
     ENG --> BR
@@ -80,6 +152,7 @@ flowchart LR
     BR --> UP
     FWD --> CL
     BR --> CL
+    WTP -.-> CL
     ENG -.-> LOG
     ENG -.-> CEF
     ENG -.-> SLED
@@ -89,7 +162,7 @@ flowchart LR
 
 | Boundary | Crossing | Trust assumption | Primary control |
 |---|---|---|---|
-| TB1 | Client to ingress | Untrusted | TLS policy, HTTP version allowlist, auth, body limits |
+| TB1 | Client to ingress | Untrusted | TLS policy, HTTP version allowlist, framing validation, auth, decompression and body limits |
 | TB2 | Trusted proxy to WAF | Only listed CIDRs are trusted for forwarding headers | `resolve_client_ip` ignores `X-Forwarded-For`/`X-Real-IP` from other peers |
 | TB3 | WAF to origin | Origin is trusted to serve its own content; it is not trusted to see forged client identity | Hop-by-hop and forwarding headers are stripped and rewritten |
 | TB4 | WAF to evidence store | Local filesystem/database and SIEM collector are operator-controlled | Optional CEF/Sled/OTel exporters; export failures are logged, not blocking |
@@ -100,7 +173,7 @@ client IP identity used for rate limiting and geo blocking, security events,
 TLS private keys and upstream CA bundles, and the availability of the proxy
 itself.
 
-## 3. Request lifecycle and enforcement points
+## 4. Request lifecycle and enforcement points
 
 The order below is the order in the code, not an idealised order. The first
 blocking decision wins.
@@ -111,18 +184,24 @@ blocking decision wins.
 | 2 | TLS handshake | `TlsManager::accept`, `TlsManager::new` | handshake failure closes the connection |
 | 3 | Protocol admission | `handle_connection`, `detect_http_version`, `is_http_version_supported` | `505` if the version is not in `server.supported_http_versions` |
 | 4 | Client identity | `WafProxyService::resolve_client_ip` | — |
-| 5 | Authentication | `ApiKeyValidator::validate_request` | `401` |
-| 6a | WebSocket upgrade | `WebSocketHandler::is_websocket_upgrade`, `WafEngine::evaluate`, `proxy_websocket` | `501` for non-HTTP/1.1, WAF status otherwise |
-| 6b | WebTransport | `WebTransportHandler::is_webtransport_request` | `501` when the `webtransport` feature is compiled |
-| 7 | Body admission | `BufferPool::read_incoming_body` under `tokio::time::timeout` | `413` over `server.max_body_size`, `408` on timeout, `400` on read error |
-| 8 | WAF evaluation | `WafEngine::evaluate` | `Decision::Block` or `Decision::RateLimit` |
-| 9 | Traditional rules | `add_default_rules` order: content inspection, `RequestSizeRule`, `MethodRule`, `RateLimiter`, `GlobalRateLimiter`, `GeoBlockingRule` | first block wins; `413`, `405`, `429`, `403` |
-| 10 | Upstream forward | `forward_to_upstream_with_protocol` | `502` on connect/read failure, `504` on timeout |
-| 11 | Response cap | `Content-Length` pre-check plus `http_body_util::Limited` | `502` if over `server.max_body_size` |
-| 12 | WebSocket data path | `bridge_websocket`, `websocket_message_blocked` | close both sides on a blocked or oversized message |
-| 13 | HTTP/3 path | `http3::handle_request`, `read_body`, `send_response` | same status codes as HTTP/1.1 |
+| 5 | Request framing | `validate_request_framing` (HTTP/1.1, HTTP/2 and HTTP/3) | generic `400` before any body read |
+| 6 | Authentication | `ApiKeyValidator::validate_request` | `401` |
+| 7a | WebSocket upgrade | `WebSocketHandler::is_websocket_upgrade`, `WafEngine::evaluate`, `proxy_websocket` | `501` for non-HTTP/1.1, WAF status otherwise |
+| 7b | WebTransport (HTTP/1.1 upgrade) | `is_webtransport_upgrade` | `501`; the implemented WebTransport listener is a separate UDP endpoint |
+| 8 | gRPC classification | `classify_request`, `probe_grpc_body` | `400`/`413` for malformed or oversized frames; streaming follows `server.grpc_streaming_policy` |
+| 8b | Bodyless fast-allow gate | `WafEngine::fast_allow` (opt-in routes only) | only bodyless, query-free requests on configured routes |
+| 9 | Body admission | `BufferPool::read_incoming_body` under `tokio::time::timeout` | `413` over `server.max_body_size`, `408` on timeout, `400` on read error |
+| 10 | Decompression | `decompress_request_body` | `415` unsupported/stacked, `413` expanded over cap, `400` malformed |
+| 11 | WAF admission | `AdmissionController::admit` (heavy inspections) | `503 + Retry-After` when saturated; never a silent allow |
+| 12 | WAF evaluation | `WafEngine::evaluate`; GraphQL and gRPC pre-checks run first | `Decision::Block` or `Decision::RateLimit` |
+| 13 | Rule chain | Coraza/Rust engine rule, then `add_default_rules`: content inspection, `RequestSizeRule`, `MethodRule`, `RateLimiter`, `GlobalRateLimiter`, `GeoBlockingRule` | first block wins; `413`, `405`, `429`, `403` |
+| 14 | Upstream forward | `forward_to_upstream_with_protocol`, `forward_grpc_stream` | `502` on connect/read failure, `504` on timeout |
+| 15 | Response cap | `Content-Length` pre-check plus `http_body_util::Limited`/`GuardedBody` | `502` if over `server.max_body_size`; response bodies are not inspected |
+| 16 | WebSocket data path | `bridge_websocket`, `websocket_message_blocked` | close both sides on a blocked or oversized message |
+| 17 | HTTP/3 path | `http3::handle_request`, `read_body`, `send_response` | same status codes as HTTP/1.1 |
+| 18 | WebTransport session | `webtransport::serve` and session handlers | `403`/`429` CONNECT rejection, session closes for auth/limits/inspection |
 
-### 3.1 Transport and protocol admission
+### 4.1 Transport and protocol admission
 
 TLS is optional (`server.tls.enabled`). When enabled, `TlsManager::new` loads the
 certificate and key, applies `server.tls.min_version`/`max_version` (1.2 and 1.3
@@ -137,9 +216,19 @@ HTTP/3 is compiled only with the `http3` feature and starts only when
 1.3. `TlsManager::quic_server_config` restricts ALPN to `h3`. If QUIC
 configuration fails, `http3::serve` returns `Ok(())` without binding, so HTTP/3
 silently degrades to TCP; the TCP listener is unaffected. HTTP/3 0-RTT is not
-explicitly enabled (rustls leaves `max_early_data_size` at 0).
+explicitly enabled (rustls leaves `max_early_data_size` at 0). Admission is
+therefore build-feature + config + ALPN; there is **no** cap on concurrent QUIC
+connections or request streams, and `serve` does not call `Incoming::retry()`
+for stateless address validation. QUIC anti-amplification limits still apply.
 
-### 3.2 Client identity
+WebTransport is compiled only with the `webtransport` feature and has its own
+UDP listener (default `0.0.0.0:4434`, which must differ from the HTTP/3 port).
+It requires TLS 1.3, `server.webtransport.enabled = true`, a non-empty Origin
+allowlist when `require_origin = true`, and a non-empty path allowlist. Global
+and per-IP session caps, stream/datagram byte caps, an idle timeout and a
+whole-session deadline are enforced by `src/proxy/webtransport.rs`.
+
+### 4.2 Client identity
 
 `resolve_client_ip` treats the socket peer as authoritative unless the peer is
 inside `server.trusted_proxies`. For a trusted peer it parses
@@ -154,7 +243,7 @@ the value written to the origin as `X-Forwarded-For` and `X-Real-IP`. The
 `X-Forwarded-Proto` value is derived from whether this listener terminated TLS,
 not from an inbound header.
 
-### 3.3 Authentication
+### 4.3 Authentication
 
 `ApiKeyValidator::validate_request` runs before the body is read. It enforces:
 
@@ -170,7 +259,15 @@ membership check is a normal `HashSet` lookup, not a constant-time comparison.
 path, and failed authentication happens before the WAF rule chain, so invalid
 keys are not rate limited by the proxy.
 
-### 3.4 Body admission
+### 4.4 Body admission, framing and decompression
+
+Before any body is read, `validate_request_framing` rejects ambiguous HTTP
+framing: `Content-Length` together with `Transfer-Encoding`, more than one
+`Content-Length` field, conflicting comma-separated lengths, an invalid length,
+or a `Transfer-Encoding` that is not exactly one `chunked` token. The rejection
+is a generic `400`; details are logged server-side only. The same check runs on
+the HTTP/1.1, HTTP/2 (`handle_request`) and HTTP/3 (`http3::handle_request`)
+paths, so a media type or protocol conversion cannot introduce a second parser.
 
 `handle_request` derives a size hint from `Content-Length`, then calls
 `BufferPool::read_incoming_body` with `Some(server.max_body_size)`. The limit is
@@ -179,37 +276,57 @@ body is buffered in memory before inspection. A separate
 `server.request_timeout_secs` timeout covers the read. `RequestSizeRule` later
 checks the recorded body size again.
 
+A request with `Content-Encoding` is decompressed by
+`decompress_request_body` before inspection. One coding per request is
+accepted — `gzip`, `deflate` (zlib) or `br`, plus explicit `identity`.
+Stacked or other codings return `415`; malformed data returns `400`; output
+larger than `server.max_body_size` returns `413`. On success
+`strip_encoding_headers` removes `Content-Encoding` and the stale
+`Content-Length`, and the upstream receives the inspected `identity` bytes. The
+gRPC path adds a bounded `grpc-encoding: gzip` decoder in front of field
+inspection, capped by `waf.grpc.max_decompressed_bytes`.
+
 `proxy.max_request_size`, `proxy.timeout_seconds`, `server.max_connections` and
 `server.keep_alive_timeout_secs` are present in configuration but are not wired
 into the runtime; the upstream request and response-collection timeouts are
-hard-coded to 30 seconds.
+hard-coded to 30 seconds. Header count and header-section size remain bounded
+only by hyper defaults.
 
-### 3.5 WAF evaluation and fail mode
+### 4.5 WAF evaluation and fail mode
 
-`WafEngine::evaluate` is called for every non-WebSocket request, and directly
-for WebSocket upgrades. In order:
+`WafEngine::evaluate` is called for every non-WebSocket HTTP request, for
+WebSocket upgrades and for each inspected WebSocket message. The default build
+compiles `wasm-reactor`, `rust-engine` and `export-system`. In order:
 
-1. If the WASM engine was configured but failed to initialise and
-   `waf.fail_mode != "open"`, return `503` (fail-closed).
-2. If the `wasm-waf` feature is compiled and enabled, run the WASM stage. A
-   block or rate-limit decision returns immediately; an engine error returns
-   `503` when fail-closed.
-3. If the `ai-threat-detection` feature is compiled and enabled, run the AI
-   stage with the same error handling.
-4. Evaluate traditional rules in insertion order and stop at the first
-   `Block` or `RateLimit`.
+1. If `waf.enabled = false`, return `Allow`; the configuration genuinely
+   disables evaluation (it is not merely a startup warning).
+2. If a configured engine failed to initialise and `waf.fail_mode != "open"`,
+   return `503` (fail-closed). A strict Rust-engine load failure aborts start-up
+   instead.
+3. The opt-in `fast_allow` gate may return a precomputed allow for a configured
+   bodyless, query-free route; stateful gates still run.
+4. `AdmissionController::admit` classifies the request. Heavy inspections need
+   a permit, may queue for `queue_timeout_ms`, and are rejected with `503 +
+   Retry-After` when saturated. Admission never skips inspection.
+5. GraphQL and gRPC protocol pre-checks run before CRS body rules. They can
+   reject, or replace the context with one whose body is withheld from CRS.
+6. If `wasm-waf` or `ai-threat-detection` is compiled and enabled, those
+   optional stages run next with the same fail-closed error handling.
+7. The rule chain runs in insertion order. The Coraza/Rust engine rule is
+   inserted first, then content inspection, `RequestSizeRule`, `MethodRule`,
+   `RateLimiter`, `GlobalRateLimiter` and `GeoBlockingRule`. The first `Block`
+   or `RateLimit` wins.
 
-In the default Beta build neither `wasm-waf` nor `ai-threat-detection` is
-compiled, and the bundled `rules/coraza.wasm` is not a Coraza/CRS engine.
-Consequently `waf.fail_mode` has no observable effect in a default build:
-traditional rules are synchronous and infallible. Fail-closed still matters for
-custom builds that enable those features.
+`waf.coraza.backend` selects `rust` (compiled default), `wasm` (Coraza 3.3.3
+WASI reference) or `native` (opt-in sidecar). With `backend = "rust"`,
+`waf.coraza.fallback = "wasm"` re-evaluates a request with Coraza after a
+Rust-engine runtime error; the default `fallback = "none"` fails closed. The
+bundled `rules/coraza.wasm` is still a Go-JS demo module and is **not** the
+Coraza engine; the live reference is the WASI reactor. The legacy
+`wasm-waf` component-ABI stage and the AI detector remain non-default and
+experimental.
 
-`waf.enabled` is also not consulted by the request path. Setting it to `false`
-logs a startup warning but does not disable evaluation. Operators must remove
-rules or not deploy the proxy if they need a pass-through.
-
-### 3.6 Traditional rules
+### 4.6 Traditional rules
 
 `ContentInspectionRule::evaluate` checks, in order:
 
@@ -218,27 +335,33 @@ rules or not deploy the proxy if they need a pass-through.
   percent-decoded once;
 - query string longer than 8 KiB: block `414`;
 - query string against all patterns, raw and percent-decoded once;
-- every header value against high-priority patterns that set `check_headers`
-  (raw value only, no percent decoding);
-- the full body (up to a 16 MiB hard cap) against all patterns that set
-  `check_body`, using `String::from_utf8_lossy`, raw and percent-decoded once.
+- every header value against high-priority patterns when
+  `waf.content_inspection.inspect_headers` is true (raw value only, no percent
+  decoding);
+- the full body (up to a 16 MiB hard cap) against all patterns when
+  `waf.content_inspection.inspect_body` is true, using
+  `String::from_utf8_lossy`, raw and percent-decoded once.
 
 Patterns are Rust `regex` expressions, so matching is linear-time and not
 vulnerable to catastrophic backtracking. Matched text is truncated to 100
-characters for the reason string. `ContentInspectionConfig::inspect_headers`,
-`inspect_body` and its `max_body_size` are not used when rules are constructed;
-only `enabled` and `threat_patterns` take effect.
+characters for the reason string. The `inspect_headers` and `inspect_body`
+flags are honoured when rules are constructed; `ContentInspectionConfig`'s own
+`max_body_size` is still not the effective limit — `server.max_body_size` and
+the rule's 16 MiB hard cap are.
 
 `RequestSizeRule` returns `413` over `server.max_body_size`. `MethodRule`
 blocks `TRACE` and `CONNECT` with `405`. `RateLimiter` is a per-IP token bucket
 keyed on the resolved client address; `GlobalRateLimiter` is one process-wide
 bucket. Both return `RateLimit`, which the proxy renders as `429` with
-`Retry-After: 60`. Expired per-IP buckets are removed on a probabilistic 1% of
-evaluations, so the bucket map can grow between cleanups. `GeoBlockingRule`
-looks up the resolved address and can block by country, region, Tor exit, VPN
-or datacenter flag.
+`Retry-After: 60`. Per-IP state is split across 64 independently locked shards
+selected by a stable IP hash. `waf.rate_limit.max_tracked_ips` (default
+100,000) is a hard cap; `capacity_policy` defaults to `fail_closed`, which
+rejects new IPs at the cap instead of allowing them, while `evict_oldest`
+evicts a shard-local entry. Cleanup sweeps one shard per 100 evaluations.
+`GeoBlockingRule` looks up the resolved address and can block by country,
+region, Tor exit, VPN or datacenter flag.
 
-### 3.7 Upstream forwarding and response handling
+### 4.7 Upstream forwarding and response handling
 
 `forward_to_upstream_with_protocol` rewrites the URI to
 `proxy.upstream_url` plus the inbound path and query, preserves the client
@@ -246,15 +369,18 @@ or datacenter flag.
 `connection`, `proxy-connection`, `upgrade`, `te`, `trailer`,
 `transfer-encoding`, `keep-alive`, `x-forwarded-for`, `x-real-ip` and
 `x-forwarded-proto`, then sets authoritative `X-Forwarded-For`, `X-Real-IP`,
-`X-Forwarded-Proto` and `X-Waf-Proxy`. The client `Content-Length` is copied
-while the body is re-framed from the buffered bytes; the proxy does not
-independently reconcile the two.
+`X-Forwarded-Proto` and `X-Waf-Proxy`. Framing validation has already rejected
+ambiguous `Content-Length`/`Transfer-Encoding` combinations; the buffered body
+is re-framed from `Bytes`, and for a decompressed request the stale
+`Content-Length` and `Content-Encoding` have been removed. A request that
+declares a length but sends different bytes is rejected while the body is read.
 
-The origin connector is a cleartext `HttpConnector`. Regular HTTP upstreams
-therefore must be `http://`; `https://` origin support exists only for
-WebSocket upstreams, where `proxy_websocket` uses rustls with `webpki-roots`
-plus an optional PEM bundle from `proxy.upstream_ca_path`. Hostname and
-certificate verification are not weakened.
+The origin connector is an `HttpsConnector` that supports both `http://` and
+`https://` upstreams over HTTP/1.1 and HTTP/2. HTTPS upstreams are verified
+against `webpki-roots`; `proxy.upstream_ca_path` adds a private CA bundle, and
+`proxy.upstream_client_cert_path`/`proxy.upstream_client_key_path` enable
+upstream mutual TLS. The same trust roots are used for TLS WebSocket upstreams.
+Hostname and certificate verification are not weakened.
 
 Responses are read with `http_body_util::Limited` capped at
 `server.max_body_size` (the same value is passed as `max_response_bytes`). A
@@ -262,9 +388,11 @@ declared `Content-Length` over the cap is rejected before reading; the
 streaming limit catches undeclared or chunked responses. Hop-by-hop response
 headers are dropped and `x-waf-processing-time-ms`, `x-waf-version` and
 `x-content-type-options: nosniff` are added. The response body is **not**
-inspected, normalised or decompressed.
+inspected, normalised or decompressed: engine response phases 3–5 exist, but
+neither `forward_to_upstream_with_protocol` nor `forward_grpc_stream` calls
+them. Response header count/size are bounded only by hyper defaults.
 
-### 3.8 WebSocket path
+### 4.8 WebSocket path
 
 `is_websocket_upgrade` requires `Upgrade: websocket`, a `Connection` token
 containing `upgrade`, `Sec-WebSocket-Version: 13` and a key. The upgrade request
@@ -276,44 +404,56 @@ the configured origin, writes a handshake assembled from the client's headers
 
 After the upgrade, `bridge_websocket` inspects each client `Text` or `Binary`
 message through the full `WafEngine::evaluate` chain, including the rate
-limiters, and closes both sides on a block. The tungstenite codec is configured
-with `server.websocket.max_frame_bytes` and `max_message_bytes` (both default
-to `server.max_body_size`), so an oversized frame or a fragmented message that
-exceeds the message cap is rejected while reading, before the complete message
-is assembled. The proxy closes both sides with a policy violation (`1008`).
-The assembled message is still re-checked against `max_message_bytes` and the
-WAF as defence in depth. Control frames are passed through, upstream-to-client
-messages are not inspected, and there is no idle timeout on the tunnel.
+limiters, and closes both sides on a block. Messages larger than
+`server.max_body_size` are blocked before inspection; tungstenite's own default
+frame/message limits also apply. Control frames are passed through,
+upstream-to-client messages are not inspected, and there is no idle or
+total-lifetime timeout on the tunnel and no cap on concurrent tunnels.
 `permessage-deflate` is not configured in the proxy's tungstenite codec, while
-client extension headers are forwarded to the origin.
+client extension headers are forwarded to the origin; an origin may therefore
+accept an extension the proxy cannot decode. Each frame consumes a rate-limit
+token and can produce a security event.
 
-### 3.9 HTTP/3 path
+### 4.9 HTTP/3 path
 
 `http3::handle_request` reconstructs the URI from pseudo-headers (falling back
 to `Host` and `https`), derives a `Host` header when absent, forces the
 outbound version to HTTP/1.1 for the shared client, applies the HTTP-version
-allowlist, resolves the client IP with the same trusted-proxy logic, runs
-authentication with `is_https = true`, reads the body with the same streaming
-cap and timeout, and calls the same `WafEngine::evaluate` and
+allowlist, resolves the client IP with the same trusted-proxy logic, validates
+request framing, runs authentication with `is_https = true`, reads the body
+with the same streaming cap and timeout, decompresses it with the same bounded
+decoder, and calls the same `WafEngine::evaluate` and
 `forward_to_upstream_with_protocol`. `send_response` strips connection-specific
-headers. There is no WebSocket/WebTransport branch on HTTP/3.
+headers. There is no WebSocket branch on HTTP/3; WebTransport is served by its
+own listener, not by this handler.
 
-Before a resolver is spawned, `h3_admission` acquires a global permit
-(`server.h3_max_inflight_requests`, default `256`) and, when configured, a
-per-client permit (`server.h3_max_inflight_per_client`). Saturation waits up to
-`server.h3_admission_timeout_ms` and then returns `503` with `Retry-After`;
-the per-client cap returns `429`. Admission happens before `resolve_request`
-and before any body read, so excess work cannot allocate a handler or body
-buffer. Permits are RAII guards and are released when the handler finishes,
-panics or is cancelled; listener shutdown closes the semaphore so waiters fail
-immediately.
+### 4.10 WebTransport path
 
-## 4. Bypass classes
+WebTransport is a **terminating** endpoint, not a proxy. `webtransport::serve`
+accepts QUIC sessions on `server.webtransport.bind_addr`, enforces a global
+session cap before the handshake, then validates the `Origin` (exact allowlist
+when `require_origin = true`), the `:path` (exact or a trailing `/*` prefix),
+API-key authentication against the CONNECT headers, and a synthetic WAF
+evaluation (`x-waf-protocol: webtransport`, body-less). Per-IP session caps and
+duplicate-session detection follow. Accepted sessions have migration and 0-RTT
+disabled, bounded bidirectional/unicast streams, bounded stream and datagram
+bytes, an idle timeout and a whole-session deadline. Stream and datagram
+payloads are inspected by the WAF when `inspect_streams`/`inspect_datagrams`
+are set. Bidirectional streams are **echoed**; no payload is forwarded to an
+upstream application. Rejections use the WebTransport CONNECT response
+(`403`/`429`); authentication failures close the session with application code
+`401` because WebTransport defines no `401` CONNECT response.
+
+If application-specific WebTransport proxying is required, it is **not
+implemented**; there is no upstream connector or stream bridge. See
+[`../developer-guide/webtransport.md`](../developer-guide/webtransport.md).
+
+## 5. Bypass classes
 
 The entries below describe attacks that are relevant to this proxy. "Current
 control" is what the Beta actually does; "residual" is what remains.
 
-### 4.1 Spoofed `X-Forwarded-For` / `X-Real-IP`
+### 5.1 Spoofed `X-Forwarded-For` / `X-Real-IP`
 
 **Attack:** forge a client address to evade per-IP rate limits, geo blocking or
 origin ACLs, or to poison audit evidence.
@@ -331,7 +471,7 @@ The WebSocket handshake does not strip `X-Forwarded-For`, `X-Real-IP` or
 the HTTP origin does not. `X-Forwarded-Proto` sent to HTTP origins reflects the
 listener, not a trusted edge.
 
-### 4.2 Encoded payloads
+### 5.2 Encoded payloads
 
 **Attack:** evade regex rules with percent encoding, double encoding, `+` for
 space, Unicode/overlong UTF-8, HTML entities, JSON escapes, base64 or
@@ -339,16 +479,19 @@ compression.
 
 **Current control:** URI, query and body are checked raw and after one
 `urlencoding::decode` pass (`percent_decode`). The body is checked in full, not
-just the first megabyte. `ContentInspectionRule` deliberately always runs the
-regex engine; SIMD helpers are not allowed to declare content safe.
+just the first megabyte. A single `gzip`, `deflate` or `br` request coding is
+decoded before inspection, so compressed bodies are no longer opaque to the
+content rules. `ContentInspectionRule` deliberately always runs the regex
+engine; SIMD helpers are not allowed to declare content safe.
 
-**Residual:** only one decoding layer is applied. Nested encodings, UTF-16,
-overlong UTF-8, entity/escape decoding, base64 and compressed bodies are not
-normalised. Header values are not percent-decoded at all and are only checked
-against high-priority patterns. The rule set is heuristic and small compared
-with CRS; it is not an anomaly-scoring engine.
+**Residual:** only one percent-decoding layer is applied. Nested encodings,
+UTF-16, overlong UTF-8, entity/escape decoding, base64 and stacked compression
+codings are not normalised. Header values are not percent-decoded at all and
+are only checked against high-priority patterns. The heuristic rule set is
+small compared with CRS; the default CRS backend provides the broad rule
+coverage, but the heuristic layer is not an anomaly-scoring engine.
 
-### 4.3 Overlong URI, headers and body
+### 5.3 Overlong URI, headers and body
 
 **Attack:** pad a URI, query, header set or body so a payload falls outside the
 inspected window, or exhaust memory.
@@ -364,17 +507,16 @@ query-parameter-count limit. The whole body is buffered in memory, and
 exhaust memory. `ContentInspectionConfig.max_body_size` is not the effective
 limit; `server.max_body_size` is.
 
-### 4.4 WebSocket frames
+### 5.4 WebSocket frames
 
 **Attack:** hide a payload in a frame, a fragmented message, a compressed
 frame, a control frame or the server-to-client direction; or hold a tunnel open
 to exhaust resources.
 
 **Current control:** text and binary messages are evaluated with the full rule
-chain; the tungstenite parser enforces `server.websocket.max_frame_bytes` and
-`max_message_bytes` while reading, so oversized frames and fragmented messages
-are rejected before assembly; blocked messages close both sides. Fragmented
-messages within the cap are reassembled by tungstenite before inspection.
+chain; messages over `server.max_body_size` are blocked; blocked messages close
+both sides. Fragmented messages are reassembled by tungstenite before
+inspection.
 
 **Residual:** control frames and upstream-to-client traffic are not inspected.
 Compression is not negotiated by the proxy's codec, but client extension
@@ -383,54 +525,67 @@ decode. There is no idle or total-lifetime timeout, no per-connection frame
 budget beyond the rate limiter, and no cap on concurrent tunnels. Each frame
 consumes a rate-limit token and can produce a security event.
 
-### 4.5 HTTP/3
+### 5.5 HTTP/3
 
 **Attack:** use QUIC to reach a path with weaker controls, spoof UDP sources,
 open many streams, or force a downgrade.
 
-**Current control:** HTTP/3 reuses the same auth, body-limit, WAF and response
-cap code. QUIC requires TLS 1.3 and ALPN `h3`; 0-RTT is not enabled.
+**Current control:** HTTP/3 reuses the same framing validation, auth,
+body-limit, decompression, WAF and response-cap code. QUIC requires TLS 1.3 and
+ALPN `h3`; 0-RTT is not enabled. WebTransport is available behind the
+`webtransport` feature as a separate terminating listener with Origin/path/
+authentication checks and session/stream/datagram limits; it does not open a
+WebSocket-over-HTTP/3 path.
 
 **Residual:** HTTP/3 is feature-gated and silently does not start if QUIC
 configuration fails, which can cause an unintended protocol downgrade. The
 endpoint does not call `Incoming::retry()`, so there is no stateless address
 validation before handshake state is allocated (QUIC anti-amplification limits
 still apply). There is no cap on concurrent QUIC connections or request
-streams. WebSocket-over-HTTP/3 (extended `CONNECT`) and WebTransport are not
-implemented.
+streams. WebSocket-over-HTTP/3 (extended `CONNECT`) remains unimplemented;
+WebTransport payloads are inspected and echoed, never proxied upstream.
 
-### 4.6 Decompression and transfer encoding
+### 5.6 Decompression and transfer encoding
 
 **Attack:** send a gzip/br/deflate request body so the WAF sees opaque bytes, or
 exploit framing differences between the proxy and the origin.
 
-**Current control:** hyper decodes chunked transfer encoding into body frames;
-`transfer-encoding`, `te`, `trailer` and `connection` are stripped before
-forwarding; the body is fully buffered and re-framed from `Bytes`.
+**Current control:** `decompress_request_body` decodes one `gzip`, `deflate` or
+`br` coding (or explicit `identity`) before WAF inspection, caps the expanded
+output at `server.max_body_size`, and strips `Content-Encoding` plus the stale
+`Content-Length` so the origin receives the inspected identity bytes. Stacked
+or unsupported codings are rejected with `415`; malformed data with `400`;
+expansion over the cap with `413`. Hyper decodes chunked transfer encoding into
+body frames; `transfer-encoding`, `te` (except gRPC `trailers`), `trailer` and
+`connection` are stripped or handled before forwarding; the body is fully
+buffered and re-framed from `Bytes`.
 
-**Residual:** `Content-Encoding` is never decoded. A compressed request body is
-inspected as compressed bytes, so content rules can be bypassed. The client
-`Content-Length` header is copied without reconciliation against the buffered
-body. There is no dedicated request-smuggling detector; the design relies on a
-single hyper HTTP/1.1 parser, full buffering, and hop-by-hop stripping.
+**Residual:** compression is decoded once, not recursively, so an application
+that itself decompresses a second layer is outside this control. The gRPC path
+decodes only `identity` and `gzip`. There is no general
+`Content-Encoding`-at-the-origin policy beyond the request coding allowlist.
 
-### 4.7 Request smuggling
+### 5.7 Request smuggling
 
 **Attack:** desynchronise the proxy and origin with conflicting
 `Content-Length`/`Transfer-Encoding`, obfuscated headers, or HTTP/2-to-HTTP/1.1
 conversion differences.
 
-**Current control:** one HTTP/1.1 parser (hyper) on ingress, full body
-buffering, `Transfer-Encoding` removed on the outbound request, and hop-by-hop
-headers dropped in both directions.
+**Current control:** `validate_request_framing` runs before any body read on
+HTTP/1.x, HTTP/2 and HTTP/3. It rejects `Content-Length` plus
+`Transfer-Encoding`, multiple `Content-Length` fields, conflicting
+comma-separated values, invalid lengths, and any `Transfer-Encoding` other than
+a single `chunked` token. The rejection is a generic `400`; the client receives
+no parser detail. One hyper HTTP/1.1 parser handles ingress, the body is fully
+buffered, `Transfer-Encoding` is removed on the outbound request, and hop-by-hop
+headers are dropped in both directions.
 
-**Residual:** the proxy does not reject ambiguous framing itself, does not
-normalise duplicate `Content-Length` headers, and copies the client
-`Content-Length` while re-framing. The origin must use a conformant parser and
-must not be reachable except through the proxy. No CRS-style smuggling rules
-exist.
+**Residual:** the check is allowlist-style on framing but does not normalise
+duplicate non-framing headers, `Host` canonicalisation or query ordering. The
+origin must still use a conformant parser and must not be reachable except
+through the proxy. No CRS-style smuggling rules replace the protocol check.
 
-### 4.8 Upstream response abuse
+### 5.8 Upstream response abuse
 
 **Attack:** a compromised or malicious origin returns an oversized body, a
 header flood, a redirect to an attacker, malicious `Set-Cookie`, or content
@@ -445,22 +600,27 @@ decompressed or filtered. There is no response-side DLP, malware scan, CSP
 injection or cookie policy. The origin can serve any content through the WAF.
 Response header size is bounded only by hyper defaults.
 
-### 4.9 Rate-limit and authentication evasion
+### 5.9 Rate-limit and authentication evasion
 
 **Attack:** rotate source addresses, distribute across a botnet, abuse IPv6
 prefixes, or brute-force API keys.
 
 **Current control:** per-IP and global token buckets; authentication is a
-startup-loaded hash set.
+startup-loaded hash set. Per-IP state is sharded and hard-capped at
+`waf.rate_limit.max_tracked_ips` (default 100,000). The default
+`capacity_policy = "fail_closed"` rejects new IPs at the cap, so an attacker
+cannot evict legitimate buckets; `evict_oldest` is explicitly less safe.
+Cleanup is incremental (one shard per 100 evaluations), so the map never grows
+without bound.
 
 **Residual:** rate limits are per process, not shared across replicas, and are
-keyed on the resolved IP. IPv6 rotation and distributed sources defeat per-IP
-limits. Bucket cleanup is probabilistic and the bucket map is unbounded between
-cleanups. Failed authentication is not rate limited because auth runs before
-the rule chain. API keys are shared secrets with no per-key quota, rotation API,
-expiry or replay protection.
+keyed on the resolved IP. IPv6 rotation and distributed sources still defeat
+per-IP limits. Failed authentication is not rate limited because auth runs
+before the rule chain; `AuthConfig::rate_limit` is parsed but not enforced.
+API keys are shared secrets with no per-key quota, rotation API, expiry or
+replay protection. The key check is a plain `HashSet` lookup, not constant-time.
 
-### 4.10 Error-path and observability issues
+### 5.10 Error-path and observability issues
 
 - `create_blocked_response` puts the block reason, including up to 100
   characters of matched payload, into the `x-waf-reason` response header. A
@@ -472,26 +632,35 @@ expiry or replay protection.
 - Security events hard-code `http_version` to `"1.1"`, set `response_status` to
   `200` for allowed requests without observing the origin, and leave
   `response_size`, `processing_time_ms`, `client_port` and all geo fields
-  unset.
-- `waf.security_events.enabled` is not checked by `SecurityEventLogger`; only
-  the minimum threat level filters events.
+  unset. `waf.security_events.enabled` is now checked before event
+  construction, but the built-in exporter filters still apply.
 
-## 5. Explicit non-goals and residual risks
+## 6. Explicit non-goals and residual risks
 
 The following are **not implemented** in Beta and must not be assumed:
 
-- **Coraza/ModSecurity/OWASP CRS.** The WASM runtime is not compiled into the
-  default build. The bundled `rules/coraza.wasm` is a Go-JS demo module, not a
-  Coraza engine. See [`../wasm-integration-status.md`](../wasm-integration-status.md).
-- **WebTransport.** Requests are rejected with `501` only when the
-  `webtransport` feature is compiled; otherwise they are treated as ordinary
-  HTTP. See [`../webtransport-plan.md`](../webtransport-plan.md).
-- **TLS to regular HTTP upstreams.** Only WebSocket upstreams support `https://`.
-  There is no upstream mTLS, no custom CA for plain HTTP forwarding, and no
-  upstream certificate pinning.
-- **Response inspection and DLP.** No data-loss prevention, PII detection,
-  malware scanning, file-upload inspection, response body filtering or
-  content-disposition policy.
+- **Coraza/ModSecurity as the default *or* as the only engine.** The default
+  build compiles the native Rust CRS engine and the Coraza 3.3.3 WASI reactor.
+  The Rust engine is the default inspection backend; Coraza is the reference
+  implementation, the differential oracle, and the explicit
+  `waf.coraza.backend = "wasm"` switch-back. The bundled `rules/coraza.wasm` is
+  still a Go-JS demo module and is not the Coraza engine. See
+  [`../coraza-wasi-reactor.md`](../coraza-wasi-reactor.md) and
+  [`../wasm-integration-status.md`](../wasm-integration-status.md).
+- **WebTransport upstream proxying.** WebTransport is implemented behind the
+  `webtransport` feature as a *terminating* endpoint: it authenticates,
+  inspects and echoes sessions locally. There is no application-specific
+  upstream bridge, and HTTP/1.1 `Upgrade: webtransport` remains `501`. See
+  [`../developer-guide/webtransport.md`](../developer-guide/webtransport.md) and
+  [`../webtransport-plan.md`](../webtransport-plan.md).
+- **TLS trust customisation beyond the documented options.** HTTP and HTTPS
+  upstreams are supported, but there is no certificate pinning, no per-upstream
+  SNI routing and no TLS inspection/termination of upstream traffic. Upstream
+  mTLS and a private CA bundle are implemented; neither is enabled by default.
+- **Response inspection and DLP.** Response bodies and headers are not
+  inspected. No data-loss prevention, PII detection, malware scanning,
+  file-upload inspection, response body filtering or content-disposition
+  policy. Engine phases 3–5 are plumbed but the proxy does not call them.
 - **Bot management and challenge.** `WafDecision::Challenge` exists in the event
   model but the request path never produces a challenge; there is no CAPTCHA,
   proof-of-work or JS challenge.
@@ -514,7 +683,7 @@ The following are **not implemented** in Beta and must not be assumed:
 - **Header and query normalisation.** No duplicate-header rejection, no
   `Host` canonicalisation, no query reordering.
 
-## 6. Deployment assumptions
+## 7. Deployment assumptions
 
 The model holds only if the operator satisfies these assumptions:
 
@@ -542,8 +711,16 @@ The model holds only if the operator satisfies these assumptions:
    use them for tenant isolation or authorization without its own validation.
 10. HTTP/3, if enabled, has UDP reachability, TLS 1.3 certificates, and a
     monitoring check that the QUIC listener actually started.
+11. WebTransport, if enabled, has a dedicated UDP port that does not collide
+    with HTTP/3, a non-empty Origin and path allowlist, and an explicit
+    decision that the terminating/echo behaviour is acceptable. There is no
+    upstream application bridge.
+12. The origin does not rely on the WAF to inspect response bodies; response
+    inspection is not proxy-wired.
+13. Request decompression is accounted for in capacity planning: a small
+    compressed body can expand up to `server.max_body_size` before inspection.
 
-## 7. Hardening checklist
+## 8. Hardening checklist
 
 - [ ] Enable TLS (`server.tls.enabled = true`), set `min_version = "1.2"` or
       `"1.3"`, and load a valid certificate chain.
@@ -559,9 +736,17 @@ The model holds only if the operator satisfies these assumptions:
       timeouts; the 30-second upstream timeout is not configurable.
 - [ ] Tune `waf.rate_limit.per_ip_*` and `global_*`; add an edge/WAF-level
       limiter if the service is horizontally scaled.
-- [ ] Keep `waf.fail_mode = "closed"` for builds with WASM or AI stages.
-- [ ] Do not rely on `waf.enabled = false`; remove rules or do not deploy the
-      proxy if pass-through is required.
+- [ ] Keep `waf.fail_mode = "closed"`; the default Rust engine and the Coraza
+      reference both fail closed on load/runtime errors.
+- [ ] `waf.enabled = false` now genuinely disables evaluation. Use it only for
+      an explicit, monitored pass-through; it removes every WAF control.
+- [ ] Keep request framing validation and bounded decompression enabled; do not
+      add a second HTTP parser or a recursive decoder in front of the proxy.
+- [ ] If WebTransport is enabled, restrict `allowed_origins`/`allowed_paths`,
+      set session/stream/datagram caps, and document that it terminates and
+      echoes rather than proxying upstream.
+- [ ] Do not assume response inspection: it is not proxy-wired. Add origin-side
+      controls for response DLP, malware scanning and cookie policy.
 - [ ] Enable JSON security events and ship them to the SIEM; set
       `min_threat_level` deliberately (default `medium` suppresses allowed
       requests).
@@ -576,10 +761,10 @@ The model holds only if the operator satisfies these assumptions:
       set memory/CPU limits.
 - [ ] Monitor `waf_blocked_total`, `waf_upstream_errors_total`, 5xx/429 rates,
       TLS handshake failures and QUIC listener startup.
-- [ ] Re-run the bypass tests in section 4 after any change to the request
+- [ ] Re-run the bypass tests in section 5 after any change to the request
       path, and re-verify the code references in this document.
 
-## 8. Incident and audit evidence
+## 9. Incident and audit evidence
 
 | Source | What it contains | Where it goes | Limitations |
 |---|---|---|---|
@@ -597,14 +782,23 @@ container image digest, the SBOM and the release attestation. The WAF does not
 record packet captures, TLS secrets, full request bodies or response bodies;
 do not expect them from this component.
 
-## 9. Code map
+## 10. Code map
 
 | File | Functions | Role |
 |---|---|---|
-| `src/proxy/service.rs` | `WafProxyService::start_with_listener`, `handle_connection`, `handle_request`, `resolve_client_ip`, `forward_to_upstream_with_protocol`, `proxy_websocket`, `bridge_websocket`, `websocket_message_blocked`, `create_blocked_response` | Ingress, pipeline order, header rewriting, response cap, WebSocket tunnel |
+| `src/proxy/service.rs` | `WafProxyService::start_with_listener`, `handle_connection`, `handle_request`, `resolve_client_ip`, `forward_to_upstream_with_protocol`, `forward_grpc_stream`, `proxy_websocket`, `bridge_websocket`, `websocket_message_blocked`, `create_blocked_response` | Ingress, pipeline order, framing/decompression calls, header rewriting, response cap, gRPC streaming, WebSocket tunnel |
+| `src/proxy/framing.rs` | `validate_request_framing` | CL/TE ambiguity rejection before body reads |
+| `src/proxy/decompression.rs` | `decompress_request_body`, `strip_encoding_headers` | Bounded gzip/deflate/br request decoding |
+| `src/proxy/grpc_body.rs` | `probe_grpc_body`, `GrpcStreamGuard` | Unary/streaming classification and whole-stream bounds |
 | `src/proxy/http3.rs` | `serve`, `handle_connection`, `handle_request`, `read_body`, `send_response`, `reconstruct_uri` | QUIC ingress reusing the same pipeline |
+| `src/proxy/webtransport.rs` | `serve`, session handlers | Terminating WebTransport endpoint (no upstream bridge) |
 | `src/proxy/buffer_pool.rs` | `BufferPool::read_incoming_body` | Streaming body limit and buffering |
-| `src/waf/mod.rs` | `WafEngine::with_config`, `add_default_rules`, `evaluate` | Rule construction, fail mode, WASM/AI/traditional order |
+| `src/waf/mod.rs` | `WafEngine::with_config`, `add_default_rules`, `evaluate`, `admit`, `precheck_core` | Rule construction, fail mode, admission, protocol pre-checks, engine/rule order |
+| `src/waf/admission.rs` | `AdmissionController::admit`, `classify` | Heavy-inspection permits and queueing |
+| `src/waf/rust_engine/` | engine IR, request/response phases | Default native CRS engine |
+| `src/waf/wasm_reactor.rs` | `WasmReactorRule` | Coraza reference/fallback backend |
+| `src/waf/grpc.rs` | `GrpcInspector::inspect` | gRPC envelope, allowlist and field-content inspection |
+| `src/waf/graphql.rs` | `GraphqlInspector` | GraphQL operation/allowlist inspection |
 | `src/waf/content_inspection.rs` | `ContentInspectionRule::evaluate`, `check_with_decoding`, `inspect_body`, `percent_decode`, `limited_match_text` | URI/query/header/body pattern matching |
 | `src/waf/rules.rs` | `RequestSizeRule::evaluate`, `MethodRule::evaluate` | Body-size and method enforcement |
 | `src/waf/auth.rs` | `ApiKeyValidator::validate_request`, `InMemoryKeyStore::from_raw_keys`, `hash_key` | API-key authentication and HTTPS requirement |
@@ -617,13 +811,41 @@ do not expect them from this component.
 | `src/metrics.rs` | `Metrics::render_prometheus` | Prometheus counters |
 | `src/config.rs` | `Config::load`, `Config::validate`, `WafConfig`, `ServerConfig`, `SecurityEventsConfig` | Configuration and startup validation |
 
-## 10. Review and change control
+## 11. Review and change control
 
 This model is part of the documentation set, not a runtime control. Update it
 when any of the following change: the request pipeline order, a new protocol
 listener, authentication or authorization, body/response limits, the rule set,
 exporters, or the health surface. Changes that alter a trust boundary or add a
 new bypass class require a security review before merge.
+
+### 11.1 Maintenance practice for security claims
+
+A security claim is only accepted when it carries all three of the following:
+
+1. **Code location** — a file and function (or a precise call site) in the
+   current tree. A configuration key alone is not a control.
+2. **Regression test** — an automated test that fails if the control is
+   removed or weakened. Helper-only unit tests do not establish that the
+   control is wired into the request path.
+3. **Introduced-in release** — the beta tag or `Unreleased` entry that first
+   shipped the behaviour, so an operator can map a claim to a deployed build.
+
+The control-status matrix in [section 2](#2-control-status-matrix) is the
+single place where those three facts are recorded. When a control changes:
+
+- update the matrix row and the prose in the same change;
+- if the test is missing, mark the row **Unverified** rather than claiming
+  **Tested**;
+- if the control is removed or unwired, move the row to **Not implemented** and
+  add the residual risk to section 6.
+
+**A stale claim is a defect.** A statement that a control is absent when it is
+implemented, or present when it is not, is treated like a failing test: it must
+be fixed before the next release. Reviewers should reject documentation changes
+that add a security claim without a code reference, a test reference and a
+release reference. This document is not a certification; the matrix records
+engineering evidence, not conformity.
 
 Related documents:
 
@@ -632,6 +854,15 @@ Related documents:
   guide.
 - [`../operations/monitoring.md`](../operations/monitoring.md) — metrics and
   alerting.
-- [`../wasm-integration-status.md`](../wasm-integration-status.md) — Coraza/WASM
-  status.
-- [`../webtransport-plan.md`](../webtransport-plan.md) — WebTransport plan.
+- [`../coraza-wasi-reactor.md`](../coraza-wasi-reactor.md) — Coraza reference
+  reactor.
+- [`../wasm-integration-status.md`](../wasm-integration-status.md) — legacy
+  WASM/ModSecurity status.
+- [`../grpc-inspection.md`](../grpc-inspection.md) — gRPC unary/streaming
+  policy.
+- [`../developer-guide/webtransport.md`](../developer-guide/webtransport.md) —
+  terminating WebTransport endpoint.
+- [`../webtransport-plan.md`](../webtransport-plan.md) — WebTransport design
+  and scope.
+- [`../operations/support-matrix.md`](../operations/support-matrix.md) —
+  supported paths and known limitations.
