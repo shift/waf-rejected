@@ -4,6 +4,21 @@ All notable changes to WAF-Rejected are documented here.
 
 ## [Unreleased]
 
+### Security
+
+- Fixed a P0 gRPC inspection gap: unary gRPC over HTTP/2 without
+  `content-length` was classified as streaming and forwarded with no body
+  inspection. Unary vs streaming is now derived from the actual length-prefixed
+  frame sequence, and unary bodies without `content-length` are buffered up to
+  `server.max_body_size` and fully inspected (including field content scans).
+- Added `server.grpc_streaming_policy` (`transport-only` default, `reject`) for
+  genuinely streaming RPCs. `transport-only` logs a start-up warning and is
+  documented as no-body-inspection; `reject` returns a clear 4xx / gRPC status.
+- Streaming gRPC now enforces whole-stream limits: total bytes, message count,
+  duration, and bounded `identity`/`gzip` decompression. Unsupported encodings
+  are rejected. See `docs/grpc-inspection.md` and
+  `docs/architecture/grpc-transport.md`.
+
 ### Added
 
 - Ordered-subsequence gates for the filler-tolerant RCE rules

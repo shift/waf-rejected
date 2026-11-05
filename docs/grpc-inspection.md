@@ -16,12 +16,12 @@ and their bodies are withheld from CRS body rules.
 
 | Check | Behaviour |
 | --- | --- |
-| `content-type` | `application/grpc`, `application/grpc+proto`, `application/grpc+json`, `application/grpc-web`, `application/grpc-web+*`, `application/grpc-web-text*` |
+| `content-type` | Only the explicit allowlist is gRPC: `application/grpc`, `application/grpc+proto`, `application/grpc+json`, `application/grpc-web`, `application/grpc-web+proto`, `application/grpc-web+json`, `application/grpc-web-text`, `application/grpc-web-text+proto`, `application/grpc-web-text+json`. Matching ignores case and parameters. Unknown `application/grpc*` types are ordinary HTTP and are body-inspected |
 | `:path` | Must be `/package.Service/Method`; validated against `method_allowlist` |
 | Frame prefix | 5 bytes per message: compressed flag (`0`/`1`) and 4-byte big-endian length |
 | Frame limits | Per-message size (`max_message_bytes`) and frame count (`max_frames`) |
 | Truncation / lengths | Truncated prefixes, truncated messages and lengths above `i32::MAX` are rejected |
-| `grpc-encoding` | `identity` accepted; every other encoding is rejected |
+| `grpc-encoding` | `identity` and `gzip` accepted; every other encoding is rejected. Gzip frames are decompressed under `waf.grpc.max_decompressed_bytes` before field inspection; the original bytes are forwarded unchanged |
 | `-bin` metadata | Base64 syntax validated; never passed to regex/text scanners |
 | `grpc-web-text` | Body base64-decoded before frame validation |
 | Protobuf fields | Decoded against descriptor metadata from the artifact: per-field string/bytes/repeated/depth limits, unknown-field policy, enum values, string sanity checks |
@@ -71,6 +71,10 @@ max_message_bytes = 4194304
 
 # Maximum frames per request body (default 64).
 max_frames = 64
+
+# Maximum decompressed bytes across all gzip frames in one request body
+# (default 10 MiB). Bounds a gzip bomb before field decoding.
+max_decompressed_bytes = 10485760
 
 # "allow" or "block". An explicit value here wins over the artifact's
 # unknown_method_action. Unset falls back to the artifact's value, then to
@@ -226,17 +230,31 @@ Do not hand-maintain `method_allowlist`. Generate it from the protobuf
   `MAX_MESSAGE_FIELD_DEPTH` (16) in the generator. Deeper messages are treated
   as opaque length-delimited fields at runtime. Methods without descriptor
   metadata keep envelope-only behaviour.
-* `grpc-encoding` values other than `identity` are rejected rather than
-  decompressed. Supporting compression requires decompression limits and is
-  deliberately out of scope.
+* `grpc-encoding` accepts `identity` and `gzip`. Gzip frames are decompressed
+  under `waf.grpc.max_decompressed_bytes` (default 10 MiB) for field
+  inspection; the original compressed bytes are forwarded unchanged. Other
+  encodings are rejected with `400`.
 * gRPC-Web text bodies are decoded here for validation; the transport/decoding
   branch owns the request path for binary-safe frames.
-* Frame validation applies when a body is available. Streaming request bodies
-  are inspected header/URI/method-only, consistent with `fast_evaluate`.
+* Unary vs streaming is classified from the actual frame sequence, not from
+  `content-length`. A unary RPC without `content-length` (normal over HTTP/2)
+  is buffered up to `server.max_body_size` and fully inspected.
+* Genuinely streaming RPCs are governed by
+  `server.grpc_streaming_policy`. The default `transport-only` relays the
+  stream without body inspection and logs a start-up warning; `reject` refuses
+  it with a clear 4xx / gRPC status. This is an explicit residual risk, not a
+  silent bypass. See
+  [gRPC transport](architecture/grpc-transport.md#streaming-rpcs).
 
 ## Tests
 
-`src/waf/grpc.rs` covers content-type detection, method-path parsing, valid,
+`src/proxy/grpc_body.rs` covers frame-sequence classification (a unary message
+followed by an empty HTTP/2 DATA frame is still unary; a second message is
+streaming), whole-stream byte/message limits, malformed frames, and bounded
+gzip expansion. `tests/integration/grpc_h2_e2e.rs` covers a unary RPC without
+`content-length` being blocked for SQLi/XSS, both streaming policies, and
+malformed/oversized frames over real HTTP/2. `src/waf/grpc.rs` covers
+content-type detection, method-path parsing, valid,
 truncated, oversized, negative-length and wrong-compressed-flag frames,
 allowlist allow/block/monitor behaviour, base64 `-bin` metadata and text
 scanner exclusion, and `grpc-web-text` decoding. Field tests cover a valid

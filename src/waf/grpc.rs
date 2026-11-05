@@ -89,6 +89,13 @@ impl GrpcContentType {
     }
 }
 
+/// Message compression negotiated by `grpc-encoding`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrpcEncoding {
+    Identity,
+    Gzip,
+}
+
 /// Returns the first gRPC `content-type` on the request, if any.
 pub fn request_content_type(headers: &HeaderMap) -> Option<GrpcContentType> {
     headers
@@ -206,13 +213,23 @@ pub enum FrameError {
     },
     /// The body contains more than `max_frames` messages.
     TooManyFrames { limit: usize },
+    /// A gzip-compressed frame could not be decompressed.
+    DecompressionFailed { index: usize, reason: String },
+    /// Decompressed frame data exceeds the configured total limit.
+    DecompressedTooLarge {
+        index: usize,
+        size: usize,
+        limit: usize,
+    },
 }
 
 impl FrameError {
     /// HTTP status used when reporting this frame error.
     pub fn status(&self) -> u16 {
         match self {
-            Self::MessageTooLarge { .. } | Self::TooManyFrames { .. } => 413,
+            Self::MessageTooLarge { .. }
+            | Self::TooManyFrames { .. }
+            | Self::DecompressedTooLarge { .. } => 413,
             _ => 400,
         }
     }
@@ -248,8 +265,40 @@ impl std::fmt::Display for FrameError {
             Self::TooManyFrames { limit } => {
                 write!(f, "gRPC body exceeds the {limit}-frame limit")
             }
+            Self::DecompressionFailed { index, reason } => {
+                write!(f, "gRPC frame {index} could not be decompressed: {reason}")
+            }
+            Self::DecompressedTooLarge { index, size, limit } => write!(
+                f,
+                "gRPC frame {index} decompresses to {size} bytes, exceeding the {limit}-byte limit"
+            ),
         }
     }
+}
+
+/// Decompress one gzip-compressed gRPC message with a hard output cap.
+///
+/// The cap is checked while reading, so a small compressed payload cannot
+/// expand into an unbounded allocation.
+pub(crate) fn decompress_gzip(payload: &[u8], limit: usize) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+
+    let mut decoder = flate2::read::GzDecoder::new(payload);
+    let mut output = Vec::new();
+    let mut chunk = [0u8; 8 * 1024];
+    loop {
+        let read = decoder
+            .read(&mut chunk)
+            .map_err(|error| format!("invalid gzip payload: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        if output.len().saturating_add(read) > limit {
+            return Err(format!("decompressed size exceeds {limit} bytes"));
+        }
+        output.extend_from_slice(&chunk[..read]);
+    }
+    Ok(output)
 }
 
 /// Validates a decoded gRPC frame sequence.
@@ -314,15 +363,16 @@ pub fn validate_frames(body: &[u8], limits: FrameLimits) -> Result<FrameReport, 
     Ok(report)
 }
 
-/// Iterates over message payloads in a frame sequence already accepted by
-/// [`validate_frames`].
-fn frame_payloads(body: &[u8]) -> impl Iterator<Item = &[u8]> {
+/// Iterates over `(compressed_flag, payload)` pairs in a frame sequence
+/// already accepted by [`validate_frames`].
+fn frame_payloads_with_flags(body: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
     let mut offset = 0usize;
     std::iter::from_fn(move || {
         let start = offset.checked_add(FRAME_PREFIX_LEN)?;
         if start > body.len() {
             return None;
         }
+        let flag = body[offset];
         let length = u32::from_be_bytes([
             body[offset + 1],
             body[offset + 2],
@@ -331,7 +381,7 @@ fn frame_payloads(body: &[u8]) -> impl Iterator<Item = &[u8]> {
         ]) as usize;
         let end = start.checked_add(length)?;
         offset = end;
-        body.get(start..end)
+        body.get(start..end).map(|payload| (flag, payload))
     })
 }
 
@@ -451,6 +501,7 @@ pub struct GrpcInspector {
     messages: HashMap<String, GrpcMessage>,
     max_message_bytes: usize,
     max_frames: usize,
+    max_decompressed_bytes: usize,
     unknown_method_blocked: bool,
     decode_limits: DecodeLimits,
     content_scan: bool,
@@ -466,6 +517,7 @@ impl std::fmt::Debug for GrpcInspector {
             .field("allowlist", &self.allowlist)
             .field("max_message_bytes", &self.max_message_bytes)
             .field("max_frames", &self.max_frames)
+            .field("max_decompressed_bytes", &self.max_decompressed_bytes)
             .field("unknown_method_blocked", &self.unknown_method_blocked)
             .field("decode_limits", &self.decode_limits)
             .field("content_scan", &self.content_scan)
@@ -538,6 +590,7 @@ impl GrpcInspector {
             messages,
             max_message_bytes: config.max_message_bytes,
             max_frames: config.max_frames,
+            max_decompressed_bytes: config.max_decompressed_bytes,
             unknown_method_blocked,
             decode_limits: DecodeLimits {
                 max_string_bytes: config.max_string_bytes,
@@ -647,21 +700,37 @@ impl GrpcInspector {
             );
         }
 
+        let mut encodings = Vec::new();
         for value in ctx.headers.get_all("grpc-encoding").iter() {
             let text = value.to_str().map_err(|_| GrpcInspectionError {
                 reason: "grpc-encoding is not valid ASCII".to_string(),
             })?;
             for token in text.split(',').map(str::trim).filter(|t| !t.is_empty()) {
-                if !token.eq_ignore_ascii_case("identity") {
-                    return Ok(GrpcVerdict::Block {
-                        status: 400,
-                        reason: format!(
-                            "unsupported grpc-encoding '{token}'; only identity is accepted"
-                        ),
-                    });
-                }
+                encodings.push(token.to_ascii_lowercase());
             }
         }
+        let encoding = match encodings.as_slice() {
+            [] => GrpcEncoding::Identity,
+            [one] if one == "identity" => GrpcEncoding::Identity,
+            [one] if one == "gzip" => GrpcEncoding::Gzip,
+            [one] => {
+                return Ok(GrpcVerdict::Block {
+                    status: 400,
+                    reason: format!(
+                        "unsupported grpc-encoding '{one}'; only identity and gzip are accepted"
+                    ),
+                })
+            }
+            _ => {
+                return Ok(GrpcVerdict::Block {
+                    status: 400,
+                    reason: format!(
+                        "unsupported grpc-encoding '{}'; exactly one encoding is accepted",
+                        encodings.join(", ")
+                    ),
+                })
+            }
+        };
 
         validate_binary_metadata(&ctx.headers)
             .map_err(|err| GrpcInspectionError { reason: err.reason })?;
@@ -693,16 +762,68 @@ impl GrpcInspector {
                     }
                 };
 
-                // `identity` means frames must not be compressed; the
-                // compressed flag is only meaningful with a negotiated
-                // encoding, and non-identity encodings are rejected above.
-                if report.compressed_frames > 0 {
+                // `identity` means frames must not be compressed. With gzip,
+                // each frame may independently be compressed (flag 1) or not
+                // (flag 0), per the gRPC wire specification.
+                if encoding == GrpcEncoding::Identity && report.compressed_frames > 0 {
                     return Ok(GrpcVerdict::Block {
                         status: 400,
                         reason: "gRPC frame is marked compressed but grpc-encoding is identity"
                             .to_string(),
                     });
                 }
+
+                // Decompress gzip frames once, even when the method has no
+                // descriptor metadata. This bounds a gzip bomb before any
+                // field decoding and keeps the envelope-only path safe.
+                let decoded_frames: Option<Vec<Vec<u8>>> = if encoding == GrpcEncoding::Gzip {
+                    let mut frames = Vec::new();
+                    let mut decompressed_total = 0usize;
+                    for (index, (flag, payload)) in frame_payloads_with_flags(body).enumerate() {
+                        let decoded = if flag == 1 {
+                            match decompress_gzip(
+                                payload,
+                                self.max_decompressed_bytes
+                                    .saturating_sub(decompressed_total),
+                            ) {
+                                Ok(decoded) => decoded,
+                                Err(reason) => {
+                                    let error = if reason.contains("exceeds") {
+                                        FrameError::DecompressedTooLarge {
+                                            index,
+                                            size: decompressed_total.saturating_add(payload.len()),
+                                            limit: self.max_decompressed_bytes,
+                                        }
+                                    } else {
+                                        FrameError::DecompressionFailed { index, reason }
+                                    };
+                                    return Ok(GrpcVerdict::Block {
+                                        status: error.status(),
+                                        reason: error.to_string(),
+                                    });
+                                }
+                            }
+                        } else {
+                            payload.to_vec()
+                        };
+                        decompressed_total = decompressed_total.saturating_add(decoded.len());
+                        if decompressed_total > self.max_decompressed_bytes {
+                            let error = FrameError::DecompressedTooLarge {
+                                index,
+                                size: decompressed_total,
+                                limit: self.max_decompressed_bytes,
+                            };
+                            return Ok(GrpcVerdict::Block {
+                                status: error.status(),
+                                reason: error.to_string(),
+                            });
+                        }
+                        frames.push(decoded);
+                    }
+                    Some(frames)
+                } else {
+                    None
+                };
 
                 // Field inspection requires descriptor metadata in the
                 // artifact. Methods without it (or version 1 artifacts) keep
@@ -711,7 +832,13 @@ impl GrpcInspector {
                     if self.messages.contains_key(input_type) {
                         let mut collected: Vec<CollectedField> = Vec::new();
                         let mut collected_bytes = 0usize;
-                        for payload in frame_payloads(body) {
+                        let payloads: Vec<&[u8]> = match decoded_frames.as_deref() {
+                            Some(frames) => frames.iter().map(Vec::as_slice).collect(),
+                            None => frame_payloads_with_flags(body)
+                                .map(|(_, payload)| payload)
+                                .collect(),
+                        };
+                        for payload in payloads {
                             let remaining =
                                 self.max_content_scan_bytes.saturating_sub(collected_bytes);
                             match protobuf::decode_message_collect(
@@ -2021,6 +2148,51 @@ mod tests {
     #[test]
     fn unsupported_encoding_is_rejected() {
         let mut ctx = grpc_context("/acme.Service/Method", Some(frame(0, b"ok")));
+        ctx.headers
+            .insert("grpc-encoding", HeaderValue::from_static("zstd"));
+        let verdict = inspector(WafGrpcConfig::default()).inspect(&ctx).unwrap();
+        assert!(matches!(verdict, GrpcVerdict::Block { status: 400, .. }));
+    }
+
+    #[test]
+    fn gzip_compressed_frame_is_decompressed_and_inspected() {
+        use std::io::Write;
+
+        let payload = b"hello gzip";
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut ctx = grpc_context("/acme.Service/Method", Some(frame(1, &compressed)));
+        ctx.headers
+            .insert("grpc-encoding", HeaderValue::from_static("gzip"));
+        let verdict = inspector(WafGrpcConfig::default()).inspect(&ctx).unwrap();
+        assert!(matches!(verdict, GrpcVerdict::Allow { .. }));
+    }
+
+    #[test]
+    fn gzip_bomb_is_bounded() {
+        use std::io::Write;
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&vec![b'A'; 64 * 1024]).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut config = WafGrpcConfig::default();
+        config.max_decompressed_bytes = 1024;
+        let mut ctx = grpc_context("/acme.Service/Method", Some(frame(1, &compressed)));
+        ctx.headers
+            .insert("grpc-encoding", HeaderValue::from_static("gzip"));
+        let verdict = inspector(config).inspect(&ctx).unwrap();
+        assert!(
+            matches!(verdict, GrpcVerdict::Block { status: 413, .. }),
+            "gzip expansion beyond the cap must be rejected: {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_gzip_frame_is_rejected() {
+        let mut ctx = grpc_context("/acme.Service/Method", Some(frame(1, b"not gzip")));
         ctx.headers
             .insert("grpc-encoding", HeaderValue::from_static("gzip"));
         let verdict = inspector(WafGrpcConfig::default()).inspect(&ctx).unwrap();
