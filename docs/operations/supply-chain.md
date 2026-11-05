@@ -95,9 +95,26 @@ still reviewed whenever it changes.
 
 ## CycloneDX SBOM and the Coraza reactor
 
-`cargo cyclonedx` inventories Rust crates only. The release workflow therefore
-adds the shipped Coraza WASI reactor as an explicit CycloneDX `file`
-component, including:
+Generate the release SBOM with the repository script:
+
+```bash
+# From the Nix dev shell (cargo-cyclonedx is a dev-shell dependency)
+./scripts/generate-sbom.sh 0.1.0-beta.13
+
+# Outside the dev shell the script falls back to a pinned nixpkgs invocation
+nix shell nixpkgs#cargo-cyclonedx nixpkgs#cargo nixpkgs#jq \
+  -c ./scripts/generate-sbom.sh 0.1.0-beta.13
+```
+
+The script writes `waf-rejected-<version>.cdx.json` and
+`waf-rejected-<version>.cdx.json.sha256`. It sets `SOURCE_DATE_EPOCH` from the
+current commit so the metadata timestamp is stable for a source revision.
+`cargo-cyclonedx` 0.5.9 names its raw output `<name>.json`; the script renames
+it to the `.cdx.json` asset name used by the release and verification tooling.
+
+`cargo cyclonedx` inventories Rust crates only. The script therefore adds the
+shipped Coraza WASI reactor as an explicit CycloneDX `file` component,
+including:
 
 - `name: coraza_reactor.wasm` and version `coraza-3.3.3`;
 - the SHA-256 digest of `wasm/coraza_reactor/coraza_reactor.wasm`;
@@ -111,6 +128,9 @@ Verify the SBOM component after download:
 ```bash
 jq '.components[] | select(.name == "coraza_reactor.wasm")' \
   waf-rejected-<version>.cdx.json
+
+# Full release verification (checksums, SBOM, module digest, tarballs, smoke)
+./scripts/verify-release.sh --dir <artifact-dir> --version <version>
 ```
 
 The release also enforces a 32 MiB budget for the module and publishes its

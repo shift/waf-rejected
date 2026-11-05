@@ -5,7 +5,8 @@ edition = "2021"
 authors = ["WAF Team"]
 description = "High-Performance Rust-Based WAF Ingress"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/your-org/waf-ingress"
+repository = "https://github.com/shift/waf-rejected"
+homepage = "https://github.com/shift/waf-rejected"
 
 [[bin]]
 name = "waf-ingress"

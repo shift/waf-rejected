@@ -57,44 +57,22 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
-      - name: Install cargo-cyclonedx
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-cyclonedx
       - name: Generate CycloneDX SBOM
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
-          cargo cyclonedx \
-            --format json \
-            --spec-version 1.5 \
-            --all \
-            --override-filename "waf-rejected-${VERSION}"
-          # cargo-cyclonedx only inventories Rust crates. Record the shipped
-          # WASI reactor explicitly so the SBOM names the module digest and
-          # the Apache-2.0 Coraza/CRS licensing obligation.
-          REACTOR_SHA="$(sha256sum wasm/coraza_reactor/coraza_reactor.wasm | awk '{print $1}')"
-          jq --arg sha "$REACTOR_SHA" \
-            '.components += [{
-              "type": "file",
-              "name": "coraza_reactor.wasm",
-              "version": "coraza-3.3.3",
-              "hashes": [{"alg": "SHA-256", "content": $sha}],
-              "licenses": [{"license": {"id": "Apache-2.0"}}],
-              "properties": [
-                {"name": "waf:component", "value": "Coraza WASI reactor built with Go 1.24 and Coraza v3.3.3"},
-                {"name": "waf:license-note", "value": "Coraza and referenced OWASP CRS material are Apache-2.0; see wasm/coraza_reactor/LICENSE-CRS"},
-                {"name": "waf:source", "value": "wasm/coraza_reactor/main.go"}
-              ]
-            }]' "waf-rejected-${VERSION}.cdx.json" > "waf-rejected-${VERSION}.cdx.json.tmp"
-          mv "waf-rejected-${VERSION}.cdx.json.tmp" "waf-rejected-${VERSION}.cdx.json"
+          nix shell nixpkgs#cargo-cyclonedx nixpkgs#cargo nixpkgs#jq \
+            -c ./scripts/generate-sbom.sh "$VERSION" .
           test -s "waf-rejected-${VERSION}.cdx.json"
-          ls -l "waf-rejected-${VERSION}.cdx.json"
+          test -s "waf-rejected-${VERSION}.cdx.json.sha256"
+          ls -l "waf-rejected-${VERSION}.cdx.json"*
       - name: Upload SBOM artifact
         uses: actions/upload-artifact@v4
         with:
           name: sbom
-          path: waf-rejected-*.cdx.json
+          path: |
+            waf-rejected-*.cdx.json
+            waf-rejected-*.cdx.json.sha256
           if-no-files-found: error
 
   trivy-filesystem:
@@ -216,6 +194,10 @@ jobs:
             "waf-rejected-v${VERSION}/wasm/PROVENANCE.md"
           install -Dm644 wasm/coraza_reactor/SHA256SUMS \
             "waf-rejected-v${VERSION}/wasm/SHA256SUMS"
+          # Installed layout used by the binary's CRS resolver. The legacy
+          # `wasm/` paths above remain for compatibility.
+          mkdir -p "waf-rejected-v${VERSION}/share"
+          cp -r result/share/waf "waf-rejected-v${VERSION}/share/waf"
           # Native Coraza sidecar: binary plus the same read-only CRS bundle.
           install -Dm755 result-sidecar/bin/coraza-sidecar \
             "waf-rejected-v${VERSION}/native/coraza-sidecar"

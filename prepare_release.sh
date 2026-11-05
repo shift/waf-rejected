@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Release preparation script for WAF-Rejected
 
 set -euo pipefail
@@ -81,9 +81,10 @@ else
     echo "⚠️  cargo-audit not installed; skipping local audit (CI still runs it)"
 fi
 
-# Build release binary
+# Build release binary with the same feature set as the Nix package and image.
 echo "🏗️  Building release binary..."
-if ! cargo build --release --bin waf-ingress --quiet; then
+if ! cargo build --release --bin waf-ingress \
+    --features http3,webtransport,wasm-reactor,coraza-native,rust-engine --quiet; then
     echo "❌ Release build failed"
     exit 1
 fi
@@ -130,15 +131,22 @@ echo "=================="
 
 # Build again to ensure version changes don't break anything
 echo "🏗️  Final build validation..."
-if ! cargo build --release --bin waf-ingress --quiet; then
+if ! cargo build --release --bin waf-ingress \
+    --features http3,webtransport,wasm-reactor,coraza-native,rust-engine --quiet; then
     echo "❌ Final build failed"
     exit 1
 fi
 echo "✅ Final build successful"
 
-# Show binary info
+# Show binary info and confirm the embedded version matches the release.
 BINARY_SIZE=$(ls -lh target/release/waf-ingress | awk '{print $5}')
 echo "📊 Release binary size: $BINARY_SIZE"
+BINARY_VERSION=$(target/release/waf-ingress --version)
+if [[ "$BINARY_VERSION" != "waf-ingress $VERSION" ]]; then
+    echo "❌ Binary reports '$BINARY_VERSION', expected 'waf-ingress $VERSION'"
+    exit 1
+fi
+echo "✅ Binary version: $BINARY_VERSION"
 
 echo ""
 echo "✅ Release v$VERSION is ready!"
@@ -149,7 +157,7 @@ echo "1. Review the changes:"
 echo "   git diff"
 echo ""
 echo "2. Commit the changes:"
-echo "   git add -A"
+echo "   git add Cargo.toml Cargo.lock CHANGELOG.md"
 echo "   git commit -m \"chore: prepare v$VERSION release\""
 echo ""
 echo "3. Create and push the tag:"

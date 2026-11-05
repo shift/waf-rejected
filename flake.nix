@@ -335,6 +335,7 @@
             curl
             jq
             cargo-audit  # Dependency vulnerability scan (cargo audit)
+            cargo-cyclonedx  # CycloneDX SBOM generation (release assets)
             gnuplot  # Added for Criterion benchmark plotting
             
             # Monitoring and observability

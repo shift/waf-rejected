@@ -34,6 +34,19 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Added
 
+- `scripts/generate-sbom.sh` generates the release CycloneDX SBOM and its
+  `.sha256` using the dev-shell `cargo-cyclonedx` or a pinned `nix shell`
+  fallback. `cargo-cyclonedx` is now part of the Nix dev shell, and the release
+  workflow and `create_release_artifacts.sh` both use the script, so a release
+  always produces `waf-rejected-<version>.cdx.json`.
+- `scripts/verify-release.sh` validates a local or downloaded release:
+  per-asset checksums, SBOM structure/version/reactor digest, module size and
+  digest, binary and sidecar tarball contents, image tarball manifest, binary
+  `--version`, and a `/health` smoke test. `--deep-image` also checks the
+  reactor digest inside the image; `--attestations` verifies GitHub provenance.
+- `waf-ingress --version` and `--help` print the package version and usage
+  without loading configuration or starting listeners.
+
 - Ordered-subsequence gates for the filler-tolerant RCE rules
   (`932125/230/235/250/260/370/380`). The native engine derives a sound
   `c…a…t`-style prerequisite from each regex (conservatively; unprovable
@@ -82,6 +95,27 @@ All notable changes to WAF-Rejected are documented here.
   back to the immediate peer and logs the reason instead of silently dropping
   only the bad entry. Multi-proxy chain behaviour is documented in
   `docs/developer-guide/request-framing-and-telemetry.md`.
+- Release tarballs now ship the installed `share/waf/rules/crs/` bundle and
+  `share/waf/wasm/` layout in addition to the legacy `wasm/` paths. The binary
+  resolves the CRS bundle relative to its own directory, so a tarball extracted
+  anywhere starts with the default Rust engine instead of failing to find
+  `crs.conf`.
+- `create_release_artifacts.sh` now emits the same asset names and set as the
+  Release workflow: `x86_64-linux` binary and sidecar tarballs, standalone
+  Coraza module/licence/provenance, SBOM, optional image tarball, and a
+  `.sha256` for each asset.
+- The Cargo package metadata now points at `shift/waf-rejected` instead of the
+  placeholder `your-org/waf-ingress` repository.
+
+### Fixed
+
+- The Release workflow's SBOM step expected `cargo-cyclonedx` to write
+  `.cdx.json`, but 0.5.9 writes `.json`; the shared script now renames the
+  output and always writes the checksum. This fixes the previously skipped
+  CycloneDX asset.
+- Documented the GHCR limitation caused by GitHub Actions billing and added a
+  manual `podman push` / `docker push` procedure plus the image-tarball
+  fallback in `docs/operations/container.md`.
 
 ### Fixed
 

@@ -26,8 +26,53 @@ The image is a Debian slim runtime with the `waf-ingress` binary, the bundled
 Tags are mutable; a digest is not. Pin by digest for anything that matters.
 
 Every tagged release publishes the image tarball, the binary tarball and the
-CycloneDX SBOM, each with a matching `<asset>.sha256` checksum file and a GitHub
-build provenance attestation.
+CycloneDX SBOM, each with a matching `<asset>.sha256` checksum file. Releases
+built by the GitHub Release workflow also carry a build provenance attestation;
+local releases built while Actions is billing-blocked do not.
+
+## Registry publishing (manual)
+
+**Current limitation:** GitHub Actions is billing-blocked, so the Release
+workflow's `build-image` job cannot push to GHCR. A release may therefore have
+no `ghcr.io/shift/waf-rejected:v<version>` tag. The image tarball attached to
+the release is the supported fallback: load it with `docker load` or
+`podman load` as shown below.
+
+Do not block a release on the GHCR tag. If registry publishing is required,
+build and push the image manually from a machine with registry credentials:
+
+```bash
+VERSION=0.1.0-beta.13
+IMAGE=ghcr.io/shift/waf-rejected
+
+# Build the same image as the Release workflow.
+podman build -t "${IMAGE}:v${VERSION}" .
+# or: docker build -t "${IMAGE}:v${VERSION}" .
+
+# Authenticate with a token that has write:packages for the repository.
+podman login ghcr.io
+# or: docker login ghcr.io
+
+podman push "${IMAGE}:v${VERSION}"
+# or: docker push "${IMAGE}:v${VERSION}"
+
+# Record the immutable digest in the release notes.
+podman image inspect --format '{{index .RepoDigests 0}}' "${IMAGE}:v${VERSION}"
+# or: docker image inspect --format '{{index .RepoDigests 0}}' "${IMAGE}:v${VERSION}"
+```
+
+If the registry is unavailable, export the image and attach it to the release
+instead:
+
+```bash
+podman save "${IMAGE}:v${VERSION}" | gzip -9 > "waf-rejected-${VERSION}-image.tar.gz"
+# or: docker save "${IMAGE}:v${VERSION}" | gzip -9 > "waf-rejected-${VERSION}-image.tar.gz"
+sha256sum "waf-rejected-${VERSION}-image.tar.gz" > "waf-rejected-${VERSION}-image.tar.gz.sha256"
+```
+
+The tarball is a complete, loadable image; consumers do not need GHCR access.
+`scripts/verify-release.sh` validates the tarball's gzip stream and Docker
+manifest, and `--deep-image` also checks the reactor digest inside the image.
 
 ## Load the released tarball
 
@@ -54,7 +99,8 @@ above. Podman uses the same archive:
 podman load -i waf-rejected-0.1.0-beta.13-image.tar.gz
 ```
 
-Alternatively pull from the registry:
+Alternatively pull from the registry, if the tag was published manually (see
+[Registry publishing](#registry-publishing-manual)):
 
 ```bash
 docker pull ghcr.io/shift/waf-rejected:v0.1.0-beta.13

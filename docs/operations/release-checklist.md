@@ -22,8 +22,13 @@
       gRPC 200) and the sidecar `--probe` readiness check works
 - [ ] `./scripts/check-coraza-reactor-size.sh` passes (digest matches and the
       module is at most 32 MiB; current build is about 18 MiB)
+- [ ] `./scripts/generate-sbom.sh <version>` produces
+      `waf-rejected-<version>.cdx.json` and `.sha256` (the script uses the
+      dev-shell `cargo-cyclonedx` or a pinned `nix shell` fallback)
 - [ ] `result/share/waf/wasm/coraza_reactor.wasm` exists in the Nix
       package, alongside `LICENSE-CRS`, `PROVENANCE.md` and `SHA256SUMS`
+- [ ] `result/share/waf/rules/crs/crs.conf` exists in the Nix package (the
+      default Rust engine needs the full CRS bundle, not just the module)
 - [ ] Container image contains `/usr/share/waf/wasm/coraza_reactor.wasm` and
       the module digest matches `SHA256SUMS`
 - [ ] The default release build includes `rust-engine` and `wasm-reactor`, and
@@ -63,9 +68,15 @@ Checksums and attestations are complementary: the `.sha256` file detects
 corruption, the attestation binds the artifact to this repository's release
 pipeline.
 
+Local releases built while GitHub Actions is billing-blocked have no
+attestation. In that case `scripts/verify-release.sh` still validates the
+checksums, SBOM, module digest, tarball contents, `--version` and health smoke
+test; record in the release notes that provenance attestations are absent.
+
 ### Smoke test
 
 ```bash
+./result/bin/waf-ingress --version   # waf-ingress 0.1.0-beta.13
 WAF_CONFIG_FILE=config.toml ./result/bin/waf-ingress
 curl -f http://127.0.0.1:8081/health
 curl -f http://127.0.0.1:8081/metrics
@@ -75,26 +86,39 @@ curl -o /dev/null -w '%{http_code}\n' -X POST --data '<script>alert(1)</script>'
 
 ### Publishing
 
+- [ ] Confirm `Cargo.toml`, `CHANGELOG.md`, the tag and the README/support
+      matrix all name the same version (`0.1.0-beta.13` today).
 - [ ] Commit release version and changelog.
 - [ ] Tag `v0.1.0-beta.13`.
 - [ ] Push branch and tag.
-- [ ] Confirm the Release workflow built and attached every asset:
+- [ ] Build the local release assets with
+      `./create_release_artifacts.sh <version>` (GitHub Actions is currently
+      billing-blocked; local builds are the supported path).
+- [ ] Confirm the release contains every asset:
       - `waf-rejected-v<version>-x86_64-linux.tar.gz` (binary tarball,
         includes `wasm/coraza_reactor.wasm`, `wasm/LICENSE-CRS`,
-        `wasm/PROVENANCE.md`, `wasm/SHA256SUMS`, and the native profile
+        `wasm/PROVENANCE.md`, `wasm/SHA256SUMS`, the installed layout under
+        `share/waf/wasm/` and `share/waf/rules/crs/`, and the native profile
         under `native/coraza-sidecar` + `native/coraza/`)
       - `waf-rejected-v<version>-coraza-sidecar-x86_64-linux.tar.gz`
         (standalone sidecar binary + CRS rules)
-      - `waf-rejected-<version>-image.tar.gz` (prebuilt container image)
+      - `waf-rejected-<version>-image.tar.gz` (prebuilt container image; this
+        is the fallback when GHCR is unavailable)
       - `waf-rejected-<version>.cdx.json` (CycloneDX SBOM, with the reactor
         file component, SHA-256 and Apache-2.0 licence note)
       - `waf-rejected-<version>-coraza_reactor.wasm` (standalone module)
       - `waf-rejected-<version>-coraza-LICENSE`
       - `waf-rejected-<version>-coraza-PROVENANCE.md`
       - `<asset>.sha256` for each of the assets above
-- [ ] Confirm the image is still pushed to GHCR under `v<version>`.
-- [ ] Download the assets and verify them: `sha256sum --check *.sha256`.
-- [ ] Verify build provenance for each asset:
+- [ ] Run `./scripts/verify-release.sh --dir <artifact-dir> --version <version>`
+      (add `--deep-image` to check the module digest inside the image, and
+      `--attestations` when the assets have GitHub attestations).
+- [ ] GHCR is currently blocked by GitHub Actions billing. Do **not** treat a
+      missing `ghcr.io/shift/waf-rejected:v<version>` tag as a release failure;
+      attach the image tarball instead. If registry publishing is required,
+      follow the manual `podman push` / `docker push` procedure in
+      [`container.md`](container.md#registry-publishing-manual).
+- [ ] Verify build provenance for each asset when attestations exist:
       `gh attestation verify <asset> --repo shift/waf-rejected`.
 - [ ] Publish the GitHub pre-release with the known-limitations section from
       `CHANGELOG.md`.

@@ -69,8 +69,10 @@ pub const CRS_CONF_RELATIVE: &str = "wasm/coraza_reactor/rules/crs/crs.conf";
 /// 1. `WAF_CRS_CONF` (explicit override for custom bundles).
 /// 2. The source-tree path (development builds and tests).
 /// 3. `<exe>/../share/waf/rules/crs/crs.conf` (Nix package layout).
-/// 4. `/usr/share/waf/rules/crs/crs.conf` (container layout).
-/// 5. `/usr/local/share/waf/rules/crs/crs.conf`.
+/// 4. `<exe>/share/waf/rules/crs/crs.conf` (release tarball layout).
+/// 5. `<exe>/wasm/coraza_reactor/rules/crs/crs.conf` (legacy tarball layout).
+/// 6. `/usr/share/waf/rules/crs/crs.conf` (container layout).
+/// 7. `/usr/local/share/waf/rules/crs/crs.conf`.
 ///
 /// The source-tree path is returned as the final fallback so a missing bundle
 /// produces a clear strict-load error instead of an empty path.
@@ -86,12 +88,16 @@ pub fn default_crs_conf_path() -> PathBuf {
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(bin_dir) = exe.parent() {
-            let installed = bin_dir
-                .join("../share/waf/rules/crs/crs.conf")
-                .canonicalize()
-                .unwrap_or_else(|_| bin_dir.join("../share/waf/rules/crs/crs.conf"));
-            if installed.is_file() {
-                return installed;
+            for relative in [
+                "../share/waf/rules/crs/crs.conf",
+                "share/waf/rules/crs/crs.conf",
+                "wasm/coraza_reactor/rules/crs/crs.conf",
+            ] {
+                let candidate = bin_dir.join(relative);
+                let candidate = candidate.canonicalize().unwrap_or(candidate);
+                if candidate.is_file() {
+                    return candidate;
+                }
             }
         }
     }
