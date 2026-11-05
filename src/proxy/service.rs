@@ -42,10 +42,13 @@ use crate::proxy::buffer_pool::{BodyReadError, BufferPool};
 use crate::proxy::decompression::{
     decompress_request_body, strip_encoding_headers, DecompressionError,
 };
-use crate::proxy::framing::validate_request_framing;
+use crate::proxy::framing::{
+    validate_request_framing_for_version, validate_request_trailers, FramingVersion,
+};
 use crate::proxy::grpc_body::{
     probe_grpc_body, GrpcBodyMode, GrpcProbeError, GrpcStreamGuard, PrefixedBody,
 };
+use crate::proxy::telemetry::{RequestRejection, RequestTelemetry};
 use crate::proxy::websocket::WebSocketHandler;
 use crate::waf::auth::{ApiKeyValidator, InMemoryKeyStore};
 use crate::waf::tls_config::TlsManager;
@@ -477,6 +480,22 @@ fn is_webtransport_upgrade(headers: &hyper::HeaderMap) -> bool {
         .get("upgrade")
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.eq_ignore_ascii_case("webtransport"))
+}
+
+/// Why a trusted peer's forwarding header was not used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClientIpFallback {
+    MalformedXForwardedFor,
+    MalformedXRealIp,
+}
+
+impl ClientIpFallback {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MalformedXForwardedFor => "malformed_x_forwarded_for",
+            Self::MalformedXRealIp => "malformed_x_real_ip",
+        }
+    }
 }
 
 /// Per-connection state cloned into each hyper service invocation.
@@ -1106,7 +1125,7 @@ impl WafProxyService {
         is_https: bool,
     ) -> Result<Response<ProxyBody>, Infallible> {
         let start_time = Instant::now();
-        state.metrics.record_request();
+        let telemetry = RequestTelemetry::begin(Arc::clone(&state.metrics));
 
         // Detect HTTP protocol version
         let http_version = Self::detect_http_version(&req);
@@ -1115,6 +1134,8 @@ impl WafProxyService {
         // Check if HTTP version is supported
         if !Self::is_http_version_supported(http_version, &state.config) {
             warn!("Unsupported HTTP version: {}", http_version);
+            telemetry.reject(RequestRejection::UnsupportedHttpVersion);
+            state.metrics.record_blocked();
             return Ok(Self::create_error_response(
                 StatusCode::HTTP_VERSION_NOT_SUPPORTED,
                 &format!("HTTP version {} not supported", http_version),
@@ -1123,15 +1144,18 @@ impl WafProxyService {
 
         let client_ip = Self::resolve_client_ip(peer_ip, req.headers(), &state.trusted_proxies);
 
-        // Reject ambiguous request framing before any body is read. Details are
-        // intentionally not exposed to the client.
-        if let Err(e) = validate_request_framing(req.headers()) {
+        // Reject ambiguous request framing before any body is read. HTTP/2 and
+        // HTTP/3 additionally reject Transfer-Encoding and connection-specific
+        // headers before the shared HTTP/1.x checks. Details are intentionally
+        // not exposed to the client.
+        let framing_version = FramingVersion::from_wire(http_version);
+        if let Err(e) = validate_request_framing_for_version(req.headers(), framing_version) {
             warn!(
                 "Rejected ambiguous request framing from {}: {}",
                 client_ip, e
             );
+            telemetry.reject(RequestRejection::InvalidFraming);
             state.metrics.record_blocked();
-            state.metrics.record_request_duration(start_time.elapsed());
             return Ok(Self::create_error_response(
                 StatusCode::BAD_REQUEST,
                 "Bad Request",
@@ -1142,9 +1166,9 @@ impl WafProxyService {
         if let Some(validator) = &state.auth_validator {
             if let Err(e) = validator.validate_request(req.headers(), is_https) {
                 warn!("Authentication rejected request from {}: {}", client_ip, e);
+                telemetry.reject(RequestRejection::Authentication);
                 state.metrics.record_auth_failure();
                 state.metrics.record_blocked();
-                state.metrics.record_request_duration(start_time.elapsed());
                 return Ok(Self::create_error_response(
                     StatusCode::UNAUTHORIZED,
                     "Unauthorized",
@@ -1155,8 +1179,8 @@ impl WafProxyService {
         // Proxy WebSocket upgrades end-to-end over a raw upstream connection.
         if WebSocketHandler::is_websocket_upgrade(req.headers()) {
             if req.version() != hyper::Version::HTTP_11 {
+                telemetry.reject(RequestRejection::WebSocketVersion);
                 state.metrics.record_blocked();
-                state.metrics.record_request_duration(start_time.elapsed());
                 return Ok(Self::create_error_response(
                     StatusCode::NOT_IMPLEMENTED,
                     "WebSocket upgrades require HTTP/1.1",
@@ -1179,8 +1203,8 @@ impl WafProxyService {
                         "WAF blocked WebSocket upgrade from {}: {} (status: {})",
                         client_ip, reason, status
                     );
+                    telemetry.reject(RequestRejection::WafBlocked);
                     state.metrics.record_blocked();
-                    state.metrics.record_request_duration(start_time.elapsed());
                     return Ok(Self::create_blocked_response(status, &reason));
                 }
                 Decision::RateLimit { reason } => {
@@ -1188,9 +1212,9 @@ impl WafProxyService {
                         "WAF rate limited WebSocket upgrade from {}: {}",
                         client_ip, reason
                     );
+                    telemetry.reject(RequestRejection::WafRateLimited);
                     state.metrics.record_rate_limited();
                     state.metrics.record_blocked();
-                    state.metrics.record_request_duration(start_time.elapsed());
                     return Ok(Self::create_rate_limit_response(&reason));
                 }
             }
@@ -1200,8 +1224,8 @@ impl WafProxyService {
         #[cfg(feature = "webtransport")]
         if is_webtransport_upgrade(req.headers()) {
             warn!("WebTransport request rejected: not implemented");
+            telemetry.reject(RequestRejection::WebTransportUnsupported);
             state.metrics.record_blocked();
-            state.metrics.record_request_duration(start_time.elapsed());
             return Ok(Self::create_error_response(
                 StatusCode::NOT_IMPLEMENTED,
                 "WebTransport is not implemented",
@@ -1229,25 +1253,25 @@ impl WafProxyService {
                     Decision::Allow => {
                         let (parts, _body) = req.into_parts();
                         state.metrics.record_allowed();
-                        let response =
-                            Self::forward_to_upstream_with_protocol(
-                                parts,
-                                ProxyBody::buffered(Bytes::new(), None),
-                                state.upstream_client,
-                                state.upstream_uri,
-                                start_time,
-                                http_version,
-                                &state.metrics,
-                                client_ip,
-                                is_https,
-                                state.config.server.max_body_size,
-                                state.config.proxy.streaming.enabled.then_some(
-                                    state.config.proxy.streaming.response_threshold_bytes,
-                                ),
-                            )
-                            .await;
-                        state.metrics.record_request_duration(start_time.elapsed());
-                        return response;
+                        return Self::forward_to_upstream_with_protocol(
+                            parts,
+                            ProxyBody::buffered(Bytes::new(), None),
+                            state.upstream_client,
+                            state.upstream_uri,
+                            start_time,
+                            http_version,
+                            &state.metrics,
+                            client_ip,
+                            is_https,
+                            state.config.server.max_body_size,
+                            state
+                                .config
+                                .proxy
+                                .streaming
+                                .enabled
+                                .then_some(state.config.proxy.streaming.response_threshold_bytes),
+                        )
+                        .await;
                     }
                     Decision::Block { status, reason } => {
                         state
@@ -1266,8 +1290,8 @@ impl WafProxyService {
                             "WAF fast-allow gate blocked request from {}: {} (status: {})",
                             client_ip, reason, status
                         );
+                        telemetry.reject(RequestRejection::FastAllowBlocked);
                         state.metrics.record_blocked();
-                        state.metrics.record_request_duration(start_time.elapsed());
                         return Ok(Self::create_blocked_response(*status, reason));
                     }
                     Decision::RateLimit { reason } => {
@@ -1287,9 +1311,9 @@ impl WafProxyService {
                             "WAF fast-allow gate rate limited request from {}: {}",
                             client_ip, reason
                         );
+                        telemetry.reject(RequestRejection::FastAllowRateLimited);
                         state.metrics.record_rate_limited();
                         state.metrics.record_blocked();
-                        state.metrics.record_request_duration(start_time.elapsed());
                         return Ok(Self::create_rate_limit_response(reason));
                     }
                 }
@@ -1333,6 +1357,7 @@ impl WafProxyService {
                                     "WAF blocked streaming gRPC request from {}: {} (status: {})",
                                     client_ip, reason, status
                                 );
+                                telemetry.reject(RequestRejection::WafBlocked);
                                 state.metrics.record_blocked();
                                 state.metrics.record_request_duration(start_time.elapsed());
                                 if state.config.server.grpc_aware_rejections {
@@ -1345,6 +1370,7 @@ impl WafProxyService {
                                     "WAF rate limited streaming gRPC request from {}: {}",
                                     client_ip, reason
                                 );
+                                telemetry.reject(RequestRejection::WafRateLimited);
                                 state.metrics.record_rate_limited();
                                 state.metrics.record_blocked();
                                 state.metrics.record_request_duration(start_time.elapsed());
@@ -1360,6 +1386,7 @@ impl WafProxyService {
                                 "Rejecting streaming gRPC request from {}: {}",
                                 client_ip, reason
                             );
+                            telemetry.reject(RequestRejection::WafBlocked);
                             state.metrics.record_blocked();
                             state.metrics.record_request_duration(start_time.elapsed());
                             if state.config.server.grpc_aware_rejections {
@@ -1392,6 +1419,7 @@ impl WafProxyService {
                                     "Rejecting streaming gRPC request from {}: {}",
                                     client_ip, error
                                 );
+                                telemetry.reject(RequestRejection::InvalidFraming);
                                 state.metrics.record_blocked();
                                 state.metrics.record_request_duration(start_time.elapsed());
                                 if state.config.server.grpc_aware_rejections {
@@ -1431,6 +1459,7 @@ impl WafProxyService {
                         "Rejecting malformed gRPC request from {}: {}",
                         client_ip, error
                     );
+                    telemetry.reject(RequestRejection::InvalidFraming);
                     state.metrics.record_blocked();
                     state.metrics.record_request_duration(start_time.elapsed());
                     if state.config.server.grpc_aware_rejections {
@@ -1464,6 +1493,7 @@ impl WafProxyService {
                         "Request body from {} exceeds limit {}",
                         client_ip, max_body_size
                     );
+                    telemetry.reject(RequestRejection::BodyTooLarge);
                     state.metrics.record_blocked();
                     state.metrics.record_request_duration(start_time.elapsed());
                     return Ok(Self::create_error_response(
@@ -1473,6 +1503,9 @@ impl WafProxyService {
                 }
                 Ok(Err(e)) => {
                     warn!("Failed to read request body from {}: {}", client_ip, e);
+                    telemetry.reject(RequestRejection::BodyReadError);
+                    state.metrics.record_blocked();
+                    state.metrics.record_request_duration(start_time.elapsed());
                     return Ok(Self::create_error_response(
                         StatusCode::BAD_REQUEST,
                         "Failed to read request body",
@@ -1480,6 +1513,9 @@ impl WafProxyService {
                 }
                 Err(_) => {
                     warn!("Request body read timed out for {}", client_ip);
+                    telemetry.reject(RequestRejection::BodyTimeout);
+                    state.metrics.record_blocked();
+                    state.metrics.record_request_duration(start_time.elapsed());
                     return Ok(Self::create_error_response(
                         StatusCode::REQUEST_TIMEOUT,
                         "Request body timeout",
@@ -1487,6 +1523,20 @@ impl WafProxyService {
                 }
             }
         };
+
+        // Trailers arrive after the body. Framing and connection metadata in a
+        // trailer block is always illegal and is rejected before forwarding.
+        if let Some(trailers) = request_trailers.as_ref() {
+            if let Err(e) = validate_request_trailers(trailers) {
+                warn!("Rejected request trailer from {}: {}", client_ip, e);
+                telemetry.reject(RequestRejection::InvalidTrailerFraming);
+                state.metrics.record_blocked();
+                return Ok(Self::create_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Bad Request",
+                ));
+            }
+        }
 
         let body_bytes = if has_content_encoding {
             match decompress_request_body(&parts.headers, body_bytes, max_body_size) {
@@ -1499,6 +1549,7 @@ impl WafProxyService {
                         "Rejecting unsupported request encoding from {} (Content-Encoding: {})",
                         client_ip, encoding
                     );
+                    telemetry.reject(RequestRejection::UnsupportedContentEncoding);
                     state.metrics.record_blocked();
                     return Ok(Self::create_error_response(
                         StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -1510,6 +1561,7 @@ impl WafProxyService {
                         "Decompressed request body from {} exceeds limit {}",
                         client_ip, max_body_size
                     );
+                    telemetry.reject(RequestRejection::DecompressedTooLarge);
                     state.metrics.record_blocked();
                     return Ok(Self::create_error_response(
                         StatusCode::PAYLOAD_TOO_LARGE,
@@ -1518,6 +1570,7 @@ impl WafProxyService {
                 }
                 Err(DecompressionError::Malformed) => {
                     warn!("Malformed compressed request body from {}", client_ip);
+                    telemetry.reject(RequestRejection::MalformedCompression);
                     state.metrics.record_blocked();
                     return Ok(Self::create_error_response(
                         StatusCode::BAD_REQUEST,
@@ -1561,7 +1614,7 @@ impl WafProxyService {
                     client_ip, http_version
                 );
                 state.metrics.record_allowed();
-                let response = Self::forward_to_upstream_with_protocol(
+                Self::forward_to_upstream_with_protocol(
                     parts,
                     ProxyBody::buffered(body_bytes, request_trailers),
                     state.upstream_client,
@@ -1579,17 +1632,15 @@ impl WafProxyService {
                         .enabled
                         .then_some(state.config.proxy.streaming.response_threshold_bytes),
                 )
-                .await;
-                state.metrics.record_request_duration(start_time.elapsed());
-                response
+                .await
             }
             Decision::Block { status, reason } => {
                 warn!(
                     "WAF blocked request from {}: {} (status: {})",
                     client_ip, reason, status
                 );
+                telemetry.reject(RequestRejection::WafBlocked);
                 state.metrics.record_blocked();
-                state.metrics.record_request_duration(start_time.elapsed());
                 if classification.is_grpc && state.config.server.grpc_aware_rejections {
                     Ok(Self::create_grpc_blocked_response(status, &reason))
                 } else {
@@ -1598,9 +1649,9 @@ impl WafProxyService {
             }
             Decision::RateLimit { reason } => {
                 warn!("WAF rate limited request from {}: {}", client_ip, reason);
+                telemetry.reject(RequestRejection::WafRateLimited);
                 state.metrics.record_rate_limited();
                 state.metrics.record_blocked();
-                state.metrics.record_request_duration(start_time.elapsed());
                 Ok(Self::create_rate_limit_response(&reason))
             }
         }
@@ -2071,43 +2122,89 @@ impl WafProxyService {
     ///
     /// `X-Forwarded-For` / `X-Real-IP` are only honoured when the immediate
     /// peer is a configured trusted proxy; otherwise the socket address is
-    /// authoritative.
+    /// authoritative. A malformed forwarded chain is never silently trimmed:
+    /// the whole header is discarded, the immediate peer is used, and a warning
+    /// names the fallback reason.
     pub(crate) fn resolve_client_ip(
         peer_ip: IpAddr,
         headers: &hyper::HeaderMap,
         trusted_proxies: &[IpNetwork],
     ) -> IpAddr {
+        let (ip, fallback) = Self::resolve_client_ip_detailed(peer_ip, headers, trusted_proxies);
+        if let Some(reason) = fallback {
+            warn!(
+                peer = %peer_ip,
+                reason = reason.as_str(),
+                "Discarding malformed forwarding header; using the immediate peer as the client address"
+            );
+        }
+        ip
+    }
+
+    /// Detailed variant used by tests and the `warn!` wrapper above.
+    pub(crate) fn resolve_client_ip_detailed(
+        peer_ip: IpAddr,
+        headers: &hyper::HeaderMap,
+        trusted_proxies: &[IpNetwork],
+    ) -> (IpAddr, Option<ClientIpFallback>) {
         let trusted_peer = trusted_proxies
             .iter()
             .any(|network| network.contains(peer_ip));
         if !trusted_peer {
-            return peer_ip;
+            return (peer_ip, None);
         }
 
-        if let Some(value) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-            let hops: Vec<IpAddr> = value
-                .split(',')
-                .map(str::trim)
-                .filter_map(|part| part.parse::<IpAddr>().ok())
-                .collect();
+        if let Some(value) = headers.get("x-forwarded-for") {
+            let value = match value.to_str() {
+                Ok(value) => value,
+                Err(_) => {
+                    return (peer_ip, Some(ClientIpFallback::MalformedXForwardedFor));
+                }
+            };
+
+            let mut hops = Vec::new();
+            for part in value.split(',') {
+                let part = part.trim();
+                if part.is_empty() {
+                    return (peer_ip, Some(ClientIpFallback::MalformedXForwardedFor));
+                }
+                match part.parse::<IpAddr>() {
+                    Ok(ip) => hops.push(ip),
+                    Err(_) => {
+                        return (peer_ip, Some(ClientIpFallback::MalformedXForwardedFor));
+                    }
+                }
+            }
+
+            if hops.is_empty() {
+                return (peer_ip, Some(ClientIpFallback::MalformedXForwardedFor));
+            }
 
             // Walk from the nearest hop backwards, skipping addresses that are
             // themselves trusted proxies. This prevents a client behind a
             // trusted LB from spoofing its source by prepending an address.
             for hop in hops.iter().rev() {
                 if !trusted_proxies.iter().any(|network| network.contains(*hop)) {
-                    return *hop;
+                    return (*hop, None);
                 }
             }
+
+            // Every hop is a trusted proxy: there is no client address to
+            // report, so the immediate peer remains authoritative.
+            return (peer_ip, None);
         }
-        if let Some(ip) = headers
-            .get("x-real-ip")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|value| value.trim().parse::<IpAddr>().ok())
-        {
-            return ip;
+
+        if let Some(value) = headers.get("x-real-ip") {
+            match value
+                .to_str()
+                .ok()
+                .and_then(|v| v.trim().parse::<IpAddr>().ok())
+            {
+                Some(ip) => return (ip, None),
+                None => return (peer_ip, Some(ClientIpFallback::MalformedXRealIp)),
+            }
         }
-        peer_ip
+        (peer_ip, None)
     }
 
     /// Detect HTTP protocol version from request
@@ -2974,6 +3071,55 @@ mod tests {
         let ip =
             WafProxyService::resolve_client_ip("10.0.0.5".parse().unwrap(), &headers, &trusted);
         assert_eq!(ip, "198.51.100.7".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn malformed_forwarded_chain_falls_back_to_peer() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "198.51.100.7, not-an-ip, 10.0.0.7".parse().unwrap(),
+        );
+        headers.insert("x-real-ip", "203.0.113.99".parse().unwrap());
+
+        let trusted: Vec<IpNetwork> = vec!["10.0.0.0/8".parse().unwrap()];
+        let (ip, fallback) = WafProxyService::resolve_client_ip_detailed(
+            "10.0.0.5".parse().unwrap(),
+            &headers,
+            &trusted,
+        );
+        assert_eq!(ip, "10.0.0.5".parse::<IpAddr>().unwrap());
+        assert_eq!(fallback, Some(ClientIpFallback::MalformedXForwardedFor));
+    }
+
+    #[test]
+    fn malformed_real_ip_falls_back_to_peer() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-real-ip", "definitely-not-an-ip".parse().unwrap());
+
+        let trusted: Vec<IpNetwork> = vec!["10.0.0.0/8".parse().unwrap()];
+        let (ip, fallback) = WafProxyService::resolve_client_ip_detailed(
+            "10.0.0.5".parse().unwrap(),
+            &headers,
+            &trusted,
+        );
+        assert_eq!(ip, "10.0.0.5".parse::<IpAddr>().unwrap());
+        assert_eq!(fallback, Some(ClientIpFallback::MalformedXRealIp));
+    }
+
+    #[test]
+    fn fully_trusted_forwarded_chain_uses_peer() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-forwarded-for", "10.0.0.9, 10.0.0.8".parse().unwrap());
+
+        let trusted: Vec<IpNetwork> = vec!["10.0.0.0/8".parse().unwrap()];
+        let (ip, fallback) = WafProxyService::resolve_client_ip_detailed(
+            "10.0.0.5".parse().unwrap(),
+            &headers,
+            &trusted,
+        );
+        assert_eq!(ip, "10.0.0.5".parse::<IpAddr>().unwrap());
+        assert_eq!(fallback, None);
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub(crate) mod h3_admission;
 pub(crate) mod http3;
 pub mod listener;
 pub mod service;
+pub(crate) mod telemetry;
 pub mod websocket;
 #[cfg(feature = "webtransport")]
 pub(crate) mod webtransport;

@@ -47,6 +47,21 @@ All notable changes to WAF-Rejected are documented here.
   path and line/column, and cover misspelled security settings such as
   `waf.coraza.backedn`.
 
+- Protocol-specific request framing: HTTP/2 and HTTP/3 reject
+  `Transfer-Encoding` and connection-specific headers before the shared
+  validator; framing fields in trailers are rejected on every version.
+  Repeated identical `Content-Length` values are accepted, conflicting values
+  are rejected. See `docs/developer-guide/request-framing-and-telemetry.md`.
+
+- Gzip request bodies are decoded with `MultiGzDecoder`: all concatenated
+  members are inspected and trailing garbage or late stream failures are
+  rejected instead of being silently ignored.
+
+- Central request-completion telemetry records exactly one duration observation
+  for every HTTP/1.x, HTTP/2 and HTTP/3 request, including early rejections,
+  body-read errors, timeouts and WebSocket tunnels, with a stable rejection
+  reason in the structured log.
+
 ### Changed
 
 - Per-IP rate limiting now uses 64 independently locked shards selected by a
@@ -63,6 +78,10 @@ All notable changes to WAF-Rejected are documented here.
   `benchmarks/performance_testing.toml` because it is not a WAF config.
 - `tests/config_files.rs` and `scripts/validate-configs.sh` now also validate
   the root test configs, unknown-key rejection, and `WAF_*` env overrides.
+- A malformed `X-Forwarded-For` / `X-Real-IP` from a trusted proxy now falls
+  back to the immediate peer and logs the reason instead of silently dropping
+  only the bad entry. Multi-proxy chain behaviour is documented in
+  `docs/developer-guide/request-framing-and-telemetry.md`.
 
 ## [0.1.0-beta.13] - 2026-11-03
 
