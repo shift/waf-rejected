@@ -126,11 +126,42 @@ pub(crate) struct RequestClassification {
     pub(crate) is_grpc_web: bool,
 }
 
+/// Media types that use the gRPC/gRPC-Web transport framing.
+///
+/// Deliberately an explicit allowlist, not a prefix match: `application/grpcx`
+/// and `application/grpc-malicious` are unknown types and must not be handed
+/// to the gRPC body framing parser.
+const GRPC_MEDIA_TYPES: &[&str] = &[
+    "application/grpc",
+    "application/grpc+proto",
+    "application/grpc+json",
+    "application/grpc-web",
+    "application/grpc-web+proto",
+    "application/grpc-web+json",
+    "application/grpc-web-text",
+    "application/grpc-web-text+proto",
+    "application/grpc-web-text+json",
+];
+
+/// The subset of [`GRPC_MEDIA_TYPES`] that uses gRPC-Web framing (trailers are
+/// carried in the body).
+const GRPC_WEB_MEDIA_TYPES: &[&str] = &[
+    "application/grpc-web",
+    "application/grpc-web+proto",
+    "application/grpc-web+json",
+    "application/grpc-web-text",
+    "application/grpc-web-text+proto",
+    "application/grpc-web-text+json",
+];
+
 /// Classify a request for gRPC transport handling.
 ///
-/// `application/grpc`, `application/grpc+proto`, `application/grpc+json`,
-/// `application/grpc-web`, `application/grpc-web-text` and their `+proto` /
-/// `+json` variants all share the `application/grpc` prefix.
+/// Only the media types in [`GRPC_MEDIA_TYPES`] are gRPC. Matching is
+/// case-insensitive and ignores parameters (`; charset=...`). Unknown types
+/// that merely start with `application/grpc` (for example `application/grpcx`
+/// or `application/grpc-malicious`) are treated as ordinary HTTP: they take
+/// the normal body-inspection path and never reach the gRPC framing parser or
+/// gRPC transport shortcuts.
 pub(crate) fn classify_request(headers: &HeaderMap) -> RequestClassification {
     let content_type = headers
         .get(hyper::header::CONTENT_TYPE)
@@ -142,8 +173,8 @@ pub(crate) fn classify_request(headers: &HeaderMap) -> RequestClassification {
         .map(|value| value.split(';').next().unwrap_or("").trim())
         .unwrap_or("");
 
-    let is_grpc = media_type.starts_with("application/grpc");
-    let is_grpc_web = media_type.starts_with("application/grpc-web");
+    let is_grpc = GRPC_MEDIA_TYPES.contains(&media_type);
+    let is_grpc_web = is_grpc && GRPC_WEB_MEDIA_TYPES.contains(&media_type);
 
     // Streaming is not inferred from HTTP framing. HTTP/2 does not require
     // `content-length`, so a unary RPC without one is still unary. The actual
@@ -2623,21 +2654,94 @@ mod tests {
     use crate::config::ProxyConfig;
     use proptest::prelude::*;
 
+    fn classify(content_type: &str) -> RequestClassification {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", content_type.parse().unwrap());
+        classify_request(&headers)
+    }
+
     #[test]
-    fn classifies_grpc_media_types() {
+    fn classifies_supported_grpc_media_types() {
         for content_type in [
             "application/grpc",
             "application/grpc+proto",
             "application/grpc+json",
             "application/grpc-web",
             "application/grpc-web+proto",
+            "application/grpc-web+json",
             "application/grpc-web-text",
-            "Application/GRPC+Proto; charset=utf-8",
+            "application/grpc-web-text+proto",
+            "application/grpc-web-text+json",
         ] {
-            let mut headers = HeaderMap::new();
-            headers.insert("content-type", content_type.parse().unwrap());
-            let classification = classify_request(&headers);
+            let classification = classify(content_type);
             assert!(classification.is_grpc, "{content_type} must be gRPC");
+        }
+
+        for content_type in [
+            "application/grpc-web",
+            "application/grpc-web+proto",
+            "application/grpc-web+json",
+            "application/grpc-web-text",
+            "application/grpc-web-text+proto",
+            "application/grpc-web-text+json",
+        ] {
+            assert!(
+                classify(content_type).is_grpc_web,
+                "{content_type} must use gRPC-Web framing"
+            );
+        }
+
+        for content_type in [
+            "application/grpc",
+            "application/grpc+proto",
+            "application/grpc+json",
+        ] {
+            assert!(
+                !classify(content_type).is_grpc_web,
+                "{content_type} must use native gRPC framing"
+            );
+        }
+    }
+
+    #[test]
+    fn grpc_classification_is_case_and_parameter_insensitive() {
+        for content_type in [
+            "Application/GRPC+Proto; charset=utf-8",
+            "APPLICATION/GRPC;charset=UTF-8",
+            "application/grpc-web+proto; charset=utf-8",
+            "  application/grpc-web-text+json ; charset=utf-8  ",
+        ] {
+            let classification = classify(content_type);
+            assert!(classification.is_grpc, "{content_type} must be gRPC");
+        }
+
+        assert!(classify("Application/GRPC-WEB+Proto; charset=utf-8").is_grpc_web);
+        assert!(
+            !classify("application/grpc+proto; charset=utf-8").is_grpc_web,
+            "native gRPC must not use gRPC-Web framing"
+        );
+    }
+
+    #[test]
+    fn unknown_grpc_prefixed_media_types_are_not_grpc() {
+        for content_type in [
+            "application/grpcx",
+            "application/grpc-malicious",
+            "application/grpc+",
+            "application/grpc/web",
+            "application/grpc-webb",
+            "application/grpc-web-textx",
+            "application/grpcjson",
+        ] {
+            let classification = classify(content_type);
+            assert!(
+                !classification.is_grpc,
+                "{content_type} must not take the gRPC path"
+            );
+            assert!(
+                !classification.is_grpc_web,
+                "{content_type} must not take the gRPC-Web path"
+            );
         }
 
         let mut headers = HeaderMap::new();
@@ -2653,10 +2757,6 @@ mod tests {
         let unary = classify_request(&headers);
         assert!(unary.is_grpc);
         assert!(!unary.is_grpc_web);
-
-        let mut headers = HeaderMap::new();
-        headers.insert("content-type", "application/grpc-web".parse().unwrap());
-        assert!(classify_request(&headers).is_grpc_web);
 
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "application/json".parse().unwrap());

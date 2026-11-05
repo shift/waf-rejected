@@ -1,9 +1,28 @@
 # gRPC transport
 
-The proxy treats gRPC as a first-class HTTP transport. Requests whose
-`content-type` starts with `application/grpc` (including `+proto`, `+json`,
-`application/grpc-web` and `application/grpc-web-text`) are classified as gRPC
-by `classify_request()` in `src/proxy/service.rs`.
+The proxy treats gRPC as a first-class HTTP transport. `classify_request()` in
+`src/proxy/service.rs` recognises an explicit allowlist of media types:
+
+| Media type |
+| --- |
+| `application/grpc` |
+| `application/grpc+proto` |
+| `application/grpc+json` |
+| `application/grpc-web` |
+| `application/grpc-web+proto` |
+| `application/grpc-web+json` |
+| `application/grpc-web-text` |
+| `application/grpc-web-text+proto` |
+| `application/grpc-web-text+json` |
+
+Matching is case-insensitive and parameters such as `; charset=utf-8` are
+ignored. The list is deliberately exhaustive rather than a prefix match: an
+unknown type that merely starts with `application/grpc` (for example
+`application/grpcx` or `application/grpc-malicious`) is **not** gRPC. It is
+treated as ordinary HTTP, takes the normal body-inspection path, and never
+reaches the gRPC framing parser or gRPC transport shortcuts (no `TE: trailers`
+injection, no gRPC-Web framing). This prevents smuggling unknown types into the
+gRPC code path while keeping them subject to WAF inspection.
 
 ## Unary RPCs
 

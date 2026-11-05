@@ -102,6 +102,29 @@ impl Body for GatedBody {
     }
 }
 
+/// A body with no size hint, so hyper uses `transfer-encoding: chunked`
+/// instead of `content-length`. This is the HTTP/1.1 shape that the old
+/// classifier mistook for a streaming RPC.
+struct NoLengthBody {
+    data: Option<Bytes>,
+}
+
+impl Body for NoLengthBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        let this = self.get_mut();
+        match this.data.take() {
+            Some(data) => Poll::Ready(Some(Ok(Frame::data(data)))),
+            None => Poll::Ready(None),
+        }
+    }
+}
+
 async fn bind() -> (TcpListener, SocketAddr) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -415,5 +438,156 @@ async fn normal_http1_requests_are_still_buffered_and_inspected() {
         calls.load(Ordering::SeqCst),
         1,
         "blocked request must not reach the upstream"
+    );
+}
+
+#[tokio::test]
+async fn unary_grpc_over_http1_chunked_without_content_length_is_buffered() {
+    let upstream = spawn_upstream(|req: Request<Incoming>| async move {
+        // The unary path re-emits the request trailers captured while probing.
+        assert_eq!(req.headers().get("te").unwrap(), "trailers");
+        let (data, _) = read_body(req.into_body()).await;
+        assert_eq!(data, Bytes::from_static(b"\x00\x00\x00\x00\x05hello"));
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/grpc+proto")
+            .header("trailer", "grpc-status, grpc-message")
+            .body(TestBody::with_trailers(grpc_status("0")))
+            .unwrap()
+    })
+    .await;
+
+    // If the missing content-length were still treated as "streaming", the
+    // reject policy would block this unary RPC.
+    let proxy = spawn_proxy(upstream, |config| {
+        config.server.grpc_streaming_policy = waf_ingress::config::GrpcStreamingPolicy::Reject;
+    })
+    .await;
+
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("http://{}/helloworld.Greeter/SayHello", proxy))
+        .header("content-type", "application/grpc+proto")
+        .header("te", "trailers")
+        .body(NoLengthBody {
+            data: Some(Bytes::from_static(b"\x00\x00\x00\x00\x05hello")),
+        })
+        .unwrap();
+
+    let response = client::<NoLengthBody>()
+        .request(request)
+        .await
+        .expect("proxy response");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a chunked unary RPC without content-length must still be buffered and forwarded"
+    );
+    let (data, trailers) = read_body(response.into_body()).await;
+    assert!(data.is_empty());
+    assert_eq!(
+        trailers.expect("grpc trailers").get("grpc-status").unwrap(),
+        "0"
+    );
+}
+
+#[tokio::test]
+async fn unknown_grpc_prefixed_media_types_take_the_http_path() {
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    // Non-frame bytes would be rejected as a malformed gRPC frame if these
+    // types were classified as gRPC. A 200 echo proves ordinary HTTP framing.
+    let echo_calls = Arc::clone(&calls);
+    let upstream = spawn_upstream(move |req: Request<Incoming>| {
+        let calls = Arc::clone(&echo_calls);
+        async move {
+            assert!(
+                req.headers().get("te").is_none(),
+                "non-gRPC requests must not gain TE: trailers"
+            );
+            calls.fetch_add(1, Ordering::SeqCst);
+            let (data, _) = read_body(req.into_body()).await;
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(TestBody {
+                    data: Some(data),
+                    trailers: None,
+                })
+                .unwrap()
+        }
+    })
+    .await;
+
+    let proxy = spawn_proxy(upstream, |_| {}).await;
+
+    for content_type in ["application/grpcx", "application/grpc-malicious"] {
+        let body = Bytes::from_static(b"plain bytes, not a gRPC frame");
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("http://{}/normal", proxy))
+            .header("content-type", content_type)
+            .body(Full::new(body.clone()))
+            .unwrap();
+        let response = client::<Full<Bytes>>()
+            .request(request)
+            .await
+            .expect("proxy response");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{content_type} must be handled as ordinary HTTP, not rejected as malformed gRPC"
+        );
+        let (data, _) = read_body(response.into_body()).await;
+        assert_eq!(
+            data, body,
+            "{content_type} body must be forwarded unchanged"
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn unknown_grpc_prefixed_media_type_bodies_are_inspected() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_upstream = Arc::clone(&calls);
+
+    let upstream = spawn_upstream(move |_req: Request<Incoming>| {
+        let calls = Arc::clone(&calls_upstream);
+        async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(TestBody::empty())
+                .unwrap()
+        }
+    })
+    .await;
+
+    let proxy = spawn_proxy(upstream, |_| {}).await;
+
+    for content_type in ["application/grpcx", "application/grpc-malicious"] {
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("http://{}/normal", proxy))
+            .header("content-type", content_type)
+            .body(Full::new(Bytes::from_static(
+                b"id=1 UNION SELECT * FROM users",
+            )))
+            .unwrap();
+        let response = client::<Full<Bytes>>()
+            .request(request)
+            .await
+            .expect("proxy response");
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "{content_type} must be body-inspected as ordinary HTTP"
+        );
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "blocked unknown gRPC-prefixed requests must not reach the upstream"
     );
 }

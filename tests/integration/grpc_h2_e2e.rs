@@ -1074,3 +1074,63 @@ async fn grpc_aware_rejection_is_opt_in_and_maps_status() {
         .unwrap()
         .contains("not in waf.grpc.method_allowlist"));
 }
+
+#[tokio::test]
+#[ignore = "requires TLS, local ports and the wasm-reactor feature"]
+async fn grpc_media_type_matching_is_case_and_parameter_insensitive() {
+    let env = test_env().await;
+    // Content scanning is irrelevant to media-type classification; disabling it
+    // keeps this test independent of CRS rule content.
+    let proxy = spawn_proxy_with_content_scan(
+        env.upstream,
+        &env.ca_path,
+        &env.cert_path,
+        &env.key_path,
+        &env.allowlist_path,
+        false,
+        "off",
+    )
+    .await;
+    let mut sender = h2_client::<Full<Bytes>>(proxy, &env.ca_path).await;
+
+    let frame = grpc_frame(&protobuf_string(1, "case-insensitive"));
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("https://127.0.0.1:{}{}", proxy.port(), SAY_HELLO))
+        .header("content-type", "Application/GRPC+Proto; charset=utf-8")
+        .header("te", "trailers")
+        .body(Full::new(frame.clone()))
+        .unwrap();
+    let response = sender
+        .send_request(request)
+        .await
+        .expect("uppercase gRPC response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let (data, trailers) = read_body(response.into_body()).await;
+    assert_eq!(data, frame);
+    assert_eq!(
+        trailers.expect("grpc trailers").get("grpc-status").unwrap(),
+        "0"
+    );
+
+    // gRPC-Web with uppercase type and a charset parameter keeps body-encoded
+    // trailers on the HTTP/1.1 path.
+    let mut web_sender = http1_client::<Full<Bytes>>(proxy, &env.ca_path).await;
+    let web_frame = grpc_frame(&protobuf_string(1, "web-case"));
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("https://127.0.0.1:{}{}", proxy.port(), WEB))
+        .header("content-type", "Application/GRPC-WEB+Proto; charset=utf-8")
+        .header("te", "trailers")
+        .body(Full::new(web_frame.clone()))
+        .unwrap();
+    let response = web_sender
+        .send_request(request)
+        .await
+        .expect("uppercase gRPC-Web response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let (data, _) = read_body(response.into_body()).await;
+    let mut expected = web_frame.to_vec();
+    expected.extend_from_slice(&grpc_web_trailer_frame());
+    assert_eq!(data, Bytes::from(expected));
+}

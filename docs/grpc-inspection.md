@@ -16,7 +16,7 @@ and their bodies are withheld from CRS body rules.
 
 | Check | Behaviour |
 | --- | --- |
-| `content-type` | `application/grpc`, `application/grpc+proto`, `application/grpc+json`, `application/grpc-web`, `application/grpc-web+*`, `application/grpc-web-text*` |
+| `content-type` | Only the explicit allowlist is gRPC: `application/grpc`, `application/grpc+proto`, `application/grpc+json`, `application/grpc-web`, `application/grpc-web+proto`, `application/grpc-web+json`, `application/grpc-web-text`, `application/grpc-web-text+proto`, `application/grpc-web-text+json`. Matching ignores case and parameters. Unknown `application/grpc*` types are ordinary HTTP and are body-inspected |
 | `:path` | Must be `/package.Service/Method`; validated against `method_allowlist` |
 | Frame prefix | 5 bytes per message: compressed flag (`0`/`1`) and 4-byte big-endian length |
 | Frame limits | Per-message size (`max_message_bytes`) and frame count (`max_frames`) |
