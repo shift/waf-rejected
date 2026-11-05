@@ -255,9 +255,26 @@ per_ip_window_secs = 60
 global_enabled = true
 global_max_requests = 10000
 global_window_secs = 60
+max_tracked_ips = 100000
+capacity_policy = "fail_closed"   # or "evict_oldest"
 ```
 
 Windows must be greater than zero when the corresponding limit is enabled.
+`max_tracked_ips` must be greater than zero. It is a hard cap on the number of
+client IPs tracked by the per-IP limiter. At the cap, `capacity_policy`
+controls new IPs:
+
+- `fail_closed` (default) rejects new IPs with a 429 rate-limit decision.
+  Existing tracked IPs keep their buckets. This prevents source-address
+  spraying from evicting legitimate clients or bypassing the limiter.
+- `evict_oldest` evicts the least-recently-seen bucket from a shard (starting
+  at the cleanup cursor) to admit the new IP. Bounded, but an attacker with
+  many source addresses can churn the table.
+
+The limiter uses 64 independently locked shards selected by a stable hash of
+the IP, so unrelated clients do not serialize. Cleanup is incremental
+(one shard per 100 evaluations) and never takes a global lock. See
+[rate-limiter.md](../developer-guide/rate-limiter.md).
 
 ### `[waf.security_events]`
 

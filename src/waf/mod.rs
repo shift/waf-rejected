@@ -925,12 +925,18 @@ impl WafEngine {
             let refill = (config.waf.rate_limit.per_ip_max_requests as f64 / window as f64)
                 .ceil()
                 .max(1.0) as u32;
-            self.add_rule(RateLimiter::new(
-                "per_ip_rate_limit",
-                config.waf.rate_limit.per_ip_max_requests.max(1),
-                refill,
-                std::time::Duration::from_secs(window),
-            ));
+            self.add_rule(
+                RateLimiter::new(
+                    "per_ip_rate_limit",
+                    config.waf.rate_limit.per_ip_max_requests.max(1),
+                    refill,
+                    std::time::Duration::from_secs(window),
+                )
+                .with_limits(
+                    config.waf.rate_limit.max_tracked_ips,
+                    config.waf.rate_limit.capacity_policy,
+                ),
+            );
         }
         if config.waf.rate_limit.global_enabled {
             let window = config.waf.rate_limit.global_window_secs.max(1);

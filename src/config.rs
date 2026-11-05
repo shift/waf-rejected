@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::info;
 
+use crate::waf::rate_limit::CapacityPolicy;
 use crate::waf::storage::StorageConfig as WafStorageConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -914,6 +915,15 @@ pub struct RateLimitConfig {
 
     /// Global rate limiting window size in seconds
     pub global_window_secs: u64,
+
+    /// Hard cap on the number of client IPs tracked by the per-IP limiter.
+    /// Once reached, `capacity_policy` decides what happens to new IPs.
+    pub max_tracked_ips: usize,
+
+    /// Behaviour when `max_tracked_ips` is reached. `fail_closed` (default)
+    /// rejects new IPs; `evict_oldest` evicts the least-recently-seen bucket
+    /// from a shard, starting at the cleanup cursor.
+    pub capacity_policy: CapacityPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1966,6 +1976,8 @@ impl Default for RateLimitConfig {
             global_enabled: true,
             global_max_requests: 1000,
             global_window_secs: 60,
+            max_tracked_ips: crate::waf::rate_limit::DEFAULT_MAX_TRACKED_IPS,
+            capacity_policy: CapacityPolicy::FailClosed,
         }
     }
 }
@@ -2293,6 +2305,9 @@ impl Config {
         }
         if self.waf.rate_limit.global_window_secs == 0 && self.waf.rate_limit.global_enabled {
             anyhow::bail!("waf.rate_limit.global_window_secs must be greater than zero");
+        }
+        if self.waf.rate_limit.max_tracked_ips == 0 {
+            anyhow::bail!("waf.rate_limit.max_tracked_ips must be greater than zero");
         }
         if self.waf.coraza.max_payload_bytes == 0 {
             anyhow::bail!("waf.coraza.max_payload_bytes must be greater than zero");
@@ -2961,6 +2976,28 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
         config.waf.coraza.fallback = CorazaFallback::Wasm;
         let error = config.validate().expect_err("must reject");
         assert!(error.to_string().contains("wasm-reactor"));
+    }
+
+    #[test]
+    fn rate_limit_capacity_config_is_validated() {
+        let mut config = Config::default();
+        assert_eq!(
+            config.waf.rate_limit.max_tracked_ips,
+            crate::waf::rate_limit::DEFAULT_MAX_TRACKED_IPS
+        );
+        assert_eq!(
+            config.waf.rate_limit.capacity_policy,
+            CapacityPolicy::FailClosed
+        );
+        assert!(config.validate().is_ok());
+
+        config.waf.rate_limit.max_tracked_ips = 0;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("max_tracked_ips"));
+
+        let mut config = Config::default();
+        config.waf.rate_limit.capacity_policy = CapacityPolicy::EvictOldest;
+        assert!(config.validate().is_ok());
     }
 
     #[test]
