@@ -114,6 +114,38 @@ impl Body for NoLengthBody {
     }
 }
 
+/// A unary body with no size hint that holds the stream open after the one
+/// complete message, then ends. This reproduces the H1 bypass: the old probe
+/// window treated the delay as a genuine stream.
+struct DelayedEndBody {
+    first: Option<Bytes>,
+    delay: Pin<Box<tokio::time::Sleep>>,
+    ended: bool,
+}
+
+impl Body for DelayedEndBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        let this = self.get_mut();
+        if let Some(first) = this.first.take() {
+            return Poll::Ready(Some(Ok(Frame::data(first))));
+        }
+        if !this.ended {
+            if std::future::Future::poll(this.delay.as_mut(), cx).is_pending() {
+                return Poll::Pending;
+            }
+            this.ended = true;
+            return Poll::Ready(Some(Ok(Frame::data(Bytes::new()))));
+        }
+        Poll::Ready(None)
+    }
+}
+
 /// Client body that sends one chunk, waits for the upstream to observe it, then
 /// sends the rest and request trailers. If the proxy buffered the request the
 /// upstream would never see the first chunk and this body would stall.
@@ -471,7 +503,7 @@ async fn spawn_proxy_with_content_scan(
         allowlist_path,
         grpc_aware_rejections,
         content_scan,
-        GrpcStreamingPolicy::TransportOnly,
+        GrpcStreamingPolicy::Reject,
     )
     .await
 }
@@ -672,13 +704,15 @@ async fn unary_grpc_over_h2_echoes_body_and_preserves_trailers() {
 #[ignore = "requires TLS, local ports and the wasm-reactor feature"]
 async fn streaming_grpc_over_h2_is_not_buffered_and_keeps_trailers() {
     let env = test_env().await;
-    let proxy = spawn_proxy(
+    let proxy = spawn_proxy_full(
         env.upstream,
         &env.ca_path,
         &env.cert_path,
         &env.key_path,
         &env.allowlist_path,
         false,
+        "off",
+        GrpcStreamingPolicy::TransportOnly,
     )
     .await;
     let mut sender = h2_client::<GatedBody>(proxy, &env.ca_path).await;
@@ -686,8 +720,8 @@ async fn streaming_grpc_over_h2_is_not_buffered_and_keeps_trailers() {
     let (gate_tx, gate_rx) = oneshot::channel();
     *env.upstream_state.gate.lock().unwrap() = Some(gate_tx);
 
-    let first = grpc_frame(b"first");
-    let rest = grpc_frame(b"second");
+    let first = grpc_frame(&protobuf_string(1, "first"));
+    let rest = grpc_frame(&protobuf_string(1, "second"));
     let mut request_trailers = HeaderMap::new();
     request_trailers.insert("grpc-request-note", "kept".parse().unwrap());
 
@@ -966,6 +1000,90 @@ async fn unary_grpc_without_content_length_is_inspected() {
         env.upstream_state.calls.load(Ordering::SeqCst),
         0,
         "blocked unary gRPC must not reach the upstream"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires TLS, local ports and the wasm-reactor feature"]
+async fn delayed_end_stream_unary_is_still_inspected() {
+    let env = test_env().await;
+    // Default policy is reject. The delayed unary must still be classified as
+    // unary and inspected, not rejected as a stream and not forwarded.
+    let proxy = spawn_proxy(
+        env.upstream,
+        &env.ca_path,
+        &env.cert_path,
+        &env.key_path,
+        &env.allowlist_path,
+        false,
+    )
+    .await;
+    let mut sender = h2_client::<DelayedEndBody>(proxy, &env.ca_path).await;
+
+    let payload = protobuf_string(1, "' OR '1'='1' -- <script>alert(1)</script>");
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("https://127.0.0.1:{}{}", proxy.port(), SQLI))
+        .header("content-type", "application/grpc+proto")
+        .header("te", "trailers")
+        .body(DelayedEndBody {
+            first: Some(grpc_frame(&payload)),
+            delay: Box::pin(tokio::time::sleep(Duration::from_millis(150))),
+            ended: false,
+        })
+        .unwrap();
+
+    let response = sender
+        .send_request(request)
+        .await
+        .expect("delayed unary response");
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "delaying END_STREAM must not bypass unary gRPC inspection"
+    );
+    assert_eq!(
+        env.upstream_state.calls.load(Ordering::SeqCst),
+        0,
+        "the blocked delayed unary must not reach the upstream"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires TLS, local ports and the wasm-reactor feature"]
+async fn streaming_messages_are_content_inspected() {
+    let env = test_env().await;
+    // transport-only is an explicit opt-out from rejecting streams, not from
+    // inspecting them. The first streamed message carries SQLi/XSS.
+    let proxy = spawn_proxy_full(
+        env.upstream,
+        &env.ca_path,
+        &env.cert_path,
+        &env.key_path,
+        &env.allowlist_path,
+        false,
+        "strings",
+        GrpcStreamingPolicy::TransportOnly,
+    )
+    .await;
+    let mut sender = h2_client::<Full<Bytes>>(proxy, &env.ca_path).await;
+
+    let payload = protobuf_string(1, "' OR '1'='1' -- <script>alert(1)</script>");
+    let mut body = grpc_frame(&payload).to_vec();
+    body.extend_from_slice(&grpc_frame(&protobuf_string(1, "second")));
+    let response = sender
+        .send_request(grpc_request(proxy, STREAM, Bytes::from(body)))
+        .await
+        .expect("streaming inspection response");
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "each streaming gRPC message must be content-inspected"
+    );
+    assert_eq!(
+        env.upstream_state.calls.load(Ordering::SeqCst),
+        0,
+        "a blocked first stream message must not reach the upstream"
     );
 }
 

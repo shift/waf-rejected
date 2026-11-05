@@ -75,8 +75,9 @@ cap and a 30 s deadline, and trailing headers are preserved. Responses without
 a `content-length`, and responses below the threshold, use the buffered path.
 
 Response bodies are not WAF-inspected in either mode; request bodies are still
-fully inspected before forwarding (streaming gRPC remains the documented
-transport-only exception).
+fully inspected before forwarding. Streaming gRPC is rejected by default and,
+when explicitly set to `transport-only`, is inspected per message before each
+frame is forwarded.
 
 ## Benchmark
 

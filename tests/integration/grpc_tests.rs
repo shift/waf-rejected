@@ -346,6 +346,10 @@ async fn streaming_grpc_is_not_buffered_and_honours_the_byte_cap() {
     .await;
 
     let proxy = spawn_proxy(upstream, |config| {
+        // Streaming is rejected by default; this test covers the explicit
+        // transport-only opt-out and its byte cap.
+        config.server.grpc_streaming_policy =
+            waf_ingress::config::GrpcStreamingPolicy::TransportOnly;
         config.server.grpc_max_stream_bytes = 32;
         config.server.grpc_max_stream_seconds = 10;
     })

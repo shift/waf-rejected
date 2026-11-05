@@ -1148,6 +1148,26 @@ impl WafEngine {
         }
     }
 
+    /// Builds a per-message inspector for the incremental streaming path.
+    ///
+    /// Returns an inspector only when protocol-aware gRPC inspection is
+    /// enabled, so streaming relays keep working in builds without it. The
+    /// returned inspector borrows the request headers/method policy but owns
+    /// cloned state, so it can live inside the request body guard.
+    #[cfg(feature = "wasm-reactor")]
+    pub(crate) fn grpc_stream_frame_inspector(
+        &self,
+        request: &RequestContext,
+    ) -> Option<grpc::GrpcStreamFrameInspector> {
+        self.grpc_inspector.as_ref().map(|inspector| {
+            grpc::GrpcStreamFrameInspector::new(
+                inspector.clone(),
+                request.clone(),
+                self.fail_closed,
+            )
+        })
+    }
+
     /// Outcome of the gRPC protocol pre-check.
     ///
     /// Synchronous by design: its Coraza field-content scan is one of the

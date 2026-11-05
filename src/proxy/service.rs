@@ -46,7 +46,7 @@ use crate::proxy::framing::{
     validate_request_framing_for_version, validate_request_trailers, FramingVersion,
 };
 use crate::proxy::grpc_body::{
-    probe_grpc_body, GrpcBodyMode, GrpcProbeError, GrpcStreamGuard, PrefixedBody,
+    probe_grpc_body, GrpcBodyMode, GrpcProbeError, GrpcStreamError, GrpcStreamGuard, PrefixedBody,
 };
 use crate::proxy::telemetry::{RequestRejection, RequestTelemetry};
 use crate::proxy::websocket::WebSocketHandler;
@@ -682,8 +682,8 @@ impl WafProxyService {
         if config.server.grpc_streaming_policy == GrpcStreamingPolicy::TransportOnly {
             warn!(
                 "server.grpc_streaming_policy = \"transport-only\": genuinely streaming gRPC \
-                 RPCs are relayed without body inspection (header/URI rules still apply). \
-                 Set it to \"reject\" to refuse streaming RPCs."
+                 RPCs are permitted; every complete message is inspected incrementally \
+                 before forwarding. Set it to \"reject\" to refuse streaming RPCs."
             );
         }
 
@@ -1336,118 +1336,44 @@ impl WafProxyService {
         // gRPC-Web keeps the buffered path because its text framing is base64.
         if classification.is_grpc && !classification.is_grpc_web {
             let mut incoming = body.take().expect("request body");
+
+            // `transport-only` is an explicit opt-out from rejecting genuine
+            // streams. It is not an opt-out from inspection: every complete
+            // message is inspected incrementally before it is forwarded. The
+            // default policy is `reject`, which classifies the body first.
+            if state.config.server.grpc_streaming_policy == GrpcStreamingPolicy::TransportOnly {
+                return Ok(Self::handle_grpc_stream(
+                    parts,
+                    incoming,
+                    Bytes::new(),
+                    &state,
+                    start_time,
+                    http_version,
+                    client_ip,
+                    is_https,
+                    &telemetry,
+                )
+                .await);
+            }
+
             match probe_grpc_body(&mut incoming, max_body_size).await {
                 Ok(probe) => match probe.mode {
                     GrpcBodyMode::Unary => {
                         pre_read = Some((probe.prefix, probe.trailers));
                     }
                     GrpcBodyMode::Streaming => {
-                        let request_context = RequestContext::with_http_version(
-                            client_ip,
-                            parts.method.clone(),
-                            parts.uri.clone(),
-                            parts.headers.clone(),
-                            None,
-                            http_version.to_string(),
-                        );
-                        match state.waf_engine.evaluate_shared(&request_context).await {
-                            Decision::Allow => {}
-                            Decision::Block { status, reason } => {
-                                warn!(
-                                    "WAF blocked streaming gRPC request from {}: {} (status: {})",
-                                    client_ip, reason, status
-                                );
-                                telemetry.reject(RequestRejection::WafBlocked);
-                                state.metrics.record_blocked();
-                                state.metrics.record_request_duration(start_time.elapsed());
-                                if state.config.server.grpc_aware_rejections {
-                                    return Ok(Self::create_grpc_blocked_response(status, &reason));
-                                }
-                                return Ok(Self::create_blocked_response(status, &reason));
-                            }
-                            Decision::RateLimit { reason } => {
-                                warn!(
-                                    "WAF rate limited streaming gRPC request from {}: {}",
-                                    client_ip, reason
-                                );
-                                telemetry.reject(RequestRejection::WafRateLimited);
-                                state.metrics.record_rate_limited();
-                                state.metrics.record_blocked();
-                                state.metrics.record_request_duration(start_time.elapsed());
-                                return Ok(Self::create_rate_limit_response(&reason));
-                            }
-                        }
-
-                        if state.config.server.grpc_streaming_policy
-                            == crate::config::GrpcStreamingPolicy::Reject
-                        {
-                            let reason = "streaming gRPC rejected by server.grpc_streaming_policy = \"reject\"";
-                            warn!(
-                                "Rejecting streaming gRPC request from {}: {}",
-                                client_ip, reason
-                            );
-                            telemetry.reject(RequestRejection::WafBlocked);
-                            state.metrics.record_blocked();
-                            state.metrics.record_request_duration(start_time.elapsed());
-                            if state.config.server.grpc_aware_rejections {
-                                return Ok(Self::create_grpc_blocked_response(403, reason));
-                            }
-                            return Ok(Self::create_blocked_response(403, reason));
-                        }
-
-                        debug!(
-                            "Streaming gRPC request from {} forwarded without body inspection (transport-only)",
-                            client_ip
-                        );
-                        let encoding = parts
-                            .headers
-                            .get("grpc-encoding")
-                            .and_then(|value| value.to_str().ok());
-                        let max_duration =
-                            Duration::from_secs(state.config.server.grpc_max_stream_seconds);
-                        let guarded = match GrpcStreamGuard::new(
-                            PrefixedBody::new(probe.prefix, incoming),
-                            encoding,
-                            state.config.server.grpc_max_stream_bytes,
-                            state.config.server.grpc_max_stream_messages,
-                            state.config.server.grpc_max_decompressed_bytes,
-                            max_duration,
-                        ) {
-                            Ok(guarded) => guarded,
-                            Err(error) => {
-                                warn!(
-                                    "Rejecting streaming gRPC request from {}: {}",
-                                    client_ip, error
-                                );
-                                telemetry.reject(RequestRejection::InvalidFraming);
-                                state.metrics.record_blocked();
-                                state.metrics.record_request_duration(start_time.elapsed());
-                                if state.config.server.grpc_aware_rejections {
-                                    return Ok(Self::create_grpc_blocked_response(
-                                        400,
-                                        &error.to_string(),
-                                    ));
-                                }
-                                return Ok(Self::create_error_response(
-                                    StatusCode::BAD_REQUEST,
-                                    &error.to_string(),
-                                ));
-                            }
-                        };
-
-                        state.metrics.record_allowed();
-                        let response = Self::forward_grpc_stream(
+                        return Ok(Self::handle_grpc_stream(
                             parts,
-                            ProxyBody::Boxed(guarded.boxed()),
+                            incoming,
+                            probe.prefix,
                             &state,
                             start_time,
                             http_version,
                             client_ip,
                             is_https,
+                            &telemetry,
                         )
-                        .await;
-                        state.metrics.record_request_duration(start_time.elapsed());
-                        return Ok(response);
+                        .await);
                     }
                 },
                 Err(error) => {
@@ -2599,12 +2525,190 @@ impl WafProxyService {
             .header("x-content-type-options", "nosniff")
     }
 
-    /// Relay a streaming gRPC exchange without buffering either direction.
+    /// Prepare and relay a gRPC stream with incremental per-message inspection.
     ///
-    /// Streaming RPCs are transport-only: the request and response bodies are
-    /// forwarded frame by frame (including trailing headers) under
-    /// `server.grpc_max_stream_bytes` and `server.grpc_max_stream_seconds`.
-    /// No WAF body inspection is performed; only header/URI rules run.
+    /// Every complete length-prefixed message is inspected by the configured
+    /// `GrpcInspector` (including its field-content scan) before that frame is
+    /// forwarded. The first message is primed before the upstream request is
+    /// sent, so a blocked/oversized/malformed first frame produces a WAF
+    /// response instead of an upstream error. There is no timing-based
+    /// classification: delaying `END_STREAM` cannot skip inspection.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_grpc_stream(
+        parts: hyper::http::request::Parts,
+        incoming: Incoming,
+        prefix: Bytes,
+        state: &ProxyState,
+        start_time: Instant,
+        http_version: &str,
+        client_ip: IpAddr,
+        is_https: bool,
+        telemetry: &RequestTelemetry,
+    ) -> Response<ProxyBody> {
+        let request_context = RequestContext::with_http_version(
+            client_ip,
+            parts.method.clone(),
+            parts.uri.clone(),
+            parts.headers.clone(),
+            None,
+            http_version.to_string(),
+        );
+
+        // Header/URI rules (including method allowlist and rate limits) still
+        // run before any body bytes are forwarded.
+        match state.waf_engine.evaluate_shared(&request_context).await {
+            Decision::Allow => {}
+            Decision::Block { status, reason } => {
+                warn!(
+                    "WAF blocked streaming gRPC request from {}: {} (status: {})",
+                    client_ip, reason, status
+                );
+                telemetry.reject(RequestRejection::WafBlocked);
+                state.metrics.record_blocked();
+                state.metrics.record_request_duration(start_time.elapsed());
+                if state.config.server.grpc_aware_rejections {
+                    return Self::create_grpc_blocked_response(status, &reason);
+                }
+                return Self::create_blocked_response(status, &reason);
+            }
+            Decision::RateLimit { reason } => {
+                warn!(
+                    "WAF rate limited streaming gRPC request from {}: {}",
+                    client_ip, reason
+                );
+                telemetry.reject(RequestRejection::WafRateLimited);
+                state.metrics.record_rate_limited();
+                state.metrics.record_blocked();
+                state.metrics.record_request_duration(start_time.elapsed());
+                return Self::create_rate_limit_response(&reason);
+            }
+        }
+
+        if state.config.server.grpc_streaming_policy == GrpcStreamingPolicy::Reject {
+            let reason = "streaming gRPC rejected by server.grpc_streaming_policy = \"reject\"";
+            warn!(
+                "Rejecting streaming gRPC request from {}: {}",
+                client_ip, reason
+            );
+            telemetry.reject(RequestRejection::WafBlocked);
+            state.metrics.record_blocked();
+            state.metrics.record_request_duration(start_time.elapsed());
+            if state.config.server.grpc_aware_rejections {
+                return Self::create_grpc_blocked_response(403, reason);
+            }
+            return Self::create_blocked_response(403, reason);
+        }
+
+        debug!(
+            "Streaming gRPC request from {} inspected incrementally (transport-only)",
+            client_ip
+        );
+        let encoding = parts
+            .headers
+            .get("grpc-encoding")
+            .and_then(|value| value.to_str().ok());
+        let max_duration = Duration::from_secs(state.config.server.grpc_max_stream_seconds);
+        let mut guarded = match GrpcStreamGuard::new(
+            PrefixedBody::new(prefix, incoming),
+            encoding,
+            state.config.server.grpc_max_stream_bytes,
+            state.config.server.grpc_max_stream_messages,
+            state.config.server.grpc_max_decompressed_bytes,
+            max_duration,
+        ) {
+            Ok(guarded) => guarded,
+            Err(error) => {
+                warn!(
+                    "Rejecting streaming gRPC request from {}: {}",
+                    client_ip, error
+                );
+                telemetry.reject(RequestRejection::InvalidFraming);
+                state.metrics.record_blocked();
+                state.metrics.record_request_duration(start_time.elapsed());
+                if state.config.server.grpc_aware_rejections {
+                    return Self::create_grpc_blocked_response(400, &error.to_string());
+                }
+                return Self::create_error_response(StatusCode::BAD_REQUEST, &error.to_string());
+            }
+        };
+        guarded = guarded.with_max_message_bytes(state.config.waf.grpc.max_message_bytes);
+        if let Some(inspector) = state
+            .waf_engine
+            .grpc_stream_frame_inspector(&request_context)
+        {
+            guarded = guarded.with_inspector(Arc::new(inspector));
+        }
+
+        let prime_timeout = Duration::from_secs(state.config.server.request_timeout_secs.max(1));
+        match tokio::time::timeout(prime_timeout, guarded.prime()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                let (status, rejection) = match &error {
+                    GrpcStreamError::InspectionBlocked { status, .. } => {
+                        (*status, RequestRejection::WafBlocked)
+                    }
+                    GrpcStreamError::MessageTooLarge { .. }
+                    | GrpcStreamError::BytesExceeded { .. }
+                    | GrpcStreamError::DecompressedExceeded { .. } => (
+                        StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+                        RequestRejection::BodyTooLarge,
+                    ),
+                    GrpcStreamError::DurationExceeded { .. } => (
+                        StatusCode::REQUEST_TIMEOUT.as_u16(),
+                        RequestRejection::BodyTimeout,
+                    ),
+                    _ => (
+                        StatusCode::BAD_REQUEST.as_u16(),
+                        RequestRejection::InvalidFraming,
+                    ),
+                };
+                warn!(
+                    "Rejecting streaming gRPC request from {}: {}",
+                    client_ip, error
+                );
+                telemetry.reject(rejection);
+                state.metrics.record_blocked();
+                state.metrics.record_request_duration(start_time.elapsed());
+                if state.config.server.grpc_aware_rejections {
+                    return Self::create_grpc_blocked_response(status, &error.to_string());
+                }
+                return Self::create_error_response(
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+                    &error.to_string(),
+                );
+            }
+            Err(_) => {
+                warn!("gRPC stream prime timed out for {}", client_ip);
+                telemetry.reject(RequestRejection::BodyTimeout);
+                state.metrics.record_blocked();
+                state.metrics.record_request_duration(start_time.elapsed());
+                return Self::create_error_response(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "gRPC request body timeout",
+                );
+            }
+        }
+
+        state.metrics.record_allowed();
+        let response = Self::forward_grpc_stream(
+            parts,
+            ProxyBody::Boxed(guarded.boxed()),
+            state,
+            start_time,
+            http_version,
+            client_ip,
+            is_https,
+        )
+        .await;
+        state.metrics.record_request_duration(start_time.elapsed());
+        response
+    }
+
+    /// Relay a gRPC stream prepared by [`Self::handle_grpc_stream`].
+    ///
+    /// The request and response bodies are forwarded frame by frame (including
+    /// trailing headers) under `server.grpc_max_stream_bytes` and
+    /// `server.grpc_max_stream_seconds`.
     #[allow(clippy::too_many_arguments)]
     async fn forward_grpc_stream(
         parts: hyper::http::request::Parts,

@@ -348,11 +348,19 @@ impl Default for WebSocketConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum GrpcStreamingPolicy {
-    /// Relay the stream without body inspection. Header/URI rules still run.
-    /// This is the compatibility default and logs a start-up warning.
-    #[default]
+    /// Explicit opt-out from rejecting genuine streams.
+    ///
+    /// Every complete gRPC message is still inspected incrementally before it
+    /// is forwarded; the policy only permits the stream to continue. It logs a
+    /// start-up warning because streaming remains a larger attack surface than
+    /// buffered unary inspection.
     TransportOnly,
-    /// Reject streaming RPCs with a clear 4xx / gRPC status.
+    /// Reject genuine streaming RPCs with a clear 4xx / gRPC status.
+    ///
+    /// This is the default: a body must end after exactly one complete
+    /// message to be accepted as unary. Delaying `END_STREAM` cannot force the
+    /// request onto the streaming path.
+    #[default]
     Reject,
 }
 
@@ -425,11 +433,12 @@ pub struct ServerConfig {
     pub grpc_max_decompressed_bytes: usize,
 
     /// Policy for genuinely streaming gRPC RPCs (more than one request
-    /// message, or a request body that is not a single complete message).
+    /// message, or additional bytes after the first complete message).
     ///
-    /// `transport-only` (default) relays the stream without body inspection
-    /// and logs a start-up warning. `reject` refuses the RPC with a clear
-    /// 4xx / gRPC status. Unary RPCs are always inspected.
+    /// `reject` (default) refuses the RPC with a clear 4xx / gRPC status.
+    /// `transport-only` is an explicit opt-out that permits the stream, but
+    /// every complete message is still inspected incrementally before it is
+    /// forwarded. Unary RPCs are always buffered and inspected.
     pub grpc_streaming_policy: GrpcStreamingPolicy,
 
     /// Return gRPC-native rejection responses for blocked gRPC requests.
@@ -1981,7 +1990,7 @@ impl Default for ServerConfig {
             grpc_max_stream_seconds: 300,
             grpc_max_stream_messages: 1024,
             grpc_max_decompressed_bytes: 10 * 1024 * 1024, // 10MiB
-            grpc_streaming_policy: GrpcStreamingPolicy::TransportOnly,
+            grpc_streaming_policy: GrpcStreamingPolicy::Reject,
             grpc_aware_rejections: false,
             tls: TlsConfig::default(),
             http2: Http2TuningConfig::default(),
@@ -3151,6 +3160,16 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
         config.server.websocket.max_frame_bytes = 1024;
         config.server.websocket.max_message_bytes = 2048;
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn grpc_streaming_policy_defaults_to_reject() {
+        let config = Config::default();
+        assert_eq!(
+            config.server.grpc_streaming_policy,
+            GrpcStreamingPolicy::Reject,
+            "streaming gRPC must be rejected unless the operator explicitly opts into transport-only"
+        );
     }
 
     #[test]

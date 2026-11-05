@@ -7,14 +7,18 @@
 //!
 //! * exactly one complete message followed by end-of-stream (or trailers) is
 //!   unary and is buffered for inspection;
-//! * a second message, or a complete first message with the stream still open,
+//! * a second message, or additional bytes after the first complete message,
 //!   is genuinely streaming.
 //!
-//! Streaming bodies are relayed through [`GrpcStreamGuard`], which enforces
-//! total bytes, message count, duration and bounded gzip decompression across
-//! the whole exchange.
+//! Classification never uses a timer: a client cannot force a unary RPC onto
+//! the streaming path by delaying `END_STREAM`. Streaming bodies are relayed
+//! through [`GrpcStreamGuard`], which inspects every complete message before
+//! forwarding it and enforces total bytes, message count, duration,
+//! per-message size and bounded gzip decompression across the whole exchange.
 
+use std::collections::VecDeque;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -23,12 +27,7 @@ use http_body_util::BodyExt;
 use hyper::body::{Body, Frame};
 use hyper::HeaderMap;
 
-use crate::waf::grpc::{decompress_gzip, FRAME_PREFIX_LEN};
-
-/// How long to wait for the next frame before treating an open stream as
-/// genuinely streaming. Unary bodies end their stream on the final data frame,
-/// so this only delays the first frame of a real stream.
-const STREAM_DETECTION_GRACE: Duration = Duration::from_millis(25);
+use crate::waf::grpc::{decompress_gzip, GrpcFrameInspector, FRAME_PREFIX_LEN};
 
 /// Classification of a gRPC request body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,8 +131,11 @@ where
                 });
             }
 
-            match tokio::time::timeout(STREAM_DETECTION_GRACE, BodyExt::frame(&mut *body)).await {
-                Ok(Some(Ok(frame))) => match frame.into_data() {
+            // Wait for the next frame without a timeout. A unary client that
+            // delays END_STREAM remains unary; only new bytes after the first
+            // complete message make the body genuinely streaming.
+            match BodyExt::frame(&mut *body).await {
+                Some(Ok(frame)) => match frame.into_data() {
                     Ok(data) => {
                         // HTTP/2 peers may terminate a unary body with an
                         // empty DATA frame carrying END_STREAM. An empty frame
@@ -162,19 +164,12 @@ where
                         });
                     }
                 },
-                Ok(Some(Err(error))) => return Err(GrpcProbeError::Read(error.to_string())),
-                Ok(None) => {
+                Some(Err(error)) => return Err(GrpcProbeError::Read(error.to_string())),
+                None => {
                     return Ok(GrpcProbe {
                         mode: GrpcBodyMode::Unary,
                         prefix: buffer.freeze(),
                         trailers,
-                    })
-                }
-                Err(_) => {
-                    return Ok(GrpcProbe {
-                        mode: GrpcBodyMode::Streaming,
-                        prefix: buffer.freeze(),
-                        trailers: None,
                     })
                 }
             }
@@ -282,11 +277,13 @@ where
 #[derive(Debug)]
 pub(crate) enum GrpcStreamError {
     BytesExceeded { limit: usize },
+    MessageTooLarge { limit: usize },
     MessagesExceeded { limit: usize },
     DurationExceeded { seconds: u64 },
     DecompressedExceeded { limit: usize },
     UnsupportedEncoding(String),
     Malformed(String),
+    InspectionBlocked { status: u16, reason: String },
 }
 
 impl std::fmt::Display for GrpcStreamError {
@@ -294,6 +291,9 @@ impl std::fmt::Display for GrpcStreamError {
         match self {
             Self::BytesExceeded { limit } => {
                 write!(f, "gRPC stream exceeds the {limit}-byte limit")
+            }
+            Self::MessageTooLarge { limit } => {
+                write!(f, "gRPC message exceeds the {limit}-byte limit")
             }
             Self::MessagesExceeded { limit } => {
                 write!(f, "gRPC stream exceeds the {limit}-message limit")
@@ -308,6 +308,9 @@ impl std::fmt::Display for GrpcStreamError {
                 write!(f, "unsupported grpc-encoding '{encoding}'")
             }
             Self::Malformed(reason) => write!(f, "malformed gRPC stream: {reason}"),
+            Self::InspectionBlocked { status, reason } => {
+                write!(f, "gRPC message blocked by inspection ({status}): {reason}")
+            }
         }
     }
 }
@@ -323,14 +326,19 @@ pub(crate) struct GrpcStreamGuard<B> {
     inner: B,
     encoding: GrpcEncoding,
     max_bytes: usize,
+    max_message_bytes: usize,
     max_messages: usize,
     max_decompressed: usize,
     max_seconds: u64,
     deadline: Pin<Box<tokio::time::Sleep>>,
     pending: BytesMut,
+    ready: VecDeque<Bytes>,
+    pending_trailers: Option<HeaderMap>,
+    inner_done: bool,
     total_bytes: usize,
     total_decompressed: usize,
     messages: usize,
+    inspector: Option<Arc<dyn GrpcFrameInspector>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,7 +347,10 @@ enum GrpcEncoding {
     Gzip,
 }
 
-impl<B> GrpcStreamGuard<B> {
+impl<B> GrpcStreamGuard<B>
+where
+    B: Body<Data = Bytes> + Unpin,
+{
     pub(crate) fn new(
         inner: B,
         encoding: Option<&str>,
@@ -358,15 +369,46 @@ impl<B> GrpcStreamGuard<B> {
             inner,
             encoding,
             max_bytes,
+            max_message_bytes: max_bytes,
             max_messages,
             max_decompressed,
             max_seconds: max_duration.as_secs(),
             deadline: Box::pin(tokio::time::sleep(max_duration)),
             pending: BytesMut::new(),
+            ready: VecDeque::new(),
+            pending_trailers: None,
+            inner_done: false,
             total_bytes: 0,
             total_decompressed: 0,
             messages: 0,
+            inspector: None,
         })
+    }
+
+    /// Attaches the per-message protocol inspector. The guard calls it for
+    /// every complete frame before making that frame visible to the upstream.
+    pub(crate) fn with_inspector(mut self, inspector: Arc<dyn GrpcFrameInspector>) -> Self {
+        self.inspector = Some(inspector);
+        self
+    }
+
+    /// Caps the declared size of one length-prefixed message.
+    pub(crate) fn with_max_message_bytes(mut self, max_message_bytes: usize) -> Self {
+        if max_message_bytes > 0 {
+            self.max_message_bytes = max_message_bytes;
+        }
+        self
+    }
+
+    fn push_data(&mut self, data: &[u8]) -> Result<(), GrpcStreamError> {
+        self.total_bytes = self.total_bytes.saturating_add(data.len());
+        if self.total_bytes > self.max_bytes {
+            return Err(GrpcStreamError::BytesExceeded {
+                limit: self.max_bytes,
+            });
+        }
+        self.pending.extend_from_slice(data);
+        Ok(())
     }
 
     fn validate_frame(&mut self) -> Result<Option<Bytes>, GrpcStreamError> {
@@ -389,6 +431,11 @@ impl<B> GrpcStreamGuard<B> {
             return Err(GrpcStreamError::Malformed(format!(
                 "invalid message length {length}"
             )));
+        }
+        if length as usize > self.max_message_bytes {
+            return Err(GrpcStreamError::MessageTooLarge {
+                limit: self.max_message_bytes,
+            });
         }
         let end = FRAME_PREFIX_LEN + length as usize;
         if self.pending.len() < end {
@@ -435,7 +482,75 @@ impl<B> GrpcStreamGuard<B> {
                 limit: self.max_messages,
             });
         }
+        if let Some(inspector) = self.inspector.as_deref() {
+            inspector.inspect_frame(&frame).map_err(|block| {
+                GrpcStreamError::InspectionBlocked {
+                    status: block.status,
+                    reason: block.reason,
+                }
+            })?;
+        }
         Ok(Some(frame))
+    }
+
+    /// Reads and inspects the first complete message before the upstream
+    /// request is sent.
+    ///
+    /// This lets a blocked first message produce a WAF `4xx` (rather than a
+    /// generic upstream error), while later messages are still inspected
+    /// incrementally as they arrive. It also removes any timing-based
+    /// classification: a client that delays `END_STREAM` after a complete
+    /// message is inspected exactly like any other.
+    pub(crate) async fn prime(&mut self) -> Result<(), GrpcStreamError>
+    where
+        B: Body<Data = Bytes> + Unpin,
+        B::Error: std::fmt::Display,
+    {
+        loop {
+            if !self.ready.is_empty() || self.inner_done {
+                return Ok(());
+            }
+            if let Some(frame) = self.validate_frame()? {
+                self.ready.push_back(frame);
+                return Ok(());
+            }
+            match BodyExt::frame(&mut self.inner).await {
+                Some(Ok(frame)) => match frame.into_data() {
+                    Ok(data) => {
+                        if data.is_empty() {
+                            continue;
+                        }
+                        self.push_data(&data)?;
+                    }
+                    Err(frame) => {
+                        if let Ok(block) = frame.into_trailers() {
+                            if !self.pending.is_empty() {
+                                return Err(GrpcStreamError::Malformed(
+                                    "trailers after a truncated gRPC frame".to_string(),
+                                ));
+                            }
+                            self.pending_trailers = Some(block);
+                            self.inner_done = true;
+                            return Ok(());
+                        }
+                    }
+                },
+                Some(Err(error)) => {
+                    return Err(GrpcStreamError::Malformed(format!(
+                        "failed to read gRPC frame: {error}"
+                    )))
+                }
+                None => {
+                    self.inner_done = true;
+                    if !self.pending.is_empty() {
+                        return Err(GrpcStreamError::Malformed(
+                            "truncated gRPC frame at end of stream".to_string(),
+                        ));
+                    }
+                    return Ok(());
+                }
+            }
+        }
     }
 }
 
@@ -458,6 +573,10 @@ where
             }))));
         }
 
+        if let Some(frame) = this.ready.pop_front() {
+            return Poll::Ready(Some(Ok(Frame::data(frame))));
+        }
+
         loop {
             match this.validate_frame() {
                 Ok(Some(frame)) => return Poll::Ready(Some(Ok(Frame::data(frame)))),
@@ -465,18 +584,24 @@ where
                 Err(error) => return Poll::Ready(Some(Err(Box::new(error)))),
             }
 
+            if this.inner_done {
+                if let Some(trailers) = this.pending_trailers.take() {
+                    return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+                }
+                if this.pending.is_empty() {
+                    return Poll::Ready(None);
+                }
+                return Poll::Ready(Some(Err(Box::new(GrpcStreamError::Malformed(
+                    "truncated gRPC frame at end of stream".to_string(),
+                )))));
+            }
+
             match Pin::new(&mut this.inner).poll_frame(cx) {
                 Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
                     Ok(data) => {
-                        this.total_bytes = this.total_bytes.saturating_add(data.len());
-                        if this.total_bytes > this.max_bytes {
-                            return Poll::Ready(Some(Err(Box::new(
-                                GrpcStreamError::BytesExceeded {
-                                    limit: this.max_bytes,
-                                },
-                            ))));
+                        if let Err(error) = this.push_data(&data) {
+                            return Poll::Ready(Some(Err(Box::new(error))));
                         }
-                        this.pending.extend_from_slice(&data);
                     }
                     Err(frame) => {
                         if let Ok(block) = frame.into_trailers() {
@@ -487,18 +612,14 @@ where
                                     ),
                                 ))));
                             }
-                            return Poll::Ready(Some(Ok(Frame::trailers(block))));
+                            this.inner_done = true;
+                            this.pending_trailers = Some(block);
                         }
                     }
                 },
                 Poll::Ready(Some(Err(error))) => return Poll::Ready(Some(Err(error.into()))),
                 Poll::Ready(None) => {
-                    if this.pending.is_empty() {
-                        return Poll::Ready(None);
-                    }
-                    return Poll::Ready(Some(Err(Box::new(GrpcStreamError::Malformed(
-                        "truncated gRPC frame at end of stream".to_string(),
-                    )))));
+                    this.inner_done = true;
                 }
                 Poll::Pending => return Poll::Pending,
             }
@@ -509,6 +630,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::waf::grpc::GrpcFrameBlock;
     use http_body_util::Full;
 
     fn frame(payload: &[u8]) -> Vec<u8> {
@@ -578,6 +700,115 @@ mod tests {
         };
         let probe = probe_grpc_body(&mut body, 1024).await.unwrap();
         assert_eq!(probe.mode, GrpcBodyMode::Streaming);
+    }
+
+    /// A body that yields one complete message, then applies a delay before
+    /// ending the stream. This models a client trying to exceed a probe
+    /// window; classification must not depend on elapsed time.
+    struct DelayedEndAfterFirst {
+        first: Option<Bytes>,
+        delay: Pin<Box<tokio::time::Sleep>>,
+        ended: bool,
+    }
+
+    impl Body for DelayedEndAfterFirst {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            let this = self.get_mut();
+            if let Some(first) = this.first.take() {
+                return Poll::Ready(Some(Ok(Frame::data(first))));
+            }
+            if !this.ended {
+                if std::future::Future::poll(this.delay.as_mut(), cx).is_pending() {
+                    return Poll::Pending;
+                }
+                this.ended = true;
+                return Poll::Ready(Some(Ok(Frame::data(Bytes::new()))));
+            }
+            Poll::Ready(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn unary_rpc_with_delayed_end_stream_is_not_forced_into_streaming() {
+        let mut body = DelayedEndAfterFirst {
+            first: Some(Bytes::from(frame(b"hello"))),
+            delay: Box::pin(tokio::time::sleep(Duration::from_millis(75))),
+            ended: false,
+        };
+        let probe = probe_grpc_body(&mut body, 1024).await.unwrap();
+        assert_eq!(
+            probe.mode,
+            GrpcBodyMode::Unary,
+            "a single complete frame must stay unary even when END_STREAM is delayed"
+        );
+        assert_eq!(probe.prefix, Bytes::from(frame(b"hello")));
+    }
+
+    struct RecordingInspector {
+        inspected: std::sync::Mutex<Vec<Bytes>>,
+        block_first: bool,
+    }
+
+    impl GrpcFrameInspector for RecordingInspector {
+        fn inspect_frame(&self, frame: &[u8]) -> Result<(), GrpcFrameBlock> {
+            let mut inspected = self.inspected.lock().unwrap();
+            inspected.push(Bytes::copy_from_slice(frame));
+            if self.block_first && inspected.len() == 1 {
+                return Err(GrpcFrameBlock {
+                    status: 403,
+                    reason: "blocked by test inspector".to_string(),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn guard_inspects_every_message_before_forwarding() {
+        let inspector = Arc::new(RecordingInspector {
+            inspected: std::sync::Mutex::new(Vec::new()),
+            block_first: false,
+        });
+        let body = Full::new(Bytes::from([frame(b"one"), frame(b"two")].concat()));
+        let guard = GrpcStreamGuard::new(body, None, 1024, 10, 1024, Duration::from_secs(30))
+            .unwrap()
+            .with_inspector(inspector.clone());
+        let forwarded = collect(guard).await.unwrap();
+        assert_eq!(forwarded, [frame(b"one"), frame(b"two")].concat());
+        assert_eq!(inspector.inspected.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn guard_prime_blocks_before_forwarding() {
+        let inspector = Arc::new(RecordingInspector {
+            inspected: std::sync::Mutex::new(Vec::new()),
+            block_first: true,
+        });
+        let body = Full::new(Bytes::from([frame(b"bad"), frame(b"worse")].concat()));
+        let mut guard = GrpcStreamGuard::new(body, None, 1024, 10, 1024, Duration::from_secs(30))
+            .unwrap()
+            .with_inspector(inspector);
+        let error = guard.prime().await.unwrap_err();
+        assert!(matches!(
+            error,
+            GrpcStreamError::InspectionBlocked { status: 403, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn guard_enforces_per_message_size() {
+        let body = Full::new(Bytes::from(frame(b"hello")));
+        let guard = GrpcStreamGuard::new(body, None, 1024, 10, 1024, Duration::from_secs(30))
+            .unwrap()
+            .with_max_message_bytes(2);
+        let error = collect(guard).await.unwrap_err();
+        assert!(error.contains("2-byte limit"), "{error}");
     }
 
     #[test]

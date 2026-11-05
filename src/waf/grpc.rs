@@ -999,6 +999,75 @@ impl GrpcInspector {
     }
 }
 
+/// A frame rejected by incremental streaming inspection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrpcFrameBlock {
+    /// HTTP status the proxy should use for the rejection.
+    pub status: u16,
+    /// Human-readable reason, also used for the gRPC `grpc-message` trailer.
+    pub reason: String,
+}
+
+/// Per-message inspector used by the streaming gRPC body guard.
+///
+/// Implementations are synchronous by design: the existing `GrpcInspector`
+/// (including its direct Coraza field-content scan) is synchronous. The guard
+/// calls this once for every complete length-prefixed message *before* the
+/// frame is forwarded upstream.
+pub trait GrpcFrameInspector: Send + Sync {
+    fn inspect_frame(&self, frame: &[u8]) -> Result<(), GrpcFrameBlock>;
+}
+
+/// A [`GrpcFrameInspector`] backed by the configured protocol-aware inspector.
+///
+/// Each frame is evaluated independently against the same request headers and
+/// method policy. Structural limits, descriptor field checks and the synthetic
+/// content scan therefore run for every message in a stream, not just for
+/// buffered unary requests.
+#[derive(Clone)]
+pub struct GrpcStreamFrameInspector {
+    inspector: GrpcInspector,
+    context: RequestContext,
+    fail_closed: bool,
+}
+
+impl GrpcStreamFrameInspector {
+    /// Builds a per-message inspector from the request template and policy.
+    pub fn new(inspector: GrpcInspector, context: RequestContext, fail_closed: bool) -> Self {
+        Self {
+            inspector,
+            context,
+            fail_closed,
+        }
+    }
+}
+
+impl GrpcFrameInspector for GrpcStreamFrameInspector {
+    fn inspect_frame(&self, frame: &[u8]) -> Result<(), GrpcFrameBlock> {
+        let mut context = self.context.clone();
+        context.body_size = Some(frame.len());
+        context.body = Some(bytes::Bytes::copy_from_slice(frame));
+        match self.inspector.inspect(&context) {
+            Ok(GrpcVerdict::Allow { .. }) => Ok(()),
+            Ok(GrpcVerdict::Block { status, reason }) => Err(GrpcFrameBlock { status, reason }),
+            Err(error) => {
+                if self.fail_closed {
+                    Err(GrpcFrameBlock {
+                        status: 503,
+                        reason: format!("gRPC inspection unavailable: {error}"),
+                    })
+                } else {
+                    debug!(
+                        error = %error,
+                        "gRPC frame inspection failed; continuing because fail_mode is open"
+                    );
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
 /// Percent-encodes a field value for `application/x-www-form-urlencoded`.
 fn form_encode(value: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";

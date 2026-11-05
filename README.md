@@ -25,9 +25,9 @@ the reference oracle and an explicit `waf.coraza.backend = "wasm"` switch-back.
 - URI, query-string, header and **request-body** inspection.
 - Protocol-aware gRPC (frame/field validation, method allowlists, bounded
   decoded-field content scan) and GraphQL-over-HTTP inspection. Unary RPCs are
-  fully inspected, including bodies without `content-length`; genuinely
-  streaming RPCs follow `server.grpc_streaming_policy` (`transport-only`
-  default, or `reject`).
+  fully inspected, including bodies without `content-length` and delayed
+  `END_STREAM`; genuinely streaming RPCs follow `server.grpc_streaming_policy`
+  (`reject` default, or explicit `transport-only` with per-message inspection).
 - Bounded `gzip`, `deflate` and `br` request decompression before WAF
   inspection, capped at `server.max_body_size`.
 - Request-framing validation (CL/TE ambiguity, duplicate/conflicting lengths)

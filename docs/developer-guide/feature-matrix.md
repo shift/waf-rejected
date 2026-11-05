@@ -97,8 +97,8 @@ heuristic module that compiles and is exercised by the library tests.
 | Unary gRPC with `content-length` | One complete frame | Yes | Buffered up to `server.max_body_size` |
 | Unary gRPC without `content-length` (HTTP/2) | One complete frame + end-of-stream/trailers | Yes | The P0 gap: no longer inferred from HTTP framing |
 | gRPC-Web binary/text | Buffered | Yes | Text framing is base64-decoded before frame validation |
-| Streaming, `grpc_streaming_policy = "transport-only"` | More than one frame / open stream | No (explicit policy) | Start-up warning; header/URI rules still run |
-| Streaming, `grpc_streaming_policy = "reject"` | More than one frame / open stream | N/A | `403` or `grpc-status: 7`; upstream not called |
+| Streaming, `grpc_streaming_policy = "transport-only"` | More than one frame / additional bytes after the first complete message | Yes, per message | Explicit opt-out; every message inspected before forwarding; start-up warning |
+| Streaming, `grpc_streaming_policy = "reject"` (default) | More than one frame / additional bytes after the first complete message | N/A | `403` or `grpc-status: 7`; upstream not called |
 | `grpc-encoding: gzip` | Any | Yes | Bounded by `waf.grpc.max_decompressed_bytes`; original bytes forwarded |
 | Unsupported `grpc-encoding` | Any | N/A | `400` |
 

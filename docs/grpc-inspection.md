@@ -237,23 +237,28 @@ Do not hand-maintain `method_allowlist`. Generate it from the protobuf
 * gRPC-Web text bodies are decoded here for validation; the transport/decoding
   branch owns the request path for binary-safe frames.
 * Unary vs streaming is classified from the actual frame sequence, not from
-  `content-length`. A unary RPC without `content-length` (normal over HTTP/2)
-  is buffered up to `server.max_body_size` and fully inspected.
+  `content-length` and not from a timeout. A unary RPC without `content-length`
+  (normal over HTTP/2) is buffered up to `server.max_body_size` and fully
+  inspected. Delaying `END_STREAM` after the single complete message does not
+  move the request onto the streaming path.
 * Genuinely streaming RPCs are governed by
-  `server.grpc_streaming_policy`. The default `transport-only` relays the
-  stream without body inspection and logs a start-up warning; `reject` refuses
-  it with a clear 4xx / gRPC status. This is an explicit residual risk, not a
-  silent bypass. See
-  [gRPC transport](architecture/grpc-transport.md#streaming-rpcs).
+  `server.grpc_streaming_policy`. The default `reject` refuses them with a
+  clear 4xx / gRPC status. `transport-only` is an explicit opt-out that permits
+  the stream, but every complete message is still inspected incrementally
+  (envelope, descriptor fields and field-content scan) before it is forwarded.
+  See [gRPC transport](architecture/grpc-transport.md#streaming-rpcs).
 
 ## Tests
 
 `src/proxy/grpc_body.rs` covers frame-sequence classification (a unary message
-followed by an empty HTTP/2 DATA frame is still unary; a second message is
-streaming), whole-stream byte/message limits, malformed frames, and bounded
-gzip expansion. `tests/integration/grpc_h2_e2e.rs` covers a unary RPC without
-`content-length` being blocked for SQLi/XSS, both streaming policies, and
-malformed/oversized frames over real HTTP/2. `src/waf/grpc.rs` covers
+followed by an empty HTTP/2 DATA frame is still unary; a delayed `END_STREAM`
+stays unary; a second message is streaming), per-message inspection before
+forwarding, whole-stream byte/message limits, per-message size, malformed
+frames, and bounded gzip expansion. `tests/integration/grpc_h2_e2e.rs` covers a
+unary RPC without `content-length` being blocked for SQLi/XSS, a delayed
+`END_STREAM` unary being inspected, streaming messages being inspected under
+`transport-only`, both streaming policies, and malformed frames over real
+HTTP/2. `src/waf/grpc.rs` covers
 content-type detection, method-path parsing, valid,
 truncated, oversized, negative-length and wrong-compressed-flag frames,
 allowlist allow/block/monitor behaviour, base64 `-bin` metadata and text

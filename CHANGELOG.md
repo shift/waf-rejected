@@ -11,12 +11,16 @@ All notable changes to WAF-Rejected are documented here.
   inspection. Unary vs streaming is now derived from the actual length-prefixed
   frame sequence, and unary bodies without `content-length` are buffered up to
   `server.max_body_size` and fully inspected (including field content scans).
-- Added `server.grpc_streaming_policy` (`transport-only` default, `reject`) for
-  genuinely streaming RPCs. `transport-only` logs a start-up warning and is
-  documented as no-body-inspection; `reject` returns a clear 4xx / gRPC status.
-- Streaming gRPC now enforces whole-stream limits: total bytes, message count,
-  duration, and bounded `identity`/`gzip` decompression. Unsupported encodings
-  are rejected. See `docs/grpc-inspection.md` and
+- Fixed a high-severity gRPC bypass (H1): a unary RPC could be forced onto the
+  streaming path by delaying `END_STREAM` beyond the old 25 ms probe window.
+  Classification is now timer-free; a second message is the only streaming
+  signal. Delayed unary bodies are buffered and inspected normally.
+- `server.grpc_streaming_policy` now defaults to `reject`. `transport-only` is
+  an explicit operator opt-out, not a silent bypass: every complete streaming
+  message is inspected incrementally (envelope, descriptor fields and
+  field-content scan) before that frame is forwarded. Whole-stream limits
+  (bytes, messages, duration, per-message size) and bounded gzip decompression
+  still apply. See `docs/grpc-inspection.md` and
   `docs/architecture/grpc-transport.md`.
 
 - Bounded HTTP/3 request admission: `server.h3_max_inflight_requests`

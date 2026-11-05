@@ -27,17 +27,20 @@ gRPC code path while keeping them subject to WAF inspection.
 ## Unary RPCs
 
 Unary vs streaming is classified from the **actual gRPC frame sequence**, not
-from HTTP framing. HTTP/2 does not require `content-length`, so a unary RPC
-without one is still unary. `probe_grpc_body()` reads the first length-prefixed
-message and checks whether the stream ends (or carries trailers) after it:
+from HTTP framing and never from a timer. HTTP/2 does not require
+`content-length`, so a unary RPC without one is still unary.
+`probe_grpc_body()` reads the first length-prefixed message and waits for the
+next frame (or end-of-stream/trailers) without a timeout:
 
 * exactly one complete message, then end-of-stream or trailers: **unary**;
-* a second message, or a complete first message with the stream still open:
+* a second message, or additional bytes after the first complete message:
   **streaming**.
 
-A unary body is buffered (subject to `server.max_body_size`), inspected by the
-WAF, and forwarded. This includes unary gRPC over HTTP/2 with no
-`content-length`; it is never silently forwarded uninspected.
+A client that delays `END_STREAM` after one complete message therefore remains
+unary; the delay cannot force the request onto the streaming path. A unary body
+is buffered (subject to `server.max_body_size`), inspected by the WAF, and
+forwarded. This includes unary gRPC over HTTP/2 with no `content-length`; it is
+never silently forwarded uninspected.
 
 Trailing headers are HTTP body frames (`Frame::trailers`) in hyper 1.x, not
 request/response parts. The unary path therefore:
@@ -58,15 +61,21 @@ followed by an open stream) is controlled by
 
 | Value | Behaviour |
 | --- | --- |
-| `transport-only` (default) | Relay the stream frame by frame without body inspection. Header/URI rules still run. A start-up warning is logged. |
-| `reject` | Refuse the RPC with `403` (or a gRPC-aware rejection with `grpc-status: 7` when `server.grpc_aware_rejections = true`). |
+| `reject` (default) | Refuse the RPC with `403` (or a gRPC-aware rejection with `grpc-status: 7` when `server.grpc_aware_rejections = true`). |
+| `transport-only` | Explicit opt-out from rejecting the stream. Relay it frame by frame, but inspect every complete message (envelope, descriptor fields and field-content scan) before forwarding that frame. A start-up warning is logged. |
 
-`transport-only` is a compatibility default, not a silent bypass: it is
-explicitly configured, logged at start-up, and documented here. Streaming
-bodies are never passed to the WAF body inspector.
+`transport-only` is an explicit operator opt-out, not a silent bypass: it is
+never inferred from a missing `content-length` or a delayed `END_STREAM`, it is
+logged at start-up, and it still performs per-message inspection. The default
+`reject` closes the residual stream attack surface entirely.
+
+The first complete message is inspected before the upstream request is sent, so
+a blocked or malformed first frame produces a WAF `4xx` rather than an upstream
+error. Later messages are inspected incrementally as they arrive. A later
+malformed/oversized/blocked frame fails closed before it is forwarded.
 
 Streaming bodies are relayed through a frame-aware guard that enforces limits
-across the **whole** exchange, not per message:
+across the **whole** exchange and a per-message size cap:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -75,11 +84,13 @@ across the **whole** exchange, not per message:
 | `server.grpc_max_stream_messages` | 1024 | Maximum request messages in one stream |
 | `server.grpc_max_decompressed_bytes` | 10 MiB | Maximum decompressed bytes when `grpc-encoding: gzip` |
 
-All must be greater than zero; `Config::validate()` rejects zero values.
-`grpc-encoding` accepts `identity` and `gzip`; any other encoding is rejected
-with `400`. Gzip frames are decompressed only to validate the bound; the
-original compressed bytes are forwarded unchanged. A gzip bomb is rejected as
-soon as the decompressed total exceeds the cap.
+Each message is also capped by `waf.grpc.max_message_bytes` before it is
+buffered. All stream limits must be greater than zero; `Config::validate()`
+rejects zero values. `grpc-encoding` accepts `identity` and `gzip`; any other
+encoding is rejected with `400`. Gzip frames are decompressed once per message
+with a hard output cap, inspected, and the original compressed bytes are
+forwarded unchanged. A gzip bomb is rejected as soon as the decompressed total
+exceeds the cap.
 
 The response body is still bounded by `grpc_max_stream_bytes` and
 `grpc_max_stream_seconds`.
@@ -105,7 +116,9 @@ because they bind local ports and generate certificates).
 | Unary echo, `te: trailers` | HTTP/2 + ALPN h2 | Body echoed; `grpc-status: 0` / `grpc-message` trailers preserved |
 | Unary with empty response body | HTTP/2 + ALPN h2 | `grpc-status` / `grpc-message` trailers preserved |
 | Unary without `content-length` | HTTP/2 + ALPN h2 | Buffered and inspected; SQLi/XSS in a declared field is blocked |
-| Streaming request (two messages) | HTTP/2 + ALPN h2 | Relayed frame by frame; request and response trailers preserved |
+| Unary with delayed `END_STREAM` | HTTP/2 + ALPN h2 | Still classified unary and inspected; SQLi/XSS is blocked |
+| Streaming request (two messages, `transport-only`) | HTTP/2 + ALPN h2 | Each message inspected before forwarding; request and response trailers preserved |
+| Streaming message with SQLi/XSS (`transport-only`) | HTTP/2 + ALPN h2 | First blocked message returns a WAF rejection; it is not forwarded |
 | Streaming with `grpc_streaming_policy = "reject"` | HTTP/2 + ALPN h2 | `403`, or `grpc-status: 7` with gRPC-aware rejections; upstream not called |
 | Gzip-compressed frame | HTTP/2 + ALPN h2 | Decompressed for inspection under `max_decompressed_bytes`; original bytes forwarded |
 | Gzip bomb | HTTP/2 + ALPN h2 | `413` before the upstream is called |

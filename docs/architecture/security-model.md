@@ -70,8 +70,8 @@ an independent penetration test passed.
 | Global token-bucket rate limiting | Tested | `src/waf/rate_limit.rs` — `GlobalRateLimiter` | `src/waf/rate_limit.rs` unit tests | beta.1 |
 | Heavy-inspection admission control (`waf.admission`) | Tested | `src/waf/admission.rs` — `AdmissionController::admit`; `src/waf/mod.rs` — `admit`, `inspection_cost` | `src/waf/mod.rs` unit tests (admission suite); `tests/integration/grpc_h2_e2e.rs` saturation cases | beta.12 |
 | Geo/anonymity blocking (MaxMind City + Anonymous IP) | Tested when databases are supplied; **Unverified** without them | `src/waf/geoip.rs` — `GeoIpService`, `GeoBlockingRule::evaluate` | `tests/integration/maxmind_tests.rs` (skipped without local `.mmdb`) | beta.1; anonymous DB later |
-| gRPC unary body inspection, incl. no `content-length` | Tested | `src/proxy/grpc_body.rs` — `probe_grpc_body`; `src/waf/grpc.rs` — `GrpcInspector::inspect` | `src/proxy/grpc_body.rs` unit tests; `tests/integration/grpc_h2_e2e.rs` (`unary_grpc_without_content_length_is_inspected`) | Unreleased (P0 fix) |
-| gRPC streaming policy (`transport-only` default, `reject`) and whole-stream bounds | Tested | `src/proxy/service.rs` — `forward_grpc_stream`; `GrpcStreamGuard`; `src/config.rs` — `grpc_streaming_policy` | `tests/integration/grpc_h2_e2e.rs` (`streaming_policy_reject_returns_grpc_status`, streaming limit cases) | Unreleased |
+| gRPC unary body inspection, incl. no `content-length` and delayed `END_STREAM` | Tested | `src/proxy/grpc_body.rs` — `probe_grpc_body`; `src/waf/grpc.rs` — `GrpcInspector::inspect` | `src/proxy/grpc_body.rs` unit tests; `tests/integration/grpc_h2_e2e.rs` (`unary_grpc_without_content_length_is_inspected`, `delayed_end_stream_unary_is_still_inspected`) | Unreleased (P0 fix) |
+| gRPC streaming policy (`reject` default, explicit `transport-only`) with per-message inspection and whole-stream bounds | Tested | `src/proxy/service.rs` — `handle_grpc_stream`, `GrpcStreamGuard`; `src/waf/grpc.rs` — `GrpcStreamFrameInspector`; `src/config.rs` — `grpc_streaming_policy` | `tests/integration/grpc_h2_e2e.rs` (`streaming_messages_are_content_inspected`, `streaming_policy_reject_returns_grpc_status`, streaming limit cases) | Unreleased |
 | GraphQL-over-HTTP inspection (`crs`, `graphql-only`, `off`) | Tested | `src/waf/graphql.rs`; `src/waf/mod.rs` — `graphql_precheck` | `tests/integration/waf_features_tests.rs`; `src/waf/graphql.rs` unit tests | beta.12 |
 | WebSocket upgrade validation and per-message WAF inspection | Tested | `src/proxy/service.rs` — `bridge_websocket`, `websocket_message_blocked`; `src/proxy/websocket.rs` | `tests/integration/websocket_tests.rs`; `src/proxy/websocket.rs` unit tests | beta.5 |
 | WebSocket per-message size cap | Tested | `src/proxy/service.rs` — `websocket_message_blocked` (uses `server.max_body_size`) | `tests/integration/websocket_tests.rs`; `src/proxy/service.rs` unit tests | beta.6 |
@@ -188,7 +188,7 @@ blocking decision wins.
 | 6 | Authentication | `ApiKeyValidator::validate_request` | `401` |
 | 7a | WebSocket upgrade | `WebSocketHandler::is_websocket_upgrade`, `WafEngine::evaluate`, `proxy_websocket` | `501` for non-HTTP/1.1, WAF status otherwise |
 | 7b | WebTransport (HTTP/1.1 upgrade) | `is_webtransport_upgrade` | `501`; the implemented WebTransport listener is a separate UDP endpoint |
-| 8 | gRPC classification | `classify_request`, `probe_grpc_body` | `400`/`413` for malformed or oversized frames; streaming follows `server.grpc_streaming_policy` |
+| 8 | gRPC classification | `classify_request`, `probe_grpc_body`, `handle_grpc_stream` | `400`/`413` for malformed or oversized frames; `reject` (default) refuses streams; explicit `transport-only` inspects every message incrementally before forwarding |
 | 8b | Bodyless fast-allow gate | `WafEngine::fast_allow` (opt-in routes only) | only bodyless, query-free requests on configured routes |
 | 9 | Body admission | `BufferPool::read_incoming_body` under `tokio::time::timeout` | `413` over `server.max_body_size`, `408` on timeout, `400` on read error |
 | 10 | Decompression | `decompress_request_body` | `415` unsupported/stacked, `413` expanded over cap, `400` malformed |
@@ -789,7 +789,7 @@ do not expect them from this component.
 | `src/proxy/service.rs` | `WafProxyService::start_with_listener`, `handle_connection`, `handle_request`, `resolve_client_ip`, `forward_to_upstream_with_protocol`, `forward_grpc_stream`, `proxy_websocket`, `bridge_websocket`, `websocket_message_blocked`, `create_blocked_response` | Ingress, pipeline order, framing/decompression calls, header rewriting, response cap, gRPC streaming, WebSocket tunnel |
 | `src/proxy/framing.rs` | `validate_request_framing` | CL/TE ambiguity rejection before body reads |
 | `src/proxy/decompression.rs` | `decompress_request_body`, `strip_encoding_headers` | Bounded gzip/deflate/br request decoding |
-| `src/proxy/grpc_body.rs` | `probe_grpc_body`, `GrpcStreamGuard` | Unary/streaming classification and whole-stream bounds |
+| `src/proxy/grpc_body.rs` | `probe_grpc_body`, `GrpcStreamGuard` | Timer-free unary/streaming classification, per-message inspection and whole-stream bounds |
 | `src/proxy/http3.rs` | `serve`, `handle_connection`, `handle_request`, `read_body`, `send_response`, `reconstruct_uri` | QUIC ingress reusing the same pipeline |
 | `src/proxy/webtransport.rs` | `serve`, session handlers | Terminating WebTransport endpoint (no upstream bridge) |
 | `src/proxy/buffer_pool.rs` | `BufferPool::read_incoming_body` | Streaming body limit and buffering |
