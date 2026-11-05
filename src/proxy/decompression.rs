@@ -213,6 +213,17 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "security finding M7: brotli trailing garbage is accepted"]
+    fn brotli_trailing_garbage_is_rejected() {
+        let mut body = brotli(b"payload").to_vec();
+        body.extend_from_slice(b"not-a-brotli-stream");
+        assert_eq!(
+            decompress_request_body(&headers("br"), Bytes::from(body), 1024),
+            Err(DecompressionError::Malformed)
+        );
+    }
+
+    #[test]
     fn oversized_output_is_rejected() {
         let body = gzip(&vec![b'A'; 4096]);
         assert_eq!(

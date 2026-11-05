@@ -691,6 +691,42 @@ mod tests {
         assert_eq!(probe.prefix, Bytes::from(frame(b"hello")));
     }
 
+    /// A body that yields one data frame and then never completes. This models
+    /// a client that sends a complete unary message but delays END_STREAM.
+    struct PendingAfterFirst {
+        first: Option<Bytes>,
+    }
+
+    impl Body for PendingAfterFirst {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            let this = self.get_mut();
+            match this.first.take() {
+                Some(first) => Poll::Ready(Some(Ok(Frame::data(first)))),
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "security finding H1: a unary RPC can be forced into streaming by delaying END_STREAM"]
+    async fn unary_rpc_with_delayed_end_stream_is_not_forced_into_streaming() {
+        let mut body = PendingAfterFirst {
+            first: Some(Bytes::from(frame(b"hello"))),
+        };
+        let probe = probe_grpc_body(&mut body, 1024).await.unwrap();
+        assert_eq!(
+            probe.mode,
+            GrpcBodyMode::Unary,
+            "a single complete frame must stay unary even when END_STREAM is delayed"
+        );
+    }
+
     #[tokio::test]
     async fn second_message_is_streaming() {
         let mut body = ChunkedBody {

@@ -340,6 +340,27 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "security finding L1: Content-Length accepts a leading '+'"]
+    fn rejects_prefixed_content_length() {
+        assert_eq!(
+            validate_request_framing(&headers(&[("content-length", "+5")])),
+            Err(FramingError::InvalidContentLength)
+        );
+    }
+
+    #[test]
+    #[ignore = "security finding L2: HTTP/1.0 accepts Transfer-Encoding: chunked"]
+    fn http10_rejects_transfer_encoding() {
+        assert_eq!(
+            validate_request_framing_for_version(
+                &headers(&[("transfer-encoding", "chunked")]),
+                FramingVersion::Http10,
+            ),
+            Err(FramingError::InvalidTransferEncoding)
+        );
+    }
+
+    #[test]
     fn rejects_invalid_transfer_encoding() {
         for value in [
             "gzip",
