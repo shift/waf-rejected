@@ -57,6 +57,7 @@ an independent penetration test passed.
 | TLS 1.2/1.3 admission, ALPN `h2`, optional client certs | Tested | `src/waf/tls_config.rs` — `TlsManager::new`, `accept`, `selected_versions` | `src/waf/tls_config.rs` unit tests (`versions_respect_min_and_max`, `alpn_defaults_advertise_h2_then_http1`) | beta.1; hardened in beta.2 |
 | HTTP-version allowlist (`505` for unlisted versions) | Tested | `src/proxy/service.rs` — `detect_http_version`, `is_http_version_supported` | `tests/integration/pipeline_tests.rs` (protocol cases); `src/proxy/service.rs` unit tests | beta.1 |
 | Trusted-proxy client-IP resolution and forwarding-header rewrite | Tested | `src/proxy/service.rs` — `resolve_client_ip`, `build_upstream_request` | `src/proxy/service.rs` unit tests (`test_client_ip_*`, proptest `resolve_client_ip_never_panics_*`) | beta.2 |
+| Client routing/override header stripping (same path/method WAF and origin) | Tested | `src/proxy/service.rs` — `HeaderStripPolicy`, `handle_request`; `src/proxy/http3.rs` | `src/proxy/service.rs` unit tests; `tests/integration/pipeline_tests.rs` (`pipeline_strips_routing_headers_*`, `pipeline_rejects_ambiguous_routing_headers_when_enabled`) | Unreleased (H3) |
 | API-key authentication and HTTPS requirement | Tested | `src/waf/auth.rs` — `ApiKeyValidator::validate_request`, `InMemoryKeyStore::from_raw_keys` | `tests/integration/auth_tests.rs`; `src/waf/auth.rs` unit tests | beta.1 |
 | Ambiguous request-framing rejection (CL/TE smuggling) | Tested | `src/proxy/framing.rs` — `validate_request_framing`; called from `service.rs` and `http3.rs` before body reads | `src/proxy/framing.rs` unit tests; `tests/integration/pipeline_tests.rs` (`pipeline_accepts_chunked_body`, `pipeline_rejects_content_length_mismatch`) | beta.10 |
 | Streaming request-body cap and read timeout | Tested | `src/proxy/buffer_pool.rs` — `read_incoming_body`; `src/proxy/service.rs`; `src/proxy/http3.rs` | `tests/integration/pipeline_tests.rs` (`pipeline_rejects_oversized_body`) | beta.1 |
@@ -376,11 +377,28 @@ region, Tor exit, VPN or datacenter flag.
 
 `forward_to_upstream_with_protocol` rewrites the URI to
 `proxy.upstream_url` plus the inbound path and query, preserves the client
-`Host` for the origin (also copied to `X-Forwarded-Host`), strips `host`,
-`connection`, `proxy-connection`, `upgrade`, `te`, `trailer`,
-`transfer-encoding`, `keep-alive`, `x-forwarded-for`, `x-real-ip` and
-`x-forwarded-proto`, then sets authoritative `X-Forwarded-For`, `X-Real-IP`,
-`X-Forwarded-Proto` and `X-Waf-Proxy`. Framing validation has already rejected
+`Host` for the origin (also copied to a proxy-generated `X-Forwarded-Host`),
+and strips hop-by-hop fields plus every client routing/override header before
+the upstream request is built. The default strip set covers `x-original-url`,
+`x-rewrite-url`, `x-http-method-override`, `x-method-override`, every
+`x-forwarded-*` header (including `-prefix`, `-server`, `-host`, `-port`,
+`-for` and `-proto`), `forwarded`, `x-host`, `x-real-ip`, and the hop-by-hop
+fields `host`, `connection`, `proxy-connection`, `upgrade`, `te`, `trailer`,
+`transfer-encoding` and `keep-alive`. `proxy.strip_headers` extends (or, with
+`strip_headers_mode = "replace"`, replaces) that set; names are
+case-insensitive and a trailing `*` is a prefix match. The proxy then sets
+authoritative `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Proto`,
+`X-Forwarded-Host` and `X-Waf-Proxy` from trusted state.
+
+The same sanitised headers and the original request method/path are used for
+WAF inspection and for the upstream leg, so a client cannot make the origin
+route to a path or method the WAF did not evaluate. This happens on HTTP/1.x,
+HTTP/2, HTTP/3 and gRPC paths; the WebSocket handshake applies the same policy.
+With `proxy.reject_ambiguous_routing = true` such headers produce `400 Bad
+Request` before inspection instead of being stripped. The default is to strip
+and log at debug level; identity headers used for trusted-proxy resolution are
+exempt from reject mode because the proxy consumes and rewrites them.
+Framing validation has already rejected
 ambiguous `Content-Length`/`Transfer-Encoding` combinations; the buffered body
 is re-framed from `Bytes`, and for a decompressed request the stale
 `Content-Length` and `Content-Encoding` have been removed. A request that
@@ -410,8 +428,10 @@ containing `upgrade`, `Sec-WebSocket-Version: 13` and a key. The upgrade request
 is evaluated by the WAF with headers and URI but no body; non-HTTP/1.1 upgrades
 are rejected with `501`. `proxy_websocket` opens a raw TCP or TLS connection to
 the configured origin, writes a handshake assembled from the client's headers
-(except `host`, `connection`, `upgrade`, `proxy-connection`,
-`x-forwarded-host`), and requires a `101` response.
+(except `host`, `connection`, `upgrade`, `proxy-connection`, and every header
+matched by the routing-header strip policy such as `x-forwarded-*`,
+`x-original-url`, `x-rewrite-url`, `forwarded` and method overrides), and
+requires a `101` response.
 
 After the upgrade, `bridge_websocket` inspects each client `Text` or `Binary`
 message through the full `WafEngine::evaluate` chain, including the rate

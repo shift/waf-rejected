@@ -224,6 +224,29 @@ async fn handle_request(
         &state.metrics,
     );
 
+    // Remove client-supplied routing/override headers before the WAF and the
+    // upstream see the request. Identity headers were consumed above and are
+    // rewritten by the proxy.
+    if state.config.proxy.reject_ambiguous_routing {
+        if let Some(name) = state.strip_policy.first_ambiguous(&parts.headers) {
+            warn!(
+                "Rejected HTTP/3 request from {} carrying ambiguous routing header '{}'",
+                client_ip, name
+            );
+            telemetry.reject(RequestRejection::AmbiguousRouting);
+            state.metrics.record_blocked();
+            return send_response(
+                &mut stream,
+                WafProxyService::create_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Ambiguous routing headers are not allowed",
+                ),
+            )
+            .await;
+        }
+    }
+    state.strip_policy.strip(&mut parts.headers, client_ip);
+
     // Reject ambiguous request framing before any body is read. Details are
     // intentionally not exposed to the client.
     if let Err(e) = validate_request_framing_for_version(&parts.headers, FramingVersion::Http3) {
@@ -418,6 +441,7 @@ async fn handle_request(
                     .streaming
                     .enabled
                     .then_some(state.config.proxy.streaming.response_threshold_bytes),
+                &state.strip_policy,
             )
             .await;
             let response = match response {

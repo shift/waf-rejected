@@ -17,6 +17,18 @@ All notable changes to WAF-Rejected are documented here.
   `waf_forwarded_header_rejected_total` metric. Headers from untrusted peers are
   ignored entirely. See `docs/architecture/security-model.md` and
   `docs/user-guide/configuration.md`.
+
+- Client-controlled routing and method/path override headers (`X-Original-URL`,
+  `X-Rewrite-URL`, `X-HTTP-Method-Override`, `X-Method-Override`, `Forwarded`,
+  `X-Host`, and every `X-Forwarded-*` header including `-prefix`, `-server`,
+  `-host` and `-port`) are now stripped before WAF inspection and upstream
+  forwarding, so the origin executes the same method/path the WAF evaluated.
+  This applies to HTTP/1.x, HTTP/2, HTTP/3, gRPC and WebSocket handshakes.
+  `proxy.strip_headers` extends the built-in set (`strip_headers_mode =
+  "extend"`, default) or replaces it (`"replace"`); stripped headers are
+  logged at debug level. `proxy.reject_ambiguous_routing = true` returns `400`
+  instead, while client identity headers used by trusted-proxy resolution are
+  exempt. Fixes audit finding H3.
 - Fixed a P0 gRPC inspection gap: unary gRPC over HTTP/2 without
   `content-length` was classified as streaming and forwarded with no body
   inspection. Unary vs streaming is now derived from the actual length-prefixed

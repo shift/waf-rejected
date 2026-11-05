@@ -34,16 +34,31 @@ async fn spawn_upstream() -> std::net::SocketAddr {
                         TokioIo::new(stream),
                         service_fn(|req: Request<hyper::body::Incoming>| async move {
                             let path = req.uri().path().to_string();
+                            // Model an upstream that trusts client-controlled
+                            // routing overrides: if either the override header
+                            // or an /admin path arrives, it serves admin.
+                            let routed_to_admin = req.headers().contains_key("x-original-url")
+                                || path.starts_with("/admin");
+                            let custom = req
+                                .headers()
+                                .get("x-custom-header")
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or("")
+                                .to_string();
                             let received = req
                                 .into_body()
                                 .collect()
                                 .await
                                 .map(|body| body.to_bytes())
                                 .unwrap_or_default();
-                            let body = if path == "/large" {
+                            let body = if routed_to_admin {
+                                Bytes::from_static(b"admin")
+                            } else if path == "/large" {
                                 Bytes::from("A".repeat(4096))
                             } else if path == "/echo" {
                                 received
+                            } else if path == "/routing-check" {
+                                Bytes::from(format!("routing-check:{}", custom))
                             } else {
                                 Bytes::from_static(b"upstream-ok")
                             };
@@ -71,6 +86,11 @@ async fn spawn_proxy_with_backend(
     upstream: std::net::SocketAddr,
     backend: ListenerIoBackend,
 ) -> String {
+    let config = test_config(upstream, backend);
+    spawn_proxy_with_config(config).await
+}
+
+fn test_config(upstream: std::net::SocketAddr, backend: ListenerIoBackend) -> Config {
     let mut config = Config {
         upstream_uri: format!("http://{}", upstream),
         ..Config::default()
@@ -80,7 +100,10 @@ async fn spawn_proxy_with_backend(
     config.waf.rate_limit.per_ip_enabled = false;
     config.waf.rate_limit.global_enabled = false;
     config.waf.coraza.enabled = false;
+    config
+}
 
+async fn spawn_proxy_with_config(config: Config) -> String {
     let service = Arc::new(WafProxyService::new(config).unwrap());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -115,6 +138,66 @@ async fn pipeline_allows_clean_requests() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.text().await.unwrap(), "upstream-ok");
+}
+
+#[tokio::test]
+async fn pipeline_strips_routing_headers_so_upstream_executes_the_inspected_path() {
+    let upstream = spawn_upstream().await;
+    let proxy = spawn_proxy(upstream).await;
+    let response = reqwest::Client::new()
+        .get(format!("{}/routing-check", proxy))
+        .header("x-original-url", "/admin")
+        .header("x-rewrite-url", "/admin")
+        .header("x-http-method-override", "DELETE")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    // The upstream model serves "admin" whenever X-Original-URL is present.
+    // Receiving the routing-check body proves the forwarded path is the same
+    // path the WAF inspected and that the override header was stripped.
+    assert_eq!(response.text().await.unwrap(), "routing-check:");
+}
+
+#[tokio::test]
+async fn pipeline_forwards_normal_custom_headers() {
+    let upstream = spawn_upstream().await;
+    let proxy = spawn_proxy(upstream).await;
+    let response = reqwest::Client::new()
+        .get(format!("{}/routing-check", proxy))
+        .header("x-custom-header", "keep-me")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), "routing-check:keep-me");
+}
+
+#[tokio::test]
+async fn pipeline_rejects_ambiguous_routing_headers_when_enabled() {
+    let upstream = spawn_upstream().await;
+    let mut config = test_config(upstream, ListenerIoBackend::Tokio);
+    config.proxy.reject_ambiguous_routing = true;
+    let proxy = spawn_proxy_with_config(config).await;
+
+    let response = reqwest::Client::new()
+        .get(format!("{}/routing-check", proxy))
+        .header("x-original-url", "/admin")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Trusted-proxy identity headers are still accepted in reject mode.
+    let response = reqwest::Client::new()
+        .get(format!("{}/routing-check", proxy))
+        .header("x-forwarded-for", "203.0.113.9")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]

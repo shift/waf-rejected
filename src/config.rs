@@ -212,7 +212,55 @@ pub struct ProxyConfig {
 
     /// Opt-in streaming policy for large upstream responses.
     pub streaming: StreamingConfig,
+
+    /// Additional client headers removed before WAF inspection and upstream
+    /// forwarding. Names are case-insensitive; a trailing `*` is a prefix
+    /// match (`x-forwarded-*`). Defaults are in
+    /// [`DEFAULT_STRIP_HEADERS`]. With the default `extend` mode these entries
+    /// are added to the built-in defaults; `replace` mode uses only this list.
+    pub strip_headers: Vec<String>,
+
+    /// How `strip_headers` combines with the built-in routing-header defaults.
+    pub strip_headers_mode: HeaderStripMode,
+
+    /// Reject requests that carry a client-supplied routing/override header
+    /// with `400 Bad Request` instead of stripping it. Client identity headers
+    /// (`X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Proto`) are never
+    /// rejected. Disabled by default.
+    pub reject_ambiguous_routing: bool,
 }
+
+/// How [`ProxyConfig::strip_headers`] combines with the built-in defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HeaderStripMode {
+    /// Add configured names to [`DEFAULT_STRIP_HEADERS`] (default).
+    #[default]
+    Extend,
+    /// Use only the configured names; the built-in defaults are not applied.
+    Replace,
+}
+
+/// Routing/override headers a client must never control on the upstream leg.
+///
+/// These headers commonly change upstream path or method selection. The proxy
+/// removes them before WAF inspection and before forwarding, then sets its own
+/// forwarding headers from trusted state (`Host`, `X-Forwarded-For`,
+/// `X-Forwarded-Proto`, `X-Forwarded-Host`).
+pub const DEFAULT_STRIP_HEADERS: &[&str] = &[
+    "x-original-url",
+    "x-rewrite-url",
+    "x-http-method-override",
+    "x-method-override",
+    "x-forwarded-prefix",
+    "x-forwarded-host",
+    "x-forwarded-server",
+    "x-forwarded-port",
+    "x-forwarded-*",
+    "forwarded",
+    "x-host",
+    "x-real-ip",
+];
 
 /// Opt-in upstream connection-pool policy.
 ///
@@ -1925,6 +1973,12 @@ impl Default for ProxyConfig {
             upstream_client_key_path: None,
             pool: UpstreamPoolConfig::default(),
             streaming: StreamingConfig::default(),
+            strip_headers: DEFAULT_STRIP_HEADERS
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+            strip_headers_mode: HeaderStripMode::default(),
+            reject_ambiguous_routing: false,
         }
     }
 }
@@ -2410,6 +2464,27 @@ impl Config {
         }
         if self.proxy.streaming.enabled && self.proxy.streaming.response_threshold_bytes == 0 {
             anyhow::bail!("proxy.streaming.response_threshold_bytes must be greater than zero");
+        }
+        for name in &self.proxy.strip_headers {
+            let trimmed = name.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!("proxy.strip_headers entries must not be empty");
+            }
+            if trimmed
+                .chars()
+                .any(|c| c.is_whitespace() || c == ':' || c.is_control())
+            {
+                anyhow::bail!(
+                    "proxy.strip_headers entry '{trimmed}' must be a header name or a trailing-* pattern"
+                );
+            }
+            if trimmed.trim_end_matches('*').contains('*')
+                || (trimmed.contains('*') && !trimmed.ends_with('*'))
+            {
+                anyhow::bail!(
+                    "proxy.strip_headers entry '{trimmed}' may only use '*' as a trailing prefix match"
+                );
+            }
         }
         if self.server.http2.enabled {
             if self.server.http2.initial_stream_window_bytes == 0

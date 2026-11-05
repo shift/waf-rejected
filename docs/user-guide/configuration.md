@@ -84,8 +84,30 @@ max_request_size = 10485760
 # upstream_ca_path = "/etc/waf/certs/upstream-ca.pem"
 # upstream_client_cert_path = "/etc/waf/certs/client.crt"
 # upstream_client_key_path = "/etc/waf/certs/client.key"
+# Client routing/override headers stripped before WAF inspection and forwarding.
+strip_headers = ["x-original-url", "x-rewrite-url", "x-http-method-override",
+  "x-method-override", "x-forwarded-*", "forwarded", "x-host", "x-real-ip"]
+strip_headers_mode = "extend"   # "extend" (default) or "replace"
+reject_ambiguous_routing = false
 ```
 
+- `strip_headers` removes client-controlled routing and method/path override
+  headers before the WAF evaluates the request and before it is forwarded.
+  Matching is case-insensitive; a trailing `*` is a prefix match, so
+  `x-forwarded-*` covers every `X-Forwarded-*` header. The built-in defaults are
+  `x-original-url`, `x-rewrite-url`, `x-http-method-override`,
+  `x-method-override`, `x-forwarded-prefix`, `x-forwarded-host`,
+  `x-forwarded-server`, `x-forwarded-port`, `x-forwarded-*`, `forwarded`,
+  `x-host` and `x-real-ip`.
+- `strip_headers_mode = "extend"` (default) adds configured names to the
+  built-in defaults. `"replace"` uses only the configured list, which is
+  explicit and therefore must include every family the deployment needs.
+  Stripped headers are logged at debug level.
+- `reject_ambiguous_routing = true` returns `400 Bad Request` instead of
+  stripping whenever a configured routing/override header is present. Client
+  identity headers (`X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Proto`) are
+  exempt so trusted-proxy operation is unchanged; the proxy still rewrites
+  those from the resolved client address. Default is `false` (strip and log).
 - `upstream_ca_path` adds a private CA bundle for HTTPS and TLS WebSocket
   upstreams.
 - Upstream mTLS requires **both** client cert and key; setting one is a startup

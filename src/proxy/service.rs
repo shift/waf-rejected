@@ -35,7 +35,9 @@ use tokio_tungstenite::WebSocketStream;
 use tower::Service;
 use tracing::{debug, error, info, warn};
 
-use crate::config::{Config, GrpcStreamingPolicy};
+use crate::config::{
+    Config, GrpcStreamingPolicy, HeaderStripMode, ProxyConfig, DEFAULT_STRIP_HEADERS,
+};
 use crate::error::WafError;
 use crate::metrics::Metrics;
 use crate::proxy::buffer_pool::{BodyReadError, BufferPool};
@@ -201,6 +203,92 @@ pub(crate) fn is_hop_by_hop_header(name: &str) -> bool {
         name,
         "connection" | "proxy-connection" | "keep-alive" | "transfer-encoding" | "upgrade"
     )
+}
+
+/// Client-supplied headers the proxy removes before WAF inspection and before
+/// forwarding to the upstream.
+///
+/// Matching is case-insensitive. A trailing `*` is a prefix match, so the
+/// default `x-forwarded-*` pattern covers `X-Forwarded-For`, `-Host`, `-Port`,
+/// `-Prefix`, `-Proto`, `-Server` and any future `X-Forwarded-*` header. The
+/// proxy then emits its own trusted `X-Forwarded-*` values from the resolved
+/// client address and inbound `Host`.
+#[derive(Debug, Clone)]
+pub(crate) struct HeaderStripPolicy {
+    patterns: Vec<String>,
+}
+
+impl HeaderStripPolicy {
+    pub(crate) fn from_config(config: &ProxyConfig) -> Self {
+        let mut patterns = Vec::new();
+        if config.strip_headers_mode == HeaderStripMode::Extend {
+            patterns.extend(DEFAULT_STRIP_HEADERS.iter().map(|name| (*name).to_string()));
+        }
+        patterns.extend(
+            config
+                .strip_headers
+                .iter()
+                .map(|name| name.trim().to_ascii_lowercase())
+                .filter(|name| !name.is_empty()),
+        );
+        patterns.sort_unstable();
+        patterns.dedup();
+        Self { patterns }
+    }
+
+    pub(crate) fn defaults() -> Self {
+        Self::from_config(&ProxyConfig::default())
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        self.patterns.iter().any(|pattern| {
+            if pattern == "*" {
+                true
+            } else if let Some(prefix) = pattern.strip_suffix('*') {
+                name.starts_with(prefix)
+            } else {
+                name.eq_ignore_ascii_case(pattern)
+            }
+        })
+    }
+
+    pub(crate) fn should_strip(&self, name: &str) -> bool {
+        self.matches(name)
+    }
+
+    /// Client identity headers must remain usable for trusted-proxy
+    /// resolution and are rewritten by the proxy, so reject mode ignores them.
+    fn is_client_identity_header(name: &str) -> bool {
+        matches!(name, "x-forwarded-for" | "x-real-ip" | "x-forwarded-proto")
+    }
+
+    pub(crate) fn is_ambiguous_routing(&self, name: &str) -> bool {
+        self.should_strip(name) && !Self::is_client_identity_header(name)
+    }
+
+    pub(crate) fn first_ambiguous<'a>(&self, headers: &'a HeaderMap) -> Option<&'a str> {
+        headers
+            .keys()
+            .find(|name| self.is_ambiguous_routing(name.as_str()))
+            .map(|name| name.as_str())
+    }
+
+    /// Remove every matching client header, logging each at debug level.
+    pub(crate) fn strip(&self, headers: &mut HeaderMap, client_ip: IpAddr) {
+        let matched: Vec<_> = headers
+            .keys()
+            .filter(|name| self.should_strip(name.as_str()))
+            .cloned()
+            .collect();
+        for name in matched {
+            headers.remove(&name);
+            debug!(
+                "Stripped client-supplied routing header '{}' from request from {}",
+                name.as_str(),
+                client_ip
+            );
+        }
+    }
 }
 
 /// Requests and responses may be buffered, passed through from hyper, or
@@ -649,6 +737,7 @@ pub(crate) struct ProxyState {
     pub(crate) buffer_pool: Arc<BufferPool>,
     pub(crate) auth_validator: Option<Arc<ApiKeyValidator>>,
     pub(crate) trusted_proxies: Arc<Vec<IpNetwork>>,
+    pub(crate) strip_policy: Arc<HeaderStripPolicy>,
     pub(crate) metrics: Arc<Metrics>,
 }
 
@@ -1062,6 +1151,7 @@ impl WafProxyService {
             buffer_pool: Arc::clone(&self.buffer_pool),
             auth_validator: self.auth_validator.clone(),
             trusted_proxies: Arc::new(self.trusted_proxies.clone()),
+            strip_policy: Arc::new(HeaderStripPolicy::from_config(&self.config.proxy)),
             metrics: Arc::clone(&self.metrics),
         };
 
@@ -1260,7 +1350,7 @@ impl WafProxyService {
 
     /// Handle incoming HTTP requests with multi-protocol support
     async fn handle_request(
-        req: Request<Incoming>,
+        mut req: Request<Incoming>,
         state: ProxyState,
         peer_ip: IpAddr,
         is_https: bool,
@@ -1289,6 +1379,27 @@ impl WafProxyService {
             &state.trusted_proxies,
             &state.metrics,
         );
+
+        // Client-controlled routing/override headers are removed before the WAF
+        // and the upstream see the request. Optional reject mode refuses them
+        // outright instead. Identity headers used by trusted-proxy resolution
+        // were consumed above and are rewritten by the proxy; they are never
+        // rejected here.
+        if state.config.proxy.reject_ambiguous_routing {
+            if let Some(name) = state.strip_policy.first_ambiguous(req.headers()) {
+                warn!(
+                    "Rejected request from {} carrying ambiguous routing header '{}'",
+                    client_ip, name
+                );
+                telemetry.reject(RequestRejection::AmbiguousRouting);
+                state.metrics.record_blocked();
+                return Ok(Self::create_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Ambiguous routing headers are not allowed",
+                ));
+            }
+        }
+        state.strip_policy.strip(req.headers_mut(), client_ip);
 
         // Reject ambiguous request framing before any body is read. HTTP/2 and
         // HTTP/3 additionally reject Transfer-Encoding and connection-specific
@@ -1416,6 +1527,7 @@ impl WafProxyService {
                                 .streaming
                                 .enabled
                                 .then_some(state.config.proxy.streaming.response_threshold_bytes),
+                            &state.strip_policy,
                         )
                         .await;
                     }
@@ -1703,6 +1815,7 @@ impl WafProxyService {
                         .streaming
                         .enabled
                         .then_some(state.config.proxy.streaming.response_threshold_bytes),
+                    &state.strip_policy,
                 )
                 .await
             }
@@ -1776,6 +1889,13 @@ impl WafProxyService {
         let mut headers = String::new();
         for (name, value) in req.headers() {
             let lower = name.as_str().to_ascii_lowercase();
+            if state.strip_policy.should_strip(lower.as_str()) {
+                debug!(
+                    "Stripped client-supplied routing header '{}' from WebSocket upgrade from {}",
+                    lower, client_ip
+                );
+                continue;
+            }
             if matches!(
                 lower.as_str(),
                 "host"
@@ -2390,6 +2510,32 @@ impl WafProxyService {
         client_ip: IpAddr,
         is_https: bool,
     ) -> Result<Request<ProxyBody>, Box<Response<ProxyBody>>> {
+        Self::build_upstream_request_with_policy(
+            parts,
+            body,
+            upstream_uri,
+            http_version,
+            client_ip,
+            is_https,
+            &HeaderStripPolicy::defaults(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_upstream_request_with_policy(
+        mut parts: hyper::http::request::Parts,
+        body: ProxyBody,
+        upstream_uri: &Uri,
+        http_version: &str,
+        client_ip: IpAddr,
+        is_https: bool,
+        strip_policy: &HeaderStripPolicy,
+    ) -> Result<Request<ProxyBody>, Box<Response<ProxyBody>>> {
+        // Defence in depth: callers sanitise before WAF inspection, but the
+        // upstream request must never contain a client routing header even if a
+        // future call site forgets to do so.
+        strip_policy.strip(&mut parts.headers, client_ip);
+
         let classification = classify_request(&parts.headers);
 
         let upstream_path_and_query = parts
@@ -2545,14 +2691,16 @@ impl WafProxyService {
         is_https: bool,
         max_response_bytes: usize,
         stream_response_threshold: Option<usize>,
+        strip_policy: &HeaderStripPolicy,
     ) -> Result<Response<ProxyBody>, Infallible> {
-        let proxy_req = match Self::build_upstream_request(
+        let proxy_req = match Self::build_upstream_request_with_policy(
             parts,
             body,
             &upstream_uri,
             http_version,
             client_ip,
             is_https,
+            strip_policy,
         ) {
             Ok(request) => request,
             Err(response) => return Ok(*response),
@@ -2951,13 +3099,14 @@ impl WafProxyService {
         let announce_grpc_trailers =
             classify_request(&parts.headers).is_grpc && matches!(http_version, "1.0" | "1.1");
 
-        let proxy_req = match Self::build_upstream_request(
+        let proxy_req = match Self::build_upstream_request_with_policy(
             parts,
             request_body,
             &state.upstream_uri,
             http_version,
             client_ip,
             is_https,
+            &state.strip_policy,
         ) {
             Ok(request) => request,
             Err(response) => return *response,
@@ -3691,6 +3840,165 @@ mod tests {
         assert!(!config.proxy.streaming.enabled);
         assert!(!config.server.http2.enabled);
         config.validate().unwrap();
+    }
+
+    fn build_upstream_for_test(request: Request<ProxyBody>) -> Request<ProxyBody> {
+        build_upstream_for_test_with_policy(request, &HeaderStripPolicy::defaults())
+    }
+
+    fn build_upstream_for_test_with_policy(
+        request: Request<ProxyBody>,
+        policy: &HeaderStripPolicy,
+    ) -> Request<ProxyBody> {
+        let (parts, body) = request.into_parts();
+        let upstream: Uri = "http://upstream.local".parse().unwrap();
+        match WafProxyService::build_upstream_request_with_policy(
+            parts,
+            body,
+            &upstream,
+            "1.1",
+            "127.0.0.1".parse().unwrap(),
+            false,
+            policy,
+        ) {
+            Ok(request) => request,
+            Err(_) => panic!("upstream request construction failed"),
+        }
+    }
+
+    #[test]
+    fn client_routing_and_override_headers_are_not_forwarded() {
+        let request = Request::builder()
+            .method("GET")
+            .uri("/public")
+            .header("x-original-url", "/admin")
+            .header("x-rewrite-url", "/admin")
+            .header("x-forwarded-prefix", "/admin")
+            .header("x-forwarded-port", "8443")
+            .header("x-forwarded-host", "admin.internal")
+            .header("x-http-method-override", "DELETE")
+            .header("x-method-override", "DELETE")
+            .header("x-forwarded-server", "admin.internal")
+            .header("x-host", "admin.internal")
+            .header("forwarded", "for=203.0.113.9")
+            .header("x-forwarded-custom", "attacker-controlled")
+            .body(ProxyBody::full(Bytes::new()))
+            .unwrap();
+
+        let built = build_upstream_for_test(request);
+        for name in [
+            "x-original-url",
+            "x-rewrite-url",
+            "x-forwarded-prefix",
+            "x-forwarded-port",
+            "x-forwarded-host",
+            "x-http-method-override",
+            "x-method-override",
+            "x-forwarded-server",
+            "x-host",
+            "forwarded",
+            "x-forwarded-custom",
+        ] {
+            assert!(
+                built.headers().get(name).is_none(),
+                "client-controlled header {name} must not reach the upstream"
+            );
+        }
+        assert_eq!(built.method(), hyper::Method::GET);
+        assert_eq!(built.uri().path(), "/public");
+    }
+
+    #[test]
+    fn normal_custom_headers_are_still_forwarded() {
+        let request = Request::builder()
+            .method("GET")
+            .uri("/public")
+            .header("x-request-id", "abc-123")
+            .header("x-custom-header", "keep-me")
+            .body(ProxyBody::full(Bytes::new()))
+            .unwrap();
+
+        let built = build_upstream_for_test(request);
+        assert_eq!(
+            built
+                .headers()
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("abc-123")
+        );
+        assert_eq!(
+            built
+                .headers()
+                .get("x-custom-header")
+                .and_then(|value| value.to_str().ok()),
+            Some("keep-me")
+        );
+    }
+
+    #[test]
+    fn config_strip_headers_extend_keeps_defaults_and_adds_names() {
+        let mut config = ProxyConfig::default();
+        config.strip_headers = vec!["x-custom-routing".to_string()];
+        config.strip_headers_mode = HeaderStripMode::Extend;
+        let policy = HeaderStripPolicy::from_config(&config);
+        assert!(policy.should_strip("x-original-url"));
+        assert!(policy.should_strip("x-forwarded-anything"));
+        assert!(policy.should_strip("x-custom-routing"));
+        assert!(!policy.should_strip("x-request-id"));
+    }
+
+    #[test]
+    fn config_strip_headers_replace_uses_only_configured_names() {
+        let mut config = ProxyConfig::default();
+        config.strip_headers = vec!["x-custom-routing".to_string()];
+        config.strip_headers_mode = HeaderStripMode::Replace;
+        let policy = HeaderStripPolicy::from_config(&config);
+        assert!(policy.should_strip("x-custom-routing"));
+        assert!(!policy.should_strip("x-original-url"));
+        assert!(!policy.should_strip("x-forwarded-host"));
+        assert!(!policy.should_strip("x-forwarded-for"));
+    }
+
+    #[test]
+    fn reject_mode_detects_routing_headers_but_not_identity_headers() {
+        let config = ProxyConfig::default();
+        let policy = HeaderStripPolicy::from_config(&config);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-original-url", "/admin".parse().unwrap());
+        assert_eq!(policy.first_ambiguous(&headers), Some("x-original-url"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
+        headers.insert("x-real-ip", "203.0.113.9".parse().unwrap());
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        assert_eq!(policy.first_ambiguous(&headers), None);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", "abc".parse().unwrap());
+        assert_eq!(policy.first_ambiguous(&headers), None);
+    }
+
+    #[test]
+    fn default_strip_headers_cover_forwarded_and_override_families() {
+        let policy = HeaderStripPolicy::defaults();
+        for name in [
+            "x-original-url",
+            "x-rewrite-url",
+            "x-http-method-override",
+            "x-method-override",
+            "x-forwarded-prefix",
+            "x-forwarded-host",
+            "x-forwarded-server",
+            "x-forwarded-port",
+            "x-forwarded-for",
+            "x-forwarded-proto",
+            "x-real-ip",
+            "forwarded",
+            "x-host",
+            "x-forwarded-future",
+        ] {
+            assert!(policy.should_strip(name), "{name} must be stripped");
+        }
     }
 
     proptest! {

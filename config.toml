@@ -33,6 +33,23 @@ max_request_size = 10485760
 # Upstream mutual TLS: set both or neither.
 # upstream_client_cert_path = "/etc/waf/certs/client.crt"
 # upstream_client_key_path = "/etc/waf/certs/client.key"
+# Client routing/override headers are stripped before WAF inspection and
+# upstream forwarding. Names are case-insensitive; a trailing "*" is a prefix
+# match. In "extend" mode these are added to the built-in defaults; in
+# "replace" mode only this list is applied. Set
+# reject_ambiguous_routing = true to return 400 instead of stripping.
+strip_headers = [
+  "x-original-url",
+  "x-rewrite-url",
+  "x-http-method-override",
+  "x-method-override",
+  "x-forwarded-*",
+  "forwarded",
+  "x-host",
+  "x-real-ip",
+]
+strip_headers_mode = "extend"
+reject_ambiguous_routing = false
 
 # Opt-in bounded upstream connection pool. Disabled leaves hyper's built-in
 # pool behaviour unchanged.

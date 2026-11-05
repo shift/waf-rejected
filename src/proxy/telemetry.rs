@@ -21,6 +21,7 @@ use crate::metrics::Metrics;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RequestRejection {
     UnsupportedHttpVersion,
+    AmbiguousRouting,
     InvalidFraming,
     InvalidTrailerFraming,
     Authentication,
@@ -42,6 +43,7 @@ impl RequestRejection {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::UnsupportedHttpVersion => "unsupported_http_version",
+            Self::AmbiguousRouting => "ambiguous_routing",
             Self::InvalidFraming => "invalid_framing",
             Self::InvalidTrailerFraming => "invalid_trailer_framing",
             Self::Authentication => "authentication",
