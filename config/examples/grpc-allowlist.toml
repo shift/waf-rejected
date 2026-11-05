@@ -37,6 +37,11 @@ supported_http_versions = ["1.0", "1.1", "2"]
 max_body_size = 10485760
 grpc_max_stream_bytes = 4194304
 grpc_max_stream_seconds = 300
+grpc_max_stream_messages = 1024
+grpc_max_decompressed_bytes = 10485760
+# "transport-only" relays genuinely streaming RPCs without body inspection
+# (start-up warning); "reject" refuses them with a clear 4xx / gRPC status.
+grpc_streaming_policy = "transport-only"
 # Return HTTP 200 + grpc-status/grpc-message trailers (7 for 403) instead of a
 # plain HTTP error page when a gRPC call is blocked.
 grpc_aware_rejections = true

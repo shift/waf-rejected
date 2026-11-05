@@ -189,6 +189,14 @@ fn grpc_status(status: &str) -> HeaderMap {
     trailers.insert("grpc-status", status.parse().unwrap());
     trailers
 }
+
+fn grpc_frame(payload: &[u8]) -> Bytes {
+    let mut out = Vec::with_capacity(5 + payload.len());
+    out.push(0);
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(payload);
+    Bytes::from(out)
+}
 #[tokio::test]
 async fn unary_grpc_keeps_status_trailers_with_empty_body() {
     let upstream = spawn_upstream(|req: Request<Incoming>| async move {
@@ -323,7 +331,7 @@ async fn streaming_grpc_is_not_buffered_and_honours_the_byte_cap() {
         .uri(format!("http://{}/svc/Stream", proxy))
         .header("content-type", "application/grpc+proto")
         .body(GatedBody {
-            first: Some(Bytes::from_static(b"0123456789")),
+            first: Some(grpc_frame(b"first")),
             // Well beyond the 32 byte cap.
             rest: Some(Bytes::from(vec![b'a'; 256])),
             gate: Some(gate_rx),

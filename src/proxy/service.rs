@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
+use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Frame, Incoming};
 use hyper::header::HeaderValue;
@@ -30,7 +31,7 @@ use tokio_tungstenite::WebSocketStream;
 use tower::Service;
 use tracing::{debug, error, info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, GrpcStreamingPolicy};
 use crate::error::WafError;
 use crate::metrics::Metrics;
 use crate::proxy::buffer_pool::{BodyReadError, BufferPool};
@@ -38,6 +39,9 @@ use crate::proxy::decompression::{
     decompress_request_body, strip_encoding_headers, DecompressionError,
 };
 use crate::proxy::framing::validate_request_framing;
+use crate::proxy::grpc_body::{
+    probe_grpc_body, GrpcBodyMode, GrpcProbeError, GrpcStreamGuard, PrefixedBody,
+};
 use crate::proxy::websocket::WebSocketHandler;
 use crate::waf::auth::{ApiKeyValidator, InMemoryKeyStore};
 use crate::waf::tls_config::TlsManager;
@@ -120,8 +124,6 @@ pub(crate) struct RequestClassification {
     pub(crate) is_grpc: bool,
     /// The body uses the gRPC-Web HTTP/1.1 framing (trailers in the body).
     pub(crate) is_grpc_web: bool,
-    /// gRPC request without `content-length`: treated as a streaming RPC.
-    pub(crate) is_grpc_streaming: bool,
 }
 
 /// Classify a request for gRPC transport handling.
@@ -142,14 +144,13 @@ pub(crate) fn classify_request(headers: &HeaderMap) -> RequestClassification {
 
     let is_grpc = media_type.starts_with("application/grpc");
     let is_grpc_web = media_type.starts_with("application/grpc-web");
-    // A unary call always carries one complete gRPC message and therefore a
-    // content-length. A body without one is a stream and must not be buffered.
-    let is_grpc_streaming = is_grpc && !headers.contains_key(hyper::header::CONTENT_LENGTH);
 
+    // Streaming is not inferred from HTTP framing. HTTP/2 does not require
+    // `content-length`, so a unary RPC without one is still unary. The actual
+    // frame sequence is classified by `grpc_body::probe_grpc_body`.
     RequestClassification {
         is_grpc,
         is_grpc_web,
-        is_grpc_streaming,
     }
 }
 
@@ -183,6 +184,8 @@ pub(crate) enum ProxyBody {
     Incoming(Incoming),
     /// A streaming body bounded by a byte cap and an overall deadline.
     Guarded(GuardedBody<Incoming>),
+    /// A type-erased body used for frame-aware gRPC streaming guards.
+    Boxed(BoxBody<Bytes, ProxyBodyError>),
 }
 
 impl ProxyBody {
@@ -263,6 +266,7 @@ impl Body for ProxyBody {
             }
             ProxyBody::Incoming(body) => map_body_poll(Pin::new(body).poll_frame(cx)),
             ProxyBody::Guarded(body) => Pin::new(body).poll_frame(cx),
+            ProxyBody::Boxed(body) => Pin::new(body).poll_frame(cx),
         }
     }
 }
@@ -603,6 +607,14 @@ impl WafProxyService {
     /// Create a new WAF proxy service with optimized connection pooling
     pub fn new(config: Config) -> Result<Self, WafError> {
         info!("Initializing WAF Proxy Service with performance optimizations");
+
+        if config.server.grpc_streaming_policy == GrpcStreamingPolicy::TransportOnly {
+            warn!(
+                "server.grpc_streaming_policy = \"transport-only\": genuinely streaming gRPC \
+                 RPCs are relayed without body inspection (header/URI rules still apply). \
+                 Set it to \"reject\" to refuse streaming RPCs."
+            );
+        }
 
         let metrics = Arc::new(Metrics::new());
         let waf_engine = Arc::new(WafEngine::with_config_and_metrics(
@@ -1152,7 +1164,7 @@ impl WafProxyService {
         // rule dispatch or audit-event construction. A query, body, framing
         // header, content encoding, upgrade, gRPC/GraphQL content type or
         // streaming gRPC request never matches and falls through unchanged.
-        if !classification.is_grpc_streaming {
+        if !classification.is_grpc {
             if let Some(outcome) = state.waf_engine.fast_allow(
                 req.method(),
                 req.uri(),
@@ -1240,98 +1252,187 @@ impl WafProxyService {
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<usize>().ok());
         let max_body_size = state.config.server.max_body_size;
+        let mut body = Some(body);
+        let mut pre_read: Option<(Bytes, Option<HeaderMap>)> = None;
 
-        // Streaming gRPC is transport-only: the body is relayed frame by frame
-        // under a byte cap and deadline instead of being buffered, so it is
-        // never passed to the WAF body inspector. Header/URI rules still run.
-        if classification.is_grpc_streaming {
-            debug!(
-                "Streaming gRPC request from {} forwarded without body inspection (transport-only)",
-                client_ip
-            );
-            let request_context = RequestContext::with_http_version(
-                client_ip,
-                parts.method.clone(),
-                parts.uri.clone(),
-                parts.headers.clone(),
-                None,
-                http_version.to_string(),
-            );
-            match state.waf_engine.evaluate_shared(&request_context).await {
-                Decision::Allow => {}
-                Decision::Block { status, reason } => {
-                    warn!(
-                        "WAF blocked streaming gRPC request from {}: {} (status: {})",
-                        client_ip, reason, status
-                    );
-                    state.metrics.record_blocked();
-                    state.metrics.record_request_duration(start_time.elapsed());
-                    if classification.is_grpc && state.config.server.grpc_aware_rejections {
-                        return Ok(Self::create_grpc_blocked_response(status, &reason));
+        // gRPC is classified from its actual frame sequence, never from the
+        // presence of `content-length`. HTTP/2 unary RPCs commonly omit it.
+        // gRPC-Web keeps the buffered path because its text framing is base64.
+        if classification.is_grpc && !classification.is_grpc_web {
+            let mut incoming = body.take().expect("request body");
+            match probe_grpc_body(&mut incoming, max_body_size).await {
+                Ok(probe) => match probe.mode {
+                    GrpcBodyMode::Unary => {
+                        pre_read = Some((probe.prefix, probe.trailers));
                     }
-                    return Ok(Self::create_blocked_response(status, &reason));
-                }
-                Decision::RateLimit { reason } => {
+                    GrpcBodyMode::Streaming => {
+                        let request_context = RequestContext::with_http_version(
+                            client_ip,
+                            parts.method.clone(),
+                            parts.uri.clone(),
+                            parts.headers.clone(),
+                            None,
+                            http_version.to_string(),
+                        );
+                        match state.waf_engine.evaluate_shared(&request_context).await {
+                            Decision::Allow => {}
+                            Decision::Block { status, reason } => {
+                                warn!(
+                                    "WAF blocked streaming gRPC request from {}: {} (status: {})",
+                                    client_ip, reason, status
+                                );
+                                state.metrics.record_blocked();
+                                state.metrics.record_request_duration(start_time.elapsed());
+                                if state.config.server.grpc_aware_rejections {
+                                    return Ok(Self::create_grpc_blocked_response(status, &reason));
+                                }
+                                return Ok(Self::create_blocked_response(status, &reason));
+                            }
+                            Decision::RateLimit { reason } => {
+                                warn!(
+                                    "WAF rate limited streaming gRPC request from {}: {}",
+                                    client_ip, reason
+                                );
+                                state.metrics.record_rate_limited();
+                                state.metrics.record_blocked();
+                                state.metrics.record_request_duration(start_time.elapsed());
+                                return Ok(Self::create_rate_limit_response(&reason));
+                            }
+                        }
+
+                        if state.config.server.grpc_streaming_policy
+                            == crate::config::GrpcStreamingPolicy::Reject
+                        {
+                            let reason = "streaming gRPC rejected by server.grpc_streaming_policy = \"reject\"";
+                            warn!(
+                                "Rejecting streaming gRPC request from {}: {}",
+                                client_ip, reason
+                            );
+                            state.metrics.record_blocked();
+                            state.metrics.record_request_duration(start_time.elapsed());
+                            if state.config.server.grpc_aware_rejections {
+                                return Ok(Self::create_grpc_blocked_response(403, reason));
+                            }
+                            return Ok(Self::create_blocked_response(403, reason));
+                        }
+
+                        debug!(
+                            "Streaming gRPC request from {} forwarded without body inspection (transport-only)",
+                            client_ip
+                        );
+                        let encoding = parts
+                            .headers
+                            .get("grpc-encoding")
+                            .and_then(|value| value.to_str().ok());
+                        let max_duration =
+                            Duration::from_secs(state.config.server.grpc_max_stream_seconds);
+                        let guarded = match GrpcStreamGuard::new(
+                            PrefixedBody::new(probe.prefix, incoming),
+                            encoding,
+                            state.config.server.grpc_max_stream_bytes,
+                            state.config.server.grpc_max_stream_messages,
+                            state.config.server.grpc_max_decompressed_bytes,
+                            max_duration,
+                        ) {
+                            Ok(guarded) => guarded,
+                            Err(error) => {
+                                warn!(
+                                    "Rejecting streaming gRPC request from {}: {}",
+                                    client_ip, error
+                                );
+                                state.metrics.record_blocked();
+                                state.metrics.record_request_duration(start_time.elapsed());
+                                if state.config.server.grpc_aware_rejections {
+                                    return Ok(Self::create_grpc_blocked_response(
+                                        400,
+                                        &error.to_string(),
+                                    ));
+                                }
+                                return Ok(Self::create_error_response(
+                                    StatusCode::BAD_REQUEST,
+                                    &error.to_string(),
+                                ));
+                            }
+                        };
+
+                        state.metrics.record_allowed();
+                        let response = Self::forward_grpc_stream(
+                            parts,
+                            ProxyBody::Boxed(guarded.boxed()),
+                            &state,
+                            start_time,
+                            http_version,
+                            client_ip,
+                            is_https,
+                        )
+                        .await;
+                        state.metrics.record_request_duration(start_time.elapsed());
+                        return Ok(response);
+                    }
+                },
+                Err(error) => {
+                    let status = match error {
+                        GrpcProbeError::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+                        _ => StatusCode::BAD_REQUEST,
+                    };
                     warn!(
-                        "WAF rate limited streaming gRPC request from {}: {}",
-                        client_ip, reason
+                        "Rejecting malformed gRPC request from {}: {}",
+                        client_ip, error
                     );
-                    state.metrics.record_rate_limited();
                     state.metrics.record_blocked();
                     state.metrics.record_request_duration(start_time.elapsed());
-                    return Ok(Self::create_rate_limit_response(&reason));
+                    if state.config.server.grpc_aware_rejections {
+                        return Ok(Self::create_grpc_blocked_response(
+                            status.as_u16(),
+                            &error.to_string(),
+                        ));
+                    }
+                    return Ok(Self::create_error_response(status, &error.to_string()));
                 }
             }
-
-            state.metrics.record_allowed();
-            let response = Self::forward_grpc_stream(
-                parts,
-                body,
-                &state,
-                start_time,
-                http_version,
-                client_ip,
-                is_https,
-            )
-            .await;
-            state.metrics.record_request_duration(start_time.elapsed());
-            return Ok(response);
         }
 
-        let (body_bytes, request_trailers) = match tokio::time::timeout(
-            Duration::from_secs(state.config.server.request_timeout_secs.max(1)),
-            state
-                .buffer_pool
-                .read_incoming_body_bytes(body, size_hint, Some(max_body_size)),
-        )
-        .await
-        {
-            Ok(Ok((bytes, trailers))) => (bytes, trailers),
-            Ok(Err(BodyReadError::TooLarge { .. })) => {
-                warn!(
-                    "Request body from {} exceeds limit {}",
-                    client_ip, max_body_size
-                );
-                state.metrics.record_blocked();
-                state.metrics.record_request_duration(start_time.elapsed());
-                return Ok(Self::create_error_response(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "Request body too large",
-                ));
-            }
-            Ok(Err(e)) => {
-                warn!("Failed to read request body from {}: {}", client_ip, e);
-                return Ok(Self::create_error_response(
-                    StatusCode::BAD_REQUEST,
-                    "Failed to read request body",
-                ));
-            }
-            Err(_) => {
-                warn!("Request body read timed out for {}", client_ip);
-                return Ok(Self::create_error_response(
-                    StatusCode::REQUEST_TIMEOUT,
-                    "Request body timeout",
-                ));
+        let (body_bytes, request_trailers) = if let Some(pre_read) = pre_read {
+            pre_read
+        } else {
+            let incoming = body.take().expect("request body");
+            match tokio::time::timeout(
+                Duration::from_secs(state.config.server.request_timeout_secs.max(1)),
+                state.buffer_pool.read_incoming_body_bytes(
+                    incoming,
+                    size_hint,
+                    Some(max_body_size),
+                ),
+            )
+            .await
+            {
+                Ok(Ok((bytes, trailers))) => (bytes, trailers),
+                Ok(Err(BodyReadError::TooLarge { .. })) => {
+                    warn!(
+                        "Request body from {} exceeds limit {}",
+                        client_ip, max_body_size
+                    );
+                    state.metrics.record_blocked();
+                    state.metrics.record_request_duration(start_time.elapsed());
+                    return Ok(Self::create_error_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "Request body too large",
+                    ));
+                }
+                Ok(Err(e)) => {
+                    warn!("Failed to read request body from {}: {}", client_ip, e);
+                    return Ok(Self::create_error_response(
+                        StatusCode::BAD_REQUEST,
+                        "Failed to read request body",
+                    ));
+                }
+                Err(_) => {
+                    warn!("Request body read timed out for {}", client_ip);
+                    return Ok(Self::create_error_response(
+                        StatusCode::REQUEST_TIMEOUT,
+                        "Request body timeout",
+                    ));
+                }
             }
         };
 
@@ -2329,7 +2430,7 @@ impl WafProxyService {
     #[allow(clippy::too_many_arguments)]
     async fn forward_grpc_stream(
         parts: hyper::http::request::Parts,
-        body: Incoming,
+        request_body: ProxyBody,
         state: &ProxyState,
         start_time: Instant,
         http_version: &str,
@@ -2343,10 +2444,9 @@ impl WafProxyService {
         let announce_grpc_trailers =
             classify_request(&parts.headers).is_grpc && matches!(http_version, "1.0" | "1.1");
 
-        let guarded = ProxyBody::guarded(body, max_bytes, max_duration);
         let proxy_req = match Self::build_upstream_request(
             parts,
-            guarded,
+            request_body,
             &state.upstream_uri,
             http_version,
             client_ip,
@@ -2542,12 +2642,16 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "application/grpc+proto".parse().unwrap());
-        assert!(classify_request(&headers).is_grpc_streaming);
+        let without_length = classify_request(&headers);
+        assert!(without_length.is_grpc);
+        assert!(
+            !without_length.is_grpc_web,
+            "content-length must not influence gRPC classification"
+        );
 
         headers.insert("content-length", "10".parse().unwrap());
         let unary = classify_request(&headers);
         assert!(unary.is_grpc);
-        assert!(!unary.is_grpc_streaming, "content-length means unary");
         assert!(!unary.is_grpc_web);
 
         let mut headers = HeaderMap::new();
@@ -2557,7 +2661,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "application/json".parse().unwrap());
         let plain = classify_request(&headers);
-        assert!(!plain.is_grpc && !plain.is_grpc_streaming && !plain.is_grpc_web);
+        assert!(!plain.is_grpc && !plain.is_grpc_web);
     }
 
     #[tokio::test]

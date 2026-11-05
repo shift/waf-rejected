@@ -136,6 +136,9 @@ supported_http_versions = ["1.0", "1.1", "2"]
 max_body_size = 10485760
 grpc_max_stream_bytes = 4194304
 grpc_max_stream_seconds = 300
+grpc_max_stream_messages = 1024
+grpc_max_decompressed_bytes = 10485760
+grpc_streaming_policy = "transport-only"
 grpc_aware_rejections = false
 io_backend = "tokio"
 ```
@@ -144,9 +147,16 @@ io_backend = "tokio"
   matches; an invalid CIDR aborts start-up.
 - `supported_http_versions` must match the listener features: HTTP/3 requires a
   `http3` build and `enable_http3 = true`; it is feature-gated, not default.
-- Streaming gRPC bodies (no `content-length`) are relayed but never buffered or
-  sent to CRS body rules. `grpc_max_stream_bytes` and
-  `grpc_max_stream_seconds` bound each exchange.
+- Unary gRPC is classified from its frame sequence, not `content-length`.
+  Unary RPCs without `content-length` (normal over HTTP/2) are buffered up to
+  `max_body_size` and inspected.
+- `grpc_streaming_policy` controls genuinely streaming RPCs:
+  `"transport-only"` (default) relays them without body inspection and logs a
+  start-up warning; `"reject"` refuses them with a clear 4xx / gRPC status.
+  `grpc_max_stream_bytes`, `grpc_max_stream_seconds`,
+  `grpc_max_stream_messages` and `grpc_max_decompressed_bytes` bound each
+  exchange. `grpc-encoding` accepts `identity` and `gzip`; other encodings are
+  rejected.
 - `grpc_aware_rejections = true` returns HTTP 200 with `grpc-status: 7`
   (PERMISSION_DENIED) for blocked gRPC calls instead of a plain HTTP error.
 - `io_backend` is `"tokio"` (default) or `"io_uring"` (requires the

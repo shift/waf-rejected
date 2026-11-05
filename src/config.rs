@@ -293,6 +293,18 @@ pub struct Http2TuningConfig {
     pub adaptive_window: bool,
 }
 
+/// Policy for genuinely streaming gRPC RPCs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GrpcStreamingPolicy {
+    /// Relay the stream without body inspection. Header/URI rules still run.
+    /// This is the compatibility default and logs a start-up warning.
+    #[default]
+    TransportOnly,
+    /// Reject streaming RPCs with a clear 4xx / gRPC status.
+    Reject,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
@@ -330,6 +342,23 @@ pub struct ServerConfig {
 
     /// Maximum duration in seconds of one streaming gRPC exchange.
     pub grpc_max_stream_seconds: u64,
+
+    /// Maximum number of length-prefixed messages in one streaming gRPC
+    /// exchange. Applies to the request stream.
+    pub grpc_max_stream_messages: usize,
+
+    /// Maximum decompressed bytes across one streaming gRPC exchange when
+    /// `grpc-encoding: gzip` is used. The compressed bytes are still bounded
+    /// by `grpc_max_stream_bytes`.
+    pub grpc_max_decompressed_bytes: usize,
+
+    /// Policy for genuinely streaming gRPC RPCs (more than one request
+    /// message, or a request body that is not a single complete message).
+    ///
+    /// `transport-only` (default) relays the stream without body inspection
+    /// and logs a start-up warning. `reject` refuses the RPC with a clear
+    /// 4xx / gRPC status. Unary RPCs are always inspected.
+    pub grpc_streaming_policy: GrpcStreamingPolicy,
 
     /// Return gRPC-native rejection responses for blocked gRPC requests.
     ///
@@ -1214,6 +1243,10 @@ pub struct WafGrpcConfig {
     /// Maximum number of length-prefixed messages in one request body.
     pub max_frames: usize,
 
+    /// Maximum decompressed bytes across all gzip-compressed frames in one
+    /// request body. Bounds a gzip bomb before field decoding.
+    pub max_decompressed_bytes: usize,
+
     /// What to do with a method that is not in a non-empty allowlist:
     /// `allow` (monitor) or `block`. When unset, it defaults to `block` for a
     /// non-empty allowlist and `allow` for an empty one.
@@ -1260,6 +1293,7 @@ impl Default for WafGrpcConfig {
             allowlist_file: None,
             max_message_bytes: 4 * 1024 * 1024,
             max_frames: 64,
+            max_decompressed_bytes: 10 * 1024 * 1024,
             unknown_method_action: None,
             max_string_bytes: 1024 * 1024,
             max_bytes_len: 1024 * 1024,
@@ -1302,6 +1336,9 @@ impl WafGrpcConfig {
         }
         if self.max_frames == 0 {
             anyhow::bail!("waf.grpc.max_frames must be greater than zero");
+        }
+        if self.max_decompressed_bytes == 0 {
+            anyhow::bail!("waf.grpc.max_decompressed_bytes must be greater than zero");
         }
         if self.max_string_bytes == 0 {
             anyhow::bail!("waf.grpc.max_string_bytes must be greater than zero");
@@ -1856,6 +1893,9 @@ impl Default for ServerConfig {
             max_body_size: 10 * 1024 * 1024,        // 10MB
             grpc_max_stream_bytes: 4 * 1024 * 1024, // 4MiB
             grpc_max_stream_seconds: 300,
+            grpc_max_stream_messages: 1024,
+            grpc_max_decompressed_bytes: 10 * 1024 * 1024, // 10MiB
+            grpc_streaming_policy: GrpcStreamingPolicy::TransportOnly,
             grpc_aware_rejections: false,
             tls: TlsConfig::default(),
             http2: Http2TuningConfig::default(),
@@ -2212,6 +2252,12 @@ impl Config {
         }
         if self.server.grpc_max_stream_seconds == 0 {
             anyhow::bail!("server.grpc_max_stream_seconds must be greater than zero");
+        }
+        if self.server.grpc_max_stream_messages == 0 {
+            anyhow::bail!("server.grpc_max_stream_messages must be greater than zero");
+        }
+        if self.server.grpc_max_decompressed_bytes == 0 {
+            anyhow::bail!("server.grpc_max_decompressed_bytes must be greater than zero");
         }
         if self.proxy.timeout_seconds == 0 || self.server.request_timeout_secs == 0 {
             anyhow::bail!("request timeouts must be greater than zero");

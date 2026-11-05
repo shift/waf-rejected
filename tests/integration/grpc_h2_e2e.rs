@@ -41,6 +41,7 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName}
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
+use waf_ingress::config::GrpcStreamingPolicy;
 use waf_ingress::proxy::WafProxyService;
 use waf_ingress::waf::grpc_allowlist::{
     AllowlistSource, GrpcAllowlist, GrpcAllowlistMethod, GrpcMessage, GrpcMessageField,
@@ -88,6 +89,28 @@ impl Body for TrailerBody {
             return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
         }
         Poll::Ready(None)
+    }
+}
+
+/// A body with no size hint, so hyper does not add `content-length`. This is
+/// the normal HTTP/2 unary shape that the old classifier mistook for a stream.
+struct NoLengthBody {
+    data: Option<Bytes>,
+}
+
+impl Body for NoLengthBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        let this = self.get_mut();
+        match this.data.take() {
+            Some(data) => Poll::Ready(Some(Ok(Frame::data(data)))),
+            None => Poll::Ready(None),
+        }
     }
 }
 
@@ -440,6 +463,30 @@ async fn spawn_proxy_with_content_scan(
     grpc_aware_rejections: bool,
     content_scan: &str,
 ) -> SocketAddr {
+    spawn_proxy_full(
+        upstream,
+        ca_path,
+        cert_path,
+        key_path,
+        allowlist_path,
+        grpc_aware_rejections,
+        content_scan,
+        GrpcStreamingPolicy::TransportOnly,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments, clippy::field_reassign_with_default)]
+async fn spawn_proxy_full(
+    upstream: SocketAddr,
+    ca_path: &Path,
+    cert_path: &Path,
+    key_path: &Path,
+    allowlist_path: &Path,
+    grpc_aware_rejections: bool,
+    content_scan: &str,
+    streaming_policy: GrpcStreamingPolicy,
+) -> SocketAddr {
     let mut config = Config::default();
     config.upstream_uri = format!("https://127.0.0.1:{}", upstream.port());
     config.proxy.upstream_ca_path = Some(ca_path.to_string_lossy().into_owned());
@@ -454,6 +501,7 @@ async fn spawn_proxy_with_content_scan(
     config.server.tls.key_path = key_path.to_string_lossy().into_owned();
     config.server.tls.alpn_protocols = vec!["h2".to_string(), "http/1.1".to_string()];
     config.server.grpc_aware_rejections = grpc_aware_rejections;
+    config.server.grpc_streaming_policy = streaming_policy;
     config.waf.rate_limit.per_ip_enabled = false;
     config.waf.rate_limit.global_enabled = false;
     config.waf.coraza.enabled = true;
@@ -876,6 +924,89 @@ async fn grpc_web_over_http1_preserves_body_encoded_trailers() {
         data.windows(b"grpc-status: 0".len())
             .any(|window| window == b"grpc-status: 0"),
         "gRPC-Web trailer frame must contain grpc-status"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires TLS, local ports and the wasm-reactor feature"]
+async fn unary_grpc_without_content_length_is_inspected() {
+    let env = test_env().await;
+    let proxy = spawn_proxy(
+        env.upstream,
+        &env.ca_path,
+        &env.cert_path,
+        &env.key_path,
+        &env.allowlist_path,
+        false,
+    )
+    .await;
+    let mut sender = h2_client::<NoLengthBody>(proxy, &env.ca_path).await;
+
+    let payload = protobuf_string(1, "' OR '1'='1' -- <script>alert(1)</script>");
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("https://127.0.0.1:{}{}", proxy.port(), SQLI))
+        .header("content-type", "application/grpc+proto")
+        .header("te", "trailers")
+        .body(NoLengthBody {
+            data: Some(grpc_frame(&payload)),
+        })
+        .unwrap();
+
+    let response = sender
+        .send_request(request)
+        .await
+        .expect("unary response without content-length");
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "a unary gRPC request without content-length must still be body-inspected"
+    );
+    assert_eq!(
+        env.upstream_state.calls.load(Ordering::SeqCst),
+        0,
+        "blocked unary gRPC must not reach the upstream"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires TLS, local ports and the wasm-reactor feature"]
+async fn streaming_policy_reject_returns_grpc_status() {
+    let env = test_env().await;
+    let proxy = spawn_proxy_full(
+        env.upstream,
+        &env.ca_path,
+        &env.cert_path,
+        &env.key_path,
+        &env.allowlist_path,
+        true,
+        "strings",
+        GrpcStreamingPolicy::Reject,
+    )
+    .await;
+    let mut sender = h2_client::<Full<Bytes>>(proxy, &env.ca_path).await;
+
+    let mut body = grpc_frame(b"first").to_vec();
+    body.extend_from_slice(&grpc_frame(b"second"));
+    let response = sender
+        .send_request(grpc_request(proxy, STREAM, Bytes::from(body)))
+        .await
+        .expect("streaming reject response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let (data, trailers) = read_body(response.into_body()).await;
+    assert!(data.is_empty());
+    let trailers = trailers.expect("grpc rejection trailers");
+    assert_eq!(trailers.get("grpc-status").unwrap(), "7");
+    assert!(trailers
+        .get("grpc-message")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("grpc_streaming_policy"));
+    assert_eq!(
+        env.upstream_state.calls.load(Ordering::SeqCst),
+        0,
+        "rejected streaming RPC must not reach the upstream"
     );
 }
 

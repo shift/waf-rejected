@@ -7,9 +7,18 @@ by `classify_request()` in `src/proxy/service.rs`.
 
 ## Unary RPCs
 
-A gRPC request that carries a `content-length` is assumed to be a single,
-complete unary message. It follows the normal pipeline: the body is buffered
-(subject to `server.max_body_size`), inspected by the WAF, and forwarded.
+Unary vs streaming is classified from the **actual gRPC frame sequence**, not
+from HTTP framing. HTTP/2 does not require `content-length`, so a unary RPC
+without one is still unary. `probe_grpc_body()` reads the first length-prefixed
+message and checks whether the stream ends (or carries trailers) after it:
+
+* exactly one complete message, then end-of-stream or trailers: **unary**;
+* a second message, or a complete first message with the stream still open:
+  **streaming**.
+
+A unary body is buffered (subject to `server.max_body_size`), inspected by the
+WAF, and forwarded. This includes unary gRPC over HTTP/2 with no
+`content-length`; it is never silently forwarded uninspected.
 
 Trailing headers are HTTP body frames (`Frame::trailers`) in hyper 1.x, not
 request/response parts. The unary path therefore:
@@ -24,22 +33,37 @@ empty, which is the normal unary response shape.
 
 ## Streaming RPCs
 
-A gRPC request without `content-length` is treated as a streaming RPC. Its body
-is **not** buffered and is passed through frame by frame in both directions,
-including trailers. Streaming RPCs are **transport-only**: the WAF still
-evaluates request headers and the request URI, but there is no body inspection
-for the stream. This is documented behaviour, not a silent bypass — a streaming
-request can never reach the body-inspection stage.
+A genuinely streaming RPC (more than one request message, or a first message
+followed by an open stream) is controlled by
+`server.grpc_streaming_policy`:
 
-Two limits bound a streaming exchange, applied to both the request and the
-response body:
+| Value | Behaviour |
+| --- | --- |
+| `transport-only` (default) | Relay the stream frame by frame without body inspection. Header/URI rules still run. A start-up warning is logged. |
+| `reject` | Refuse the RPC with `403` (or a gRPC-aware rejection with `grpc-status: 7` when `server.grpc_aware_rejections = true`). |
+
+`transport-only` is a compatibility default, not a silent bypass: it is
+explicitly configured, logged at start-up, and documented here. Streaming
+bodies are never passed to the WAF body inspector.
+
+Streaming bodies are relayed through a frame-aware guard that enforces limits
+across the **whole** exchange, not per message:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `server.grpc_max_stream_bytes` | 4 MiB | Maximum bytes relayed per streaming exchange |
+| `server.grpc_max_stream_bytes` | 4 MiB | Maximum raw bytes relayed per streaming exchange |
 | `server.grpc_max_stream_seconds` | 300 | Overall deadline for a streaming exchange |
+| `server.grpc_max_stream_messages` | 1024 | Maximum request messages in one stream |
+| `server.grpc_max_decompressed_bytes` | 10 MiB | Maximum decompressed bytes when `grpc-encoding: gzip` |
 
-Both must be greater than zero; `Config::validate()` rejects zero values.
+All must be greater than zero; `Config::validate()` rejects zero values.
+`grpc-encoding` accepts `identity` and `gzip`; any other encoding is rejected
+with `400`. Gzip frames are decompressed only to validate the bound; the
+original compressed bytes are forwarded unchanged. A gzip bomb is rejected as
+soon as the decompressed total exceeds the cap.
+
+The response body is still bounded by `grpc_max_stream_bytes` and
+`grpc_max_stream_seconds`.
 
 ## HTTP/2 and ALPN
 
@@ -61,7 +85,11 @@ because they bind local ports and generate certificates).
 | --- | --- | --- |
 | Unary echo, `te: trailers` | HTTP/2 + ALPN h2 | Body echoed; `grpc-status: 0` / `grpc-message` trailers preserved |
 | Unary with empty response body | HTTP/2 + ALPN h2 | `grpc-status` / `grpc-message` trailers preserved |
-| Streaming request (no `content-length`) | HTTP/2 + ALPN h2 | Relayed frame by frame; request and response trailers preserved |
+| Unary without `content-length` | HTTP/2 + ALPN h2 | Buffered and inspected; SQLi/XSS in a declared field is blocked |
+| Streaming request (two messages) | HTTP/2 + ALPN h2 | Relayed frame by frame; request and response trailers preserved |
+| Streaming with `grpc_streaming_policy = "reject"` | HTTP/2 + ALPN h2 | `403`, or `grpc-status: 7` with gRPC-aware rejections; upstream not called |
+| Gzip-compressed frame | HTTP/2 + ALPN h2 | Decompressed for inspection under `max_decompressed_bytes`; original bytes forwarded |
+| Gzip bomb | HTTP/2 + ALPN h2 | `413` before the upstream is called |
 | Malformed frame (truncated prefix) | HTTP/2 + ALPN h2 | `400` before the upstream is called |
 | Oversized frame | HTTP/2 + ALPN h2 | `413` before the upstream is called |
 | SQLi/XSS text in a declared protobuf string field | HTTP/2 + ALPN h2 | `403` (or gRPC-aware rejection): decoded field content is scanned by Coraza via a synthetic form payload |
