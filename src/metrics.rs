@@ -91,6 +91,7 @@ pub struct Metrics {
     fast_allow_hits_total: AtomicU64,
     fast_allow_blocks_total: AtomicU64,
     fast_allow_fallthrough_total: AtomicU64,
+    forwarded_header_rejected_total: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -174,6 +175,7 @@ impl Metrics {
             fast_allow_hits_total: AtomicU64::new(0),
             fast_allow_blocks_total: AtomicU64::new(0),
             fast_allow_fallthrough_total: AtomicU64::new(0),
+            forwarded_header_rejected_total: AtomicU64::new(0),
         }
     }
 
@@ -530,6 +532,13 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A trusted peer sent a forwarding header that was discarded because it
+    /// was malformed, oversized or over-long; the socket peer was used.
+    pub fn record_forwarded_header_rejected(&self) {
+        self.forwarded_header_rejected_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn uptime_seconds(&self) -> u64 {
         self.start_time.elapsed().as_secs()
     }
@@ -757,10 +766,14 @@ impl Metrics {
              waf_fast_allow_blocks_total {}\n\
              # HELP waf_fast_allow_fallthrough_total Matched fast-allow routes that fell through to full evaluation.\n\
              # TYPE waf_fast_allow_fallthrough_total counter\n\
-             waf_fast_allow_fallthrough_total {}\n",
+             waf_fast_allow_fallthrough_total {}\n\
+             # HELP waf_forwarded_header_rejected_total Trusted-peer forwarding headers discarded in favour of the socket peer.\n\
+             # TYPE waf_forwarded_header_rejected_total counter\n\
+             waf_forwarded_header_rejected_total {}\n",
             self.fast_allow_hits_total.load(Ordering::Relaxed),
             self.fast_allow_blocks_total.load(Ordering::Relaxed),
             self.fast_allow_fallthrough_total.load(Ordering::Relaxed),
+            self.forwarded_header_rejected_total.load(Ordering::Relaxed),
         ));
 
         out.push_str(

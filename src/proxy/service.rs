@@ -482,20 +482,161 @@ fn is_webtransport_upgrade(headers: &hyper::HeaderMap) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case("webtransport"))
 }
 
+/// Maximum number of bytes accepted across every value of one forwarding
+/// header family. Larger chains are discarded rather than silently truncated.
+pub(crate) const MAX_FORWARDED_HEADER_BYTES: usize = 8 * 1024;
+
+/// Maximum number of hops accepted in one forwarding chain. Larger chains are
+/// discarded rather than silently truncated.
+pub(crate) const MAX_FORWARDED_CHAIN_HOPS: usize = 32;
+
 /// Why a trusted peer's forwarding header was not used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClientIpFallback {
     MalformedXForwardedFor,
+    MalformedForwarded,
     MalformedXRealIp,
+    MalformedXClientIp,
+    ForwardedHeaderTooLarge,
+    ForwardedChainTooLong,
 }
 
 impl ClientIpFallback {
     fn as_str(self) -> &'static str {
         match self {
             Self::MalformedXForwardedFor => "malformed_x_forwarded_for",
+            Self::MalformedForwarded => "malformed_forwarded",
             Self::MalformedXRealIp => "malformed_x_real_ip",
+            Self::MalformedXClientIp => "malformed_x_client_ip",
+            Self::ForwardedHeaderTooLarge => "forwarded_header_too_large",
+            Self::ForwardedChainTooLong => "forwarded_chain_too_long",
         }
     }
+
+    fn for_header(header: ForwardedHeader) -> Self {
+        match header {
+            ForwardedHeader::XForwardedFor => Self::MalformedXForwardedFor,
+            ForwardedHeader::Forwarded => Self::MalformedForwarded,
+            ForwardedHeader::XRealIp => Self::MalformedXRealIp,
+            ForwardedHeader::XClientIp => Self::MalformedXClientIp,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardedHeader {
+    XForwardedFor,
+    Forwarded,
+    XRealIp,
+    XClientIp,
+}
+
+impl ForwardedHeader {
+    fn name(self) -> &'static str {
+        match self {
+            Self::XForwardedFor => "x-forwarded-for",
+            Self::Forwarded => "forwarded",
+            Self::XRealIp => "x-real-ip",
+            Self::XClientIp => "x-client-ip",
+        }
+    }
+}
+
+/// Parse one forwarding-chain member. Bare addresses, IPv4 `addr:port`,
+/// bracketed IPv6 `[addr]:port` and bare IPv6 are accepted.
+fn parse_forwarded_ip(raw: &str) -> Option<IpAddr> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    if let Some(rest) = raw.strip_prefix('[') {
+        let (inside, after) = rest.split_once(']')?;
+        let ip = inside.parse::<IpAddr>().ok()?;
+        if after.is_empty() {
+            return Some(ip);
+        }
+        let port = after.strip_prefix(':')?;
+        if port.is_empty() || port.parse::<u16>().is_err() {
+            return None;
+        }
+        return Some(ip);
+    }
+
+    if let Ok(ip) = raw.parse::<IpAddr>() {
+        return Some(ip);
+    }
+
+    raw.parse::<SocketAddr>().ok().map(|socket| socket.ip())
+}
+
+/// Split on `delimiter` while ignoring delimiters inside quoted strings.
+/// Returns `None` when a quote is left unterminated.
+fn split_quoted(value: &str, delimiter: char) -> Option<Vec<&str>> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut in_quotes = false;
+    let mut escaped = false;
+
+    for (index, ch) in value.char_indices() {
+        if in_quotes {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_quotes = false;
+            }
+        } else if ch == '"' {
+            in_quotes = true;
+        } else if ch == delimiter {
+            parts.push(&value[start..index]);
+            start = index + ch.len_utf8();
+        }
+    }
+
+    if in_quotes || escaped {
+        return None;
+    }
+    parts.push(&value[start..]);
+    Some(parts)
+}
+
+fn unquote_forwarded(value: &str) -> Option<String> {
+    if let Some(inner) = value.strip_prefix('"') {
+        let inner = inner.strip_suffix('"')?;
+        let mut out = String::with_capacity(inner.len());
+        let mut chars = inner.chars();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\\' => out.push(chars.next()?),
+                '"' => return None,
+                _ => out.push(ch),
+            }
+        }
+        Some(out)
+    } else if value.contains('"') {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+/// Extract the `for=` parameter from one RFC 7239 Forwarded element.
+fn parse_forwarded_element(element: &str) -> Option<IpAddr> {
+    let mut address = None;
+    for parameter in split_quoted(element, ';')? {
+        let (name, value) = parameter.split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("for") {
+            continue;
+        }
+        if address.is_some() {
+            return None;
+        }
+        let value = unquote_forwarded(value.trim())?;
+        address = Some(parse_forwarded_ip(&value)?);
+    }
+    address
 }
 
 /// Per-connection state cloned into each hyper service invocation.
@@ -1142,7 +1283,12 @@ impl WafProxyService {
             ));
         }
 
-        let client_ip = Self::resolve_client_ip(peer_ip, req.headers(), &state.trusted_proxies);
+        let client_ip = Self::resolve_client_ip_with_metrics(
+            peer_ip,
+            req.headers(),
+            &state.trusted_proxies,
+            &state.metrics,
+        );
 
         // Reject ambiguous request framing before any body is read. HTTP/2 and
         // HTTP/3 additionally reject Transfer-Encoding and connection-specific
@@ -2046,28 +2192,54 @@ impl WafProxyService {
 
     /// Resolve the client address without blindly trusting client headers.
     ///
-    /// `X-Forwarded-For` / `X-Real-IP` are only honoured when the immediate
-    /// peer is a configured trusted proxy; otherwise the socket address is
-    /// authoritative. A malformed forwarded chain is never silently trimmed:
-    /// the whole header is discarded, the immediate peer is used, and a warning
-    /// names the fallback reason.
+    /// Forwarding headers are only honoured when the immediate peer is a
+    /// configured trusted proxy; otherwise the socket address is
+    /// authoritative. The precedence is `X-Forwarded-For`, `Forwarded`
+    /// (`for=`), `X-Real-IP`, then `X-Client-IP`. Every family is read in wire
+    /// order across repeated header lines and comma-separated members. A
+    /// malformed, oversized or over-long chain is never silently trimmed: the
+    /// selected header family is discarded, the immediate peer is used, and a
+    /// warning names the fallback reason.
     pub(crate) fn resolve_client_ip(
         peer_ip: IpAddr,
         headers: &hyper::HeaderMap,
         trusted_proxies: &[IpNetwork],
     ) -> IpAddr {
+        Self::resolve_client_ip_inner(peer_ip, headers, trusted_proxies, None)
+    }
+
+    /// Same as [`Self::resolve_client_ip`], but also records a rejection metric
+    /// when a trusted peer's forwarding header is discarded.
+    pub(crate) fn resolve_client_ip_with_metrics(
+        peer_ip: IpAddr,
+        headers: &hyper::HeaderMap,
+        trusted_proxies: &[IpNetwork],
+        metrics: &Metrics,
+    ) -> IpAddr {
+        Self::resolve_client_ip_inner(peer_ip, headers, trusted_proxies, Some(metrics))
+    }
+
+    fn resolve_client_ip_inner(
+        peer_ip: IpAddr,
+        headers: &hyper::HeaderMap,
+        trusted_proxies: &[IpNetwork],
+        metrics: Option<&Metrics>,
+    ) -> IpAddr {
         let (ip, fallback) = Self::resolve_client_ip_detailed(peer_ip, headers, trusted_proxies);
         if let Some(reason) = fallback {
+            if let Some(metrics) = metrics {
+                metrics.record_forwarded_header_rejected();
+            }
             warn!(
                 peer = %peer_ip,
                 reason = reason.as_str(),
-                "Discarding malformed forwarding header; using the immediate peer as the client address"
+                "Discarding forwarded header; using the immediate peer as the client address"
             );
         }
         ip
     }
 
-    /// Detailed variant used by tests and the `warn!` wrapper above.
+    /// Detailed variant used by tests and the wrappers above.
     pub(crate) fn resolve_client_ip_detailed(
         peer_ip: IpAddr,
         headers: &hyper::HeaderMap,
@@ -2080,57 +2252,110 @@ impl WafProxyService {
             return (peer_ip, None);
         }
 
-        if let Some(value) = headers.get("x-forwarded-for") {
-            let value = match value.to_str() {
-                Ok(value) => value,
-                Err(_) => {
-                    return (peer_ip, Some(ClientIpFallback::MalformedXForwardedFor));
-                }
+        for header in [
+            ForwardedHeader::XForwardedFor,
+            ForwardedHeader::Forwarded,
+            ForwardedHeader::XRealIp,
+            ForwardedHeader::XClientIp,
+        ] {
+            if !headers.contains_key(header.name()) {
+                continue;
+            }
+
+            let hops = match header {
+                ForwardedHeader::Forwarded => Self::collect_forwarded_chain(headers),
+                _ => Self::collect_forwarded_chain_for(headers, header),
             };
 
-            let mut hops = Vec::new();
+            match hops {
+                Err(reason) => return (peer_ip, Some(reason)),
+                Ok(hops) => {
+                    // Walk from the nearest hop backwards, skipping addresses
+                    // that are themselves trusted proxies. This prevents a
+                    // client behind a trusted LB from spoofing its source by
+                    // prepending an address or by using a separate header
+                    // line.
+                    for hop in hops.iter().rev() {
+                        if !trusted_proxies.iter().any(|network| network.contains(*hop)) {
+                            return (*hop, None);
+                        }
+                    }
+                    // Every hop is a trusted proxy: there is no client address
+                    // to report, so the immediate peer remains authoritative.
+                    return (peer_ip, None);
+                }
+            }
+        }
+
+        (peer_ip, None)
+    }
+
+    fn collect_forwarded_chain_for(
+        headers: &hyper::HeaderMap,
+        header: ForwardedHeader,
+    ) -> Result<Vec<IpAddr>, ClientIpFallback> {
+        let malformed = ClientIpFallback::for_header(header);
+        let mut hops = Vec::new();
+        let mut bytes = 0usize;
+
+        for value in headers.get_all(header.name()) {
+            bytes = bytes.saturating_add(value.as_bytes().len());
+            if bytes > MAX_FORWARDED_HEADER_BYTES {
+                return Err(ClientIpFallback::ForwardedHeaderTooLarge);
+            }
+            let value = value.to_str().map_err(|_| malformed)?;
             for part in value.split(',') {
                 let part = part.trim();
                 if part.is_empty() {
-                    return (peer_ip, Some(ClientIpFallback::MalformedXForwardedFor));
+                    return Err(malformed);
                 }
-                match part.parse::<IpAddr>() {
-                    Ok(ip) => hops.push(ip),
-                    Err(_) => {
-                        return (peer_ip, Some(ClientIpFallback::MalformedXForwardedFor));
-                    }
-                }
-            }
-
-            if hops.is_empty() {
-                return (peer_ip, Some(ClientIpFallback::MalformedXForwardedFor));
-            }
-
-            // Walk from the nearest hop backwards, skipping addresses that are
-            // themselves trusted proxies. This prevents a client behind a
-            // trusted LB from spoofing its source by prepending an address.
-            for hop in hops.iter().rev() {
-                if !trusted_proxies.iter().any(|network| network.contains(*hop)) {
-                    return (*hop, None);
+                let ip = parse_forwarded_ip(part).ok_or(malformed)?;
+                hops.push(ip);
+                if hops.len() > MAX_FORWARDED_CHAIN_HOPS {
+                    return Err(ClientIpFallback::ForwardedChainTooLong);
                 }
             }
-
-            // Every hop is a trusted proxy: there is no client address to
-            // report, so the immediate peer remains authoritative.
-            return (peer_ip, None);
         }
 
-        if let Some(value) = headers.get("x-real-ip") {
-            match value
+        if hops.is_empty() {
+            return Err(malformed);
+        }
+        Ok(hops)
+    }
+
+    fn collect_forwarded_chain(
+        headers: &hyper::HeaderMap,
+    ) -> Result<Vec<IpAddr>, ClientIpFallback> {
+        let mut hops = Vec::new();
+        let mut bytes = 0usize;
+
+        for value in headers.get_all("forwarded") {
+            bytes = bytes.saturating_add(value.as_bytes().len());
+            if bytes > MAX_FORWARDED_HEADER_BYTES {
+                return Err(ClientIpFallback::ForwardedHeaderTooLarge);
+            }
+            let value = value
                 .to_str()
-                .ok()
-                .and_then(|v| v.trim().parse::<IpAddr>().ok())
-            {
-                Some(ip) => return (ip, None),
-                None => return (peer_ip, Some(ClientIpFallback::MalformedXRealIp)),
+                .map_err(|_| ClientIpFallback::MalformedForwarded)?;
+            let elements = split_quoted(value, ',').ok_or(ClientIpFallback::MalformedForwarded)?;
+            for element in elements {
+                let element = element.trim();
+                if element.is_empty() {
+                    return Err(ClientIpFallback::MalformedForwarded);
+                }
+                let ip =
+                    parse_forwarded_element(element).ok_or(ClientIpFallback::MalformedForwarded)?;
+                hops.push(ip);
+                if hops.len() > MAX_FORWARDED_CHAIN_HOPS {
+                    return Err(ClientIpFallback::ForwardedChainTooLong);
+                }
             }
         }
-        (peer_ip, None)
+
+        if hops.is_empty() {
+            return Err(ClientIpFallback::MalformedForwarded);
+        }
+        Ok(hops)
     }
 
     /// Detect HTTP protocol version from request
@@ -3178,6 +3403,38 @@ mod tests {
     }
 
     #[test]
+    fn multiple_forwarded_for_headers_are_read_in_wire_order() {
+        // The audit's H2 regression: the first header is client-controlled and
+        // the trusted proxy appended a second header. Reading only the first
+        // value would return the spoofed address; the fixed code reads every
+        // value in wire order and selects the right-most untrusted hop.
+        let mut headers = hyper::HeaderMap::new();
+        headers.append("x-forwarded-for", "203.0.113.9".parse().unwrap());
+        headers.append("x-forwarded-for", "198.51.100.7".parse().unwrap());
+
+        let trusted: Vec<IpNetwork> = vec!["10.0.0.0/8".parse().unwrap()];
+        let (ip, fallback) = WafProxyService::resolve_client_ip_detailed(
+            "10.0.0.5".parse().unwrap(),
+            &headers,
+            &trusted,
+        );
+        assert_eq!(ip, "198.51.100.7".parse::<IpAddr>().unwrap());
+        assert_eq!(fallback, None);
+    }
+
+    #[test]
+    fn multiple_forwarded_for_headers_skip_appended_trusted_hops() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.append("x-forwarded-for", "203.0.113.9".parse().unwrap());
+        headers.append("x-forwarded-for", "198.51.100.7, 10.0.0.7".parse().unwrap());
+
+        let trusted: Vec<IpNetwork> = vec!["10.0.0.0/8".parse().unwrap()];
+        let ip =
+            WafProxyService::resolve_client_ip("10.0.0.5".parse().unwrap(), &headers, &trusted);
+        assert_eq!(ip, "198.51.100.7".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
     fn malformed_forwarded_chain_falls_back_to_peer() {
         let mut headers = hyper::HeaderMap::new();
         headers.insert(
@@ -3185,6 +3442,21 @@ mod tests {
             "198.51.100.7, not-an-ip, 10.0.0.7".parse().unwrap(),
         );
         headers.insert("x-real-ip", "203.0.113.99".parse().unwrap());
+
+        let trusted: Vec<IpNetwork> = vec!["10.0.0.0/8".parse().unwrap()];
+        let (ip, fallback) = WafProxyService::resolve_client_ip_detailed(
+            "10.0.0.5".parse().unwrap(),
+            &headers,
+            &trusted,
+        );
+        assert_eq!(ip, "10.0.0.5".parse::<IpAddr>().unwrap());
+        assert_eq!(fallback, Some(ClientIpFallback::MalformedXForwardedFor));
+    }
+
+    #[test]
+    fn empty_forwarded_chain_falls_back_to_peer() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-forwarded-for", "  ".parse().unwrap());
 
         let trusted: Vec<IpNetwork> = vec!["10.0.0.0/8".parse().unwrap()];
         let (ip, fallback) = WafProxyService::resolve_client_ip_detailed(
@@ -3212,6 +3484,128 @@ mod tests {
     }
 
     #[test]
+    fn malformed_client_ip_falls_back_to_peer() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-client-ip", "definitely-not-an-ip".parse().unwrap());
+
+        let trusted: Vec<IpNetwork> = vec!["10.0.0.0/8".parse().unwrap()];
+        let (ip, fallback) = WafProxyService::resolve_client_ip_detailed(
+            "10.0.0.5".parse().unwrap(),
+            &headers,
+            &trusted,
+        );
+        assert_eq!(ip, "10.0.0.5".parse::<IpAddr>().unwrap());
+        assert_eq!(fallback, Some(ClientIpFallback::MalformedXClientIp));
+    }
+
+    #[test]
+    fn malformed_forwarded_rfc7239_falls_back_to_peer() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("forwarded", "for=not-an-ip;proto=https".parse().unwrap());
+
+        let trusted: Vec<IpNetwork> = vec!["10.0.0.0/8".parse().unwrap()];
+        let (ip, fallback) = WafProxyService::resolve_client_ip_detailed(
+            "10.0.0.5".parse().unwrap(),
+            &headers,
+            &trusted,
+        );
+        assert_eq!(ip, "10.0.0.5".parse::<IpAddr>().unwrap());
+        assert_eq!(fallback, Some(ClientIpFallback::MalformedForwarded));
+    }
+
+    #[test]
+    fn forwarded_rfc7239_chain_handles_quotes_ipv6_and_ports() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "forwarded",
+            "for=192.0.2.60;proto=https, for=\"[2001:db8:cafe::17]:4711\""
+                .parse()
+                .unwrap(),
+        );
+
+        let trusted: Vec<IpNetwork> = vec!["10.0.0.0/8".parse().unwrap()];
+        let ip =
+            WafProxyService::resolve_client_ip("10.0.0.5".parse().unwrap(), &headers, &trusted);
+        assert_eq!(ip, "2001:db8:cafe::17".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn forwarded_chain_accepts_ipv6_and_port_forms() {
+        for value in [
+            "2001:db8::1",
+            "[2001:db8::1]",
+            "[2001:db8::1]:8443",
+            "198.51.100.7:443",
+        ] {
+            let mut headers = hyper::HeaderMap::new();
+            headers.insert("x-forwarded-for", value.parse().unwrap());
+            let trusted: Vec<IpNetwork> = vec!["10.0.0.0/8".parse().unwrap()];
+            let ip =
+                WafProxyService::resolve_client_ip("10.0.0.5".parse().unwrap(), &headers, &trusted);
+            let expected: IpAddr = if value.starts_with("198.") {
+                "198.51.100.7".parse().unwrap()
+            } else {
+                "2001:db8::1".parse().unwrap()
+            };
+            assert_eq!(ip, expected, "failed to parse forwarding value {value}");
+        }
+    }
+
+    #[test]
+    fn forwarding_header_precedence_is_documented_order() {
+        let trusted: Vec<IpNetwork> = vec!["10.0.0.0/8".parse().unwrap()];
+        let peer: IpAddr = "10.0.0.5".parse().unwrap();
+
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.5".parse().unwrap());
+        headers.insert("forwarded", "for=198.51.100.1".parse().unwrap());
+        headers.insert("x-real-ip", "192.0.2.1".parse().unwrap());
+        headers.insert("x-client-ip", "192.0.2.2".parse().unwrap());
+        assert_eq!(
+            WafProxyService::resolve_client_ip(peer, &headers, &trusted),
+            "203.0.113.5".parse::<IpAddr>().unwrap()
+        );
+
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("forwarded", "for=198.51.100.1".parse().unwrap());
+        headers.insert("x-real-ip", "192.0.2.1".parse().unwrap());
+        headers.insert("x-client-ip", "192.0.2.2".parse().unwrap());
+        assert_eq!(
+            WafProxyService::resolve_client_ip(peer, &headers, &trusted),
+            "198.51.100.1".parse::<IpAddr>().unwrap()
+        );
+
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-real-ip", "192.0.2.1".parse().unwrap());
+        headers.insert("x-client-ip", "192.0.2.2".parse().unwrap());
+        assert_eq!(
+            WafProxyService::resolve_client_ip(peer, &headers, &trusted),
+            "192.0.2.1".parse::<IpAddr>().unwrap()
+        );
+
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-client-ip", "192.0.2.2".parse().unwrap());
+        assert_eq!(
+            WafProxyService::resolve_client_ip(peer, &headers, &trusted),
+            "192.0.2.2".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn untrusted_peer_ignores_every_forwarding_header() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.5".parse().unwrap());
+        headers.insert("forwarded", "for=198.51.100.1".parse().unwrap());
+        headers.insert("x-real-ip", "192.0.2.1".parse().unwrap());
+        headers.insert("x-client-ip", "192.0.2.2".parse().unwrap());
+
+        let peer: IpAddr = "203.0.113.10".parse().unwrap();
+        let (ip, fallback) = WafProxyService::resolve_client_ip_detailed(peer, &headers, &[]);
+        assert_eq!(ip, peer);
+        assert_eq!(fallback, None);
+    }
+
+    #[test]
     fn fully_trusted_forwarded_chain_uses_peer() {
         let mut headers = hyper::HeaderMap::new();
         headers.insert("x-forwarded-for", "10.0.0.9, 10.0.0.8".parse().unwrap());
@@ -3224,6 +3618,57 @@ mod tests {
         );
         assert_eq!(ip, "10.0.0.5".parse::<IpAddr>().unwrap());
         assert_eq!(fallback, None);
+    }
+
+    #[test]
+    fn over_long_forwarded_chain_falls_back_to_peer() {
+        let value = vec!["203.0.113.9"; MAX_FORWARDED_CHAIN_HOPS + 1].join(",");
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-forwarded-for", value.parse().unwrap());
+
+        let trusted: Vec<IpNetwork> = vec!["10.0.0.0/8".parse().unwrap()];
+        let (ip, fallback) = WafProxyService::resolve_client_ip_detailed(
+            "10.0.0.5".parse().unwrap(),
+            &headers,
+            &trusted,
+        );
+        assert_eq!(ip, "10.0.0.5".parse::<IpAddr>().unwrap());
+        assert_eq!(fallback, Some(ClientIpFallback::ForwardedChainTooLong));
+    }
+
+    #[test]
+    fn oversized_forwarded_header_falls_back_to_peer() {
+        let value = "1".repeat(MAX_FORWARDED_HEADER_BYTES + 1);
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-forwarded-for", value.parse().unwrap());
+
+        let trusted: Vec<IpNetwork> = vec!["10.0.0.0/8".parse().unwrap()];
+        let (ip, fallback) = WafProxyService::resolve_client_ip_detailed(
+            "10.0.0.5".parse().unwrap(),
+            &headers,
+            &trusted,
+        );
+        assert_eq!(ip, "10.0.0.5".parse::<IpAddr>().unwrap());
+        assert_eq!(fallback, Some(ClientIpFallback::ForwardedHeaderTooLarge));
+    }
+
+    #[test]
+    fn rejected_forwarded_header_is_counted() {
+        let metrics = Metrics::new();
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-forwarded-for", "not-an-ip".parse().unwrap());
+
+        let trusted: Vec<IpNetwork> = vec!["10.0.0.0/8".parse().unwrap()];
+        let ip = WafProxyService::resolve_client_ip_with_metrics(
+            "10.0.0.5".parse().unwrap(),
+            &headers,
+            &trusted,
+            &metrics,
+        );
+        assert_eq!(ip, "10.0.0.5".parse::<IpAddr>().unwrap());
+        assert!(metrics
+            .render_prometheus()
+            .contains("waf_forwarded_header_rejected_total 1"));
     }
 
     #[test]

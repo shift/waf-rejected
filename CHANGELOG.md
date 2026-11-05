@@ -6,6 +6,17 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Security
 
+- Fixed client-IP spoofing through repeated forwarding headers. A trusted peer's
+  `X-Forwarded-For`, RFC 7239 `Forwarded` (`for=`), `X-Real-IP` and
+  `X-Client-IP` values are now read in full wire order, combined into one chain
+  and walked right-to-left with the documented precedence
+  (`X-Forwarded-For` > `Forwarded` > `X-Real-IP` > `X-Client-IP`). A
+  client-supplied first header can no longer win. Malformed, empty, oversized
+  (over 8 KiB) or over-long (over 32 hops) chains discard the selected header
+  family and fall back to the immediate peer, with a warning and the new
+  `waf_forwarded_header_rejected_total` metric. Headers from untrusted peers are
+  ignored entirely. See `docs/architecture/security-model.md` and
+  `docs/user-guide/configuration.md`.
 - Fixed a P0 gRPC inspection gap: unary gRPC over HTTP/2 without
   `content-length` was classified as streaming and forwarded with no body
   inspection. Unary vs streaming is now derived from the actual length-prefixed

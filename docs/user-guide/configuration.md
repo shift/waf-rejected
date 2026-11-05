@@ -146,11 +146,17 @@ grpc_aware_rejections = false
 io_backend = "tokio"
 ```
 
-- `trusted_proxies` is a CIDR list. `X-Forwarded-For` is ignored unless the peer
-  matches; an invalid CIDR aborts start-up. For a trusted peer the chain is
-  walked right-to-left, skipping other trusted proxies, so multiple proxies can
-  be listed. A malformed chain is discarded as a whole, the immediate peer is
-  used, and a warning is logged. See
+- `trusted_proxies` is a CIDR list. All forwarding headers are ignored unless
+  the immediate peer matches; an invalid CIDR aborts start-up. For a trusted
+  peer the forwarding sources are considered in this order:
+  `X-Forwarded-For`, `Forwarded` (`for=`), `X-Real-IP`, then `X-Client-IP`.
+  Every value of the selected header family is read in wire order (repeated
+  header lines and comma-separated members included), then the combined chain
+  is walked right-to-left, skipping other trusted proxies, so multiple proxies
+  can be listed. IPv6, `addr:port` and `[addr]:port` forms are accepted. A
+  malformed, non-UTF-8, oversized (over 8 KiB) or over-long (over 32 hops)
+  chain is discarded as a whole, the immediate peer is used, a warning is
+  logged, and `waf_forwarded_header_rejected_total` is incremented. See
   `docs/developer-guide/request-framing-and-telemetry.md`.
 - `supported_http_versions` must match the listener features: HTTP/3 requires a
   `http3` build and `enable_http3 = true`; it is feature-gated, not default.

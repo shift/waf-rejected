@@ -163,7 +163,7 @@ flowchart LR
 | Boundary | Crossing | Trust assumption | Primary control |
 |---|---|---|---|
 | TB1 | Client to ingress | Untrusted | TLS policy, HTTP version allowlist, framing validation, auth, decompression and body limits |
-| TB2 | Trusted proxy to WAF | Only listed CIDRs are trusted for forwarding headers | `resolve_client_ip` ignores `X-Forwarded-For`/`X-Real-IP` from other peers |
+| TB2 | Trusted proxy to WAF | Only listed CIDRs are trusted for forwarding headers | `resolve_client_ip` ignores all forwarding headers from other peers; for trusted peers it combines every `X-Forwarded-For`, `Forwarded`, `X-Real-IP` and `X-Client-IP` value and walks right-to-left |
 | TB3 | WAF to origin | Origin is trusted to serve its own content; it is not trusted to see forged client identity | Hop-by-hop and forwarding headers are stripped and rewritten |
 | TB4 | WAF to evidence store | Local filesystem/database and SIEM collector are operator-controlled | Optional CEF/Sled/OTel exporters; export failures are logged, not blocking |
 | TB5 | WAF to health/metrics | Operator network only | Separate listener; no authentication or TLS in the process |
@@ -231,12 +231,23 @@ whole-session deadline are enforced by `src/proxy/webtransport.rs`.
 ### 4.2 Client identity
 
 `resolve_client_ip` treats the socket peer as authoritative unless the peer is
-inside `server.trusted_proxies`. For a trusted peer it parses
-`X-Forwarded-For`, walks the chain from the right, skips hops that are
-themselves trusted proxies, and returns the first non-trusted hop. If every hop
-is trusted it falls back to `X-Real-IP`, then to the peer address. Invalid CIDRs
-are ignored at startup with a warning; `Config::validate` rejects them when
-loading a config file.
+inside `server.trusted_proxies`. For a trusted peer it reads every value of the
+first forwarding header family present, in precedence order:
+`X-Forwarded-For`, `Forwarded` (`for=`), `X-Real-IP`, then `X-Client-IP`.
+Repeated header lines are appended in wire order and every value is split on
+commas (or RFC 7239 elements for `Forwarded`). The resulting chain is walked
+from the right, hops that are themselves trusted proxies are skipped, and the
+first non-trusted hop is the client. IPv6, `addr:port` and `[addr]:port` forms
+are accepted. If every hop is a trusted proxy the immediate peer is used.
+
+A malformed, empty, non-UTF-8, oversized (more than 8 KiB across the selected
+header family) or over-long (more than 32 hops) chain causes the entire selected
+header family to be discarded, the immediate peer to be used, and a warning plus
+the `waf_forwarded_header_rejected_total` metric to record the reason. The first
+client-supplied element is never used. Forwarding headers from any peer outside
+`server.trusted_proxies` are ignored completely. Invalid CIDRs are ignored at
+startup with a warning; `Config::validate` rejects them when loading a config
+file.
 
 The resolved address is the key for per-IP rate limiting and geo blocking and is
 the value written to the origin as `X-Forwarded-For` and `X-Real-IP`. The
@@ -459,14 +470,19 @@ control" is what the Beta actually does; "residual" is what remains.
 origin ACLs, or to poison audit evidence.
 
 **Current control:** `resolve_client_ip` ignores forwarding headers from peers
-outside `server.trusted_proxies`, and for trusted peers walks the chain from the
-right, skipping trusted hops. Forwarding headers are removed before the origin
-request and replaced with the resolved address.
+outside `server.trusted_proxies`. For trusted peers it reads every
+`X-Forwarded-For`, `Forwarded` (`for=`), `X-Real-IP` and `X-Client-IP` value in
+wire order, follows the documented precedence, and walks the combined chain from
+the right, skipping trusted hops. Repeated headers therefore cannot make a
+client-supplied first value win. Malformed, oversized or over-long chains
+discard the whole selected header family and fall back to the immediate peer,
+with a warning and the `waf_forwarded_header_rejected_total` metric. Forwarding
+headers are removed before the origin request and replaced with the resolved
+address.
 
 **Residual:** the control is only as good as the CIDR list. A broad entry such
-as `0.0.0.0/0` makes every peer trusted and every header spoofable. If all
-supplied hops are trusted, the code accepts `X-Real-IP` from that trusted peer.
-The WebSocket handshake does not strip `X-Forwarded-For`, `X-Real-IP` or
+as `0.0.0.0/0` makes every peer trusted and every header spoofable. The
+WebSocket handshake does not strip `X-Forwarded-For`, `X-Real-IP` or
 `X-Forwarded-Proto`, so the WebSocket origin sees client-supplied values while
 the HTTP origin does not. `X-Forwarded-Proto` sent to HTTP origins reflects the
 listener, not a trusted edge.

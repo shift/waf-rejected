@@ -43,27 +43,36 @@ codings such as `gzip, gzip` are rejected rather than decoded recursively.
 
 ## Client IP through trusted proxies
 
-`server.trusted_proxies` is the only way to make `X-Forwarded-For` or
-`X-Real-IP` authoritative. The immediate socket peer is used for every other
-connection.
+`server.trusted_proxies` is the only way to make forwarding headers
+authoritative. The immediate socket peer is used for every other connection,
+and headers from an untrusted peer are ignored completely, not merely
+deprioritised.
 
-For a trusted peer, `X-Forwarded-For` is parsed as a comma-separated chain and
-walked from right to left. Hops that are themselves trusted proxies are
-skipped, so the first untrusted address is the client. This supports multiple
-proxies in front of the WAF:
+For a trusted peer, the forwarding sources are considered in this precedence
+order: `X-Forwarded-For`, `Forwarded` (`for=`), `X-Real-IP`, then
+`X-Client-IP`. The first family present is authoritative; it is read across
+every repeated header line in wire order, and each value is split on commas
+(RFC 7239 elements for `Forwarded`). The combined chain is walked from right to
+left. Hops that are themselves trusted proxies are skipped, so the first
+untrusted address is the client. This supports multiple proxies in front of the
+WAF and prevents a client-supplied first value from winning when a trusted
+proxy appends a separate header:
 
 ```text
 client, edge-proxy, regional-proxy  ->  WAF peer
         ^ first untrusted hop from the right is the client
 ```
 
-If every hop is a trusted proxy, there is no client address in the chain and
-the immediate peer is used. If any entry is malformed (non-IP, empty member or
-non-UTF-8 value), the whole `X-Forwarded-For` header is discarded, the
-immediate peer is used, and a warning is logged with
-`reason="malformed_x_forwarded_for"`. A malformed `X-Real-IP` behaves the same
-with `reason="malformed_x_real_ip"`. The proxy never silently drops only the
-bad entry and continues with a partially trusted chain.
+IPv6, `addr:port` and `[addr]:port` forms are accepted. If every hop is a
+trusted proxy, there is no client address in the chain and the immediate peer is
+used. If any entry is malformed (non-IP, empty member or non-UTF-8 value), or
+the chain exceeds 8 KiB across the selected header family or 32 hops, the whole
+selected header family is discarded, the immediate peer is used, and a warning
+is logged with a reason such as `reason="malformed_x_forwarded_for"`,
+`reason="malformed_forwarded"` or `reason="forwarded_header_too_large"`. The
+`waf_forwarded_header_rejected_total` metric increments once per discard. The
+proxy never silently drops only the bad entry and continues with a partially
+trusted chain.
 
 Deployment example:
 

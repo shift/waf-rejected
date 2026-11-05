@@ -217,8 +217,12 @@ async fn handle_request(
 
     // The QUIC peer address is authoritative; forwarded headers are only
     // honoured when that peer is a configured trusted proxy.
-    let client_ip =
-        WafProxyService::resolve_client_ip(peer_ip, &parts.headers, &state.trusted_proxies);
+    let client_ip = WafProxyService::resolve_client_ip_with_metrics(
+        peer_ip,
+        &parts.headers,
+        &state.trusted_proxies,
+        &state.metrics,
+    );
 
     // Reject ambiguous request framing before any body is read. Details are
     // intentionally not exposed to the client.

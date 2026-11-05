@@ -136,7 +136,12 @@ async fn handle_session(
     let headers = request_headers(&request);
     // The QUIC peer address is authoritative; forwarded headers are only
     // honoured when that peer is a configured trusted proxy.
-    let client_ip = WafProxyService::resolve_client_ip(peer_ip, &headers, &state.trusted_proxies);
+    let client_ip = WafProxyService::resolve_client_ip_with_metrics(
+        peer_ip,
+        &headers,
+        &state.trusted_proxies,
+        &state.metrics,
+    );
     let path = request.path().to_string();
     let origin = request.origin().map(str::to_string);
     let authority = request.authority().to_string();
