@@ -68,6 +68,11 @@ pub struct Metrics {
     admission_wait_count: AtomicU64,
     admission_cheap_inflight: AtomicU64,
     admission_heavy_inflight: AtomicU64,
+    h3_admission_admitted_total: AtomicU64,
+    h3_admission_waited_total: AtomicU64,
+    h3_admission_rejected_client_limit_total: AtomicU64,
+    h3_admission_rejected_timeout_total: AtomicU64,
+    h3_admission_inflight: AtomicU64,
     grpc_allow_total: AtomicU64,
     grpc_block_total: AtomicU64,
     grpc_error_total: AtomicU64,
@@ -146,6 +151,11 @@ impl Metrics {
             admission_wait_count: AtomicU64::new(0),
             admission_cheap_inflight: AtomicU64::new(0),
             admission_heavy_inflight: AtomicU64::new(0),
+            h3_admission_admitted_total: AtomicU64::new(0),
+            h3_admission_waited_total: AtomicU64::new(0),
+            h3_admission_rejected_client_limit_total: AtomicU64::new(0),
+            h3_admission_rejected_timeout_total: AtomicU64::new(0),
+            h3_admission_inflight: AtomicU64::new(0),
             grpc_allow_total: AtomicU64::new(0),
             grpc_block_total: AtomicU64::new(0),
             grpc_error_total: AtomicU64::new(0),
@@ -369,6 +379,40 @@ impl Metrics {
     pub fn admission_heavy_finished(&self) {
         self.admission_heavy_inflight
             .fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn h3_admission_admitted(&self) {
+        self.h3_admission_admitted_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count an HTTP/3 request that had to wait for a global admission permit.
+    pub fn h3_admission_waited(&self) {
+        self.h3_admission_waited_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn h3_admission_rejected_client_limit(&self) {
+        self.h3_admission_rejected_client_limit_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn h3_admission_rejected_timeout(&self) {
+        self.h3_admission_rejected_timeout_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn h3_inflight(&self) -> u64 {
+        self.h3_admission_inflight.load(Ordering::Relaxed)
+    }
+
+    pub fn h3_admission_started(&self) {
+        self.h3_admission_inflight.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn h3_admission_finished(&self) {
+        self.h3_admission_inflight.fetch_sub(1, Ordering::Relaxed);
     }
 
     pub fn record_webtransport_session(&self) {
@@ -656,6 +700,25 @@ impl Metrics {
             self.admission_rejected_timeout_total.load(Ordering::Relaxed),
             self.admission_cheap_inflight.load(Ordering::Relaxed),
             self.admission_heavy_inflight.load(Ordering::Relaxed),
+        ));
+
+        out.push_str(&format!(
+            "# HELP waf_h3_admission_total HTTP/3 request admission outcomes.\n\
+             # TYPE waf_h3_admission_total counter\n\
+             waf_h3_admission_total{{outcome=\"admitted\"}} {}\n\
+             waf_h3_admission_total{{outcome=\"waited\"}} {}\n\
+             waf_h3_admission_total{{outcome=\"rejected\",reason=\"client_limit\"}} {}\n\
+             waf_h3_admission_total{{outcome=\"rejected\",reason=\"timeout\"}} {}\n\
+             # HELP waf_h3_admission_inflight HTTP/3 requests currently holding an admission permit.\n\
+             # TYPE waf_h3_admission_inflight gauge\n\
+             waf_h3_admission_inflight {}\n",
+            self.h3_admission_admitted_total.load(Ordering::Relaxed),
+            self.h3_admission_waited_total.load(Ordering::Relaxed),
+            self.h3_admission_rejected_client_limit_total
+                .load(Ordering::Relaxed),
+            self.h3_admission_rejected_timeout_total
+                .load(Ordering::Relaxed),
+            self.h3_admission_inflight.load(Ordering::Relaxed),
         ));
 
         out.push_str(&format!(

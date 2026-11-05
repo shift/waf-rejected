@@ -12,6 +12,9 @@ use tokio::net::TcpListener;
 use tokio_rustls::rustls;
 use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::TlsAcceptor;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
+use tokio_tungstenite::tungstenite::protocol::frame::Frame;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 
 use waf_ingress::proxy::WafProxyService;
@@ -54,6 +57,38 @@ async fn spawn_proxy(upstream: std::net::SocketAddr) -> String {
     format!("{}", addr)
 }
 
+async fn spawn_proxy_with_ws_limits(
+    upstream: std::net::SocketAddr,
+    max_frame_bytes: usize,
+    max_message_bytes: usize,
+) -> String {
+    let mut config = Config {
+        upstream_uri: format!("http://{}", upstream),
+        ..Config::default()
+    };
+    config.server.max_body_size = 4096;
+    config.server.websocket.max_frame_bytes = max_frame_bytes;
+    config.server.websocket.max_message_bytes = max_message_bytes;
+    config.waf.rate_limit.per_ip_enabled = false;
+    config.waf.rate_limit.global_enabled = false;
+    config.waf.coraza.enabled = false;
+
+    let service = Arc::new(WafProxyService::new(config).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = service.start_with_listener(listener).await;
+    });
+
+    format!("{}", addr)
+}
+
+fn permissive_client_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_frame_size(None)
+        .max_message_size(None)
+}
+
 #[tokio::test]
 async fn websocket_upgrade_is_tunneled_to_upstream() {
     let upstream = spawn_ws_upstream().await;
@@ -75,6 +110,102 @@ async fn websocket_upgrade_is_tunneled_to_upstream() {
         .expect("websocket error");
 
     assert_eq!(echoed, Message::Text("hello-through-waf".into()));
+}
+
+#[tokio::test]
+async fn websocket_fragmented_oversized_message_is_rejected_before_forwarding() {
+    let upstream = spawn_ws_upstream().await;
+    let proxy = spawn_proxy_with_ws_limits(upstream, 1024, 1024).await;
+
+    let (mut client, _) = tokio_tungstenite::connect_async_with_config(
+        format!("ws://{}/ws", proxy),
+        Some(permissive_client_config()),
+        false,
+    )
+    .await
+    .expect("websocket handshake through proxy");
+
+    // Each fragment is below the frame cap, but the reassembled message
+    // exceeds the message cap. The proxy parser must reject it before the
+    // complete message is assembled or forwarded.
+    let first = vec![b'A'; 700];
+    let second = vec![b'B'; 700];
+    client
+        .send(Message::Frame(Frame::message(
+            first,
+            OpCode::Data(Data::Text),
+            false,
+        )))
+        .await
+        .unwrap();
+    client
+        .send(Message::Frame(Frame::message(
+            second,
+            OpCode::Data(Data::Continue),
+            true,
+        )))
+        .await
+        .unwrap();
+
+    let next = tokio::time::timeout(std::time::Duration::from_secs(3), client.next())
+        .await
+        .expect("proxy must reject the oversized fragmented message");
+    match next {
+        Some(Ok(Message::Close(frame))) => {
+            assert_eq!(
+                frame.map(|frame| frame.code),
+                Some(tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy)
+            );
+        }
+        Some(Err(_)) | None => {}
+        Some(Ok(other)) => panic!("oversized fragmented message was forwarded: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn websocket_normal_fragmented_message_is_forwarded() {
+    let upstream = spawn_ws_upstream().await;
+    let proxy = spawn_proxy_with_ws_limits(upstream, 1024, 1024).await;
+
+    let (mut client, _) = tokio_tungstenite::connect_async_with_config(
+        format!("ws://{}/ws", proxy),
+        Some(permissive_client_config()),
+        false,
+    )
+    .await
+    .expect("websocket handshake through proxy");
+
+    let first = vec![b'A'; 200];
+    let second = vec![b'B'; 200];
+    client
+        .send(Message::Frame(Frame::message(
+            first.clone(),
+            OpCode::Data(Data::Text),
+            false,
+        )))
+        .await
+        .unwrap();
+    client
+        .send(Message::Frame(Frame::message(
+            second.clone(),
+            OpCode::Data(Data::Continue),
+            true,
+        )))
+        .await
+        .unwrap();
+
+    let echoed = tokio::time::timeout(std::time::Duration::from_secs(3), client.next())
+        .await
+        .expect("echo timeout")
+        .expect("stream closed")
+        .expect("websocket error");
+
+    let mut expected = first;
+    expected.extend_from_slice(&second);
+    assert_eq!(
+        echoed,
+        Message::Text(String::from_utf8(expected).unwrap().into())
+    );
 }
 
 #[tokio::test]

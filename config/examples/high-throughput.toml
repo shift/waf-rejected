@@ -50,10 +50,21 @@ enable_http2 = true
 enable_http3 = false
 supported_http_versions = ["1.0", "1.1", "2"]
 max_body_size = 10485760
+# HTTP/3 admission (only used when enable_http3 = true and the binary is built
+# with the `http3` feature). Bounds concurrent handlers before body reads.
+h3_max_inflight_requests = 256
+h3_max_inflight_per_client = 0
+h3_admission_timeout_ms = 250
 grpc_max_stream_bytes = 4194304
 grpc_max_stream_seconds = 300
 grpc_aware_rejections = true
 io_backend = "tokio"
+
+[server.websocket]
+# Parser limits enforced before a message is assembled. 0 inherits
+# server.max_body_size. max_frame_bytes must not exceed max_message_bytes.
+max_frame_bytes = 0
+max_message_bytes = 0
 
 [server.http2]
 enabled = true

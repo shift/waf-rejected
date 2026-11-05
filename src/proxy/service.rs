@@ -25,8 +25,12 @@ use std::task::{Context as TaskContext, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
-use tokio_tungstenite::tungstenite::protocol::Role;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::error::CapacityError;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::{
+    CloseFrame, Role, WebSocketConfig as WsCodecConfig,
+};
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::WebSocketStream;
 use tower::Service;
 use tracing::{debug, error, info, warn};
@@ -382,6 +386,23 @@ where
             Poll::Pending => Poll::Pending,
         }
     }
+}
+
+/// Build the tungstenite codec limits from the server configuration.
+///
+/// The parser enforces these while reading, so an oversized frame or a
+/// fragmented message that exceeds the message cap is rejected before the
+/// complete message is assembled. `0` values inherit `server.max_body_size`.
+fn websocket_codec_config(config: &crate::config::ServerConfig) -> WsCodecConfig {
+    let max_frame = config
+        .websocket
+        .resolved_max_frame_bytes(config.max_body_size);
+    let max_message = config
+        .websocket
+        .resolved_max_message_bytes(config.max_body_size);
+    WsCodecConfig::default()
+        .max_frame_size(Some(max_frame))
+        .max_message_size(Some(max_message))
 }
 
 /// Resolve a WebSocket upstream URI to `(use_tls, port)`.
@@ -1875,7 +1896,12 @@ impl WafProxyService {
             "1.1".to_string(),
         );
         let leftover = buffer[header_end..].to_vec();
-        let max_frame_bytes = state.config.server.max_body_size;
+        let max_message_bytes = state
+            .config
+            .server
+            .websocket
+            .resolved_max_message_bytes(state.config.server.max_body_size);
+        let codec_config = websocket_codec_config(&state.config.server);
         tokio::spawn(async move {
             let upgraded = match on_upgrade.await {
                 Ok(upgraded) => upgraded,
@@ -1887,17 +1913,19 @@ impl WafProxyService {
             };
 
             let client_io = hyper_util::rt::TokioIo::new(upgraded);
-            let client_ws = WebSocketStream::from_raw_socket(client_io, Role::Server, None).await;
+            let client_ws =
+                WebSocketStream::from_raw_socket(client_io, Role::Server, Some(codec_config)).await;
             let upstream_io = PrefixedIo::new(leftover, upstream_stream);
             let upstream_ws =
-                WebSocketStream::from_raw_socket(upstream_io, Role::Client, None).await;
+                WebSocketStream::from_raw_socket(upstream_io, Role::Client, Some(codec_config))
+                    .await;
 
             Self::bridge_websocket(
                 client_ws,
                 upstream_ws,
                 waf_engine,
                 base_context,
-                max_frame_bytes,
+                max_message_bytes,
             )
             .await;
         });
@@ -1918,7 +1946,7 @@ impl WafProxyService {
         mut upstream: WebSocketStream<U>,
         waf_engine: Arc<WafEngine>,
         base_context: RequestContext,
-        max_frame_bytes: usize,
+        max_message_bytes: usize,
     ) where
         C: AsyncRead + AsyncWrite + Unpin,
         U: AsyncRead + AsyncWrite + Unpin,
@@ -1932,7 +1960,7 @@ impl WafProxyService {
                                 &waf_engine,
                                 &base_context,
                                 &message,
-                                max_frame_bytes,
+                                max_message_bytes,
                             )
                             .await
                             {
@@ -1945,7 +1973,27 @@ impl WafProxyService {
                             }
                         }
                         Some(Err(e)) => {
-                            debug!("WebSocket client stream error: {}", e);
+                            // The parser rejects an oversized frame or a
+                            // fragmented message that exceeds the message cap
+                            // before assembling it. Close both sides with a
+                            // policy violation rather than forwarding.
+                            if matches!(
+                                e,
+                                WsError::Capacity(CapacityError::MessageTooLong { .. })
+                            ) {
+                                warn!(
+                                    "WebSocket client {} exceeded the configured limit: {}",
+                                    base_context.client_ip, e
+                                );
+                                let close = CloseFrame {
+                                    code: CloseCode::Policy,
+                                    reason: "WebSocket message exceeds configured limit".into(),
+                                };
+                                let _ = client.send(Message::Close(Some(close.clone()))).await;
+                                let _ = upstream.send(Message::Close(Some(close))).await;
+                            } else {
+                                debug!("WebSocket client stream error: {}", e);
+                            }
                             break;
                         }
                         None => break,
@@ -1973,7 +2021,7 @@ impl WafProxyService {
         waf_engine: &Arc<WafEngine>,
         base_context: &RequestContext,
         message: &Message,
-        max_frame_bytes: usize,
+        max_message_bytes: usize,
     ) -> bool {
         let payload = match message {
             Message::Text(text) => text.as_bytes().to_vec(),
@@ -1983,12 +2031,14 @@ impl WafProxyService {
         if payload.is_empty() {
             return false;
         }
-        if payload.len() > max_frame_bytes {
+        // Defence in depth: the tungstenite parser already enforces
+        // `server.websocket.max_message_bytes` before a message is assembled.
+        if payload.len() > max_message_bytes {
             warn!(
-                "WAF blocked oversized WebSocket frame from {}: {} bytes exceeds {}",
+                "WAF blocked oversized WebSocket message from {}: {} bytes exceeds {}",
                 base_context.client_ip,
                 payload.len(),
-                max_frame_bytes
+                max_message_bytes
             );
             return true;
         }

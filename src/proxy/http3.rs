@@ -21,6 +21,7 @@ use crate::error::WafError;
 use crate::proxy::decompression::{
     decompress_request_body, strip_encoding_headers, DecompressionError,
 };
+use crate::proxy::h3_admission::{H3Admission, H3AdmissionRejection};
 use crate::proxy::service::{ProxyState, WafProxyService};
 use crate::waf::tls_config::TlsManager;
 use crate::waf::{Decision, RequestContext};
@@ -61,13 +62,21 @@ pub(crate) async fn serve(
         endpoint.local_addr().unwrap_or(bind_addr)
     );
 
+    let admission = H3Admission::new(
+        state.config.server.h3_max_inflight_requests,
+        state.config.server.h3_max_inflight_per_client,
+        Duration::from_millis(state.config.server.h3_admission_timeout_ms.max(1)),
+        state.metrics.clone(),
+    );
+
     while let Some(incoming) = endpoint.accept().await {
         let state = state.clone();
+        let admission = admission.clone();
         tokio::spawn(async move {
             match incoming.await {
                 Ok(connection) => {
                     let peer_ip = connection.remote_address().ip();
-                    if let Err(e) = handle_connection(connection, state, peer_ip).await {
+                    if let Err(e) = handle_connection(connection, state, peer_ip, admission).await {
                         debug!("HTTP/3 connection from {} closed: {}", peer_ip, e);
                     }
                 }
@@ -76,6 +85,10 @@ pub(crate) async fn serve(
         });
     }
 
+    // Listener shutdown: fail any waiters and let admitted requests release
+    // their permits as they finish.
+    admission.shutdown();
+
     Ok(())
 }
 
@@ -83,6 +96,7 @@ async fn handle_connection(
     connection: quinn::Connection,
     state: ProxyState,
     peer_ip: IpAddr,
+    admission: H3Admission,
 ) -> Result<(), WafError> {
     let mut connection = h3::server::Connection::<h3_quinn::Connection, Bytes>::new(
         h3_quinn::Connection::new(connection),
@@ -93,8 +107,54 @@ async fn handle_connection(
     loop {
         match connection.accept().await {
             Ok(Some(resolver)) => {
+                // Admission is acquired before `resolve_request`, so a
+                // saturated listener never spawns a handler or reads a body
+                // for excess work. Waiting here provides per-connection
+                // backpressure and the global semaphore bounds all tasks.
+                let permit = match admission.acquire(peer_ip).await {
+                    Ok(permit) => permit,
+                    Err(rejection) => {
+                        warn!(
+                            "Rejected HTTP/3 request from {} before body read: {}",
+                            peer_ip, rejection
+                        );
+                        state.metrics.record_request();
+                        let started = Instant::now();
+                        let response = admission_rejection_response(rejection);
+                        let rejected = tokio::time::timeout(
+                            Duration::from_secs(
+                                state.config.server.request_timeout_secs.max(1),
+                            ),
+                            async {
+                                match resolver.resolve_request().await {
+                                    Ok((_request, mut stream)) => {
+                                        send_response(&mut stream, response).await
+                                    }
+                                    Err(e) => {
+                                        debug!(
+                                            "HTTP/3 admission rejection could not resolve headers from {}: {}",
+                                            peer_ip, e
+                                        );
+                                        Ok(())
+                                    }
+                                }
+                            },
+                        )
+                        .await;
+                        if rejected.is_err() {
+                            debug!(
+                                "Timed out sending HTTP/3 admission rejection to {}",
+                                peer_ip
+                            );
+                        }
+                        state.metrics.record_request_duration(started.elapsed());
+                        continue;
+                    }
+                };
+
                 let state = state.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     match resolver.resolve_request().await {
                         Ok((request, stream)) => {
                             if let Err(e) = handle_request(request, stream, state, peer_ip).await {
@@ -367,6 +427,25 @@ async fn handle_request(
             .await
         }
     }
+}
+
+/// Map an admission rejection to a clear, retryable HTTP/3 response.
+fn admission_rejection_response(
+    rejection: H3AdmissionRejection,
+) -> Response<crate::proxy::service::ProxyBody> {
+    let (status, message) = match rejection {
+        H3AdmissionRejection::ClientLimit { .. } => {
+            (StatusCode::TOO_MANY_REQUESTS, "Too Many Requests")
+        }
+        H3AdmissionRejection::Timeout { .. } => {
+            (StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable")
+        }
+    };
+    let mut response = WafProxyService::create_error_response(status, message);
+    response
+        .headers_mut()
+        .insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
+    response
 }
 
 enum BodyReadError {
@@ -856,6 +935,62 @@ F4s3IuSi44rR0CGaogZ+O/I=
         .await;
 
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn admission_saturation_rejects_before_body_and_releases_permit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (proxy_addr, endpoint) = start_h3_proxy(dir.path(), |config| {
+            config.server.h3_max_inflight_requests = 1;
+            config.server.h3_admission_timeout_ms = 50;
+        })
+        .await;
+
+        let connection = connect_h3(&endpoint, proxy_addr).await;
+        let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(connection))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+
+        // Hold the only permit by leaving the first request body open.
+        let request = Request::post(format!("https://localhost:{}/hold", proxy_addr.port()))
+            .body(())
+            .unwrap();
+        let mut first = send_request.send_request(request).await.unwrap();
+        first
+            .send_data(Bytes::from_static(b"partial"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // A second request is rejected with 503 before its body is read.
+        let request = Request::get(format!("https://localhost:{}/second", proxy_addr.port()))
+            .body(())
+            .unwrap();
+        let mut second = send_request.send_request(request).await.unwrap();
+        second.finish().await.unwrap();
+        let response = second.recv_response().await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        while second.recv_data().await.unwrap().is_some() {}
+
+        // Completing the first request releases the permit.
+        first.finish().await.unwrap();
+        let response = first.recv_response().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        while first.recv_data().await.unwrap().is_some() {}
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let request = Request::get(format!(
+            "https://localhost:{}/after-release",
+            proxy_addr.port()
+        ))
+        .body(())
+        .unwrap();
+        let (status, body) = send_h3_request(&endpoint, proxy_addr, request, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], b"upstream-ok");
     }
 
     #[tokio::test]

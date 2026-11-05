@@ -294,6 +294,56 @@ pub struct Http2TuningConfig {
     pub adaptive_window: bool,
 }
 
+/// WebSocket codec limits.
+///
+/// The tungstenite parser enforces these limits while reading, so a single
+/// oversized frame, or a fragmented message whose reassembled size exceeds the
+/// message cap, is rejected before the full message is assembled. The WAF then
+/// re-checks the assembled message as defence in depth.
+///
+/// `0` means "inherit `server.max_body_size`" for both values, preserving the
+/// pre-existing behaviour where the transport cap also bounded WebSocket
+/// messages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebSocketConfig {
+    /// Maximum size of a single WebSocket frame in bytes (`0` = inherit).
+    pub max_frame_bytes: usize,
+
+    /// Maximum size of a reassembled WebSocket message in bytes
+    /// (`0` = inherit `server.max_body_size`).
+    pub max_message_bytes: usize,
+}
+
+impl WebSocketConfig {
+    /// Resolve the frame cap against `server.max_body_size`.
+    pub fn resolved_max_frame_bytes(&self, max_body_size: usize) -> usize {
+        if self.max_frame_bytes == 0 {
+            max_body_size
+        } else {
+            self.max_frame_bytes
+        }
+    }
+
+    /// Resolve the message cap against `server.max_body_size`.
+    pub fn resolved_max_message_bytes(&self, max_body_size: usize) -> usize {
+        if self.max_message_bytes == 0 {
+            max_body_size
+        } else {
+            self.max_message_bytes
+        }
+    }
+}
+
+impl Default for WebSocketConfig {
+    fn default() -> Self {
+        Self {
+            max_frame_bytes: 0,
+            max_message_bytes: 0,
+        }
+    }
+}
+
 /// Policy for genuinely streaming gRPC RPCs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -333,6 +383,27 @@ pub struct ServerConfig {
 
     /// Maximum request body size in bytes
     pub max_body_size: usize,
+
+    /// Maximum number of concurrent HTTP/3 request handlers.
+    ///
+    /// Accepted requests acquire one permit before their request body is
+    /// read. When the limit is saturated, new requests wait up to
+    /// `h3_admission_timeout_ms` and are then rejected with `503`. Bounds the
+    /// Tokio tasks (and body buffers) an HTTP/3 client can create.
+    pub h3_max_inflight_requests: usize,
+
+    /// Maximum concurrent HTTP/3 requests from one client IP.
+    ///
+    /// `0` disables the per-client limit. When set, excess requests from that
+    /// client are rejected with `429` before their body is read.
+    pub h3_max_inflight_per_client: usize,
+
+    /// Maximum time an HTTP/3 request waits for an admission permit before
+    /// being rejected with `503`.
+    pub h3_admission_timeout_ms: u64,
+
+    /// WebSocket frame/message limits enforced by the tungstenite parser.
+    pub websocket: WebSocketConfig,
 
     /// Maximum number of bytes forwarded for one streaming gRPC exchange.
     ///
@@ -1900,7 +1971,11 @@ impl Default for ServerConfig {
                 "2".to_string(),
                 "3".to_string(),
             ],
-            max_body_size: 10 * 1024 * 1024,        // 10MB
+            max_body_size: 10 * 1024 * 1024, // 10MB
+            h3_max_inflight_requests: 256,
+            h3_max_inflight_per_client: 0,
+            h3_admission_timeout_ms: 250,
+            websocket: WebSocketConfig::default(),
             grpc_max_stream_bytes: 4 * 1024 * 1024, // 4MiB
             grpc_max_stream_seconds: 300,
             grpc_max_stream_messages: 1024,
@@ -2258,6 +2333,44 @@ impl Config {
         }
         if self.server.max_body_size == 0 {
             anyhow::bail!("server.max_body_size must be greater than zero");
+        }
+        if self.server.h3_max_inflight_requests == 0 {
+            anyhow::bail!("server.h3_max_inflight_requests must be greater than zero");
+        }
+        if self.server.h3_admission_timeout_ms == 0 {
+            anyhow::bail!("server.h3_admission_timeout_ms must be greater than zero");
+        }
+        if self.server.h3_max_inflight_per_client > 0
+            && self.server.h3_max_inflight_per_client > self.server.h3_max_inflight_requests
+        {
+            anyhow::bail!(
+                "server.h3_max_inflight_per_client ({}) must not exceed \
+                 server.h3_max_inflight_requests ({})",
+                self.server.h3_max_inflight_per_client,
+                self.server.h3_max_inflight_requests
+            );
+        }
+        let ws_frame = self
+            .server
+            .websocket
+            .resolved_max_frame_bytes(self.server.max_body_size);
+        let ws_message = self
+            .server
+            .websocket
+            .resolved_max_message_bytes(self.server.max_body_size);
+        if ws_frame == 0 || ws_message == 0 {
+            anyhow::bail!(
+                "server.websocket.max_frame_bytes and max_message_bytes must resolve to \
+                 greater than zero"
+            );
+        }
+        if ws_frame > ws_message {
+            anyhow::bail!(
+                "server.websocket.max_frame_bytes ({}) must not exceed \
+                 server.websocket.max_message_bytes ({})",
+                ws_frame,
+                ws_message
+            );
         }
         if self.server.grpc_max_stream_bytes == 0 {
             anyhow::bail!("server.grpc_max_stream_bytes must be greater than zero");
@@ -2997,6 +3110,44 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
 
         let mut config = Config::default();
         config.waf.rate_limit.capacity_policy = CapacityPolicy::EvictOldest;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn h3_and_websocket_limits_are_validated() {
+        let mut config = Config::default();
+        assert_eq!(config.server.h3_max_inflight_requests, 256);
+        assert_eq!(config.server.h3_max_inflight_per_client, 0);
+        assert_eq!(config.server.h3_admission_timeout_ms, 250);
+        assert_eq!(
+            config
+                .server
+                .websocket
+                .resolved_max_frame_bytes(config.server.max_body_size),
+            config.server.max_body_size
+        );
+        assert!(config.validate().is_ok());
+
+        config.server.h3_max_inflight_requests = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.server.h3_admission_timeout_ms = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.server.h3_max_inflight_requests = 4;
+        config.server.h3_max_inflight_per_client = 5;
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.server.websocket.max_frame_bytes = 2048;
+        config.server.websocket.max_message_bytes = 1024;
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.server.websocket.max_frame_bytes = 1024;
+        config.server.websocket.max_message_bytes = 2048;
         assert!(config.validate().is_ok());
     }
 

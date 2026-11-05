@@ -276,11 +276,16 @@ the configured origin, writes a handshake assembled from the client's headers
 
 After the upgrade, `bridge_websocket` inspects each client `Text` or `Binary`
 message through the full `WafEngine::evaluate` chain, including the rate
-limiters, and closes both sides on a block. Messages larger than
-`server.max_body_size` are blocked before inspection. Control frames are passed
-through, upstream-to-client messages are not inspected, and there is no idle
-timeout on the tunnel. `permessage-deflate` is not configured in the proxy's
-tungstenite codec, while client extension headers are forwarded to the origin.
+limiters, and closes both sides on a block. The tungstenite codec is configured
+with `server.websocket.max_frame_bytes` and `max_message_bytes` (both default
+to `server.max_body_size`), so an oversized frame or a fragmented message that
+exceeds the message cap is rejected while reading, before the complete message
+is assembled. The proxy closes both sides with a policy violation (`1008`).
+The assembled message is still re-checked against `max_message_bytes` and the
+WAF as defence in depth. Control frames are passed through, upstream-to-client
+messages are not inspected, and there is no idle timeout on the tunnel.
+`permessage-deflate` is not configured in the proxy's tungstenite codec, while
+client extension headers are forwarded to the origin.
 
 ### 3.9 HTTP/3 path
 
@@ -292,6 +297,16 @@ authentication with `is_https = true`, reads the body with the same streaming
 cap and timeout, and calls the same `WafEngine::evaluate` and
 `forward_to_upstream_with_protocol`. `send_response` strips connection-specific
 headers. There is no WebSocket/WebTransport branch on HTTP/3.
+
+Before a resolver is spawned, `h3_admission` acquires a global permit
+(`server.h3_max_inflight_requests`, default `256`) and, when configured, a
+per-client permit (`server.h3_max_inflight_per_client`). Saturation waits up to
+`server.h3_admission_timeout_ms` and then returns `503` with `Retry-After`;
+the per-client cap returns `429`. Admission happens before `resolve_request`
+and before any body read, so excess work cannot allocate a handler or body
+buffer. Permits are RAII guards and are released when the handler finishes,
+panics or is cancelled; listener shutdown closes the semaphore so waiters fail
+immediately.
 
 ## 4. Bypass classes
 
@@ -356,9 +371,10 @@ frame, a control frame or the server-to-client direction; or hold a tunnel open
 to exhaust resources.
 
 **Current control:** text and binary messages are evaluated with the full rule
-chain; messages over `server.max_body_size` are blocked; blocked messages close
-both sides. Fragmented messages are reassembled by tungstenite before
-inspection.
+chain; the tungstenite parser enforces `server.websocket.max_frame_bytes` and
+`max_message_bytes` while reading, so oversized frames and fragmented messages
+are rejected before assembly; blocked messages close both sides. Fragmented
+messages within the cap are reassembled by tungstenite before inspection.
 
 **Residual:** control frames and upstream-to-client traffic are not inspected.
 Compression is not negotiated by the proxy's codec, but client extension

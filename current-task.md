@@ -1159,3 +1159,26 @@ subsequence prerequisite and gate on it without any false negative.
       (573 µs / 943 µs). The RCE families account for only ~75 µs of regex
       time; the remaining gate cost is the existing literal transform + AC
       pipeline. Details in the doc.
+
+## Resource limits: HTTP/3 admission + WebSocket parser (`fix/h3-ws-limits`)
+
+- [x] HTTP/3: global `server.h3_max_inflight_requests` semaphore (default 256)
+      acquired before `resolve_request`/body read; optional per-client cap
+      (`h3_max_inflight_per_client`, 0 = off) and bounded wait
+      (`h3_admission_timeout_ms`, default 250). Excess work gets 503/429 with
+      `Retry-After`; RAII permits release on completion/cancel/shutdown.
+- [x] Metrics: `waf_h3_admission_total{outcome,reason}` and
+      `waf_h3_admission_inflight`.
+- [x] WebSocket: pass `server.websocket.max_frame_bytes` and
+      `max_message_bytes` (0 = inherit `server.max_body_size`) to tungstenite
+      so oversized frames/fragmented messages fail before assembly; close with
+      policy violation 1008. Post-assembly WAF check retained.
+- [x] Tests: h3 saturation/timeout/release/shutdown and per-client cap;
+      end-to-end h3 saturation + permit release; WS fragmented oversized
+      rejection, normal fragmented forwarding, config validation.
+- [x] Config examples (`config.toml`, `config/examples/high-throughput.toml`),
+      docs (`configuration.md`, `security-model.md`), CHANGELOG.
+- [x] Verify: fmt, `cargo test --lib --features http3` (547 passed),
+      h3 admission/HTTP3 tests (11 passed), WebSocket integration tests
+      (6 passed), config tests (5 passed), clippy lib with and without
+      `http3` `--deny warnings`.

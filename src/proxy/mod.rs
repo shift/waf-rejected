@@ -9,6 +9,8 @@ pub(crate) mod decompression;
 pub mod framing;
 pub(crate) mod grpc_body;
 #[cfg(feature = "http3")]
+pub(crate) mod h3_admission;
+#[cfg(feature = "http3")]
 pub(crate) mod http3;
 pub mod listener;
 pub mod service;

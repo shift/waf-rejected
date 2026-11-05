@@ -19,6 +19,19 @@ All notable changes to WAF-Rejected are documented here.
   are rejected. See `docs/grpc-inspection.md` and
   `docs/architecture/grpc-transport.md`.
 
+- Bounded HTTP/3 request admission: `server.h3_max_inflight_requests`
+  (default `256`) caps concurrent handlers before any request body is read,
+  with an optional per-client cap (`h3_max_inflight_per_client`) and a bounded
+  wait (`h3_admission_timeout_ms`). Saturation returns `503`/`429` with
+  `Retry-After`; permits are RAII guards released on completion, cancellation
+  or shutdown. New `waf_h3_admission_*` metrics expose outcomes and in-flight
+  requests.
+- WebSocket parser limits: `server.websocket.max_frame_bytes` and
+  `max_message_bytes` (both default to `server.max_body_size`) are passed to
+  tungstenite, so oversized frames and fragmented messages are rejected before
+  assembly and closed with policy violation `1008`. The post-assembly WAF
+  check remains as defence in depth.
+
 ### Added
 
 - Ordered-subsequence gates for the filler-tolerant RCE rules

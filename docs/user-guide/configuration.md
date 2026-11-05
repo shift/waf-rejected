@@ -134,6 +134,9 @@ enable_http2 = true
 enable_http3 = false
 supported_http_versions = ["1.0", "1.1", "2"]
 max_body_size = 10485760
+h3_max_inflight_requests = 256
+h3_max_inflight_per_client = 0
+h3_admission_timeout_ms = 250
 grpc_max_stream_bytes = 4194304
 grpc_max_stream_seconds = 300
 grpc_max_stream_messages = 1024
@@ -162,6 +165,29 @@ io_backend = "tokio"
 - `io_backend` is `"tokio"` (default) or `"io_uring"` (requires the
   non-default `io-uring` feature; unsupported hosts fall back to tokio with a
   warning).
+- `h3_max_inflight_requests` (default `256`) bounds concurrent HTTP/3 request
+  handlers. A permit is acquired before the request body is read; excess
+  requests wait up to `h3_admission_timeout_ms` (default `250`) and then
+  receive `503` with `Retry-After`. `h3_max_inflight_per_client` (default `0`,
+  disabled) additionally caps one client IP and rejects excess requests with
+  `429`. Both limits are enforced only by `http3` builds with
+  `enable_http3 = true`.
+
+### `[server.websocket]`
+
+```toml
+[server.websocket]
+max_frame_bytes = 0
+max_message_bytes = 0
+```
+
+- The tungstenite parser enforces these limits while reading, so an oversized
+  frame or a fragmented message whose reassembled size exceeds
+  `max_message_bytes` is rejected before the full message is allocated. The
+  proxy closes both sides with a policy violation (`1008`).
+- `0` inherits `server.max_body_size` for both values, preserving the previous
+  behaviour. `max_frame_bytes` must not exceed `max_message_bytes`.
+- The assembled message is still re-checked by the WAF as defence in depth.
 
 ### `[server.tls]`
 
