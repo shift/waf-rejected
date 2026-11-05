@@ -10,6 +10,10 @@
 //! input is already capped by the normal body-read path, but a small compressed
 //! payload can expand dramatically, so the decoder checks the output limit on
 //! every chunk and aborts as soon as it is exceeded.
+//!
+//! Gzip is decoded with `MultiGzDecoder`: every concatenated member is decoded
+//! and inspected, and trailing bytes that are not another valid gzip member
+//! are rejected as malformed rather than silently ignored.
 
 use std::io::{Cursor, Read};
 
@@ -73,7 +77,7 @@ pub(crate) fn decompress_request_body(
     }
     match coding {
         "gzip" => decode(
-            flate2::read::GzDecoder::new(Cursor::new(body)),
+            flate2::read::MultiGzDecoder::new(Cursor::new(body)),
             max_body_size,
         ),
         "deflate" => decode(
@@ -152,6 +156,47 @@ mod tests {
         let body = gzip(b"id=1 UNION SELECT * FROM users");
         let decoded = decompress_request_body(&headers("gzip"), body, 1024).unwrap();
         assert_eq!(decoded.as_ref(), b"id=1 UNION SELECT * FROM users");
+    }
+
+    #[test]
+    fn concatenated_gzip_members_are_all_decoded() {
+        let mut body = gzip(b"first;").to_vec();
+        body.extend_from_slice(&gzip(b"UNION SELECT password FROM users"));
+        let decoded = decompress_request_body(&headers("gzip"), Bytes::from(body), 1024).unwrap();
+        assert_eq!(decoded.as_ref(), b"first;UNION SELECT password FROM users");
+    }
+
+    #[test]
+    fn gzip_trailing_garbage_is_rejected() {
+        let mut body = gzip(b"payload").to_vec();
+        body.extend_from_slice(b"not-a-gzip-member");
+        assert_eq!(
+            decompress_request_body(&headers("gzip"), Bytes::from(body), 1024),
+            Err(DecompressionError::Malformed)
+        );
+    }
+
+    #[test]
+    fn gzip_truncated_trailer_fails_late() {
+        let complete = gzip(b"a payload whose checksum is missing").to_vec();
+        // Keep the valid header and deflate stream but drop the final CRC/length.
+        let truncated = complete[..complete.len() - 4].to_vec();
+        assert_eq!(
+            decompress_request_body(&headers("gzip"), Bytes::from(truncated), 1024),
+            Err(DecompressionError::Malformed)
+        );
+    }
+
+    #[test]
+    fn gzip_corrupt_late_byte_is_rejected() {
+        let mut body = gzip(b"late corruption test payload").to_vec();
+        // Flip a byte near the end of the deflate stream, after a valid header.
+        let index = body.len().saturating_sub(12);
+        body[index] ^= 0xff;
+        assert_eq!(
+            decompress_request_body(&headers("gzip"), Bytes::from(body), 1024),
+            Err(DecompressionError::Malformed)
+        );
     }
 
     #[test]

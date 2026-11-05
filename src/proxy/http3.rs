@@ -21,8 +21,12 @@ use crate::error::WafError;
 use crate::proxy::decompression::{
     decompress_request_body, strip_encoding_headers, DecompressionError,
 };
+use crate::proxy::framing::{
+    validate_request_framing_for_version, validate_request_trailers, FramingVersion,
+};
 use crate::proxy::h3_admission::{H3Admission, H3AdmissionRejection};
 use crate::proxy::service::{ProxyState, WafProxyService};
+use crate::proxy::telemetry::{RequestRejection, RequestTelemetry};
 use crate::waf::tls_config::TlsManager;
 use crate::waf::{Decision, RequestContext};
 
@@ -185,7 +189,7 @@ async fn handle_request(
     peer_ip: IpAddr,
 ) -> Result<(), WafError> {
     let start_time = Instant::now();
-    state.metrics.record_request();
+    let telemetry = RequestTelemetry::begin(Arc::clone(&state.metrics));
 
     let (mut parts, ()) = request.into_parts();
     let has_content_encoding = parts.headers.contains_key(http::header::CONTENT_ENCODING);
@@ -199,8 +203,8 @@ async fn handle_request(
     let http_version = "3".to_string();
     if !WafProxyService::is_http_version_supported(&http_version, &state.config) {
         warn!("Unsupported HTTP version 3 request from {}", peer_ip);
+        telemetry.reject(RequestRejection::UnsupportedHttpVersion);
         state.metrics.record_blocked();
-        state.metrics.record_request_duration(start_time.elapsed());
         return send_response(
             &mut stream,
             WafProxyService::create_error_response(
@@ -218,13 +222,13 @@ async fn handle_request(
 
     // Reject ambiguous request framing before any body is read. Details are
     // intentionally not exposed to the client.
-    if let Err(e) = crate::proxy::framing::validate_request_framing(&parts.headers) {
+    if let Err(e) = validate_request_framing_for_version(&parts.headers, FramingVersion::Http3) {
         warn!(
             "Rejected ambiguous HTTP/3 request framing from {}: {}",
             client_ip, e
         );
+        telemetry.reject(RequestRejection::InvalidFraming);
         state.metrics.record_blocked();
-        state.metrics.record_request_duration(start_time.elapsed());
         return send_response(
             &mut stream,
             WafProxyService::create_error_response(StatusCode::BAD_REQUEST, "Bad Request"),
@@ -238,9 +242,9 @@ async fn handle_request(
                 "Authentication rejected HTTP/3 request from {}: {}",
                 client_ip, e
             );
+            telemetry.reject(RequestRejection::Authentication);
             state.metrics.record_auth_failure();
             state.metrics.record_blocked();
-            state.metrics.record_request_duration(start_time.elapsed());
             return send_response(
                 &mut stream,
                 WafProxyService::create_error_response(StatusCode::UNAUTHORIZED, "Unauthorized"),
@@ -250,7 +254,7 @@ async fn handle_request(
     }
 
     let max_body_size = state.config.server.max_body_size;
-    let body_bytes = match tokio::time::timeout(
+    let (body_bytes, request_trailers) = match tokio::time::timeout(
         Duration::from_secs(state.config.server.request_timeout_secs.max(1)),
         read_body(&mut stream, max_body_size),
     )
@@ -262,8 +266,8 @@ async fn handle_request(
                 "HTTP/3 request body from {} exceeds limit {}",
                 client_ip, max_body_size
             );
+            telemetry.reject(RequestRejection::BodyTooLarge);
             state.metrics.record_blocked();
-            state.metrics.record_request_duration(start_time.elapsed());
             return send_response(
                 &mut stream,
                 WafProxyService::create_error_response(
@@ -278,6 +282,8 @@ async fn handle_request(
                 "Failed to read HTTP/3 request body from {}: {}",
                 client_ip, e
             );
+            telemetry.reject(RequestRejection::BodyReadError);
+            state.metrics.record_blocked();
             return send_response(
                 &mut stream,
                 WafProxyService::create_error_response(
@@ -289,6 +295,8 @@ async fn handle_request(
         }
         Err(_) => {
             warn!("HTTP/3 request body read timed out for {}", client_ip);
+            telemetry.reject(RequestRejection::BodyTimeout);
+            state.metrics.record_blocked();
             return send_response(
                 &mut stream,
                 WafProxyService::create_error_response(
@@ -299,6 +307,19 @@ async fn handle_request(
             .await;
         }
     };
+
+    if let Some(trailers) = request_trailers.as_ref() {
+        if let Err(e) = validate_request_trailers(trailers) {
+            warn!("Rejected HTTP/3 request trailer from {}: {}", client_ip, e);
+            telemetry.reject(RequestRejection::InvalidTrailerFraming);
+            state.metrics.record_blocked();
+            return send_response(
+                &mut stream,
+                WafProxyService::create_error_response(StatusCode::BAD_REQUEST, "Bad Request"),
+            )
+            .await;
+        }
+    }
 
     let body_bytes = if has_content_encoding {
         match decompress_request_body(&parts.headers, body_bytes, max_body_size) {
@@ -311,6 +332,7 @@ async fn handle_request(
                     "Rejecting unsupported HTTP/3 request encoding from {} (Content-Encoding: {})",
                     client_ip, encoding
                 );
+                telemetry.reject(RequestRejection::UnsupportedContentEncoding);
                 state.metrics.record_blocked();
                 return send_response(
                     &mut stream,
@@ -326,6 +348,7 @@ async fn handle_request(
                     "Decompressed HTTP/3 request body from {} exceeds limit {}",
                     client_ip, max_body_size
                 );
+                telemetry.reject(RequestRejection::DecompressedTooLarge);
                 state.metrics.record_blocked();
                 return send_response(
                     &mut stream,
@@ -341,6 +364,7 @@ async fn handle_request(
                     "Malformed compressed HTTP/3 request body from {}",
                     client_ip
                 );
+                telemetry.reject(RequestRejection::MalformedCompression);
                 state.metrics.record_blocked();
                 return send_response(
                     &mut stream,
@@ -375,7 +399,7 @@ async fn handle_request(
             state.metrics.record_allowed();
             let response = WafProxyService::forward_to_upstream_with_protocol(
                 parts,
-                crate::proxy::service::ProxyBody::buffered(body_bytes, None),
+                crate::proxy::service::ProxyBody::buffered(body_bytes, request_trailers),
                 state.upstream_client.clone(),
                 state.upstream_uri.clone(),
                 start_time,
@@ -396,7 +420,6 @@ async fn handle_request(
                 Ok(response) => response,
                 Err(never) => match never {},
             };
-            state.metrics.record_request_duration(start_time.elapsed());
             send_response(&mut stream, response).await
         }
         Decision::Block { status, reason } => {
@@ -404,8 +427,8 @@ async fn handle_request(
                 "WAF blocked HTTP/3 request from {}: {} (status: {})",
                 client_ip, reason, status
             );
+            telemetry.reject(RequestRejection::WafBlocked);
             state.metrics.record_blocked();
-            state.metrics.record_request_duration(start_time.elapsed());
             send_response(
                 &mut stream,
                 WafProxyService::create_blocked_response(status, &reason),
@@ -417,9 +440,9 @@ async fn handle_request(
                 "WAF rate limited HTTP/3 request from {}: {}",
                 client_ip, reason
             );
+            telemetry.reject(RequestRejection::WafRateLimited);
             state.metrics.record_rate_limited();
             state.metrics.record_blocked();
-            state.metrics.record_request_duration(start_time.elapsed());
             send_response(
                 &mut stream,
                 WafProxyService::create_rate_limit_response(&reason),
@@ -453,7 +476,10 @@ enum BodyReadError {
     Stream(String),
 }
 
-async fn read_body(stream: &mut H3Stream, max_body_size: usize) -> Result<Bytes, BodyReadError> {
+async fn read_body(
+    stream: &mut H3Stream,
+    max_body_size: usize,
+) -> Result<(Bytes, Option<HeaderMap>), BodyReadError> {
     let mut body = BytesMut::new();
     while let Some(mut chunk) = stream
         .recv_data()
@@ -466,7 +492,11 @@ async fn read_body(stream: &mut H3Stream, max_body_size: usize) -> Result<Bytes,
         }
         body.extend_from_slice(&chunk.copy_to_bytes(len));
     }
-    Ok(body.freeze())
+    let trailers = stream
+        .recv_trailers()
+        .await
+        .map_err(|e| BodyReadError::Stream(e.to_string()))?;
+    Ok((body.freeze(), trailers))
 }
 
 async fn send_response(

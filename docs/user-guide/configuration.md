@@ -147,7 +147,11 @@ io_backend = "tokio"
 ```
 
 - `trusted_proxies` is a CIDR list. `X-Forwarded-For` is ignored unless the peer
-  matches; an invalid CIDR aborts start-up.
+  matches; an invalid CIDR aborts start-up. For a trusted peer the chain is
+  walked right-to-left, skipping other trusted proxies, so multiple proxies can
+  be listed. A malformed chain is discarded as a whole, the immediate peer is
+  used, and a warning is logged. See
+  `docs/developer-guide/request-framing-and-telemetry.md`.
 - `supported_http_versions` must match the listener features: HTTP/3 requires a
   `http3` build and `enable_http3 = true`; it is feature-gated, not default.
 - Unary gRPC is classified from its frame sequence, not `content-length`.
