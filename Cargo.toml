@@ -376,6 +376,13 @@ compliance = ["sled"]
 name = "security_performance"
 harness = false
 
+# Per-IP rate-limiter contention/cardinality benchmark (baseline vs sharded).
+#   cargo bench --bench rate_limit_shard -- baseline
+#   cargo bench --bench rate_limit_shard -- sharded
+[[bench]]
+name = "rate_limit_shard"
+harness = false
+
 # Opt-in HTTP/2 and upstream-pool tuning benchmark.
 #   cargo bench --bench http2_tuning -- --tuned
 [[bench]]

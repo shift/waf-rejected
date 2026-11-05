@@ -515,3 +515,44 @@ workload mix, not the ~0.8 GiB warm baseline.
 - Rate limiting was disabled. A separate pass with production limits is
   required before claiming the 429 path is validated.
 
+
+### Rate limiter contention
+
+`benches/rate_limit_shard.rs` compares the pre-sharding per-IP limiter (one
+global `RwLock<HashMap>`) with the 64-shard limiter. Each mode runs in its own
+process so the RSS delta is clean. The workload is 1 000 000 operations over
+100 000 unique IPs (high-cardinality) and 1 000 000 operations on one IP
+(hot-IP); the concurrent modes use eight threads with 200 000 operations each.
+
+| workload | p50 | p99 | throughput | RSS delta at 100k IPs |
+|---|---:|---:|---:|---:|
+| baseline high-cardinality | 152 ns | 421 ns | 4.85 M ops/s | 15.0 MiB |
+| sharded high-cardinality | 224 ns | 5.88 µs | 2.34 M ops/s | 17.5 MiB |
+| baseline hot-IP | 101 ns | 107 ns | 7.32 M ops/s | — |
+| sharded hot-IP | 140 ns | 14.2 µs | 3.05 M ops/s | — |
+
+Single-threaded, the sharded path pays for the stable hash, per-shard mutex,
+atomic reservation and incremental sweep, so it is slower than the uncontended
+global lock. The p99 tail is dominated by the one-shard-per-100-evaluations
+sweep. The design targets multi-core contention, where the global write lock
+serializes every request; the concurrent rows below are the relevant
+before/after.
+
+| concurrent workload (8 threads) | p50 | p99 | throughput |
+|---|---:|---:|---:|
+| baseline high-cardinality | 1 134 ns | 8.67 µs | 2.63 M ops/s |
+| sharded high-cardinality | 259 ns | 26.96 µs | 6.02 M ops/s |
+| baseline hot-IP | 548 ns | 7.73 µs | 3.10 M ops/s |
+| sharded hot-IP | 364 ns | 33.11 µs | 3.42 M ops/s |
+
+High-cardinality throughput improves 2.3× and p50 falls 4.4× because unrelated
+IPs land in different shards instead of serializing on one write lock. A single
+hot IP cannot benefit from sharding (all requests still target one shard); its
+throughput is roughly flat, while the p99 tail grows because the eight threads
+now contend on a shard mutex plus the cleanup counter rather than only the
+global lock. The cleanup sweep is the source of the single-threaded p99 tail;
+it is bounded to one shard per tick and never blocks the whole table.
+
+Memory at the 100 000-IP cap is bounded: the sharded table adds roughly 2.5 MiB
+over the baseline map on this host, and the cap prevents unbounded growth from
+source-address spraying.

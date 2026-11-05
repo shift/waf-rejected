@@ -21,6 +21,13 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Changed
 
+- Per-IP rate limiting now uses 64 independently locked shards selected by a
+  stable IP hash instead of one global `RwLock<HashMap>`. Cleanup sweeps one
+  shard per 100 evaluations, so the request path never takes a global lock.
+  A new hard cap, `waf.rate_limit.max_tracked_ips` (default `100000`), bounds
+  memory; `waf.rate_limit.capacity_policy` defaults to `fail_closed`, which
+  rejects new IPs at the cap rather than silently allowing them. See
+  `docs/developer-guide/rate-limiter.md`.
 - Migrated `config/test.toml` and `config/security-export-example.toml` to the
   current schema; obsolete keys such as `[server] host/port/workers`,
   `[proxy] upstream`, `[security]` and `[health]`/`[metrics]`/`[export]` are no

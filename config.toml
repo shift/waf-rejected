@@ -151,6 +151,10 @@ per_ip_window_secs = 60
 global_enabled = true
 global_max_requests = 10000
 global_window_secs = 60
+# Hard cap on tracked client IPs. At the cap, new IPs are rejected
+# (fail_closed) unless capacity_policy = "evict_oldest".
+max_tracked_ips = 100000
+capacity_policy = "fail_closed"
 
 [waf.security_events]
 enabled = true
