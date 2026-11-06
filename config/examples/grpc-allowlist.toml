@@ -1,0 +1,104 @@
+# gRPC-aware inspection with a method allowlist and decoded-field content scan.
+#
+# gRPC bodies are length-prefixed protobuf frames. The WAF validates the
+# envelope and field shape, withholds the raw bytes from CRS body rules, and
+# (with `content_scan = "strings"`) sends decoded string/bytes field values to
+# the configured request-inspection backend as a bounded synthetic payload.
+#
+# The allowlist below is an example. Generate a real one from a protobuf
+# `FileDescriptorSet`:
+#
+#   grpc-allowlist generate --descriptor service.binpb \
+#       --out /etc/waf/grpc/allowlist.json --unknown-method-action block
+#
+# then set `allowlist_file` instead of (or in addition to) `method_allowlist`.
+# A configured allowlist file that cannot be loaded aborts start-up.
+#
+# Run:
+#   WAF_CONFIG_FILE=config/examples/grpc-allowlist.toml waf-ingress
+
+bind_addr = "0.0.0.0:8080"
+health_bind_addr = "0.0.0.0:8081"
+upstream_uri = "http://127.0.0.1:3000"
+
+[proxy]
+upstream_url = "http://127.0.0.1:3000"
+bind_addr = "0.0.0.0:8080"
+timeout_seconds = 30
+max_request_size = 10485760
+
+[server]
+max_connections = 1000
+request_timeout_secs = 30
+keep_alive_timeout_secs = 90
+enable_http2 = true
+enable_http3 = false
+supported_http_versions = ["1.0", "1.1", "2"]
+max_body_size = 10485760
+grpc_max_stream_bytes = 4194304
+grpc_max_stream_seconds = 300
+grpc_max_stream_messages = 1024
+grpc_max_decompressed_bytes = 10485760
+# "reject" (default) refuses genuinely streaming RPCs with a clear 4xx /
+# gRPC status. "transport-only" is an explicit opt-out that permits them, but
+# every complete message is still inspected before it is forwarded.
+grpc_streaming_policy = "reject"
+# Return HTTP 200 + grpc-status/grpc-message trailers (7 for 403) instead of a
+# plain HTTP error page when a gRPC call is blocked.
+grpc_aware_rejections = true
+
+[logging]
+level = "info"
+json_format = true
+
+[waf]
+enabled = true
+fail_mode = "closed"
+upstream_timeout_ms = 30000
+
+[waf.coraza]
+backend = "rust"
+fallback = "none"
+max_payload_bytes = 65536
+
+[waf.grpc]
+enabled = true
+# Fully-qualified methods that may be called. With a non-empty list the
+# unknown-method action defaults to block; it is pinned here for clarity.
+method_allowlist = [
+  "/demo.Echo/Say",
+  "/demo.Echo/Stream",
+]
+unknown_method_action = "block"
+# Optional generated artifact; merged with method_allowlist.
+# allowlist_file = "/etc/waf/grpc/allowlist.json"
+max_message_bytes = 4194304
+max_frames = 64
+# Structural limits applied while decoding protobuf fields.
+max_string_bytes = 1048576
+max_bytes_len = 1048576
+max_repeated = 1024
+max_depth = 32
+max_decoded_fields = 100000
+reject_unknown_fields = false
+validate_strings = true
+# Send decoded string/bytes values to the request-inspection backend.
+# `off` keeps the fastest envelope-only mode.
+content_scan = "strings"
+max_content_scan_bytes = 65536
+
+[waf.rate_limit]
+per_ip_enabled = true
+per_ip_max_requests = 100
+per_ip_window_secs = 60
+global_enabled = true
+global_max_requests = 10000
+global_window_secs = 60
+
+[waf.security_events]
+enabled = true
+format = "json"
+min_threat_level = "medium"
+enable_cef = false
+enable_otel = false
+enable_sled = false

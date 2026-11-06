@@ -1,0 +1,70 @@
+# Example: WAF proxy with the experimental native Coraza sidecar.
+#
+#   docker compose -f deploy/compose/coraza-native.yaml up --build
+#
+# The proxy and sidecar share a Unix socket volume. The sidecar runs as the
+# same uid as the proxy (1000) so the 0660 socket is usable by both. The
+# sidecar filesystem is read-only; only /run/waf and /tmp are writable.
+
+services:
+  coraza-init:
+    image: alpine:3.20
+    command:
+      - sh
+      - -c
+      - mkdir -p /run/waf && chown 1000:1000 /run/waf && chmod 0750 /run/waf
+    volumes:
+      - coraza-run:/run/waf
+    restart: "no"
+
+  coraza-sidecar:
+    build:
+      context: ../..
+      dockerfile: deploy/container/Dockerfile.coraza-sidecar
+    user: "1000:1000"
+    command:
+      - --socket
+      - /run/waf/coraza.sock
+      - --rules
+      - /usr/share/waf/coraza/crs/crs.conf
+      - --max-body
+      - "65536"
+      - --timeout
+      - 5s
+      - --grace
+      - 10s
+    volumes:
+      - coraza-run:/run/waf
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    depends_on:
+      coraza-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  waf-proxy:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    volumes:
+      - coraza-run:/run/waf:ro
+      - ./config.native.toml:/etc/waf/config.toml:ro
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+    depends_on:
+      - coraza-sidecar
+    restart: unless-stopped
+
+  upstream:
+    image: hashicorp/http-echo:1.0
+    command: ["-listen=:3000", "-text=upstream-ok"]
+    restart: unless-stopped
+
+volumes:
+  coraza-run:
