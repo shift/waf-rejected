@@ -1,5 +1,8 @@
 # Release Checklist
 
+Tag naming, signing and asset-verification rules are in
+[`release-policy.md`](release-policy.md).
+
 ## Beta 0.1.0-beta.13
 
 ### Verification
