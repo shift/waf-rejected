@@ -232,7 +232,7 @@ subtle = "2"
 
 # OpenTelemetry dependencies for security event export (simplified)
 opentelemetry = { version = "0.20", optional = true }
-opentelemetry_sdk = { version = "0.20", optional = true }
+opentelemetry_sdk = { version = "0.32", optional = true }
 
 # Embedded database for persistence before K/V integration
 sled = { version = "0.34", optional = true }
