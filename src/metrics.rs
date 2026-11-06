@@ -93,6 +93,12 @@ pub struct Metrics {
     fast_allow_blocks_total: AtomicU64,
     fast_allow_fallthrough_total: AtomicU64,
     forwarded_header_rejected_total: AtomicU64,
+    response_inspections_total: AtomicU64,
+    response_blocks_total: AtomicU64,
+    response_errors_total: AtomicU64,
+    response_skipped_streaming_total: AtomicU64,
+    response_skipped_unsupported_total: AtomicU64,
+    response_body_truncated_total: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -178,6 +184,12 @@ impl Metrics {
             fast_allow_blocks_total: AtomicU64::new(0),
             fast_allow_fallthrough_total: AtomicU64::new(0),
             forwarded_header_rejected_total: AtomicU64::new(0),
+            response_inspections_total: AtomicU64::new(0),
+            response_blocks_total: AtomicU64::new(0),
+            response_errors_total: AtomicU64::new(0),
+            response_skipped_streaming_total: AtomicU64::new(0),
+            response_skipped_unsupported_total: AtomicU64::new(0),
+            response_body_truncated_total: AtomicU64::new(0),
         }
     }
 
@@ -545,6 +557,34 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_response_inspection(&self) {
+        self.response_inspections_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_response_block(&self) {
+        self.response_blocks_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_response_error(&self) {
+        self.response_errors_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_response_skipped_streaming(&self) {
+        self.response_skipped_streaming_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_response_skipped_unsupported(&self) {
+        self.response_skipped_unsupported_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_response_body_truncated(&self) {
+        self.response_body_truncated_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn uptime_seconds(&self) -> u64 {
         self.start_time.elapsed().as_secs()
     }
@@ -784,6 +824,33 @@ impl Metrics {
             self.fast_allow_blocks_total.load(Ordering::Relaxed),
             self.fast_allow_fallthrough_total.load(Ordering::Relaxed),
             self.forwarded_header_rejected_total.load(Ordering::Relaxed),
+        ));
+
+        out.push_str(&format!(
+            "# HELP waf_response_inspections_total Upstream responses evaluated by response inspection.\n\
+             # TYPE waf_response_inspections_total counter\n\
+             waf_response_inspections_total {}\n\
+             # HELP waf_response_blocks_total Upstream responses blocked by response inspection.\n\
+             # TYPE waf_response_blocks_total counter\n\
+             waf_response_blocks_total {}\n\
+             # HELP waf_response_errors_total Response-inspection engine errors (fail-closed).\n\
+             # TYPE waf_response_errors_total counter\n\
+             waf_response_errors_total {}\n\
+             # HELP waf_response_skipped_streaming_total Responses not body-inspected because they were streamed.\n\
+             # TYPE waf_response_skipped_streaming_total counter\n\
+             waf_response_skipped_streaming_total {}\n\
+             # HELP waf_response_skipped_unsupported_total Responses not inspected because the backend/protocol has no response path.\n\
+             # TYPE waf_response_skipped_unsupported_total counter\n\
+             waf_response_skipped_unsupported_total {}\n\
+             # HELP waf_response_body_truncated_total Response bodies truncated to the inspection cap.\n\
+             # TYPE waf_response_body_truncated_total counter\n\
+             waf_response_body_truncated_total {}\n",
+            self.response_inspections_total.load(Ordering::Relaxed),
+            self.response_blocks_total.load(Ordering::Relaxed),
+            self.response_errors_total.load(Ordering::Relaxed),
+            self.response_skipped_streaming_total.load(Ordering::Relaxed),
+            self.response_skipped_unsupported_total.load(Ordering::Relaxed),
+            self.response_body_truncated_total.load(Ordering::Relaxed),
         ));
 
         out.push_str(

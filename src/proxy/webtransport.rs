@@ -56,6 +56,11 @@ pub(crate) async fn serve(
     state: ProxyState,
     config: WebTransportConfig,
 ) -> Result<(), WafError> {
+    if state.config.waf.response_inspection.enabled {
+        // WebTransport is a terminating endpoint with no upstream HTTP
+        // response to inspect.
+        state.metrics.record_response_skipped_unsupported();
+    }
     let tls_config = match tls_manager.quic_server_config() {
         Ok(config) => config,
         Err(e) => {

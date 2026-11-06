@@ -198,6 +198,23 @@ async fn streamed_response_preserves_body_and_arrives_incrementally() {
 }
 
 #[tokio::test]
+async fn response_inspection_skips_streamed_body_and_passes_through() {
+    let upstream = spawn_upstream().await;
+    let proxy = spawn_proxy(upstream.addr, |config| {
+        config.waf.response_inspection.enabled = true;
+        config.waf.response_inspection.inspect_body = true;
+        config.waf.response_inspection.max_body_bytes = 1024;
+        config.proxy.streaming.enabled = true;
+        config.proxy.streaming.response_threshold_bytes = 1;
+    })
+    .await;
+
+    let client = client();
+    let body = get(&client, format!("http://{}/", proxy)).await;
+    assert_eq!(body.len(), BODY_LEN);
+}
+
+#[tokio::test]
 async fn http1_keep_alive_reuses_client_connection() {
     let upstream = spawn_upstream().await;
     let proxy = spawn_proxy(upstream.addr, |_| {}).await;

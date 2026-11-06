@@ -79,7 +79,7 @@ an independent penetration test passed.
 | HTTP/3 (QUIC) ingress reusing the same pipeline | Tested | `src/proxy/http3.rs` — `serve`, `handle_request`, `read_body` | `src/proxy/http3.rs` integration tests (feature-gated) | beta.7 |
 | WebTransport terminating endpoint (Origin/path/auth/limits/inspection) | Tested (feature-gated) | `src/proxy/webtransport.rs` — `serve`, session handlers | `tests/integration/webtransport_tests.rs`; `src/proxy/webtransport.rs` unit tests | beta.9 |
 | Upstream response size cap | Tested | `src/proxy/service.rs` — `forward_to_upstream_with_protocol`, `Limited`/`GuardedBody` | `tests/integration/pipeline_tests.rs` (`pipeline_rejects_oversized_upstream_response`) | beta.1 |
-| Response body/header inspection | **Not implemented** (engine phases exist, proxy does not call them) | `src/waf/rust_engine/` response phases; **no call site in `src/proxy/service.rs` or `src/proxy/http3.rs`** | None at the proxy level | Engine phases beta.13; proxy wiring not scheduled |
+| Response body/header inspection | Opt-in, tested (native Rust engine only) | `src/proxy/service.rs` — `inspect_upstream_response`, `forward_to_upstream_with_protocol`; `src/waf/rust_engine/` response phases; `src/config.rs` — `ResponseInspectionConfig` | `src/waf/rust_engine/engine.rs` response tests; `src/proxy/service.rs` response-inspection tests; `tests/integration/http2_tuning_tests.rs` (h2 buffered + streamed skip) | Unreleased |
 | WebTransport upstream proxying | **Not implemented** | `src/proxy/webtransport.rs` is a terminating/echo endpoint; no upstream connector | `tests/integration/webtransport_tests.rs` verifies echo and rejection only | — |
 | Configurable header-size / header-count / concurrent-connection limits | **Not implemented** (hyper defaults only; `server.max_connections` is not read) | `src/config.rs` defines `max_connections`; no enforcement in `src/proxy/listener.rs` or `service.rs` | None | — |
 
@@ -197,7 +197,7 @@ blocking decision wins.
 | 12 | WAF evaluation | `WafEngine::evaluate`; GraphQL and gRPC pre-checks run first | `Decision::Block` or `Decision::RateLimit` |
 | 13 | Rule chain | Coraza/Rust engine rule, then `add_default_rules`: content inspection, `RequestSizeRule`, `MethodRule`, `RateLimiter`, `GlobalRateLimiter`, `GeoBlockingRule` | first block wins; `413`, `405`, `429`, `403` |
 | 14 | Upstream forward | `forward_to_upstream_with_protocol`, `forward_grpc_stream` | `502` on connect/read failure, `504` on timeout |
-| 15 | Response cap | `Content-Length` pre-check plus `http_body_util::Limited`/`GuardedBody` | `502` if over `server.max_body_size`; response bodies are not inspected |
+| 15 | Response cap and inspection | `Content-Length` pre-check plus `http_body_util::Limited`/`GuardedBody`; opt-in `inspect_upstream_response` | `502` if over `server.max_body_size`; when `waf.response_inspection.enabled`, headers (and buffered bodies up to `max_body_bytes`) are evaluated and a block returns `block_status` with a generic body |
 | 16 | WebSocket data path | `bridge_websocket`, `websocket_message_blocked` | close both sides on a blocked or oversized message |
 | 17 | HTTP/3 path | `http3::handle_request`, `read_body`, `send_response` | same status codes as HTTP/1.1 |
 | 18 | WebTransport session | `webtransport::serve` and session handlers | `403`/`429` CONNECT rejection, session closes for auth/limits/inspection |
@@ -422,10 +422,16 @@ Responses are read with `http_body_util::Limited` capped at
 declared `Content-Length` over the cap is rejected before reading; the
 streaming limit catches undeclared or chunked responses. Hop-by-hop response
 headers are dropped and `x-waf-processing-time-ms`, `x-waf-version` and
-`x-content-type-options: nosniff` are added. The response body is **not**
-inspected, normalised or decompressed: engine response phases 3–5 exist, but
-neither `forward_to_upstream_with_protocol` nor `forward_grpc_stream` calls
-them. Response header count/size are bounded only by hyper defaults.
+`x-content-type-options: nosniff` are added. Response inspection is opt-in via
+`waf.response_inspection.enabled` and only the native Rust engine implements it.
+Headers are evaluated on buffered and streamed responses; body inspection
+requires buffering and inspects at most the first `max_body_bytes`
+deterministically. A streamed response is passed through without body
+inspection and counted in `waf_response_skipped_streaming_total`. gRPC response
+bodies are treated as streaming and are not body-inspected. A block returns
+`block_status` with a generic WAF body, never upstream content; engine errors
+fail closed. Response bodies are not normalised or decompressed. Response
+header count/size are bounded only by hyper defaults.
 
 ### 4.8 WebSocket path
 
@@ -635,12 +641,17 @@ that attacks the client through the trusted proxy origin.
 
 **Current control:** response bodies are capped at `server.max_body_size` with
 a `Content-Length` pre-check and a streaming `Limited`; hop-by-hop response
-headers are removed; `nosniff` is added.
+headers are removed; `nosniff` is added. Opt-in response inspection evaluates
+headers and, when buffered, the first `max_body_bytes` of the body with the
+native Rust engine. Blocks return `block_status` with a generic body and engine
+errors fail closed. Streamed and gRPC response bodies are skipped with a metric.
 
-**Residual:** response bodies and headers are not inspected, sanitised,
-decompressed or filtered. There is no response-side DLP, malware scan, CSP
-injection or cookie policy. The origin can serve any content through the WAF.
-Response header size is bounded only by hyper defaults.
+**Residual:** response inspection is disabled by default and unavailable on the
+Coraza backends. It does not normalise or decompress response bodies, and
+streamed/gRPC bodies are not inspected. There is no response-side DLP, malware
+scan, CSP injection or cookie policy. The origin can serve any content through
+the WAF when inspection is off. Response header size is bounded only by hyper
+defaults.
 
 ### 5.9 Rate-limit and authentication evasion
 

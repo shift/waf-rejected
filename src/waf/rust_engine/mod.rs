@@ -58,7 +58,10 @@ pub use response::{EngineResponse, ResponseConfig};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::waf::{Decision, RequestContext, WafRule};
+use crate::waf::{
+    Decision, RequestContext, ResponseContext, ResponseEvaluator, ResponseInspectionOptions,
+    WafRule,
+};
 
 /// Repository-relative path of the pinned CRS bundle used by the reactor.
 pub const CRS_CONF_RELATIVE: &str = "wasm/coraza_reactor/rules/crs/crs.conf";
@@ -179,6 +182,70 @@ fn evaluate_request(engine: &RustEngine, ctx: &RequestContext) -> Result<Decisio
     engine
         .evaluate_detailed(&request)
         .map(|outcome| outcome.decision)
+}
+
+/// Response-phase evaluator backed by the native engine.
+///
+/// The proxy attaches this only for `waf.coraza.backend = "rust"`. It replays
+/// the request phases and then runs response phases 3–5, so response rules see
+/// the same request collections and `TX` state as the request path.
+pub struct RustEngineResponseEvaluator {
+    engine: Arc<RustEngine>,
+}
+
+impl RustEngineResponseEvaluator {
+    /// Wraps a compiled engine.
+    pub fn new(engine: Arc<RustEngine>) -> Self {
+        Self { engine }
+    }
+}
+
+impl ResponseEvaluator for RustEngineResponseEvaluator {
+    fn evaluate_response(
+        &self,
+        ctx: &RequestContext,
+        response: &ResponseContext,
+        options: &ResponseInspectionOptions,
+    ) -> Decision {
+        let uri = ctx.uri.to_string();
+        let headers: Vec<(String, String)> = ctx
+            .headers
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_string(),
+                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+        let request = EngineRequest {
+            method: ctx.method.as_str(),
+            uri: &uri,
+            http_version: &ctx.http_version,
+            headers: &headers,
+            body: ctx.body.as_deref(),
+        };
+
+        // Deterministic inspection prefix: never hand more than the configured
+        // cap to the engine, even when the caller buffered a larger body.
+        let body = response.body.as_deref().map(|body| {
+            let end = body.len().min(options.max_body_bytes);
+            &body[..end]
+        });
+        let engine_response = EngineResponse {
+            status: response.status,
+            protocol: &response.protocol,
+            headers: &response.headers,
+            body,
+        };
+        let config = ResponseConfig {
+            inspect_body: options.inspect_body,
+            max_body_bytes: options.max_body_bytes,
+            ..ResponseConfig::default()
+        };
+        self.engine
+            .evaluate_response(&request, &engine_response, &config)
+    }
 }
 
 /// gRPC field-content scanner for the default Rust backend.

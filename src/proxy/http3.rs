@@ -486,6 +486,12 @@ async fn handle_request(
                 client_ip
             );
             state.metrics.record_allowed();
+            let response_inspection = state.config.waf.response_inspection.enabled.then(|| {
+                crate::proxy::service::ResponseInspectionRequest {
+                    request: &request_context,
+                    config: &state.config.waf.response_inspection,
+                }
+            });
             let response = WafProxyService::forward_to_upstream_with_protocol(
                 parts,
                 crate::proxy::service::ProxyBody::buffered(body_bytes, request_trailers),
@@ -493,6 +499,7 @@ async fn handle_request(
                 state.upstream_uri.clone(),
                 start_time,
                 &http_version,
+                &state.waf_engine,
                 &state.metrics,
                 client_ip,
                 true,
@@ -504,6 +511,7 @@ async fn handle_request(
                     .enabled
                     .then_some(state.config.proxy.streaming.response_threshold_bytes),
                 &state.strip_policy,
+                response_inspection,
             )
             .await;
             let response = match response {

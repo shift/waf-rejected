@@ -20,7 +20,8 @@ configurations are in [`config/examples/`](../../config/examples/).
 > receives a full OWASP CRS body scan on the Coraza reference backend. The
 > native Rust engine is the default request-inspection backend; Coraza remains
 > the reference implementation and the explicit `wasm` backend. Response
-> inspection is plumbed in the engine but is not proxy-wired yet.
+> inspection is opt-in (`waf.response_inspection.enabled`) and only the native
+> Rust engine implements it.
 
 ## Workload matrix
 
@@ -39,7 +40,7 @@ Measured p50 unless stated otherwise. `native` = native Rust engine
 | Native Coraza sidecar | `waf.coraza.backend = "native"` | Opt-in | ~6× faster body inspection than wasm | Extra process, Unix socket, shared uid/gid and separate upgrade lifecycle. See `native-performance-profile.md`. |
 | Native Rust engine | `waf.coraza.backend = "rust"` | **Default** (compiled with `rust-engine`) | End-to-end proxy p50 0.414 / 0.642 / 1.091 / 1.614 ms for bodyless / 1 / 4 / 8 KiB; start-up 276 ms, ~30 MiB RSS | 505/505 rules, 2,110/2,112 corpus parity, 0 native-only FNs. Coraza remains the reference oracle. Runtime errors fail closed unless `waf.coraza.fallback = "wasm"`. |
 | Coraza WASI reactor | `waf.coraza.backend = "wasm"` | Reference / explicit switch-back | End-to-end proxy p50 4.47 / 40.13 / 169.56 / 354.09 ms for bodyless / 1 / 4 / 8 KiB; start-up ~4.9 s, ~801 MiB RSS | Full reference implementation and differential oracle. Available in default builds; slower than the Rust engine. |
-| Response inspection | engine phases 3–5 | Plumbed, not proxy-wired | Not on the proxy path | Response header/body collections and outbound scoring exist, but the proxy does not yet feed responses through them. |
+| Response inspection | engine phases 3–5 | Opt-in, native Rust engine only | Adds response evaluation cost; body inspection buffers up to `max_body_bytes` | `waf.response_inspection.enabled = true`. Headers are inspected on buffered and streamed responses; bodies only when buffered. Streamed and gRPC bodies are skipped with a metric. Coraza backends have no response path. |
 
 Measured numbers are from the reference 6-core laptop described in
 `performance-validation.md` and `subms-budget.md`. They are **capacity floors**
@@ -63,7 +64,7 @@ This table is the operator-facing summary.
 | WebSocket per-message inspection | Supported | `server.max_body_size` per message | Client text/binary messages are inspected; control frames and upstream-to-client traffic are not. No idle timeout or concurrent-tunnel cap. |
 | HTTP/3 admission | Supported (feature-gated) | `http3` feature + `enable_http3` + `"3"` in `supported_http_versions` + TLS 1.3 | No cap on concurrent QUIC connections/streams; no stateless retry. |
 | WebTransport | Supported (feature-gated, terminating) | `webtransport` feature + `server.webtransport` | Origin/path/auth checks, session/stream/datagram caps, local inspection and bounded echo. **No upstream proxying.** |
-| Response inspection | Not implemented | — | Engine phases 3–5 exist but the proxy does not call them. Response bodies are size-capped only. |
+| Response inspection | Opt-in (native Rust engine) | `waf.response_inspection.enabled = true` | Headers and buffered bodies (first `max_body_bytes`) are evaluated; blocks return `block_status` with a generic body. Streamed/gRPC bodies are skipped with a metric. Disabled by default; Coraza backends unsupported. |
 | Header-size / header-count / connection caps | Not implemented | hyper defaults | `server.max_connections` is parsed but not enforced. |
 
 ## Body inspection policy
@@ -213,8 +214,8 @@ owns every core**. Leave at least one core for the proxy, TLS and networking.
 - The native Rust engine is the default, but corpus agreement is 2,110/2,112,
   not 100 %; the two differences are documented and match the corpus labels.
   Coraza remains available but slower (`backend = "wasm"`).
-- Response inspection is plumbed but **not proxy-wired**; phases 3–5 do not
-  run on proxied responses yet.
+- Response inspection is **opt-in** and native-Rust-engine only. It is off by
+  default; streamed and gRPC response bodies are not inspected.
 - WebTransport is a **terminating** endpoint: it authenticates, inspects and
   echoes sessions locally. Application-specific upstream proxying is **not
   implemented**, and HTTP/1.1 `Upgrade: webtransport` remains `501`.

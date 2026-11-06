@@ -4,6 +4,17 @@ All notable changes to WAF-Rejected are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in upstream response inspection (`waf.response_inspection`) wired into
+  the proxy for the native Rust engine. Headers are evaluated on buffered and
+  streamed responses; bodies are evaluated when buffered, using a deterministic
+  `max_body_bytes` prefix. Blocks return the configured `block_status` with a
+  generic WAF body, engine errors fail closed, and streamed/gRPC bodies are
+  skipped with metrics. Disabled by default; Coraza backends have no response
+  path. See `docs/user-guide/configuration.md` and
+  `docs/architecture/security-model.md`.
+
 ### Security
 
 - Hardened request framing and protocol handling against the November 2026

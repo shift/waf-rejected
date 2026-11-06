@@ -2675,4 +2675,102 @@ SecRule RESPONSE_BODY "@contains evil" "id:1001,phase:4,pass,setvar:tx.outbound_
             );
         }
     }
+
+    fn response_engine() -> RustEngine {
+        let text = r#"
+SecRule RESPONSE_BODY "@rx (?i)(union\s+select|'\s*or\s*'1'='1)" "id:2001,phase:4,deny,status:403"
+SecRule RESPONSE_BODY "@rx (?i)<script[^>]*>" "id:2002,phase:4,deny,status:403"
+"#;
+        RustEngine::from_conf_str(text, ".", CompilePolicy::Strict).expect("response engine")
+    }
+
+    fn response<'a>(headers: &'a [(String, String)], body: &'a [u8]) -> EngineResponse<'a> {
+        EngineResponse {
+            status: 200,
+            protocol: "HTTP/1.1",
+            headers,
+            body: Some(body),
+        }
+    }
+
+    #[test]
+    fn response_body_benign_is_allowed() {
+        let engine = response_engine();
+        let headers = vec![("Content-Type".to_string(), "text/html".to_string())];
+        assert_eq!(
+            engine.evaluate_response(
+                &request("/"),
+                &response(&headers, b"<html><body>hello</body></html>"),
+                &ResponseConfig::raw_body(),
+            ),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn response_body_sqli_and_xss_are_blocked() {
+        let engine = response_engine();
+        let headers = vec![("Content-Type".to_string(), "text/html".to_string())];
+        for body in [
+            b"<html>' OR '1'='1</html>".as_slice(),
+            b"<html>UNION SELECT password FROM users</html>".as_slice(),
+            b"<html><script>alert(1)</script></html>".as_slice(),
+        ] {
+            assert!(
+                matches!(
+                    engine.evaluate_response(
+                        &request("/"),
+                        &response(&headers, body),
+                        &ResponseConfig::raw_body(),
+                    ),
+                    Decision::Block { status: 403, .. }
+                ),
+                "expected block for {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn response_body_cap_is_deterministic() {
+        let engine = response_engine();
+        let headers = vec![("Content-Type".to_string(), "text/html".to_string())];
+        let body = b"benign-prefix-<script>alert(1)</script>";
+        let config = ResponseConfig {
+            max_body_bytes: 14,
+            ..ResponseConfig::raw_body()
+        };
+        // The malicious suffix is beyond the cap and must not be inspected.
+        assert_eq!(
+            engine.evaluate_response(&request("/"), &response(&headers, body), &config),
+            Decision::Allow
+        );
+        let config = ResponseConfig {
+            max_body_bytes: body.len(),
+            ..ResponseConfig::raw_body()
+        };
+        assert!(matches!(
+            engine.evaluate_response(&request("/"), &response(&headers, body), &config),
+            Decision::Block { .. }
+        ));
+    }
+
+    #[test]
+    fn response_engine_errors_fail_closed() {
+        let engine = response_engine().with_limits(Limits {
+            max_values_per_rule: 0,
+            max_value_bytes: 0,
+            max_total_bytes: 0,
+            max_matches_per_rule: 0,
+        });
+        let headers = vec![("Content-Type".to_string(), "text/html".to_string())];
+        assert!(matches!(
+            engine.evaluate_response(
+                &request("/"),
+                &response(&headers, b"benign"),
+                &ResponseConfig::raw_body(),
+            ),
+            Decision::Block { status: 500, .. }
+        ));
+    }
 }

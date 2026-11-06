@@ -829,6 +829,9 @@ pub struct WafConfig {
     /// Content inspection configuration
     pub content_inspection: ContentInspectionConfig,
 
+    /// Opt-in upstream response inspection (phases 3–5).
+    pub response_inspection: ResponseInspectionConfig,
+
     /// Geographic blocking configuration
     pub geo_blocking: GeoBlockingConfig,
 
@@ -1108,6 +1111,70 @@ pub struct ContentInspectionConfig {
 
     /// Threat patterns to detect
     pub threat_patterns: Vec<String>,
+}
+
+/// Opt-in upstream response inspection (Coraza phases 3–5).
+///
+/// Disabled by default. When enabled, the proxy evaluates the upstream
+/// response headers (and, with `inspect_body`, the response body) with the
+/// native Rust engine. Enabling body inspection buffers responses up to
+/// `max_body_bytes` for inspection; the full response is still relayed unless
+/// it exceeds `server.max_body_size`. Only the first `max_body_bytes` are
+/// inspected, deterministically, so a large body cannot exhaust the engine
+/// budget. The Coraza WASI/native backends do not implement response
+/// inspection; enabling this with those backends records an unsupported
+/// metric and leaves responses uninspected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ResponseInspectionConfig {
+    /// Enable response inspection. Defaults to `false`.
+    pub enabled: bool,
+
+    /// Inspect the response body in addition to headers. Defaults to `false`.
+    /// Enabling this buffers the response (up to the configured caps).
+    pub inspect_body: bool,
+
+    /// Maximum number of response body bytes handed to the engine. The
+    /// inspection prefix is deterministic; bytes beyond this cap are not
+    /// inspected. Defaults to 1 MiB.
+    pub max_body_bytes: usize,
+
+    /// Status returned to the client when a response rule blocks. Defaults to
+    /// `403`. The body is a generic WAF message; upstream content is never
+    /// echoed.
+    pub block_status: u16,
+}
+
+impl Default for ResponseInspectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            inspect_body: false,
+            max_body_bytes: 1024 * 1024,
+            block_status: 403,
+        }
+    }
+}
+
+impl ResponseInspectionConfig {
+    /// Validate the response-inspection settings.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.max_body_bytes == 0 {
+            anyhow::bail!("waf.response_inspection.max_body_bytes must be greater than zero");
+        }
+        if !(400..=599).contains(&self.block_status) {
+            anyhow::bail!(
+                "waf.response_inspection.block_status must be a 4xx or 5xx status (got {})",
+                self.block_status
+            );
+        }
+        if self.inspect_body && !self.enabled {
+            anyhow::bail!(
+                "waf.response_inspection.inspect_body requires waf.response_inspection.enabled = true"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2094,6 +2161,7 @@ impl Default for WafConfig {
             rate_limit: RateLimitConfig::default(),
             security_events: SecurityEventsConfig::default(),
             content_inspection: ContentInspectionConfig::default(),
+            response_inspection: ResponseInspectionConfig::default(),
             geo_blocking: GeoBlockingConfig::default(),
             wasm: WasmConfig::default(),
             coraza: WafCorazaConfig::default(),
@@ -2598,6 +2666,7 @@ impl Config {
             }
         }
         self.waf.fast_allow.validate()?;
+        self.waf.response_inspection.validate()?;
         self.waf.grpc.validate()?;
         self.waf.graphql.validate()?;
         if self.security.auth.enabled && self.security.auth.api_keys.is_empty() {
@@ -3546,6 +3615,37 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
             error.contains("allow_audit_sample_rate"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn response_inspection_is_disabled_by_default() {
+        let config = Config::default();
+        assert!(!config.waf.response_inspection.enabled);
+        assert!(!config.waf.response_inspection.inspect_body);
+        assert_eq!(config.waf.response_inspection.max_body_bytes, 1024 * 1024);
+        assert_eq!(config.waf.response_inspection.block_status, 403);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn response_inspection_validation_rejects_bad_limits() {
+        let mut config = Config::default();
+        config.waf.response_inspection.max_body_bytes = 0;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("max_body_bytes"),
+            "unexpected error: {error}"
+        );
+
+        let mut config = Config::default();
+        config.waf.response_inspection.block_status = 200;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("block_status"), "unexpected error: {error}");
+
+        let mut config = Config::default();
+        config.waf.response_inspection.inspect_body = true;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("inspect_body"), "unexpected error: {error}");
     }
 
     #[test]

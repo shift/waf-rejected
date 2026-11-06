@@ -372,6 +372,30 @@ max_body_size = 10485760
 threat_patterns = ["sql_injection", "xss", "command_injection", "path_traversal"]
 ```
 
+### `[waf.response_inspection]` — opt-in
+
+Evaluates upstream responses with the native Rust engine's phases 3–5. Disabled
+by default. Only `waf.coraza.backend = "rust"` implements response inspection;
+the Coraza WASI/native backends record `waf_response_skipped_unsupported_total`
+and leave responses uninspected.
+
+```toml
+[waf.response_inspection]
+enabled = false
+inspect_body = false
+max_body_bytes = 1048576
+block_status = 403
+```
+
+Enabling `inspect_body` buffers the response so the body can be inspected. The
+proxy inspects at most the first `max_body_bytes` deterministically; the full
+response is still relayed unless it exceeds `server.max_body_size`. A response
+that is streamed under `[proxy.streaming]` is passed through without body
+inspection and counted in `waf_response_skipped_streaming_total`; headers are
+still inspected when `inspect_body = false`. gRPC response bodies are treated as
+streaming and are not body-inspected. A block returns `block_status` with a
+generic WAF body; upstream content is never echoed. Engine errors fail closed.
+
 ### `[waf.geo_blocking]`
 
 ```toml

@@ -55,7 +55,7 @@ use crate::proxy::telemetry::{RequestRejection, RequestTelemetry};
 use crate::proxy::websocket::WebSocketHandler;
 use crate::waf::auth::{ApiKeyValidator, InMemoryKeyStore};
 use crate::waf::tls_config::TlsManager;
-use crate::waf::{Decision, RequestContext, WafEngine};
+use crate::waf::{Decision, RequestContext, ResponseContext, ResponseInspectionOptions, WafEngine};
 
 /// Core WAF Proxy Service with multi-protocol support
 ///
@@ -193,6 +193,11 @@ pub(crate) fn classify_request(headers: &HeaderMap) -> RequestClassification {
         is_grpc,
         is_grpc_web,
     }
+}
+
+/// True when the request is a gRPC call (response bodies are framed/streamed).
+fn is_grpc_request(request: &RequestContext) -> bool {
+    classify_request(&request.headers).is_grpc
 }
 
 /// Connection-scoped header fields that must not be forwarded by a proxy.
@@ -765,6 +770,12 @@ fn parse_forwarded_element(element: &str) -> Option<IpAddr> {
         address = Some(parse_forwarded_ip(&value)?);
     }
     address
+}
+
+/// Request-side context needed to evaluate an upstream response.
+pub(crate) struct ResponseInspectionRequest<'a> {
+    pub(crate) request: &'a RequestContext,
+    pub(crate) config: &'a crate::config::ResponseInspectionConfig,
 }
 
 /// Per-connection state cloned into each hyper service invocation.
@@ -1592,6 +1603,21 @@ impl WafProxyService {
                 match &outcome.decision {
                     Decision::Allow => {
                         let (parts, _body) = req.into_parts();
+                        let fast_ctx = state.config.waf.response_inspection.enabled.then(|| {
+                            RequestContext::with_http_version(
+                                client_ip,
+                                parts.method.clone(),
+                                parts.uri.clone(),
+                                parts.headers.clone(),
+                                None,
+                                http_version.to_string(),
+                            )
+                        });
+                        let response_inspection =
+                            fast_ctx.as_ref().map(|request| ResponseInspectionRequest {
+                                request,
+                                config: &state.config.waf.response_inspection,
+                            });
                         state.metrics.record_allowed();
                         return Self::forward_to_upstream_with_protocol(
                             parts,
@@ -1600,6 +1626,7 @@ impl WafProxyService {
                             state.upstream_uri,
                             start_time,
                             http_version,
+                            &state.waf_engine,
                             &state.metrics,
                             client_ip,
                             is_https,
@@ -1611,6 +1638,7 @@ impl WafProxyService {
                                 .enabled
                                 .then_some(state.config.proxy.streaming.response_threshold_bytes),
                             &state.strip_policy,
+                            response_inspection,
                         )
                         .await;
                     }
@@ -1898,6 +1926,23 @@ impl WafProxyService {
                     client_ip, http_version
                 );
                 state.metrics.record_allowed();
+                let response_ctx = state.config.waf.response_inspection.enabled.then(|| {
+                    RequestContext::with_http_version(
+                        client_ip,
+                        parts.method.clone(),
+                        parts.uri.clone(),
+                        parts.headers.clone(),
+                        request_context.body_size,
+                        http_version.to_string(),
+                    )
+                });
+                let response_inspection =
+                    response_ctx
+                        .as_ref()
+                        .map(|request| ResponseInspectionRequest {
+                            request,
+                            config: &state.config.waf.response_inspection,
+                        });
                 Self::forward_to_upstream_with_protocol(
                     parts,
                     ProxyBody::buffered(body_bytes, request_trailers),
@@ -1905,6 +1950,7 @@ impl WafProxyService {
                     state.upstream_uri,
                     start_time,
                     http_version,
+                    &state.waf_engine,
                     &state.metrics,
                     client_ip,
                     is_https,
@@ -1916,6 +1962,7 @@ impl WafProxyService {
                         .enabled
                         .then_some(state.config.proxy.streaming.response_threshold_bytes),
                     &state.strip_policy,
+                    response_inspection,
                 )
                 .await
             }
@@ -1949,6 +1996,11 @@ impl WafProxyService {
         state: &ProxyState,
         client_ip: IpAddr,
     ) -> Response<ProxyBody> {
+        if state.config.waf.response_inspection.enabled {
+            // WebSocket frames are not an HTTP response body; response
+            // inspection does not apply to the upgraded tunnel.
+            state.metrics.record_response_skipped_unsupported();
+        }
         let upstream = &state.upstream_uri;
         let (use_tls, port) = match websocket_upstream_transport(upstream) {
             Ok(transport) => transport,
@@ -2782,6 +2834,69 @@ impl WafProxyService {
         })
     }
 
+    /// Evaluate an upstream response when response inspection is enabled.
+    ///
+    /// Returns `None` when inspection is disabled or unavailable. The body is
+    /// truncated to `max_body_bytes` before it reaches the engine; the caller
+    /// still relays the full body. Engine errors fail closed.
+    async fn inspect_upstream_response(
+        waf_engine: &Arc<WafEngine>,
+        metrics: &Metrics,
+        inspection: &ResponseInspectionRequest<'_>,
+        status: u16,
+        protocol: &str,
+        headers: &[(String, String)],
+        body: Option<&[u8]>,
+    ) -> Option<Decision> {
+        if !inspection.config.enabled {
+            return None;
+        }
+        if !waf_engine.has_response_evaluator() {
+            metrics.record_response_skipped_unsupported();
+            return None;
+        }
+
+        let mut inspected_body = body;
+        if let Some(bytes) = body {
+            if bytes.len() > inspection.config.max_body_bytes {
+                metrics.record_response_body_truncated();
+                inspected_body = Some(&bytes[..inspection.config.max_body_bytes]);
+            }
+        }
+
+        let response = ResponseContext {
+            status,
+            protocol: protocol.to_string(),
+            headers: headers.to_vec(),
+            body: inspected_body.map(Bytes::copy_from_slice),
+        };
+        let options = ResponseInspectionOptions {
+            inspect_body: inspection.config.inspect_body,
+            max_body_bytes: inspection.config.max_body_bytes,
+        };
+        metrics.record_response_inspection();
+        let decision = waf_engine
+            .evaluate_response_shared(inspection.request, &response, &options)
+            .await;
+        match &decision {
+            Some(Decision::Block { .. } | Decision::RateLimit { .. }) => {
+                metrics.record_response_block();
+            }
+            Some(Decision::Allow) => {}
+            None => metrics.record_response_skipped_unsupported(),
+        }
+        decision
+    }
+
+    /// Safe client-facing block for a response rejected by response inspection.
+    fn create_response_blocked_response(status_code: u16, is_grpc: bool) -> Response<ProxyBody> {
+        if is_grpc {
+            Self::create_grpc_blocked_response(status_code, "response blocked by WAF")
+        } else {
+            Self::create_blocked_response(status_code, "response inspection")
+        }
+    }
+
     /// Protocol-aware request forwarding with version preservation.
     ///
     /// The request body is already buffered (and inspected) by the caller. By
@@ -2790,8 +2905,12 @@ impl WafProxyService {
     /// with an empty body. When `stream_response_threshold` is set and the
     /// upstream advertises a `content-length` at or above it, the body is
     /// relayed frame by frame under the same byte cap instead of being
-    /// buffered. Response bodies are not WAF-inspected in either mode; the
-    /// size cap and the request-side inspection are unchanged.
+    /// buffered.
+    ///
+    /// Response inspection is opt-in. Headers are evaluated on both buffered
+    /// and streamed responses; body inspection requires buffering, so a
+    /// streamed response is passed through and counted as skipped. gRPC
+    /// responses are treated as streaming and are not body-inspected.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn forward_to_upstream_with_protocol(
         parts: hyper::http::request::Parts,
@@ -2800,12 +2919,14 @@ impl WafProxyService {
         upstream_uri: Uri,
         start_time: Instant,
         http_version: &str,
+        waf_engine: &Arc<WafEngine>,
         metrics: &Metrics,
         client_ip: IpAddr,
         is_https: bool,
         max_response_bytes: usize,
         stream_response_threshold: Option<usize>,
         strip_policy: &HeaderStripPolicy,
+        response_inspection: Option<ResponseInspectionRequest<'_>>,
     ) -> Result<Response<ProxyBody>, Infallible> {
         let proxy_req = match Self::build_upstream_request_with_policy(
             parts,
@@ -2829,6 +2950,22 @@ impl WafProxyService {
                 debug!("Request processed in {:?}", processing_time);
 
                 let (parts, body) = response.into_parts();
+                let inspection = response_inspection.filter(|inspection| inspection.config.enabled);
+                let is_grpc = inspection
+                    .as_ref()
+                    .is_some_and(|inspection| is_grpc_request(inspection.request));
+                let inspection_headers = inspection.as_ref().map(|_| {
+                    parts
+                        .headers
+                        .iter()
+                        .map(|(name, value)| {
+                            (
+                                name.as_str().to_string(),
+                                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                });
                 let has_trailer_header = parts.headers.contains_key(hyper::header::TRAILER);
                 let content_length = parts
                     .headers
@@ -2847,6 +2984,37 @@ impl WafProxyService {
 
                 if let Some(threshold) = stream_response_threshold {
                     if content_length.is_some_and(|length| length >= threshold) {
+                        if let Some(inspection) = &inspection {
+                            if inspection.config.inspect_body {
+                                // Body inspection needs the whole body; a
+                                // streamed response is passed through instead.
+                                if is_grpc {
+                                    metrics.record_response_skipped_unsupported();
+                                } else {
+                                    metrics.record_response_skipped_streaming();
+                                }
+                            } else if let Some(decision) = Self::inspect_upstream_response(
+                                waf_engine,
+                                metrics,
+                                inspection,
+                                parts.status.as_u16(),
+                                &format!("{:?}", parts.version),
+                                inspection_headers.as_deref().unwrap_or(&[]),
+                                None,
+                            )
+                            .await
+                            {
+                                if matches!(
+                                    decision,
+                                    Decision::Block { .. } | Decision::RateLimit { .. }
+                                ) {
+                                    return Ok(Self::create_response_blocked_response(
+                                        inspection.config.block_status,
+                                        is_grpc,
+                                    ));
+                                }
+                            }
+                        }
                         let response_builder = Self::build_upstream_response_head(
                             parts.status,
                             parts.version,
@@ -2935,6 +3103,40 @@ impl WafProxyService {
                     } else {
                         None
                     };
+
+                if let Some(inspection) = &inspection {
+                    if is_grpc {
+                        // gRPC response bodies are framed/streamed; only the
+                        // headers are safe to inspect here.
+                        metrics.record_response_skipped_unsupported();
+                    }
+                    let body = if inspection.config.inspect_body && !is_grpc {
+                        Some(collected.as_slice())
+                    } else {
+                        None
+                    };
+                    if let Some(decision) = Self::inspect_upstream_response(
+                        waf_engine,
+                        metrics,
+                        inspection,
+                        parts.status.as_u16(),
+                        &format!("{:?}", parts.version),
+                        inspection_headers.as_deref().unwrap_or(&[]),
+                        body,
+                    )
+                    .await
+                    {
+                        if matches!(
+                            decision,
+                            Decision::Block { .. } | Decision::RateLimit { .. }
+                        ) {
+                            return Ok(Self::create_response_blocked_response(
+                                inspection.config.block_status,
+                                is_grpc,
+                            ));
+                        }
+                    }
+                }
 
                 let response_builder = Self::build_upstream_response_head(
                     parts.status,
@@ -4290,5 +4492,266 @@ mod tests {
                 prop_assert_eq!(resolved, peer);
             }
         }
+    }
+
+    struct FakeResponseEvaluator {
+        decision: Decision,
+        seen_body_len: std::sync::Mutex<Option<usize>>,
+        panic: bool,
+    }
+
+    impl crate::waf::ResponseEvaluator for FakeResponseEvaluator {
+        fn evaluate_response(
+            &self,
+            _request: &RequestContext,
+            response: &ResponseContext,
+            _options: &ResponseInspectionOptions,
+        ) -> Decision {
+            if self.panic {
+                panic!("simulated response engine failure");
+            }
+            *self.seen_body_len.lock().unwrap() = response.body.as_ref().map(Bytes::len);
+            self.decision.clone()
+        }
+    }
+
+    fn response_test_context() -> RequestContext {
+        RequestContext::new(
+            "127.0.0.1".parse().unwrap(),
+            hyper::Method::GET,
+            "/".parse().unwrap(),
+            HeaderMap::new(),
+            None,
+        )
+    }
+
+    fn response_test_config() -> crate::config::ResponseInspectionConfig {
+        crate::config::ResponseInspectionConfig {
+            enabled: true,
+            inspect_body: true,
+            max_body_bytes: 4,
+            block_status: 403,
+        }
+    }
+
+    #[tokio::test]
+    async fn response_inspection_disabled_by_default() {
+        let config = crate::config::ResponseInspectionConfig::default();
+        assert!(!config.enabled);
+        assert!(!config.inspect_body);
+        let engine = Arc::new(WafEngine::new());
+        let metrics = Metrics::new();
+        let request = response_test_context();
+        let inspection = ResponseInspectionRequest {
+            request: &request,
+            config: &config,
+        };
+        let decision = WafProxyService::inspect_upstream_response(
+            &engine,
+            &metrics,
+            &inspection,
+            200,
+            "HTTP/1.1",
+            &[],
+            Some(b"evil"),
+        )
+        .await;
+        assert!(decision.is_none());
+    }
+
+    #[tokio::test]
+    async fn response_inspection_blocks_and_truncates_body() {
+        let evaluator = Arc::new(FakeResponseEvaluator {
+            decision: Decision::Block {
+                status: 403,
+                reason: "response rule".to_string(),
+            },
+            seen_body_len: std::sync::Mutex::new(None),
+            panic: false,
+        });
+        let mut engine = WafEngine::new();
+        engine.set_response_evaluator(evaluator.clone());
+        let engine = Arc::new(engine);
+        let metrics = Metrics::new();
+        let request = response_test_context();
+        let config = response_test_config();
+        let inspection = ResponseInspectionRequest {
+            request: &request,
+            config: &config,
+        };
+        let decision = WafProxyService::inspect_upstream_response(
+            &engine,
+            &metrics,
+            &inspection,
+            200,
+            "HTTP/1.1",
+            &[],
+            Some(b"0123456789"),
+        )
+        .await;
+        assert!(matches!(decision, Some(Decision::Block { .. })));
+        assert_eq!(*evaluator.seen_body_len.lock().unwrap(), Some(4));
+    }
+
+    #[tokio::test]
+    async fn response_inspection_fails_closed_on_engine_panic() {
+        let evaluator = Arc::new(FakeResponseEvaluator {
+            decision: Decision::Allow,
+            seen_body_len: std::sync::Mutex::new(None),
+            panic: true,
+        });
+        let mut engine = WafEngine::new();
+        engine.set_response_evaluator(evaluator);
+        let engine = Arc::new(engine);
+        let metrics = Metrics::new();
+        let request = response_test_context();
+        let config = response_test_config();
+        let inspection = ResponseInspectionRequest {
+            request: &request,
+            config: &config,
+        };
+        let decision = WafProxyService::inspect_upstream_response(
+            &engine,
+            &metrics,
+            &inspection,
+            200,
+            "HTTP/1.1",
+            &[],
+            Some(b"benign"),
+        )
+        .await;
+        assert!(matches!(
+            decision,
+            Some(Decision::Block { status: 500, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn response_inspection_without_evaluator_is_skipped() {
+        let engine = Arc::new(WafEngine::new());
+        let metrics = Metrics::new();
+        let request = response_test_context();
+        let config = response_test_config();
+        let inspection = ResponseInspectionRequest {
+            request: &request,
+            config: &config,
+        };
+        let decision = WafProxyService::inspect_upstream_response(
+            &engine,
+            &metrics,
+            &inspection,
+            200,
+            "HTTP/1.1",
+            &[],
+            Some(b"benign"),
+        )
+        .await;
+        assert!(decision.is_none());
+    }
+
+    #[tokio::test]
+    async fn response_inspection_runs_on_h2_upstream_response() {
+        use http_body_util::Full;
+        use hyper::service::service_fn;
+        use hyper_util::rt::TokioIo;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(value) => value,
+                    Err(_) => break,
+                };
+                tokio::spawn(async move {
+                    let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                        .serve_connection(
+                            TokioIo::new(stream),
+                            service_fn(|_req: Request<Incoming>| async {
+                                Ok::<_, Infallible>(
+                                    Response::builder()
+                                        .status(StatusCode::OK)
+                                        .body(Full::new(Bytes::from_static(b"h2-benign")))
+                                        .unwrap(),
+                                )
+                            }),
+                        )
+                        .await;
+                });
+            }
+        });
+
+        let tls = build_upstream_tls_config(None, None, None).unwrap();
+        let connector = HttpsConnectorBuilder::new()
+            .with_tls_config(tls)
+            .https_or_http()
+            .enable_http1()
+            .enable_http2()
+            .wrap_connector(HttpConnector::new());
+        let connector = UpstreamConnector {
+            inner: connector,
+            metrics: Arc::new(Metrics::new()),
+        };
+        let client = Client::builder(TokioExecutor::new())
+            .http2_only(true)
+            .build(connector);
+
+        let evaluator = Arc::new(FakeResponseEvaluator {
+            decision: Decision::Allow,
+            seen_body_len: std::sync::Mutex::new(None),
+            panic: false,
+        });
+        let mut engine = WafEngine::new();
+        engine.set_response_evaluator(evaluator.clone());
+        let engine = Arc::new(engine);
+        let metrics = Metrics::new();
+        let request = response_test_context();
+        let config = response_test_config();
+        let inspection = ResponseInspectionRequest {
+            request: &request,
+            config: &config,
+        };
+
+        let req = Request::builder().method("GET").uri("/").body(()).unwrap();
+        let (parts, _) = req.into_parts();
+        let response = WafProxyService::forward_to_upstream_with_protocol(
+            parts,
+            ProxyBody::buffered(Bytes::new(), None),
+            client,
+            format!("http://{upstream_addr}").parse().unwrap(),
+            Instant::now(),
+            "2",
+            &engine,
+            &metrics,
+            "127.0.0.1".parse().unwrap(),
+            false,
+            1024 * 1024,
+            None,
+            &HeaderStripPolicy::from_config(&ProxyConfig::default()),
+            Some(inspection),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"h2-benign");
+        // The inspection prefix is capped at `max_body_bytes` (4 in the test
+        // config); the full body is still relayed.
+        assert_eq!(*evaluator.seen_body_len.lock().unwrap(), Some(4));
+    }
+
+    #[test]
+    fn grpc_requests_are_detected_for_response_skip() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/grpc+proto".parse().unwrap());
+        let request = RequestContext::new(
+            "127.0.0.1".parse().unwrap(),
+            hyper::Method::POST,
+            "/svc/Method".parse().unwrap(),
+            headers,
+            None,
+        );
+        assert!(is_grpc_request(&request));
     }
 }

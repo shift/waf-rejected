@@ -214,6 +214,44 @@ impl RequestContext {
     }
 }
 
+/// An upstream response as seen by the response-inspection path.
+#[derive(Debug, Clone)]
+pub struct ResponseContext {
+    /// HTTP status code.
+    pub status: u16,
+    /// Protocol string, e.g. `HTTP/1.1` or `HTTP/2.0`.
+    pub protocol: String,
+    /// Response headers in wire order.
+    pub headers: Vec<(String, String)>,
+    /// Response body, when the caller captured it.
+    pub body: Option<Bytes>,
+}
+
+/// Response-inspection options derived from
+/// [`crate::config::ResponseInspectionConfig`].
+#[derive(Debug, Clone, Copy)]
+pub struct ResponseInspectionOptions {
+    /// Inspect the response body in addition to headers.
+    pub inspect_body: bool,
+    /// Maximum body bytes handed to the engine.
+    pub max_body_bytes: usize,
+}
+
+/// Backend that can evaluate response phases 3–5.
+///
+/// Only the native Rust engine implements this today. The Coraza WASI/native
+/// backends have no response path, so they leave the evaluator unset.
+pub trait ResponseEvaluator: Send + Sync {
+    /// Evaluate the response and return a decision. Implementations must
+    /// fail closed on internal errors.
+    fn evaluate_response(
+        &self,
+        request: &RequestContext,
+        response: &ResponseContext,
+        options: &ResponseInspectionOptions,
+    ) -> Decision;
+}
+
 /// WAF rule trait for implementing custom rules
 pub trait WafRule: Send + Sync {
     fn name(&self) -> &str;
@@ -322,6 +360,8 @@ pub struct WafEngine {
     allow_cache: Option<Arc<allow_cache::AllowCache>>,
     /// Compiled bodyless allowlist fast path.
     fast_allow: Arc<fast_allow::FastAllow>,
+    /// Optional response-phase evaluator (native Rust engine only).
+    response_evaluator: Option<Arc<dyn ResponseEvaluator>>,
 }
 
 /// Result of the synchronous inspection stages.
@@ -404,6 +444,7 @@ impl Clone for WafEngine {
             #[cfg(feature = "allow-cache")]
             allow_cache: self.allow_cache.clone(),
             fast_allow: Arc::clone(&self.fast_allow),
+            response_evaluator: self.response_evaluator.clone(),
         }
     }
 }
@@ -436,6 +477,7 @@ impl WafEngine {
             #[cfg(feature = "allow-cache")]
             allow_cache: None,
             fast_allow: Arc::new(fast_allow::FastAllow::disabled()),
+            response_evaluator: None,
         }
     }
 
@@ -498,6 +540,7 @@ impl WafEngine {
             #[cfg(feature = "allow-cache")]
             allow_cache: None,
             fast_allow,
+            response_evaluator: None,
         };
 
         // gRPC is protocol-aware: validate the envelope before Coraza runs so
@@ -692,7 +735,11 @@ impl WafEngine {
                             rss_bytes = rss_bytes().unwrap_or(0),
                             "Compiled the Rust engine rule IR at startup"
                         );
-                        let rule = rust_engine::RustEngineRule::new(Arc::new(engine));
+                        let engine = Arc::new(engine);
+                        self.response_evaluator = Some(Arc::new(
+                            rust_engine::RustEngineResponseEvaluator::new(Arc::clone(&engine)),
+                        ));
+                        let rule = rust_engine::RustEngineRule::new(engine);
                         #[cfg(feature = "wasm-reactor")]
                         let scanner: GrpcContentScannerHandle = rule.content_scanner();
                         #[cfg(not(feature = "wasm-reactor"))]
@@ -1791,6 +1838,51 @@ impl WafEngine {
                     )
                     .await
                 }
+            }
+        }
+    }
+
+    /// True when a response-phase evaluator is attached (native Rust engine).
+    pub fn has_response_evaluator(&self) -> bool {
+        self.response_evaluator.is_some()
+    }
+
+    /// Attach a response evaluator (used by proxy unit tests).
+    #[cfg(test)]
+    pub(crate) fn set_response_evaluator(&mut self, evaluator: Arc<dyn ResponseEvaluator>) {
+        self.response_evaluator = Some(evaluator);
+    }
+
+    /// Evaluate an upstream response with the attached response evaluator.
+    ///
+    /// Returns `None` when response inspection is unavailable (WAF disabled or
+    /// a backend without a response path). Engine errors and panics fail
+    /// closed with a `500` block.
+    pub async fn evaluate_response_shared(
+        self: &Arc<Self>,
+        request: &RequestContext,
+        response: &ResponseContext,
+        options: &ResponseInspectionOptions,
+    ) -> Option<Decision> {
+        if !self.enabled {
+            return None;
+        }
+        let evaluator = self.response_evaluator.clone()?;
+        let request = request.clone();
+        let response = response.clone();
+        let options = *options;
+        match tokio::task::spawn_blocking(move || {
+            evaluator.evaluate_response(&request, &response, &options)
+        })
+        .await
+        {
+            Ok(decision) => Some(decision),
+            Err(error) => {
+                tracing::error!(error = %error, "response inspection task failed");
+                Some(Decision::Block {
+                    status: 500,
+                    reason: "response inspection failed (fail-closed)".to_string(),
+                })
             }
         }
     }
