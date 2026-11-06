@@ -1544,31 +1544,6 @@ impl WafEngine {
         CoreOutcome::new(Decision::Allow, triggered_rules)
     }
 
-    /// Early allow-cache probe for the synchronous path.
-    ///
-    /// Returns `Some(outcome)` only when the original request's fingerprint
-    /// matches a live entry, in which case the stateless protocol pre-checks
-    /// can be skipped (they already ran, unchanged, during the original
-    /// evaluation). The returned outcome runs the *non-cacheable* rules, so
-    /// stateful and IP-dependent rules still execute. A miss returns `None` and
-    /// leaves the miss counter to the authoritative lookup in
-    /// [`Self::rules_with_cache`], so a miss is counted once.
-    #[cfg(feature = "allow-cache")]
-    fn cache_hit_early(&self, request: &RequestContext) -> Option<CoreOutcome> {
-        let cache = self.allow_cache.as_ref()?;
-        if !cache.applies_to(&request.uri) {
-            return None;
-        }
-        let allow_cache::KeyBuild::Fingerprint(fingerprint) = cache.fingerprint(request) else {
-            return None;
-        };
-        let body = request.body.as_deref().unwrap_or_default();
-        if !cache.probe(fingerprint, body) {
-            return None;
-        }
-        Some(self.rules_core_cache_hit(request))
-    }
-
     /// Rule chain with the experimental allow-verdict cache in front.
     ///
     /// The cache is consulted after the protocol pre-checks and admission (the
@@ -1612,25 +1587,10 @@ impl WafEngine {
     /// keep the inline path (see [`Self::evaluate_shared`]).
     #[cfg(not(any(feature = "wasm-waf", feature = "ai-threat-detection")))]
     fn evaluate_core(&self, request: &RequestContext) -> CoreOutcome {
-        // Early allow-cache probe, *before* the protocol pre-checks.
-        //
-        // The pre-checks are pure functions of method, URI, headers and body,
-        // and the fingerprint hashes all of them (the body as a keyed digest).
-        // An early hit therefore implies the pre-checks already ran on this
-        // exact request during the original evaluation and returned Allow
-        // without stripping the body: a stripped request hashes to a different
-        // fingerprint (body present vs absent), so it cannot hit here and falls
-        // through to the normal pre-check path. Protocol descriptor reloads are
-        // covered by the documented `invalidate_allow_cache()` contract. The
-        // fail-closed init gate is checked first, so a hit can never turn a
-        // 503 into an Allow.
-        #[cfg(feature = "allow-cache")]
-        if self.init_failure().is_none() {
-            if let Some(outcome) = self.cache_hit_early(request) {
-                return outcome;
-            }
-        }
-
+        // Protocol pre-checks always run, including on an allow-cache hit. The
+        // cache only memoises the pure content-rule verdict; it must never skip
+        // gRPC/GraphQL descriptor checks. Descriptor reloads invalidate the
+        // cache through `reload_protocol_descriptors`.
         let stripped = match self.precheck_core(request) {
             PrecheckOutcome::Reject(outcome) => return outcome,
             PrecheckOutcome::Continue(stripped) => stripped,
@@ -1670,17 +1630,7 @@ impl WafEngine {
             Err(decision) => return decision,
         };
 
-        // Same early probe as `evaluate_core`: admission has already run, so a
-        // hit can skip the stateless pre-checks. See the comment there for the
-        // safety argument.
-        #[cfg(feature = "allow-cache")]
-        if self.init_failure().is_none() {
-            if let Some(outcome) = self.cache_hit_early(request) {
-                drop(guard);
-                return outcome.decision;
-            }
-        }
-
+        // Protocol pre-checks always run, including on an allow-cache hit.
         let stripped = match self.precheck_core(request) {
             PrecheckOutcome::Reject(outcome) => {
                 drop(guard);
@@ -2031,6 +1981,59 @@ impl WafEngine {
         if let Some(cache) = &self.allow_cache {
             cache.invalidate();
         }
+    }
+
+    /// Reload gRPC/GraphQL descriptor-backed policy and invalidate the
+    /// allow-verdict cache.
+    ///
+    /// A descriptor reload changes the inputs to the protocol pre-checks, so a
+    /// cached `Allow` from the previous descriptor generation must never be
+    /// served. This is the only supported reload entry point; callers must not
+    /// replace the inspectors directly.
+    #[cfg(feature = "wasm-reactor")]
+    pub fn reload_protocol_descriptors(&mut self, config: &Config) -> Result<(), String> {
+        let grpc_enabled =
+            config.waf.enabled && config.waf.coraza.enabled && config.waf.grpc.enabled;
+        if grpc_enabled {
+            match self.grpc_inspector.as_mut() {
+                Some(inspector) => inspector
+                    .reload_from_config(&config.waf.grpc)
+                    .map_err(|error| error.to_string())?,
+                None => {
+                    let mut inspector = grpc::GrpcInspector::try_from_config(&config.waf.grpc)
+                        .map_err(|error| error.to_string())?;
+                    if let Some(metrics) = &self.metrics {
+                        inspector = inspector.with_metrics(Arc::clone(metrics));
+                    }
+                    self.grpc_inspector = Some(inspector);
+                }
+            }
+        } else {
+            self.grpc_inspector = None;
+        }
+
+        let graphql_enabled = config.waf.enabled
+            && config.waf.graphql.enabled
+            && config.waf.graphql.scan_mode() != crate::config::WafGraphqlScanMode::Off;
+        if graphql_enabled {
+            match self.graphql_inspector.as_mut() {
+                Some(inspector) => inspector
+                    .reload_from_config(&config.waf.graphql)
+                    .map_err(|error| error.to_string())?,
+                None => {
+                    self.graphql_inspector = Some(graphql::GraphqlInspector::try_from_config(
+                        &config.waf.graphql,
+                    )?);
+                }
+            }
+        } else {
+            self.graphql_inspector = None;
+        }
+
+        #[cfg(feature = "allow-cache")]
+        self.invalidate_allow_cache();
+
+        Ok(())
     }
 }
 
@@ -3653,6 +3656,64 @@ mod tests {
             engine.invalidate_allow_cache();
             assert_eq!(engine.evaluate(&request).await, Decision::Allow);
             assert_eq!(cacheable.load(Ordering::SeqCst), 2);
+        }
+
+        #[cfg(feature = "wasm-reactor")]
+        #[tokio::test]
+        async fn cache_hit_still_runs_protocol_prechecks() {
+            let metrics = Arc::new(crate::metrics::Metrics::new());
+            let mut engine = cache_engine(true, 30, Vec::new(), 1024);
+            engine.metrics = Some(Arc::clone(&metrics));
+            engine.graphql_inspector = Some(crate::waf::graphql::GraphqlInspector::from_config(
+                &super::graphql_config(crate::config::WafGraphqlScanMode::Crs),
+            ));
+            engine.add_rule(CacheableContentRule::new(
+                "cacheable-allow",
+                Arc::new(AtomicUsize::new(0)),
+                "never-present",
+            ));
+
+            let request = super::graphql_context(
+                r#"{"query":"query GetUser { user { id } }","operationName":"GetUser"}"#,
+            );
+            assert_eq!(engine.evaluate(&request).await, Decision::Allow);
+            assert_eq!(engine.evaluate(&request).await, Decision::Allow);
+            assert_eq!(engine.allow_cache().unwrap().stats().hits, 1);
+            assert!(
+                metrics
+                    .render_prometheus()
+                    .contains("waf_graphql_decisions_total{decision=\"allow\"} 2"),
+                "a cache hit must still run the GraphQL pre-check"
+            );
+        }
+
+        #[cfg(feature = "wasm-reactor")]
+        #[tokio::test]
+        async fn descriptor_reload_invalidates_the_allow_cache() {
+            let mut engine = cache_engine(true, 30, Vec::new(), 1024);
+            let cacheable = Arc::new(AtomicUsize::new(0));
+            engine.add_rule(CacheableContentRule::new(
+                "cacheable-allow",
+                Arc::clone(&cacheable),
+                "never-present",
+            ));
+
+            let request = create_test_context();
+            assert_eq!(engine.evaluate(&request).await, Decision::Allow);
+            assert_eq!(engine.evaluate(&request).await, Decision::Allow);
+            assert_eq!(cacheable.load(Ordering::SeqCst), 1);
+            assert_eq!(engine.allow_cache().unwrap().stats().hits, 1);
+
+            let config = crate::config::Config::default();
+            engine.reload_protocol_descriptors(&config).unwrap();
+            assert_eq!(engine.allow_cache().unwrap().stats().entries, 0);
+
+            assert_eq!(engine.evaluate(&request).await, Decision::Allow);
+            assert_eq!(
+                cacheable.load(Ordering::SeqCst),
+                2,
+                "a descriptor reload must force re-evaluation"
+            );
         }
 
         #[tokio::test]

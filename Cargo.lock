@@ -4206,6 +4206,7 @@ dependencies = [
  "sha2 0.10.9",
  "sled",
  "socket2",
+ "subtle",
  "tempfile",
  "testcontainers",
  "thiserror 1.0.69",

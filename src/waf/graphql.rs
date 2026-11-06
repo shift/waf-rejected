@@ -173,6 +173,16 @@ impl GraphqlInspector {
         Ok(Self::build(config, artifact.as_ref()))
     }
 
+    /// Reload descriptor-backed policy from configuration.
+    pub fn reload_from_config(&mut self, config: &WafGraphqlConfig) -> Result<(), String> {
+        let artifact = match config.allowlist_file.as_deref() {
+            Some(path) => Some(load_allowlist(path).map_err(|error| error.to_string())?),
+            None => None,
+        };
+        *self = Self::build(config, artifact.as_ref());
+        Ok(())
+    }
+
     fn build(config: &WafGraphqlConfig, artifact: Option<&GraphqlAllowlist>) -> Self {
         let mut operation_names = HashSet::new();
         let mut query_hashes = HashSet::new();

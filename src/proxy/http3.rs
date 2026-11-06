@@ -112,11 +112,11 @@ async fn handle_connection(
     loop {
         match connection.accept().await {
             Ok(Some(resolver)) => {
-                // Admission is acquired before `resolve_request`, so a
+                // The global permit is acquired before `resolve_request`, so a
                 // saturated listener never spawns a handler or reads a body
-                // for excess work. Waiting here provides per-connection
-                // backpressure and the global semaphore bounds all tasks.
-                let permit = match admission.acquire(peer_ip).await {
+                // for excess work. The per-client permit is acquired later,
+                // after the resolved client address is known.
+                let global = match admission.acquire_global().await {
                     Ok(permit) => permit,
                     Err(rejection) => {
                         warn!(
@@ -158,15 +158,19 @@ async fn handle_connection(
                 };
 
                 let state = state.clone();
+                let admission = admission.clone();
                 tokio::spawn(async move {
-                    let _permit = permit;
                     match resolver.resolve_request().await {
                         Ok((request, stream)) => {
-                            if let Err(e) = handle_request(request, stream, state, peer_ip).await {
+                            if let Err(e) =
+                                handle_request(request, stream, state, peer_ip, global, admission)
+                                    .await
+                            {
                                 debug!("HTTP/3 request from {} failed: {}", peer_ip, e);
                             }
                         }
                         Err(e) => {
+                            drop(global);
                             debug!("HTTP/3 request headers from {} rejected: {}", peer_ip, e)
                         }
                     }
@@ -188,6 +192,8 @@ async fn handle_request(
     mut stream: H3Stream,
     state: ProxyState,
     peer_ip: IpAddr,
+    global: crate::proxy::h3_admission::H3GlobalGuard,
+    admission: H3Admission,
 ) -> Result<(), WafError> {
     let start_time = Instant::now();
     let telemetry = RequestTelemetry::begin(Arc::clone(&state.metrics));
@@ -224,6 +230,26 @@ async fn handle_request(
         &state.trusted_proxies,
         &state.metrics,
     );
+
+    // The per-client admission bucket is keyed on the resolved client, not the
+    // QUIC peer, so a trusted HTTP/3 proxy does not collapse every client into
+    // one bucket. The global permit is already held from before header
+    // resolution.
+    let client_permit = match admission.acquire_client(client_ip) {
+        Ok(permit) => permit,
+        Err(rejection) => {
+            warn!(
+                "Rejected HTTP/3 request from {} after header resolution: {}",
+                client_ip, rejection
+            );
+            telemetry.reject(RequestRejection::WafRateLimited);
+            state.metrics.record_rate_limited();
+            state.metrics.record_blocked();
+            return send_response(&mut stream, admission_rejection_response(rejection)).await;
+        }
+    };
+    let _global = global;
+    let _client = client_permit;
 
     // Remove client-supplied routing/override headers before the WAF and the
     // upstream see the request. Identity headers were consumed above and are
@@ -265,19 +291,37 @@ async fn handle_request(
     }
 
     if let Some(validator) = &state.auth_validator {
-        if let Err(e) = validator.validate_request(&parts.headers, true) {
-            warn!(
-                "Authentication rejected HTTP/3 request from {}: {}",
-                client_ip, e
-            );
-            telemetry.reject(RequestRejection::Authentication);
-            state.metrics.record_auth_failure();
-            state.metrics.record_blocked();
-            return send_response(
-                &mut stream,
-                WafProxyService::create_error_response(StatusCode::UNAUTHORIZED, "Unauthorized"),
-            )
-            .await;
+        match validator.validate_request_for_client(&parts.headers, true, Some(client_ip)) {
+            Ok(()) => {}
+            Err(crate::error::WafError::RateLimitError(e)) => {
+                warn!(
+                    "Authentication rate limited HTTP/3 request from {}: {}",
+                    client_ip, e
+                );
+                telemetry.reject(RequestRejection::WafRateLimited);
+                state.metrics.record_auth_rate_limited();
+                state.metrics.record_rate_limited();
+                state.metrics.record_blocked();
+                return send_response(&mut stream, WafProxyService::create_rate_limit_response(&e))
+                    .await;
+            }
+            Err(e) => {
+                warn!(
+                    "Authentication rejected HTTP/3 request from {}: {}",
+                    client_ip, e
+                );
+                telemetry.reject(RequestRejection::Authentication);
+                state.metrics.record_auth_failure();
+                state.metrics.record_blocked();
+                return send_response(
+                    &mut stream,
+                    WafProxyService::create_error_response(
+                        StatusCode::UNAUTHORIZED,
+                        "Unauthorized",
+                    ),
+                )
+                .await;
+            }
         }
     }
 

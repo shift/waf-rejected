@@ -263,13 +263,19 @@ not from an inbound header.
   passes `true`); a plaintext listener with this enabled rejects every request;
 - presence of `security.auth.header_name` (default `X-API-Key`);
 - membership of the SHA-256 hash of the presented value in the in-memory set
-  built by `InMemoryKeyStore::from_raw_keys`.
+  built by `InMemoryKeyStore::from_raw_keys`, compared in constant time against
+  every stored digest with `subtle`;
+- the configured `security.auth.rate_limit` windows: per-key
+  (`requests_per_minute`), optional per-IP (`per_ip_enabled`,
+  `per_ip_max_requests`, `per_ip_window_secs`) and optional global
+  (`global_enabled`, `global_max_requests`, `global_window_secs`). A saturated
+  limiter table, or a per-IP limit without a resolved client address, fails
+  closed. Rejections increment `waf_auth_rate_limited_total` and return `429`.
 
-Keys are held in plaintext in configuration and hashed at startup; the
-membership check is a normal `HashSet` lookup, not a constant-time comparison.
-`AuthConfig::rate_limit` exists but is not enforced anywhere in the request
-path, and failed authentication happens before the WAF rule chain, so invalid
-keys are not rate limited by the proxy.
+Keys are held in plaintext in configuration and hashed at startup. Failed
+authentication happens before the WAF rule chain, so invalid keys are not rate
+limited by the proxy; only successfully validated keys consume the auth
+limiter.
 
 ### 4.4 Body admission, framing and decompression
 
@@ -652,9 +658,9 @@ without bound.
 **Residual:** rate limits are per process, not shared across replicas, and are
 keyed on the resolved IP. IPv6 rotation and distributed sources still defeat
 per-IP limits. Failed authentication is not rate limited because auth runs
-before the rule chain; `AuthConfig::rate_limit` is parsed but not enforced.
-API keys are shared secrets with no per-key quota, rotation API, expiry or
-replay protection. The key check is a plain `HashSet` lookup, not constant-time.
+before the rule chain. API keys are shared secrets with no rotation API, expiry
+or replay protection. The auth limiter's per-key/per-IP tables are hard-capped
+and fail closed at capacity.
 
 ### 5.10 Error-path and observability issues
 

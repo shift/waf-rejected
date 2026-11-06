@@ -543,11 +543,15 @@ enabled = false
 api_keys = []
 header_name = "X-API-Key"
 require_https = false
-# Optional per-key limits:
+# Optional auth-stage limits:
 # [security.auth.rate_limit]
+# requests_per_minute = 60      # per API key
 # per_ip_enabled = true
 # per_ip_max_requests = 100
 # per_ip_window_secs = 60
+# global_enabled = true
+# global_max_requests = 1000
+# global_window_secs = 60
 ```
 
 Enabling auth with an empty `api_keys` list aborts start-up. Prefer injecting

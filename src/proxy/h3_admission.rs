@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -24,7 +25,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::metrics::Metrics;
 
 /// Upper bound on tracked client entries. Entries with no live holders are
-/// pruned when the map is full, so this only bounds a pathological fan-out.
+/// pruned when the map is full; if every entry is live, the least-recently-used
+/// entry is evicted so the map can never grow past this cap.
 const MAX_TRACKED_CLIENTS: usize = 4096;
 
 /// Why an HTTP/3 request was not admitted.
@@ -50,10 +52,16 @@ impl std::fmt::Display for H3AdmissionRejection {
     }
 }
 
+struct ClientEntry {
+    semaphore: Weak<Semaphore>,
+    last_used: u64,
+}
+
 struct Inner {
     global: Arc<Semaphore>,
     per_client_limit: Option<usize>,
-    clients: Mutex<HashMap<IpAddr, Weak<Semaphore>>>,
+    clients: Mutex<HashMap<IpAddr, ClientEntry>>,
+    clock: AtomicU64,
     timeout: Duration,
     metrics: Arc<Metrics>,
 }
@@ -64,17 +72,38 @@ pub struct H3Admission {
     inner: Arc<Inner>,
 }
 
-/// RAII guard for one admitted HTTP/3 request. Dropping it releases the global
-/// (and optional per-client) permit and updates the in-flight gauge.
-pub struct H3AdmissionGuard {
+/// RAII guard for the global HTTP/3 admission permit. Acquired before request
+/// headers are resolved so a saturated listener never spawns a handler or reads
+/// a body for excess work.
+pub struct H3GlobalGuard {
     _global: OwnedSemaphorePermit,
-    _client: Option<OwnedSemaphorePermit>,
     metrics: Arc<Metrics>,
 }
 
-impl Drop for H3AdmissionGuard {
+impl Drop for H3GlobalGuard {
     fn drop(&mut self) {
         self.metrics.h3_admission_finished();
+    }
+}
+
+/// RAII guard for one per-client HTTP/3 permit.
+pub struct H3ClientPermit {
+    _client: Option<OwnedSemaphorePermit>,
+}
+
+/// RAII guard for one admitted HTTP/3 request. Dropping it releases the global
+/// (and optional per-client) permit and updates the in-flight gauge.
+pub struct H3AdmissionGuard {
+    _global: H3GlobalGuard,
+    _client: Option<H3ClientPermit>,
+}
+
+impl H3AdmissionGuard {
+    pub fn new(global: H3GlobalGuard, client: Option<H3ClientPermit>) -> Self {
+        Self {
+            _global: global,
+            _client: client,
+        }
     }
 }
 
@@ -91,6 +120,7 @@ impl H3Admission {
                 global: Arc::new(Semaphore::new(max_inflight.max(1))),
                 per_client_limit: (max_per_client > 0).then_some(max_per_client),
                 clients: Mutex::new(HashMap::new()),
+                clock: AtomicU64::new(0),
                 timeout,
                 metrics,
             }),
@@ -100,11 +130,16 @@ impl H3Admission {
     /// Acquire admission for one request. The returned guard must be held for
     /// the lifetime of the request handler.
     pub async fn acquire(&self, client: IpAddr) -> Result<H3AdmissionGuard, H3AdmissionRejection> {
+        let global = self.acquire_global().await?;
         let client_permit = match self.inner.per_client_limit {
-            Some(limit) => Some(self.acquire_client(client, limit)?),
+            Some(_) => Some(self.acquire_client(client)?),
             None => None,
         };
+        Ok(H3AdmissionGuard::new(global, client_permit))
+    }
 
+    /// Acquire the global permit before request headers are resolved.
+    pub async fn acquire_global(&self) -> Result<H3GlobalGuard, H3AdmissionRejection> {
         let global = match self.inner.global.clone().try_acquire_owned() {
             Ok(permit) => {
                 self.inner.metrics.h3_admission_admitted();
@@ -133,38 +168,73 @@ impl H3Admission {
         };
 
         self.inner.metrics.h3_admission_started();
-        Ok(H3AdmissionGuard {
+        Ok(H3GlobalGuard {
             _global: global,
-            _client: client_permit,
             metrics: Arc::clone(&self.inner.metrics),
         })
     }
 
-    fn acquire_client(
-        &self,
-        client: IpAddr,
-        limit: usize,
-    ) -> Result<OwnedSemaphorePermit, H3AdmissionRejection> {
+    /// Acquire the per-client permit using the resolved client address.
+    ///
+    /// This runs after request headers are resolved, so a trusted HTTP/3 proxy
+    /// does not collapse every client into the proxy's QUIC peer bucket.
+    pub fn acquire_client(&self, client: IpAddr) -> Result<H3ClientPermit, H3AdmissionRejection> {
+        let limit = match self.inner.per_client_limit {
+            Some(limit) => limit,
+            None => {
+                // No per-client limit: the guard is a no-op.
+                return Ok(H3ClientPermit { _client: None });
+            }
+        };
+
+        let now = self.inner.clock.fetch_add(1, Ordering::Relaxed);
         let semaphore = {
             let mut clients = self
                 .inner
                 .clients
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(existing) = clients.get(&client).and_then(Weak::upgrade) {
-                existing
+            if let Some(entry) = clients.get_mut(&client) {
+                if let Some(existing) = entry.semaphore.upgrade() {
+                    entry.last_used = now;
+                    existing
+                } else {
+                    let semaphore = Arc::new(Semaphore::new(limit));
+                    *entry = ClientEntry {
+                        semaphore: Arc::downgrade(&semaphore),
+                        last_used: now,
+                    };
+                    semaphore
+                }
             } else {
                 if clients.len() >= MAX_TRACKED_CLIENTS {
-                    clients.retain(|_, weak| weak.strong_count() > 0);
+                    clients.retain(|_, entry| entry.semaphore.strong_count() > 0);
+                }
+                if clients.len() >= MAX_TRACKED_CLIENTS {
+                    if let Some(oldest) = clients
+                        .iter()
+                        .min_by_key(|(_, entry)| entry.last_used)
+                        .map(|(client, _)| *client)
+                    {
+                        clients.remove(&oldest);
+                    }
                 }
                 let semaphore = Arc::new(Semaphore::new(limit));
-                clients.insert(client, Arc::downgrade(&semaphore));
+                clients.insert(
+                    client,
+                    ClientEntry {
+                        semaphore: Arc::downgrade(&semaphore),
+                        last_used: now,
+                    },
+                );
                 semaphore
             }
         };
 
         match semaphore.try_acquire_owned() {
-            Ok(permit) => Ok(permit),
+            Ok(permit) => Ok(H3ClientPermit {
+                _client: Some(permit),
+            }),
             Err(_) => {
                 self.inner.metrics.h3_admission_rejected_client_limit();
                 Err(H3AdmissionRejection::ClientLimit { limit })
@@ -189,6 +259,15 @@ impl H3Admission {
     #[cfg(test)]
     fn in_flight(&self) -> u64 {
         self.inner.metrics.h3_inflight()
+    }
+
+    #[cfg(test)]
+    fn tracked_clients(&self) -> usize {
+        self.inner
+            .clients
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
     }
 }
 
@@ -241,6 +320,41 @@ mod tests {
 
         // A different client still has capacity.
         assert!(admission.acquire(ip(2)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn high_cardinality_clients_never_exceed_the_tracked_cap() {
+        let admission = controller(MAX_TRACKED_CLIENTS + 8, 1, 1000);
+        let mut held = Vec::new();
+        for index in 0..(MAX_TRACKED_CLIENTS + 8) {
+            let client = IpAddr::from(std::net::Ipv4Addr::from(index as u32));
+            held.push(admission.acquire(client).await.unwrap());
+        }
+        assert!(
+            admission.tracked_clients() <= MAX_TRACKED_CLIENTS,
+            "tracked client map grew past its cap: {}",
+            admission.tracked_clients()
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn per_client_admission_is_keyed_on_the_resolved_client() {
+        let admission = controller(8, 1, 1000);
+        let global = admission.acquire_global().await.unwrap();
+        let resolved_a = ip(2);
+        let resolved_b = ip(3);
+
+        let first = admission.acquire_client(resolved_a).unwrap();
+        let second = admission.acquire_client(resolved_b).unwrap();
+        assert!(matches!(
+            admission.acquire_client(resolved_a),
+            Err(H3AdmissionRejection::ClientLimit { limit: 1 })
+        ));
+
+        drop(first);
+        drop(second);
+        drop(global);
     }
 
     #[tokio::test]

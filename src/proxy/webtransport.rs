@@ -164,14 +164,28 @@ async fn handle_session(
     }
 
     if let Some(validator) = &state.auth_validator {
-        if let Err(e) = validator.validate_request(&headers, true) {
-            warn!(
-                "Authentication rejected WebTransport session from {}: {}",
-                client_ip, e
-            );
-            state.metrics.record_webtransport_blocked();
-            reject(request, CLOSE_UNAUTHORIZED, "Unauthorized").await;
-            return Ok(());
+        match validator.validate_request_for_client(&headers, true, Some(client_ip)) {
+            Ok(()) => {}
+            Err(crate::error::WafError::RateLimitError(e)) => {
+                warn!(
+                    "Authentication rate limited WebTransport session from {}: {}",
+                    client_ip, e
+                );
+                state.metrics.record_auth_rate_limited();
+                state.metrics.record_rate_limited();
+                state.metrics.record_webtransport_blocked();
+                reject(request, CLOSE_TOO_MANY_REQUESTS, "Too many requests").await;
+                return Ok(());
+            }
+            Err(e) => {
+                warn!(
+                    "Authentication rejected WebTransport session from {}: {}",
+                    client_ip, e
+                );
+                state.metrics.record_webtransport_blocked();
+                reject(request, CLOSE_UNAUTHORIZED, "Unauthorized").await;
+                return Ok(());
+            }
         }
     }
 

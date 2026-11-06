@@ -997,7 +997,7 @@ mod tests {
             HeaderMap::new(),
             body.map(<[u8]>::len),
         )
-        .with_body(body.map(|body| bytes::Bytes::copy_from_slice(body)))
+        .with_body(body.map(bytes::Bytes::copy_from_slice))
     }
 
     fn fingerprint(cache: &AllowCache, request: &RequestContext) -> Fingerprint {

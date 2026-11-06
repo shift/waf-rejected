@@ -9,7 +9,7 @@ use futures_util::{SinkExt, StreamExt};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Frame, Incoming};
-use hyper::header::HeaderValue;
+use hyper::header::{HeaderName, HeaderValue};
 use hyper::service::service_fn;
 use hyper::{HeaderMap, Request, Response, StatusCode, Uri};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
@@ -1461,15 +1461,29 @@ impl WafProxyService {
 
         // Authentication is a first-class pipeline stage, not an unused module.
         if let Some(validator) = &state.auth_validator {
-            if let Err(e) = validator.validate_request(req.headers(), is_https) {
-                warn!("Authentication rejected request from {}: {}", client_ip, e);
-                telemetry.reject(RequestRejection::Authentication);
-                state.metrics.record_auth_failure();
-                state.metrics.record_blocked();
-                return Ok(Self::create_error_response(
-                    StatusCode::UNAUTHORIZED,
-                    "Unauthorized",
-                ));
+            match validator.validate_request_for_client(req.headers(), is_https, Some(client_ip)) {
+                Ok(()) => {}
+                Err(WafError::RateLimitError(e)) => {
+                    warn!(
+                        "Authentication rate limited request from {}: {}",
+                        client_ip, e
+                    );
+                    telemetry.reject(RequestRejection::WafRateLimited);
+                    state.metrics.record_auth_rate_limited();
+                    state.metrics.record_rate_limited();
+                    state.metrics.record_blocked();
+                    return Ok(Self::create_rate_limit_response(&e));
+                }
+                Err(e) => {
+                    warn!("Authentication rejected request from {}: {}", client_ip, e);
+                    telemetry.reject(RequestRejection::Authentication);
+                    state.metrics.record_auth_failure();
+                    state.metrics.record_blocked();
+                    return Ok(Self::create_error_response(
+                        StatusCode::UNAUTHORIZED,
+                        "Unauthorized",
+                    ));
+                }
             }
         }
 
@@ -2194,12 +2208,17 @@ impl WafProxyService {
         };
 
         let head = String::from_utf8_lossy(&buffer[..header_end]);
-        let mut lines = head.lines();
-        let status = lines
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .and_then(|code| code.parse::<u16>().ok())
-            .unwrap_or(502);
+        let (status, upstream_headers) = match parse_websocket_handshake_head(&head) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                warn!("Malformed WebSocket upstream handshake response: {}", e);
+                state.metrics.record_upstream_error();
+                return Self::create_error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "WebSocket upstream handshake response was malformed",
+                );
+            }
+        };
         if status != 101 {
             warn!("WebSocket upstream rejected upgrade with status {}", status);
             return Self::create_error_response(
@@ -2211,14 +2230,8 @@ impl WafProxyService {
         let mut builder = Response::builder()
             .status(StatusCode::SWITCHING_PROTOCOLS)
             .version(hyper::Version::HTTP_11);
-        for line in lines {
-            if let Some((name, value)) = line.split_once(':') {
-                let lower = name.trim().to_ascii_lowercase();
-                if lower == "connection" || lower == "upgrade" {
-                    continue;
-                }
-                builder = builder.header(name.trim(), value.trim());
-            }
+        for (name, value) in upstream_headers.iter() {
+            builder = builder.header(name.clone(), value.clone());
         }
         builder = builder
             .header("connection", "upgrade")
@@ -3374,6 +3387,54 @@ impl WafProxyService {
     }
 }
 
+/// Parse the upstream WebSocket handshake response head without panicking.
+///
+/// `http::response::Builder::header` panics on an invalid name or value, so a
+/// malformed upstream must be rejected here with a typed error before the
+/// builder is touched. `Connection` and `Upgrade` are dropped because the
+/// proxy writes its own values.
+fn parse_websocket_handshake_head(head: &str) -> Result<(u16, HeaderMap), WafError> {
+    let mut lines = head.lines();
+    let status_line = lines
+        .next()
+        .ok_or_else(|| WafError::Upstream("empty WebSocket handshake response".to_string()))?;
+    let mut status_parts = status_line.split_whitespace();
+    let version = status_parts
+        .next()
+        .ok_or_else(|| WafError::Upstream("missing HTTP version".to_string()))?;
+    if !version.starts_with("HTTP/") {
+        return Err(WafError::Upstream(format!(
+            "invalid WebSocket handshake status line '{status_line}'"
+        )));
+    }
+    let status = status_parts
+        .next()
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| WafError::Upstream("invalid WebSocket handshake status code".to_string()))?;
+
+    let mut headers = HeaderMap::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let (name, value) = line.split_once(':').ok_or_else(|| {
+            WafError::Upstream(format!("malformed WebSocket handshake header '{line}'"))
+        })?;
+        let name = HeaderName::from_bytes(name.trim().as_bytes()).map_err(|e| {
+            WafError::Upstream(format!("invalid WebSocket handshake header name: {e}"))
+        })?;
+        let value = HeaderValue::from_str(value.trim()).map_err(|e| {
+            WafError::Upstream(format!("invalid WebSocket handshake header value: {e}"))
+        })?;
+        if name == hyper::header::CONNECTION || name == hyper::header::UPGRADE {
+            continue;
+        }
+        headers.append(name, value);
+    }
+
+    Ok((status, headers))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4150,6 +4211,50 @@ mod tests {
         ] {
             assert!(policy.should_strip(name), "{name} must be stripped");
         }
+    }
+
+    #[test]
+    fn websocket_handshake_parses_valid_response_headers() {
+        let head = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: abc\r\n\r\n";
+        let (status, headers) = parse_websocket_handshake_head(head).unwrap();
+        assert_eq!(status, 101);
+        assert_eq!(headers.get("sec-websocket-accept").unwrap(), "abc");
+        assert!(!headers.contains_key("upgrade"));
+        assert!(!headers.contains_key("connection"));
+    }
+
+    #[test]
+    fn websocket_handshake_rejects_invalid_header_name() {
+        let head = "HTTP/1.1 101 Switching Protocols\r\nBad Header: value\r\n\r\n";
+        assert!(matches!(
+            parse_websocket_handshake_head(head),
+            Err(WafError::Upstream(_))
+        ));
+    }
+
+    #[test]
+    fn websocket_handshake_rejects_invalid_header_value() {
+        let head = "HTTP/1.1 101 Switching Protocols\r\nX-Test: bad\u{7f}value\r\n\r\n";
+        assert!(matches!(
+            parse_websocket_handshake_head(head),
+            Err(WafError::Upstream(_))
+        ));
+    }
+
+    #[test]
+    fn websocket_handshake_rejects_malformed_lines_and_status() {
+        assert!(matches!(
+            parse_websocket_handshake_head("HTTP/1.1 101 OK\r\nnot-a-header\r\n\r\n"),
+            Err(WafError::Upstream(_))
+        ));
+        assert!(matches!(
+            parse_websocket_handshake_head("not-http\r\n\r\n"),
+            Err(WafError::Upstream(_))
+        ));
+        assert!(matches!(
+            parse_websocket_handshake_head("HTTP/1.1 nope\r\n\r\n"),
+            Err(WafError::Upstream(_))
+        ));
     }
 
     proptest! {

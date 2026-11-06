@@ -24,6 +24,7 @@ pub struct Metrics {
     allowed_total: AtomicU64,
     blocked_total: AtomicU64,
     auth_failures_total: AtomicU64,
+    auth_rate_limited_total: AtomicU64,
     rate_limited_total: AtomicU64,
     upstream_errors_total: AtomicU64,
     upstream_requests_total: AtomicU64,
@@ -108,6 +109,7 @@ impl Metrics {
             allowed_total: AtomicU64::new(0),
             blocked_total: AtomicU64::new(0),
             auth_failures_total: AtomicU64::new(0),
+            auth_rate_limited_total: AtomicU64::new(0),
             rate_limited_total: AtomicU64::new(0),
             upstream_errors_total: AtomicU64::new(0),
             upstream_requests_total: AtomicU64::new(0),
@@ -193,6 +195,10 @@ impl Metrics {
 
     pub fn record_auth_failure(&self) {
         self.auth_failures_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_auth_rate_limited(&self) {
+        self.auth_rate_limited_total.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_rate_limited(&self) {
@@ -559,6 +565,9 @@ impl Metrics {
              # HELP waf_auth_failures_total Requests rejected by API-key authentication.\n\
              # TYPE waf_auth_failures_total counter\n\
              waf_auth_failures_total {}\n\
+             # HELP waf_auth_rate_limited_total Authenticated requests rejected by the auth rate limiter.\n\
+             # TYPE waf_auth_rate_limited_total counter\n\
+             waf_auth_rate_limited_total {}\n\
              # HELP waf_rate_limited_total Requests rejected by rate limiting.\n\
              # TYPE waf_rate_limited_total counter\n\
              waf_rate_limited_total {}\n\
@@ -596,6 +605,7 @@ impl Metrics {
             self.allowed_total.load(Ordering::Relaxed),
             self.blocked_total.load(Ordering::Relaxed),
             self.auth_failures_total.load(Ordering::Relaxed),
+            self.auth_rate_limited_total.load(Ordering::Relaxed),
             self.rate_limited_total.load(Ordering::Relaxed),
             self.upstream_errors_total.load(Ordering::Relaxed),
             self.upstream_requests_total.load(Ordering::Relaxed),

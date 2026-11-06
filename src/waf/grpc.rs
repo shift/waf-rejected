@@ -610,6 +610,25 @@ impl GrpcInspector {
         }
     }
 
+    /// Reload descriptor-backed policy while preserving the attached content
+    /// scanner and metrics registry.
+    pub fn reload_from_config(&mut self, config: &WafGrpcConfig) -> Result<(), GrpcAllowlistError> {
+        let artifact = match config.allowlist_file.as_deref() {
+            Some(path) => Some(grpc_allowlist::load_allowlist(path)?),
+            None => None,
+        };
+        let mut reloaded = Self::build(config, artifact.as_ref());
+        reloaded.content_scanner = self.content_scanner.clone();
+        reloaded.metrics = self.metrics.clone();
+        *self = reloaded;
+        Ok(())
+    }
+
+    /// Clone the attached content scanner, if any.
+    pub fn content_scanner(&self) -> Option<Arc<dyn GrpcContentScanner>> {
+        self.content_scanner.clone()
+    }
+
     /// Attaches the direct Coraza backend used for field-content scanning.
     pub fn with_content_scanner(mut self, scanner: Arc<dyn GrpcContentScanner>) -> Self {
         self.content_scanner = Some(scanner);

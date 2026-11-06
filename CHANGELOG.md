@@ -26,6 +26,27 @@ All notable changes to WAF-Rejected are documented here.
     `trailers` (L5), and trailers reject framing, connection, host and
     representation fields (L6).
 
+- Enforced `security.auth.rate_limit` in the authentication stage. Per-key,
+  optional per-IP and optional global windows are checked after key validation
+  and before the body is read; table saturation and a missing client IP for a
+  configured per-IP limit fail closed. Added the
+  `waf_auth_rate_limited_total` metric. Fixes audit finding M3.
+- Bounded the HTTP/3 per-client admission map with LRU eviction and keyed the
+  per-client bucket on the resolved client address rather than the QUIC peer,
+  so a trusted HTTP/3 proxy no longer collapses all clients into one bucket.
+  Fixes audit findings M6 and L7.
+- API-key validation now compares every stored SHA-256 digest in constant time
+  with `subtle`, removing the timing side channel. Fixes audit finding L3.
+- WebSocket upstream handshake response headers are parsed with typed
+  `HeaderName`/`HeaderValue` errors instead of panicking the request task on a
+  malformed upstream response. Fixes audit finding L4.
+- Allow-cache hits now always run the gRPC/GraphQL protocol pre-checks, and
+  `WafEngine::reload_protocol_descriptors` invalidates the cache on descriptor
+  reload. Fixes audit finding L8.
+- Removed the dead `WebSocketHandler` small-message fast path; WebSocket
+  messages now always go through the full shared inspection path with their
+  body attached. Fixes audit finding L9.
+
 - Fixed client-IP spoofing through repeated forwarding headers. A trusted peer's
   `X-Forwarded-For`, RFC 7239 `Forwarded` (`for=`), `X-Real-IP` and
   `X-Client-IP` values are now read in full wire order, combined into one chain

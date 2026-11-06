@@ -305,3 +305,25 @@ Verification performed:
 - `nix develop -c cargo test --lib 'proxy::'` — 68 passed, 0 failed, 8 ignored.
 - `nix develop -c cargo test --lib 'proxy::' -- --include-ignored` — the 8 ignored tests fail as expected, demonstrating the findings.
 - `nix develop -c cargo fmt -- --check` — clean.
+
+## Remediation (2026-11-06)
+
+The auth/state findings below are fixed on `fix/audit-auth`:
+
+- **M3** — `security.auth.rate_limit` is enforced after key validation with
+  per-key, optional per-IP and optional global windows; saturation fails
+  closed and `waf_auth_rate_limited_total` is exported.
+- **M6** — the HTTP/3 per-client admission map is hard-capped and evicts the
+  least-recently-used live entry when full.
+- **L3** — API-key digests are compared in constant time with `subtle`.
+- **L4** — WebSocket handshake response headers are parsed with typed errors;
+  malformed upstream heads return `502` instead of panicking.
+- **L7** — HTTP/3 per-client admission is keyed on the resolved client address,
+  while the global permit is still acquired before header resolution.
+- **L8** — allow-cache hits always run the gRPC/GraphQL pre-checks, and
+  `WafEngine::reload_protocol_descriptors` invalidates the cache.
+- **L9** — the dead `WebSocketHandler` small-message fast path is removed;
+  messages always use the full shared inspection path with their body attached.
+
+Regression tests were added for each finding. The remaining findings in this
+document are unchanged.

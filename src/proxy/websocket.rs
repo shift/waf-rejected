@@ -164,8 +164,9 @@ impl WebSocketHandler {
             None, // WebSocket upgrades don't have initial body
         );
 
-        // Use fast_evaluate for optimal performance
-        Ok(self.waf_engine.fast_evaluate(&request_context).await)
+        // Use the full shared inspection path so the upgrade cannot bypass
+        // protocol pre-checks or the async WAF stages.
+        Ok(self.waf_engine.evaluate_shared(&request_context).await)
     }
 
     /// Perform WebSocket handshake
@@ -403,11 +404,6 @@ impl WebSocketHandler {
 
         match message {
             Message::Text(text) => {
-                // Fast path for small messages
-                if text.len() < 1024 && !text.contains(&['<', '>', '\'', '"', ';', '&'][..]) {
-                    return Ok(Decision::Allow);
-                }
-
                 // Pre-allocated headers for text messages
                 let mut headers = HeaderMap::with_capacity(2);
                 headers.insert("content-type", "text/plain".parse().unwrap());
@@ -421,17 +417,14 @@ impl WebSocketHandler {
                     uri.clone(),
                     headers,
                     Some(text.len()),
-                );
+                )
+                .with_body(Some(Bytes::copy_from_slice(text.as_bytes())));
 
-                // Use fast evaluation for performance
-                Ok(self.waf_engine.fast_evaluate(&request_context).await)
+                // Always run the full inspection path. The old small-message
+                // fast path allowed text under 1 KiB without WAF evaluation.
+                Ok(self.waf_engine.evaluate_shared(&request_context).await)
             }
             Message::Binary(data) => {
-                // Fast path for small binary messages
-                if data.len() < 512 {
-                    return Ok(Decision::Allow);
-                }
-
                 // Pre-allocated headers for binary messages
                 let mut headers = HeaderMap::with_capacity(2);
                 headers.insert("content-type", "application/octet-stream".parse().unwrap());
@@ -445,10 +438,12 @@ impl WebSocketHandler {
                     uri.clone(),
                     headers,
                     Some(data.len()),
-                );
+                )
+                .with_body(Some(Bytes::copy_from_slice(data)));
 
-                // Use fast evaluation for performance
-                Ok(self.waf_engine.fast_evaluate(&request_context).await)
+                // Always run the full inspection path. The old small-message
+                // fast path allowed binary under 512 bytes without evaluation.
+                Ok(self.waf_engine.evaluate_shared(&request_context).await)
             }
             Message::Close(_) | Message::Ping(_) | Message::Pong(_) => {
                 // Control frames - allow immediately for performance
@@ -549,5 +544,43 @@ mod tests {
         let mut headers = upgrade_headers("Upgrade");
         headers.insert("sec-websocket-key", "c2hvcnQ=".parse().unwrap());
         assert!(WebSocketHandler::validate_websocket_handshake(&headers).is_err());
+
+    #[cfg(feature = "websocket")]
+    struct BlockMarkerRule;
+
+    #[cfg(feature = "websocket")]
+    impl crate::waf::WafRule for BlockMarkerRule {
+        fn name(&self) -> &str {
+            "block-marker"
+        }
+
+        fn evaluate(&self, ctx: &RequestContext) -> Decision {
+            if ctx
+                .body
+                .as_deref()
+                .is_some_and(|body| body.windows(6).any(|window| window == b"attack"))
+            {
+                Decision::Block {
+                    status: 403,
+                    reason: "marker".to_string(),
+                }
+            } else {
+                Decision::Allow
+            }
+        }
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn small_text_message_is_not_allowed_by_a_fast_path() {
+        let mut engine = WafEngine::new();
+        engine.add_rule(BlockMarkerRule);
+        let handler = WebSocketHandler::new(Arc::new(engine), Arc::new(Config::default()));
+
+        let decision = handler
+            .inspect_websocket_message(&Message::Text("attack".into()), None)
+            .await
+            .unwrap();
+        assert!(matches!(decision, Decision::Block { status: 403, .. }));
     }
 }
