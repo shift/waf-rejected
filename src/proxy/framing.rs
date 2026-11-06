@@ -34,10 +34,14 @@ pub enum FramingError {
     InvalidTransferEncoding,
     /// `Transfer-Encoding` is never valid on HTTP/2 or HTTP/3.
     TransferEncodingNotAllowed,
+    /// `TE` on HTTP/2 or HTTP/3 contained a value other than `trailers`.
+    InvalidTeHeader,
     /// A connection-specific header field was supplied on HTTP/2 or HTTP/3.
     ConnectionSpecificHeader(&'static str),
     /// A framing-related field was supplied in a trailer block.
     ForbiddenTrailerField(&'static str),
+    /// The buffered body length did not match the declared `Content-Length`.
+    ContentLengthMismatch { declared: u64, actual: u64 },
 }
 
 impl fmt::Display for FramingError {
@@ -56,6 +60,9 @@ impl fmt::Display for FramingError {
             Self::TransferEncodingNotAllowed => {
                 f.write_str("Transfer-Encoding is not allowed on HTTP/2 or HTTP/3")
             }
+            Self::InvalidTeHeader => {
+                f.write_str("TE is only allowed with the value 'trailers' on HTTP/2 or HTTP/3")
+            }
             Self::ConnectionSpecificHeader(name) => {
                 write!(f, "connection-specific header '{name}' is not allowed")
             }
@@ -65,6 +72,10 @@ impl fmt::Display for FramingError {
                     "framing-related field '{name}' is not allowed in trailers"
                 )
             }
+            Self::ContentLengthMismatch { declared, actual } => write!(
+                f,
+                "Content-Length declares {declared} bytes but the body has {actual}"
+            ),
         }
     }
 }
@@ -111,6 +122,12 @@ pub fn validate_request_framing_for_version(
         if headers.contains_key(TRANSFER_ENCODING) {
             return Err(FramingError::TransferEncodingNotAllowed);
         }
+        validate_te_header(headers)?;
+    }
+
+    if version == FramingVersion::Http10 && headers.contains_key(TRANSFER_ENCODING) {
+        // HTTP/1.0 does not define the chunked transfer coding.
+        return Err(FramingError::InvalidTransferEncoding);
     }
 
     validate_request_framing(headers)
@@ -146,19 +163,43 @@ pub fn validate_request_framing(headers: &HeaderMap) -> Result<(), FramingError>
 /// Trailers must not carry framing or connection metadata: only end-to-end
 /// fields such as gRPC `grpc-status` / `grpc-message` are forwarded.
 pub fn validate_request_trailers(trailers: &HeaderMap) -> Result<(), FramingError> {
-    if trailers.contains_key(CONTENT_LENGTH) {
-        return Err(FramingError::ForbiddenTrailerField("content-length"));
-    }
-    if trailers.contains_key(TRANSFER_ENCODING) {
-        return Err(FramingError::ForbiddenTrailerField("transfer-encoding"));
-    }
-    if trailers.contains_key("trailer") {
-        return Err(FramingError::ForbiddenTrailerField("trailer"));
-    }
-    for name in CONNECTION_SPECIFIC_HEADERS {
+    // Trailers are end-to-end metadata only. Framing, connection, host and
+    // representation headers must never appear there: an upstream that merges
+    // trailers into its request view could otherwise be influenced after the
+    // WAF has inspected the request head.
+    const FORBIDDEN_TRAILER_FIELDS: [&str; 11] = [
+        "content-length",
+        "transfer-encoding",
+        "trailer",
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "upgrade",
+        "host",
+        "te",
+        "content-encoding",
+        "content-type",
+    ];
+    for name in FORBIDDEN_TRAILER_FIELDS {
         if trailers.contains_key(name) {
             return Err(FramingError::ForbiddenTrailerField(name));
         }
+    }
+    Ok(())
+}
+
+/// Compare the buffered body length with the declared `Content-Length`.
+///
+/// An absent `Content-Length` is valid (HTTP/2 and HTTP/3 commonly omit it);
+/// a present value must match the bytes actually received. Callers run this
+/// before decompression, because `Content-Length` describes the encoded body.
+pub fn reconcile_content_length(headers: &HeaderMap, actual: usize) -> Result<(), FramingError> {
+    let Some(declared) = declared_content_length(headers)? else {
+        return Ok(());
+    };
+    let actual = actual as u64;
+    if declared != actual {
+        return Err(FramingError::ContentLengthMismatch { declared, actual });
     }
     Ok(())
 }
@@ -173,19 +214,28 @@ fn validate_connection_specific_headers(headers: &HeaderMap) -> Result<(), Frami
 }
 
 fn validate_content_length(headers: &HeaderMap) -> Result<(), FramingError> {
-    let mut parsed = None;
-    let mut saw_value = false;
+    match declared_content_length(headers)? {
+        Some(_) => Ok(()),
+        None => Err(FramingError::InvalidContentLength),
+    }
+}
 
-    // RFC 9112 permits repeated Content-Length fields only when every value is
-    // the same decimal number. Identical duplicates are accepted; any
-    // disagreement is rejected as conflicting.
+/// Parse the unambiguous `Content-Length` value, if present.
+///
+/// RFC 9112 permits repeated Content-Length fields only when every value is the
+/// same decimal number. Identical duplicates are accepted; any disagreement is
+/// rejected as conflicting. Every byte must be an ASCII digit: Rust's integer
+/// parser would otherwise accept a leading `+`, which HTTP/1.1 peers reject.
+fn declared_content_length(headers: &HeaderMap) -> Result<Option<u64>, FramingError> {
+    let mut parsed = None;
+
     for header in headers.get_all(CONTENT_LENGTH) {
         let value = header
             .to_str()
             .map_err(|_| FramingError::InvalidContentLength)?;
         for part in value.split(',') {
             let part = part.trim();
-            if part.is_empty() {
+            if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
                 return Err(FramingError::InvalidContentLength);
             }
             let value = part
@@ -198,14 +248,21 @@ fn validate_content_length(headers: &HeaderMap) -> Result<(), FramingError> {
             } else {
                 parsed = Some(value);
             }
-            saw_value = true;
         }
     }
 
-    if !saw_value || parsed.is_none() {
-        return Err(FramingError::InvalidContentLength);
-    }
+    Ok(parsed)
+}
 
+fn validate_te_header(headers: &HeaderMap) -> Result<(), FramingError> {
+    for header in headers.get_all("te") {
+        let value = header.to_str().map_err(|_| FramingError::InvalidTeHeader)?;
+        for token in value.split(',') {
+            if !token.trim().eq_ignore_ascii_case("trailers") {
+                return Err(FramingError::InvalidTeHeader);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -340,16 +397,17 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "security finding L1: Content-Length accepts a leading '+'"]
     fn rejects_prefixed_content_length() {
-        assert_eq!(
-            validate_request_framing(&headers(&[("content-length", "+5")])),
-            Err(FramingError::InvalidContentLength)
-        );
+        for value in ["+5", "+0", "  +5"] {
+            assert_eq!(
+                validate_request_framing(&headers(&[("content-length", value)])),
+                Err(FramingError::InvalidContentLength),
+                "value {value:?} should be rejected"
+            );
+        }
     }
 
     #[test]
-    #[ignore = "security finding L2: HTTP/1.0 accepts Transfer-Encoding: chunked"]
     fn http10_rejects_transfer_encoding() {
         assert_eq!(
             validate_request_framing_for_version(
@@ -463,6 +521,50 @@ mod tests {
     }
 
     #[test]
+    fn http2_and_http3_restrict_te_to_trailers() {
+        for version in [FramingVersion::Http2, FramingVersion::Http3] {
+            assert_eq!(
+                validate_request_framing_for_version(&headers(&[("te", "trailers")]), version),
+                Ok(())
+            );
+            assert_eq!(
+                validate_request_framing_for_version(
+                    &headers(&[("te", "trailers, trailers")]),
+                    version,
+                ),
+                Ok(())
+            );
+            for value in ["gzip", "trailers, gzip", "", "TRAILERS, deflate"] {
+                assert_eq!(
+                    validate_request_framing_for_version(&headers(&[("te", value)]), version),
+                    Err(FramingError::InvalidTeHeader),
+                    "TE value {value:?} should be rejected on {version:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn content_length_is_reconciled_with_buffered_body() {
+        let declared = headers(&[("content-length", "5")]);
+        assert_eq!(reconcile_content_length(&declared, 5), Ok(()));
+        assert_eq!(
+            reconcile_content_length(&declared, 10),
+            Err(FramingError::ContentLengthMismatch {
+                declared: 5,
+                actual: 10
+            })
+        );
+        // An absent Content-Length is valid for HTTP/2 and HTTP/3.
+        assert_eq!(reconcile_content_length(&HeaderMap::new(), 10), Ok(()));
+        // A malformed value is still rejected.
+        assert_eq!(
+            reconcile_content_length(&headers(&[("content-length", "+5")]), 5),
+            Err(FramingError::InvalidContentLength)
+        );
+    }
+
+    #[test]
     fn trailers_reject_framing_and_connection_fields() {
         for field in [
             "content-length",
@@ -472,6 +574,10 @@ mod tests {
             "keep-alive",
             "proxy-connection",
             "upgrade",
+            "host",
+            "te",
+            "content-encoding",
+            "content-type",
         ] {
             assert_eq!(
                 validate_request_trailers(&headers(&[(field, "1")])),

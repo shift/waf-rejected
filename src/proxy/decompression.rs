@@ -84,10 +84,7 @@ pub(crate) fn decompress_request_body(
             flate2::read::ZlibDecoder::new(Cursor::new(body)),
             max_body_size,
         ),
-        "br" => decode(
-            brotli::Decompressor::new(Cursor::new(body), DECODE_CHUNK_SIZE),
-            max_body_size,
-        ),
+        "br" => decode_brotli(&body, max_body_size),
         other => Err(DecompressionError::UnsupportedEncoding(other.to_string())),
     }
 }
@@ -97,6 +94,66 @@ pub(crate) fn decompress_request_body(
 pub(crate) fn strip_encoding_headers(headers: &mut HeaderMap) {
     headers.remove(CONTENT_ENCODING);
     headers.remove(CONTENT_LENGTH);
+}
+
+/// Decode exactly one brotli stream and reject any trailing bytes.
+///
+/// `brotli::Decompressor` stops at the end of the first stream and may read
+/// ahead into trailing data, so it cannot report leftovers. The low-level
+/// streaming API exposes the exact input offset consumed, which lets us reject
+/// a body that continues after a complete stream.
+fn decode_brotli(input: &[u8], max_body_size: usize) -> Result<Bytes, DecompressionError> {
+    use brotli::reader::StandardAlloc;
+    use brotli::{BrotliDecompressStream, BrotliResult, BrotliState};
+
+    let mut state = BrotliState::new(
+        StandardAlloc::default(),
+        StandardAlloc::default(),
+        StandardAlloc::default(),
+    );
+    let mut available_in = input.len();
+    let mut input_offset = 0usize;
+    let mut output = Vec::new();
+    let mut chunk = [0u8; DECODE_CHUNK_SIZE];
+
+    loop {
+        let mut available_out = chunk.len();
+        let mut output_offset = 0usize;
+        let mut total_out = 0usize;
+        let result = BrotliDecompressStream(
+            &mut available_in,
+            &mut input_offset,
+            input,
+            &mut available_out,
+            &mut output_offset,
+            &mut chunk,
+            &mut total_out,
+            &mut state,
+        );
+
+        if output_offset > 0 {
+            if output.len().saturating_add(output_offset) > max_body_size {
+                return Err(DecompressionError::TooLarge);
+            }
+            output.extend_from_slice(&chunk[..output_offset]);
+        }
+
+        match result {
+            BrotliResult::ResultSuccess => {
+                if input_offset != input.len() {
+                    return Err(DecompressionError::Malformed);
+                }
+                return Ok(Bytes::from(output));
+            }
+            BrotliResult::ResultFailure => return Err(DecompressionError::Malformed),
+            BrotliResult::NeedsMoreInput => {
+                if available_in == 0 {
+                    return Err(DecompressionError::Malformed);
+                }
+            }
+            BrotliResult::NeedsMoreOutput => {}
+        }
+    }
 }
 
 fn decode<R: Read>(mut decoder: R, max_body_size: usize) -> Result<Bytes, DecompressionError> {
@@ -213,7 +270,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "security finding M7: brotli trailing garbage is accepted"]
     fn brotli_trailing_garbage_is_rejected() {
         let mut body = brotli(b"payload").to_vec();
         body.extend_from_slice(b"not-a-brotli-stream");

@@ -22,7 +22,8 @@ use crate::proxy::decompression::{
     decompress_request_body, strip_encoding_headers, DecompressionError,
 };
 use crate::proxy::framing::{
-    validate_request_framing_for_version, validate_request_trailers, FramingVersion,
+    reconcile_content_length, validate_request_framing_for_version, validate_request_trailers,
+    FramingVersion,
 };
 use crate::proxy::h3_admission::{H3Admission, H3AdmissionRejection};
 use crate::proxy::service::{ProxyState, WafProxyService};
@@ -334,6 +335,23 @@ async fn handle_request(
             .await;
         }
     };
+
+    // HTTP/3 DATA frames are not checked against Content-Length by the
+    // transport. Reconcile before decompression so the WAF and upstream see
+    // the same bytes; an absent Content-Length is valid.
+    if let Err(e) = reconcile_content_length(&parts.headers, body_bytes.len()) {
+        warn!(
+            "Rejected HTTP/3 request from {} with mismatched Content-Length: {}",
+            client_ip, e
+        );
+        telemetry.reject(RequestRejection::InvalidFraming);
+        state.metrics.record_blocked();
+        return send_response(
+            &mut stream,
+            WafProxyService::create_error_response(StatusCode::BAD_REQUEST, "Bad Request"),
+        )
+        .await;
+    }
 
     if let Some(trailers) = request_trailers.as_ref() {
         if let Err(e) = validate_request_trailers(trailers) {

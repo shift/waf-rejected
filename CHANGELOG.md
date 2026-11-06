@@ -6,6 +6,26 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Security
 
+- Hardened request framing and protocol handling against the November 2026
+  audit findings M1, M2, M4, M5, M7, M8, L1, L2, L5 and L6:
+  - `Connection`-nominated header fields are now stripped alongside the fixed
+    hop-by-hop set on HTTP/1.x, HTTP/2, HTTP/3 and WebSocket handshakes (M1).
+  - Buffered HTTP/2 and HTTP/3 bodies are reconciled with `Content-Length`
+    before decompression; a mismatch returns `400`, while an absent
+    `Content-Length` remains valid (M2).
+  - Streaming gRPC trailers are validated with the same forbidden-field rules
+    as buffered trailers before they are forwarded (M4).
+  - WebSocket upgrades reject request bodies and framing/content-coding
+    headers, validate the handshake key, and no longer forward framing headers
+    upstream (M5).
+  - Brotli decoding rejects trailing bytes after a complete stream (M7), and
+    gRPC gzip decoding uses multi-member decoding and rejects trailing garbage
+    (M8).
+  - `Content-Length` must be all ASCII digits (no leading `+`) (L1), HTTP/1.0
+    rejects `Transfer-Encoding` (L2), HTTP/2 and HTTP/3 restrict `TE` to
+    `trailers` (L5), and trailers reject framing, connection, host and
+    representation fields (L6).
+
 - Fixed client-IP spoofing through repeated forwarding headers. A trusted peer's
   `X-Forwarded-For`, RFC 7239 `Forwarded` (`for=`), `X-Real-IP` and
   `X-Client-IP` values are now read in full wire order, combined into one chain

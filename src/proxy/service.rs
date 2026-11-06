@@ -45,7 +45,8 @@ use crate::proxy::decompression::{
     decompress_request_body, strip_encoding_headers, DecompressionError,
 };
 use crate::proxy::framing::{
-    validate_request_framing_for_version, validate_request_trailers, FramingVersion,
+    reconcile_content_length, validate_request_framing_for_version, validate_request_trailers,
+    FramingVersion,
 };
 use crate::proxy::grpc_body::{
     probe_grpc_body, GrpcBodyMode, GrpcProbeError, GrpcStreamError, GrpcStreamGuard, PrefixedBody,
@@ -203,6 +204,25 @@ pub(crate) fn is_hop_by_hop_header(name: &str) -> bool {
         name,
         "connection" | "proxy-connection" | "keep-alive" | "transfer-encoding" | "upgrade"
     )
+}
+
+/// Collect the lower-case field names nominated by every `Connection` header.
+///
+/// RFC 9110 makes these hop-by-hop for the current connection, so they must
+/// never be forwarded even when they are not in the fixed hop-by-hop set.
+fn connection_nominated_headers(headers: &HeaderMap) -> Vec<String> {
+    let mut nominated = Vec::new();
+    for value in headers.get_all("connection") {
+        if let Ok(value) = value.to_str() {
+            for token in value.split(',') {
+                let token = token.trim();
+                if !token.is_empty() {
+                    nominated.push(token.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+    nominated
 }
 
 /// Client-supplied headers the proxy removes before WAF inspection and before
@@ -494,6 +514,26 @@ fn websocket_codec_config(config: &crate::config::ServerConfig) -> WsCodecConfig
     WsCodecConfig::default()
         .max_frame_size(Some(max_frame))
         .max_message_size(Some(max_message))
+}
+
+/// A WebSocket upgrade must not carry a request body. Any framing or content
+/// coding header means the client is trying to smuggle bytes past the normal
+/// body inspection path.
+fn websocket_upgrade_has_body(headers: &HeaderMap) -> bool {
+    if headers.contains_key(hyper::header::TRANSFER_ENCODING)
+        || headers.contains_key(hyper::header::CONTENT_ENCODING)
+    {
+        return true;
+    }
+    match headers.get(hyper::header::CONTENT_LENGTH) {
+        Some(value) => value
+            .to_str()
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(|length| length != 0)
+            .unwrap_or(true),
+        None => false,
+    }
 }
 
 /// Resolve a WebSocket upstream URI to `(use_tls, port)`.
@@ -1443,6 +1483,35 @@ impl WafProxyService {
                     "WebSocket upgrades require HTTP/1.1",
                 ));
             }
+            if req.method() != hyper::Method::GET {
+                telemetry.reject(RequestRejection::WebSocketVersion);
+                state.metrics.record_blocked();
+                return Ok(Self::create_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "WebSocket upgrades require GET",
+                ));
+            }
+            if websocket_upgrade_has_body(req.headers()) {
+                warn!(
+                    "Rejected WebSocket upgrade from {} carrying a request body",
+                    client_ip
+                );
+                telemetry.reject(RequestRejection::InvalidFraming);
+                state.metrics.record_blocked();
+                return Ok(Self::create_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "WebSocket upgrades must not carry a body",
+                ));
+            }
+            if let Err(reason) = WebSocketHandler::validate_websocket_handshake(req.headers()) {
+                warn!(
+                    "Rejected invalid WebSocket handshake from {}: {}",
+                    client_ip, reason
+                );
+                telemetry.reject(RequestRejection::WebSocketVersion);
+                state.metrics.record_blocked();
+                return Ok(Self::create_error_response(StatusCode::BAD_REQUEST, reason));
+            }
 
             // The upgrade request must pass the WAF before any tunneling.
             let upgrade_context = RequestContext::with_http_version(
@@ -1722,6 +1791,23 @@ impl WafProxyService {
             }
         }
 
+        // HTTP/2 and HTTP/3 do not enforce that DATA length matches the
+        // declared Content-Length. Reconcile before decompression (the header
+        // describes the encoded body) so the WAF and upstream see the same
+        // bytes. An absent Content-Length is valid on both versions.
+        if let Err(e) = reconcile_content_length(&parts.headers, body_bytes.len()) {
+            warn!(
+                "Rejected request from {} with mismatched Content-Length: {}",
+                client_ip, e
+            );
+            telemetry.reject(RequestRejection::InvalidFraming);
+            state.metrics.record_blocked();
+            return Ok(Self::create_error_response(
+                StatusCode::BAD_REQUEST,
+                "Bad Request",
+            ));
+        }
+
         let body_bytes = if has_content_encoding {
             match decompress_request_body(&parts.headers, body_bytes, max_body_size) {
                 Ok(decoded) => {
@@ -1886,6 +1972,7 @@ impl WafProxyService {
             format!("{}:{}", host, port)
         };
 
+        let connection_nominated = connection_nominated_headers(req.headers());
         let mut headers = String::new();
         for (name, value) in req.headers() {
             let lower = name.as_str().to_ascii_lowercase();
@@ -1902,11 +1989,21 @@ impl WafProxyService {
                     | "connection"
                     | "upgrade"
                     | "proxy-connection"
+                    | "keep-alive"
+                    | "transfer-encoding"
+                    | "content-length"
+                    | "content-encoding"
+                    | "te"
+                    | "trailer"
+                    | "sec-websocket-accept"
                     | "x-forwarded-host"
                     | "x-forwarded-for"
                     | "x-real-ip"
                     | "x-forwarded-proto"
-            ) {
+            ) || connection_nominated
+                .iter()
+                .any(|nominated| nominated == &lower)
+            {
                 continue;
             }
             if let Ok(value) = value.to_str() {
@@ -2596,6 +2693,7 @@ impl WafProxyService {
         // Copy headers, skipping hop-by-hop values that the upstream connection
         // must negotiate for itself. `Te` and `Trailer` are end-to-end header
         // fields for gRPC: dropping them silently breaks trailing status.
+        let connection_nominated = connection_nominated_headers(&parts.headers);
         let mut has_te = false;
         for (key, value) in parts.headers {
             if let Some(key) = key {
@@ -2611,7 +2709,10 @@ impl WafProxyService {
                         | "x-forwarded-for"
                         | "x-real-ip"
                         | "x-forwarded-proto"
-                ) {
+                ) || connection_nominated
+                    .iter()
+                    .any(|nominated| nominated == &key_str)
+                {
                     continue;
                 }
                 if key_str == "te" {
@@ -3906,6 +4007,56 @@ mod tests {
         }
         assert_eq!(built.method(), hyper::Method::GET);
         assert_eq!(built.uri().path(), "/public");
+    }
+
+    #[test]
+    fn connection_nominated_headers_are_stripped() {
+        let request = Request::builder()
+            .method("GET")
+            .uri("/public")
+            .header("connection", "X-Custom-Hop, Content-Length")
+            .header("x-custom-hop", "secret")
+            .header("content-length", "0")
+            .header("x-keep", "yes")
+            .body(ProxyBody::full(Bytes::new()))
+            .unwrap();
+
+        let built = build_upstream_for_test(request);
+        assert!(
+            built.headers().get("x-custom-hop").is_none(),
+            "Connection-nominated header must not reach the upstream"
+        );
+        assert!(
+            built.headers().get("content-length").is_none(),
+            "Connection-nominated framing header must not reach the upstream"
+        );
+        assert_eq!(
+            built
+                .headers()
+                .get("x-keep")
+                .and_then(|value| value.to_str().ok()),
+            Some("yes")
+        );
+    }
+
+    #[test]
+    fn websocket_upgrade_body_headers_are_rejected() {
+        assert!(!websocket_upgrade_has_body(&HeaderMap::new()));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(hyper::header::CONTENT_LENGTH, "0".parse().unwrap());
+        assert!(!websocket_upgrade_has_body(&headers));
+
+        headers.insert(hyper::header::CONTENT_LENGTH, "5".parse().unwrap());
+        assert!(websocket_upgrade_has_body(&headers));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(hyper::header::TRANSFER_ENCODING, "chunked".parse().unwrap());
+        assert!(websocket_upgrade_has_body(&headers));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(hyper::header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        assert!(websocket_upgrade_has_body(&headers));
     }
 
     #[test]

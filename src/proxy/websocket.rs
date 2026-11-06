@@ -65,6 +65,27 @@ impl WebSocketHandler {
         has_upgrade && connection_has_upgrade && version_ok && key_present
     }
 
+    /// Validate the client handshake fields before any upstream connection is
+    /// opened. `is_websocket_upgrade` already checks the upgrade tokens and
+    /// version; this additionally requires a well-formed 16-byte key.
+    pub fn validate_websocket_handshake(headers: &HeaderMap) -> Result<(), &'static str> {
+        if !Self::is_websocket_upgrade(headers) {
+            return Err("invalid WebSocket upgrade headers");
+        }
+        let key = headers
+            .get("sec-websocket-key")
+            .and_then(|value| value.to_str().ok())
+            .ok_or("missing Sec-WebSocket-Key")?;
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(key.trim())
+            .map_err(|_| "invalid Sec-WebSocket-Key")?;
+        if decoded.len() != 16 {
+            return Err("invalid Sec-WebSocket-Key length");
+        }
+        Ok(())
+    }
+
     /// Handle WebSocket upgrade with WAF validation
     pub async fn handle_websocket_upgrade(
         &self,
@@ -512,5 +533,21 @@ mod tests {
         let mut headers = upgrade_headers("Upgrade");
         headers.remove("sec-websocket-version");
         assert!(!WebSocketHandler::is_websocket_upgrade(&headers));
+    }
+
+    #[test]
+    fn validates_websocket_handshake_key() {
+        assert_eq!(
+            WebSocketHandler::validate_websocket_handshake(&upgrade_headers("Upgrade")),
+            Ok(())
+        );
+
+        let mut headers = upgrade_headers("Upgrade");
+        headers.insert("sec-websocket-key", "not-base64!!".parse().unwrap());
+        assert!(WebSocketHandler::validate_websocket_handshake(&headers).is_err());
+
+        let mut headers = upgrade_headers("Upgrade");
+        headers.insert("sec-websocket-key", "c2hvcnQ=".parse().unwrap());
+        assert!(WebSocketHandler::validate_websocket_handshake(&headers).is_err());
     }
 }

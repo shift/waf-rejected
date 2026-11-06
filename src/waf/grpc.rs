@@ -283,7 +283,9 @@ impl std::fmt::Display for FrameError {
 pub(crate) fn decompress_gzip(payload: &[u8], limit: usize) -> Result<Vec<u8>, String> {
     use std::io::Read;
 
-    let mut decoder = flate2::read::GzDecoder::new(payload);
+    // Decode every concatenated member and reject trailing bytes that are not
+    // another valid gzip member, matching the HTTP body decompressor.
+    let mut decoder = flate2::read::MultiGzDecoder::new(payload);
     let mut output = Vec::new();
     let mut chunk = [0u8; 8 * 1024];
     loop {
@@ -2236,6 +2238,32 @@ mod tests {
             .insert("grpc-encoding", HeaderValue::from_static("gzip"));
         let verdict = inspector(WafGrpcConfig::default()).inspect(&ctx).unwrap();
         assert!(matches!(verdict, GrpcVerdict::Allow { .. }));
+    }
+
+    #[test]
+    fn gzip_concatenated_members_are_all_decoded() {
+        use std::io::Write;
+
+        let mut first = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        first.write_all(b"first;").unwrap();
+        let mut payload = first.finish().unwrap();
+        let mut second = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        second.write_all(b"second").unwrap();
+        payload.extend_from_slice(&second.finish().unwrap());
+
+        assert_eq!(decompress_gzip(&payload, 1024).unwrap(), b"first;second");
+    }
+
+    #[test]
+    fn gzip_trailing_garbage_is_rejected() {
+        use std::io::Write;
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(b"payload").unwrap();
+        let mut payload = encoder.finish().unwrap();
+        payload.extend_from_slice(b"not-a-gzip-member");
+
+        assert!(decompress_gzip(&payload, 1024).is_err());
     }
 
     #[test]

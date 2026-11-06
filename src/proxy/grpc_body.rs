@@ -27,6 +27,7 @@ use http_body_util::BodyExt;
 use hyper::body::{Body, Frame};
 use hyper::HeaderMap;
 
+use crate::proxy::framing::validate_request_trailers;
 use crate::waf::grpc::{decompress_gzip, GrpcFrameInspector, FRAME_PREFIX_LEN};
 
 /// Classification of a gRPC request body.
@@ -400,6 +401,16 @@ where
         self
     }
 
+    /// Validate and stage a trailer block before it can be forwarded.
+    fn accept_trailers(&mut self, block: HeaderMap) -> Result<(), GrpcStreamError> {
+        validate_request_trailers(&block).map_err(|error| {
+            GrpcStreamError::Malformed(format!("invalid gRPC trailers: {error}"))
+        })?;
+        self.pending_trailers = Some(block);
+        self.inner_done = true;
+        Ok(())
+    }
+
     fn push_data(&mut self, data: &[u8]) -> Result<(), GrpcStreamError> {
         self.total_bytes = self.total_bytes.saturating_add(data.len());
         if self.total_bytes > self.max_bytes {
@@ -529,8 +540,7 @@ where
                                     "trailers after a truncated gRPC frame".to_string(),
                                 ));
                             }
-                            self.pending_trailers = Some(block);
-                            self.inner_done = true;
+                            self.accept_trailers(block)?;
                             return Ok(());
                         }
                     }
@@ -612,8 +622,9 @@ where
                                     ),
                                 ))));
                             }
-                            this.inner_done = true;
-                            this.pending_trailers = Some(block);
+                            if let Err(error) = this.accept_trailers(block) {
+                                return Poll::Ready(Some(Err(Box::new(error))));
+                            }
                         }
                     }
                 },
@@ -874,6 +885,66 @@ mod tests {
             GrpcStreamGuard::new(body, None, 1024, 10, 1024, Duration::from_secs(30)).unwrap();
         let error = collect(guard).await.unwrap_err();
         assert!(error.contains("truncated"), "{error}");
+    }
+
+    struct DataThenTrailers {
+        data: Option<Bytes>,
+        trailers: Option<HeaderMap>,
+    }
+
+    impl Body for DataThenTrailers {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            let this = self.get_mut();
+            if let Some(data) = this.data.take() {
+                return Poll::Ready(Some(Ok(Frame::data(data))));
+            }
+            if let Some(trailers) = this.trailers.take() {
+                return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+            }
+            Poll::Ready(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn guard_rejects_forbidden_trailers() {
+        let mut trailers = HeaderMap::new();
+        trailers.insert("content-length", "5".parse().unwrap());
+        let body = DataThenTrailers {
+            data: Some(Bytes::from(frame(b"hello"))),
+            trailers: Some(trailers),
+        };
+        let guard =
+            GrpcStreamGuard::new(body, None, 1024, 10, 1024, Duration::from_secs(30)).unwrap();
+        let error = collect(guard).await.unwrap_err();
+        assert!(error.contains("invalid gRPC trailers"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn guard_forwards_end_to_end_trailers() {
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", "0".parse().unwrap());
+        let body = DataThenTrailers {
+            data: Some(Bytes::from(frame(b"hello"))),
+            trailers: Some(trailers),
+        };
+        let guard =
+            GrpcStreamGuard::new(body, None, 1024, 10, 1024, Duration::from_secs(30)).unwrap();
+        let mut guard = std::pin::pin!(guard);
+        let mut saw_trailers = false;
+        while let Some(frame) = guard.frame().await {
+            let frame = frame.unwrap();
+            if let Ok(block) = frame.into_trailers() {
+                assert_eq!(block.get("grpc-status").unwrap(), "0");
+                saw_trailers = true;
+            }
+        }
+        assert!(saw_trailers, "end-to-end trailers must be forwarded");
     }
 
     #[tokio::test]
