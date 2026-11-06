@@ -19,7 +19,7 @@ Go-compiled-to-wasm execution penalty: a constant ~5.2× on top of native Go for
 CRS operator scanning. Moving Coraza out of wasm removes that dominant cost
 without reducing inspection depth or the inspected body size.
 
-This backend runs the **same vendored Coraza 3.3.3 and OWASP CRS 4.14.0
+This backend runs the **same vendored Coraza 3.8.1 and OWASP CRS 4.14.0
 bundle** used by the WASI reactor as a native Go process and talks to it over a
 Unix domain socket. The request envelope is the same JSON payload as the wasm
 ABI, so decisions and configuration can be compared directly.

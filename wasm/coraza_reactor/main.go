@@ -440,13 +440,14 @@ func wafEval(ptr int32, length int32) (code int32) {
 		return errPayload
 	}
 
-	base := uintptr(unsafe.Pointer(&inputBuf[0]))
+	inputPtr := unsafe.Pointer(&inputBuf[0])
+	base := uintptr(inputPtr)
 	p := uintptr(uint32(ptr))
 	if p < base || p+uintptr(length) > base+uintptr(maxInputBytes) {
 		return errBounds
 	}
 
-	payload := unsafe.Slice((*byte)(unsafe.Pointer(p)), int(length))
+	payload := unsafe.Slice((*byte)(unsafe.Add(inputPtr, p-base)), int(length))
 
 	// Fast path: the compact binary envelope. The host writes it directly into
 	// the static input buffer, so the guest only slices it and never decodes

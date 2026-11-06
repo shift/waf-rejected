@@ -3,9 +3,9 @@
 - Module: `coraza_reactor.wasm`
 - Source: `wasm/coraza_reactor/main.go`
 - Build: `scripts/build-coraza-reactor.sh`
-- Go: `go1.24.5` (or newer 1.24.x), `GOOS=wasip1 GOARCH=wasm`
+- Go: `go1.26.10` (or newer 1.26.x), `GOOS=wasip1 GOARCH=wasm`
 - Build mode: `c-shared` (`-buildmode=c-shared -trimpath -ldflags="-s -w"`)
-- Coraza: `github.com/corazawaf/coraza/v3 v3.3.3`
+- Coraza: `github.com/corazawaf/coraza/v3 v3.8.1`
 - Licence: Coraza and the referenced OWASP CRS material are Apache-2.0.
   See `LICENSE-CRS` in this directory.
 
@@ -23,7 +23,7 @@ also publishes the digest as a standalone `.sha256` asset.
 ## Local patches
 
 The vendored tree carries one local patch, recorded in
-`patches/coraza-v3.3.3-remove-rule-by-id.patch`:
+`patches/coraza-remove-rule-by-id.patch`:
 
 - **`types.Transaction.RemoveRuleByID(int)`** — the implementation already
   exists on `*internal/corazawaf.Transaction` (it backs the `ctl` action), but

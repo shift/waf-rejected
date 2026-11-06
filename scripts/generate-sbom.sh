@@ -67,11 +67,11 @@ jq --arg sha "$REACTOR_SHA" \
     '.components += [{
       "type": "file",
       "name": "coraza_reactor.wasm",
-      "version": "coraza-3.3.3",
+      "version": "coraza-3.8.1",
       "hashes": [{"alg": "SHA-256", "content": $sha}],
       "licenses": [{"license": {"id": "Apache-2.0"}}],
       "properties": [
-        {"name": "waf:component", "value": "Coraza WASI reactor built with Go 1.24 and Coraza v3.3.3"},
+        {"name": "waf:component", "value": "Coraza WASI reactor built with Go 1.26 and Coraza v3.8.1"},
         {"name": "waf:license-note", "value": "Coraza and referenced OWASP CRS material are Apache-2.0; see wasm/coraza_reactor/LICENSE-CRS"},
         {"name": "waf:source", "value": "wasm/coraza_reactor/main.go"}
       ]

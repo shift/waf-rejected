@@ -47,6 +47,6 @@ apply_patch() {
 # Expose (*internal/corazawaf.Transaction).RemoveRuleByID on the public
 # types.Transaction interface. The implementation already exists upstream.
 apply_patch \
-    "$PATCH_DIR/coraza-v3.3.3-remove-rule-by-id.patch" \
+    "$PATCH_DIR/coraza-remove-rule-by-id.patch" \
     "RemoveRuleByID(id int)" \
     "$VENDOR/types/transaction.go"

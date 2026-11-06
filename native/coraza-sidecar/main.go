@@ -245,6 +245,13 @@ SecResponseBodyAccess Off
 	if earlyBlocking {
 		preamble += `SecAction "id:900120,phase:1,pass,nolog,t:none,setvar:tx.early_blocking=1"
 `
+	} else {
+		// The vendored CRS bundle defaults tx.early_blocking to 1 (see
+		// rules/crs/PROVENANCE.md). Set it explicitly so --early-blocking=false
+		// still disables phase-1 blocking; rule 901115 only applies its default
+		// when the variable is unset.
+		preamble += `SecAction "id:900120,phase:1,pass,nolog,t:none,setvar:tx.early_blocking=0"
+`
 	}
 	return coraza.NewWAF(
 		coraza.NewWAFConfig().

@@ -8,7 +8,7 @@ this reactor.
 **Source:** `wasm/coraza_reactor/main.go`
 
 This reactor replaces the historical `GOOS=js GOARCH=wasm` demo with a real
-[Coraza](https://github.com/corazawaf/coraza) engine compiled as a Go 1.24
+[Coraza](https://github.com/corazawaf/coraza) engine compiled as a Go 1.26
 WASI reactor. It has no `syscall/js` imports and no runtime dependency on
 `rules/coraza.conf`: a pinned OWASP Core Rule Set (CRS) bundle is embedded in
 the binary. The host embeds [wasmtime](https://wasmtime.dev) 49 (Cranelift)
@@ -104,11 +104,11 @@ Verified in the project Nix development shell:
 | --- | --- |
 | Rust | `rustc 1.99.1` (pinned in `flake.nix`) |
 | Host runtime | `wasmtime` / `wasmtime-wasi` 49.0.5 |
-| Go | `go1.24.5 linux/amd64` |
-| Coraza | `github.com/corazawaf/coraza/v3 v3.3.3` |
+| Go | `go1.26.10 linux/amd64` |
+| Coraza | `github.com/corazawaf/coraza/v3 v3.8.1` |
 | Target | `GOOS=wasip1 GOARCH=wasm` |
 
-Go 1.24 `//go:wasmexport` and `-buildmode=c-shared` are required (the latter
+Go 1.26 `//go:wasmexport` and `-buildmode=c-shared` are required (the latter
 also enables the reactor's `_initialize` export).
 
 ## Build
@@ -124,7 +124,7 @@ nix develop
 ./scripts/build-coraza-reactor.sh --verify   # rebuild and compare to checksum
 ```
 
-The script requires Go 1.24.x (`GOTOOLCHAIN=local`), sets
+The script requires Go 1.26.x (`GOTOOLCHAIN=local`), sets
 `GOOS=wasip1 GOARCH=wasm`, `CGO_ENABLED=0`, `GOFLAGS=-mod=vendor` and
 `GOPROXY=off`, and builds with `-buildmode=c-shared -trimpath -buildvcs=false
 -ldflags="-s -w -buildid="`. Equivalent manual command:
@@ -156,7 +156,7 @@ in evaluation cost, so it is not wired into the reproducible build.
 Go's Wasm builds are byte-reproducible with the flags above: the build ID is
 empty, paths are trimmed, VCS metadata is excluded, and all inputs come from
 the committed `go.mod`, `go.sum` and `vendor/` tree. Two clean builds on the
-same `linux/amd64` host with Go 1.24.5 produce identical bytes.
+same `linux/amd64` host with Go 1.26.10 produce identical bytes.
 
 The build writes `wasm/coraza_reactor/coraza_reactor.wasm.sha256` next to the
 artifact. `--verify` rebuilds from scratch and fails if the SHA-256 differs

@@ -51,6 +51,42 @@ Current exceptions:
 | --- | --- | --- |
 | `RUSTSEC-2025-0134` | `rustls-pemfile` 2.2.0 | Crate archived with no fixed release. Used only to parse operator-supplied PEM TLS material (`src/waf/tls_config.rs`, `src/proxy/http3.rs`). Follow-up: migrate to `rustls-pki-types` `PemObject`. |
 
+### Dependency remediation (November 2026)
+
+GitHub Dependabot reported 27 alerts (4 high, 23 moderate) against the public
+repository. The Rust graph was already clean: `cargo audit` and
+`cargo deny check advisories` reported no vulnerabilities, only the accepted
+`rustls-pemfile` unmaintained warning. The alerts came from the two Go modules
+that ship the Coraza engine (`wasm/coraza_reactor` and
+`native/coraza-sidecar`), which share one vendored dependency tree.
+
+`govulncheck` reproduced 11 reachable Coraza advisories and 4 reachable
+`golang.org/x/net` advisories. All 15 module advisories are fixed by the
+upgrade below; the remaining `govulncheck` findings are Go standard-library
+advisories in the build toolchain, not module dependencies.
+
+| Module | Before | After | Advisories fixed |
+| --- | --- | --- | --- |
+| `github.com/corazawaf/coraza/v3` | `v3.3.3` | `v3.8.1` | `GO-2026-6699`, `GO-2026-6698`, `GO-2026-6697`, `GO-2026-6696`, `GO-2026-6694`, `GO-2026-6693`, `GO-2026-6692`, `GO-2026-6691`, `GO-2026-6690`, `GO-2026-6669`, `GO-2026-6668` |
+| `golang.org/x/net` | `v0.37.0` | `v0.60.0` | `GO-2026-6617`, `GO-2026-6612`, `GO-2026-6611`, `GO-2026-6603` |
+| `github.com/corazawaf/libinjection-go` | `v0.2.2` | `v0.3.3` | pulled in by Coraza v3.8.1 |
+| `golang.org/x/sync` | `v0.12.0` | `v0.23.0` | pulled in by Coraza v3.8.1 |
+| `google.golang.org/protobuf` | `v1.35.1` | `v1.36.11` | pulled in by Coraza v3.8.1 |
+
+The Coraza upgrade keeps the pinned OWASP CRS bundle (`4.14.0`) and the
+`coraza-coreruleset` module revision unchanged. The local
+`types.Transaction.RemoveRuleByID` patch still applies to v3.8.1 and was
+renamed to `patches/coraza-remove-rule-by-id.patch`. The committed WASI
+reactor was rebuilt with Go 1.26.10 and its digest updated.
+
+**Go standard library.** The previous `nixpkgs` pin provided Go 1.26.4, which
+`govulncheck` flagged for standard-library advisories fixed in Go 1.26.5–1.26.10
+(`crypto/tls`, `crypto/x509`, `net/http`, `net/url`, `net/textproto`,
+`encoding/xml`, `encoding/asn1`). The `nixpkgs` flake input was updated to the
+2026-11-03 revision, which provides Go 1.26.10. `govulncheck` now reports
+`No vulnerabilities found` for both Go modules. The reactor and sidecar were
+rebuilt with the updated toolchain.
+
 ### Licences
 
 Only the following licences are accepted. Everything else fails the build and

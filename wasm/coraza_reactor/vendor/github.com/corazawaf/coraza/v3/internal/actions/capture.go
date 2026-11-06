@@ -20,9 +20,11 @@ import (
 // All the other variables contain the captured values, in the order in which the capturing parentheses appear in the regular expression.
 //
 // Example:
-// ```
-// SecRule REQUEST_BODY "^username=(\w{25,})" phase:2,capture,t:none,chain,id:105
-// SecRule TX:1 "(?:(?:a(dmin|nonymous)))"
+// ```seclang
+//
+//	  SecRule REQUEST_BODY "^username=(\w{25,})" "phase:2,capture,t:none,chain,id:105"
+//		   SecRule TX:1 "(?:(?:a(dmin|nonymous)))"
+//
 // ```
 type captureFn struct{}
 

@@ -17,6 +17,15 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Security
 
+- Remediated the Dependabot dependency alerts in the Go Coraza modules.
+  Upgraded `github.com/corazawaf/coraza/v3` from `v3.3.3` to `v3.8.1` and
+  `golang.org/x/net` from `v0.37.0` to `v0.60.0`, fixing 11 reachable Coraza
+  advisories and 4 reachable `x/net` advisories. The vendored tree, WASI
+  reactor digest, native sidecar and SBOM metadata were regenerated. The
+  pinned OWASP CRS bundle is unchanged. See
+  `docs/operations/supply-chain.md` for the remediation table and the accepted
+  Go standard-library toolchain risk.
+
 - Hardened request framing and protocol handling against the November 2026
   audit findings M1, M2, M4, M5, M7, M8, L1, L2, L5 and L6:
   - `Connection`-nominated header fields are now stripped alongside the fixed

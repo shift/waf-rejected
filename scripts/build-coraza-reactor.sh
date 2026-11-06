@@ -5,7 +5,7 @@
 #   ./scripts/build-coraza-reactor.sh          # build, verify and write checksum
 #   ./scripts/build-coraza-reactor.sh --verify # rebuild and compare to checksum
 #
-# The module is built from the committed vendor tree with a local Go 1.24
+# The module is built from the committed vendor tree with a local Go 1.26
 # toolchain only. Deterministic flags (trimpath, empty build ID, no VCS stamp)
 # make repeated builds byte-identical.
 set -euo pipefail
@@ -28,9 +28,9 @@ command -v go >/dev/null 2>&1 || {
 
 GO_VERSION="$(go env GOVERSION)"
 case "$GO_VERSION" in
-    go1.24.*) ;;
+    go1.26.*) ;;
     *)
-        echo "error: pinned Go 1.24.x required, found $GO_VERSION" >&2
+        echo "error: pinned Go 1.26.x required, found $GO_VERSION" >&2
         exit 1
         ;;
 esac
@@ -44,7 +44,7 @@ esac
 
 cd "$SRC"
 
-# Pinned, offline, deterministic Go 1.24 WASI build settings.
+# Pinned, offline, deterministic Go 1.26 WASI build settings.
 export CGO_ENABLED=0
 export GOOS=wasip1
 export GOARCH=wasm

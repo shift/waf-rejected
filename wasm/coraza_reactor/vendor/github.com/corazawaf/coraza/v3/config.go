@@ -25,8 +25,9 @@ type WAFConfig interface {
 	// WithRequestBodyAccess enables access to the request body.
 	WithRequestBodyAccess() WAFConfig
 
-	// WithRequestBodyLimit sets the maximum number of bytes that can be read from the request body. Bytes beyond that set
-	// in WithInMemoryLimit will be buffered to disk.
+	// WithRequestBodyLimit sets the maximum number of bytes that can be read from the request body.
+	// If the body exceeds the limit set in WithRequestBodyInMemoryLimit, the whole body will be
+	// buffered to disk instead of being kept in memory.
 	// For usability purposes body limits are enforced as int (and not int64)
 	// int is a signed integer type that is at least 32 bits in size (platform-dependent size).
 	// While, the theoretical settable upper limit for 32-bit machines is 2GiB,
@@ -94,6 +95,7 @@ type wafRule struct {
 // int is a signed integer type that is at least 32 bits in size (platform-dependent size).
 // We still basically assume 64-bit usage where int are big sizes.
 type wafConfig struct {
+	ruleObserver             func(rule types.RuleMetadata)
 	rules                    []wafRule
 	auditLog                 *auditLogConfig
 	requestBodyAccess        bool
@@ -116,6 +118,12 @@ func (c *wafConfig) WithRules(rules ...*corazawaf.Rule) WAFConfig {
 	for _, r := range rules {
 		ret.rules = append(ret.rules, wafRule{rule: r})
 	}
+	return ret
+}
+
+func (c *wafConfig) WithRuleObserver(observer func(rule types.RuleMetadata)) WAFConfig {
+	ret := c.clone()
+	ret.ruleObserver = observer
 	return ret
 }
 
