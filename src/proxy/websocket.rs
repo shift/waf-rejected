@@ -544,6 +544,7 @@ mod tests {
         let mut headers = upgrade_headers("Upgrade");
         headers.insert("sec-websocket-key", "c2hvcnQ=".parse().unwrap());
         assert!(WebSocketHandler::validate_websocket_handshake(&headers).is_err());
+    }
 
     #[cfg(feature = "websocket")]
     struct BlockMarkerRule;
