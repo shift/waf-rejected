@@ -1264,7 +1264,8 @@ Baseline `main` = e05d918: bodyless 0.373 ms, 4 KiB 0.924 ms, 8 KiB
       pre-release with 14 assets published.
 - [x] Release commit `9203229`; local checks and the uploaded assets verified.
       Worktrees cleaned; GHCR untouched.
-- [ ] Confirm public CI (Feature Matrix, Release, CodeQL, Production
-      Deployment) on the public release commit `c177904`. Release and CodeQL
-      were in progress; Production Deployment fails at its documented
-      secret/kubeconfig preflight, as in beta 15.
+- [x] Confirm public CI on `a6b7d7e`: Feature Matrix success, Release success
+      (14 assets, provenance attested), CodeQL success. Production Deployment
+      still fails at the `cachix-action` step because the `waf-rejected` cache
+      is private/missing and no `CACHIX_AUTH_TOKEN` is configured; deploy jobs
+      are skipped, as in beta 15. Both rulesets restored to `active`.
