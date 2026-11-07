@@ -82,7 +82,7 @@ security:
 ```yaml
 # Production values.yaml
 image:
-  tag: "v0.1.0-beta.14"
+  tag: "v0.1.0-beta.15"
 
 resources:
   requests:
@@ -398,6 +398,6 @@ config:
 ```bash
 # Update to latest security patch
 helm upgrade waf-rejected waf-rejected/waf-rejected \
-  --set image.tag=v0.1.0-beta.14 \
+  --set image.tag=v0.1.0-beta.15 \
   -n security
 ```

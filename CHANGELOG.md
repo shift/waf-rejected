@@ -4,8 +4,45 @@ All notable changes to WAF-Rejected are documented here.
 
 ## [Unreleased]
 
+## [0.1.0-beta.15] - 2026-11-07
+
+### Release summary
+
+Beta 15 trims end-to-end latency and gets the public CI jobs green. The default
+Rust engine now reuses transform-cache/gate identities per argument, borrows
+identity-path candidates, prunes literal/subsequence gate groups per phase and
+runs normal-size body scans inline; heuristics reuse the CRS literal extractor.
+End-to-end p50 is 0.924 ms at 4 KiB (from 1.09 ms), 1.354 ms at 8 KiB (from
+1.61 ms) and 0.373 ms bodyless, with 2,112/2,112 corpus parity. The release also
+fixes the `--no-default-features` build (gRPC stream-inspector stub), removes
+the vulnerable OpenTelemetry SDK in favour of the `opentelemetry` 0.33 API, and
+makes the public workflows resilient (Nix-based SBOM, opt-in non-blocking GHCR
+push, fixable-only Trivy gate, SARIF permissions, kube preflight gating).
+
+### Performance
+
+- Cut end-to-end latency for the default Rust engine at 4/8 KiB: `ARGS` and
+  `ARGS_GET`/`ARGS_POST` (and the matching name collections) now share one
+  transform-cache/gate identity per argument, identity-pipeline candidates are
+  borrowed instead of copied into the transform arena, the transform cache is
+  reused across request phases, and literal/subsequence gate groups are pruned
+  per phase. Normal-size Rust-engine body scans now run inline instead of a
+  `spawn_blocking` hop plus an owned `RequestContext` clone (bodies above
+  64 KiB still offload).
+- The heuristic content-inspection rules now consult the same conservative
+  required-literal extractor used for the CRS artifact before running a regex.
+  A missing literal proves the pattern cannot match, so benign 4/8 KiB bodies
+  skip the expensive scans without weakening detection. Proxy responses no
+  longer allocate a lowercase copy of every header name for the hop-by-hop
+  check. Measured p50: bodyless 0.373 ms, 4 KiB 0.924 ms (from 1.09 ms), 8 KiB
+  1.354 ms (from 1.61 ms); corpus parity 2,112/2,112. See
+  `docs/design/engine-proxy-8k.md`.
+
 ### Fixed
 
+- Restored the `--no-default-features` build by providing a gRPC stream
+  inspector stub when the reactor feature is disabled; this was the only failing
+  public CI job.
 - Public GitHub Actions workflows no longer fail on missing infrastructure:
   - `release.yml` installs Nix in the `sbom` job, makes GHCR publishing opt-in
     through the `PUSH_IMAGE` repository variable while still building and

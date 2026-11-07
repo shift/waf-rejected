@@ -7,3 +7,6 @@ logs
 *.log
 result
 result-*
+.worktrees
+.release-assets
+.container-storage*

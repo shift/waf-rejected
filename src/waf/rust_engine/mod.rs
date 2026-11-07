@@ -449,8 +449,6 @@ mod adapter_tests {
 
     #[test]
     fn content_scanner_decodes_the_serialised_payload() {
-        use crate::waf::grpc::GrpcContentScanner as _;
-
         let engine = RustEngine::from_conf_str(
             r#"SecRule ARGS "@rx attack" "id:1001,phase:2,deny,status:403""#,
             ".",

@@ -7,7 +7,7 @@ release steps remain in [`release-checklist.md`](release-checklist.md).
 
 - Release tags use `vMAJOR.MINOR.PATCH`, for example `v0.1.0`.
 - Pre-release tags use `vMAJOR.MINOR.PATCH-beta.N`, for example
-  `v0.1.0-beta.14`.
+  `v0.1.0-beta.15`.
 - Beta tags are published as GitHub **pre-releases**, never as the latest
   stable release.
 - Tags are immutable. Do not move, delete or re-point a published tag. If a
@@ -17,8 +17,8 @@ release steps remain in [`release-checklist.md`](release-checklist.md).
 
 ## Signing
 
-- Prefer signed, annotated tags: `git tag -s v0.1.0-beta.14 -m "..."`.
-- Verify a tag before trusting it: `git tag -v v0.1.0-beta.14`.
+- Prefer signed, annotated tags: `git tag -s v0.1.0-beta.15 -m "..."`.
+- Verify a tag before trusting it: `git tag -v v0.1.0-beta.15`.
 - If the release maintainer has no signing key configured, use an annotated tag
   (`git tag -a`) and state in the release notes that the tag is unsigned. Do not
   use lightweight tags for releases.
