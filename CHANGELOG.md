@@ -15,8 +15,12 @@ parsing, constant-time API-key comparison, HTTP/3 admission bounds and
 allow-cache protocol checks. Upstream response inspection is now available as
 an opt-in native-engine feature (`waf.response_inspection`), disabled by
 default. Dependabot alerts were remediated by upgrading Coraza to 3.8.1 and
-the Go toolchain to 1.26, leaving zero known vulnerable Rust or Go modules in
-the release SBOM. The release also adds repository hardening (rulesets,
+the Go toolchain to 1.26, leaving zero open Go alerts. One moderate Rust
+advisory remains in the optional OpenTelemetry SDK (`opentelemetry_sdk`
+0.20.0, W3C Baggage allocation, CVE-2026-48504); the binary never initialises
+an SDK tracer provider or baggage extraction, and the patched 0.32.1 release
+is recorded as the upgrade path in `docs/operations/supply-chain.md`. The
+release also adds repository hardening (rulesets,
 CODEOWNERS, security policy, community files), reproducible CI/release
 tooling, and a CycloneDX SBOM with per-asset checksums.
 
@@ -40,7 +44,10 @@ tooling, and a CycloneDX SBOM with per-asset checksums.
   reactor digest, native sidecar and SBOM metadata were regenerated. The
   pinned OWASP CRS bundle is unchanged. See
   `docs/operations/supply-chain.md` for the remediation table and the accepted
-  Go standard-library toolchain risk.
+  Go standard-library toolchain risk. The one remaining Rust advisory
+  (`opentelemetry_sdk` 0.20.0, CVE-2026-48504) is documented there with the
+  patched 0.32.1 upgrade path; no SDK provider or baggage extractor is
+  initialised by the shipped binary, so the vulnerable path is not reachable.
 
 - Hardened request framing and protocol handling against the November 2026
   audit findings M1, M2, M4, M5, M7, M8, L1, L2, L5 and L6:
