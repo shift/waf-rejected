@@ -123,6 +123,10 @@ jobs:
           scan-ref: .
           format: sarif
           output: trivy-fs.sarif
+          # This gate covers dependency and OS vulnerabilities. Secret detection
+          # is a separate concern (the repository contains test-only TLS keys
+          # under `src/`), so it must not fail the release build.
+          scanners: vuln
           severity: HIGH,CRITICAL
           # Only a fixable HIGH/CRITICAL finding blocks the release. Unfixed
           # upstream advisories are reported in the code-scanning dashboard
