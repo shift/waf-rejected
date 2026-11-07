@@ -1216,3 +1216,33 @@ subsequence prerequisite and gate on it without any false negative.
       h3 admission/HTTP3 tests (11 passed), WebSocket integration tests
       (6 passed), config tests (5 passed), clippy lib with and without
       `http3` `--deny warnings`.
+
+## Perf: fixed proxy + WAF-wrapper floor (`perf/wrapper-floor`)
+
+Baseline `main` = e05d918: bodyless 0.373 ms, 4 KiB 0.924 ms, 8 KiB
+1.354 ms; proxy floor 126–153 µs; engine 556/941 µs.
+
+- [x] ns-level profile of the wrapper: `bodyless-bench --profile --rust`
+      (context build, admission, metrics, rule chain, audit) and
+      `rust-engine-parity --bench`.
+- [x] Borrow `http_version` in `RequestContext` (`Cow<'static, str>`); the
+      proxy passes its `&'static str` instead of allocating.
+- [x] Rust-engine adapter borrows the request head:
+      `RustEngine::evaluate_detailed_borrowed` builds the collection view
+      straight from `HeaderMap`/URI; no owned header strings or URI copy.
+- [x] Content-inspection header scan: one case-insensitive Aho–Corasick
+      candidate pass per header per rule instead of one gate search per
+      pattern literal (sound over-approximation; non-ASCII values stay
+      always-inspected).
+- [x] Proxy fixed cost: no lowercase `String` per forwarded header, one
+      client-IP header allocation per request.
+- [x] Benchmark p50/p95/p99 bodyless/1/4/8 KiB at c=1 and c=16
+      (`bench-subms --no-wasm`; median of 7 branch runs; before/after pair
+      pinned to the same cores). Bodyless 0.315 ms median (best 0.294), 1 KiB
+      0.454, 4 KiB 0.810, 8 KiB 1.234; 4/8 KiB targets met, bodyless ~15 µs
+      over at the median (engine-bound; documented).
+- [x] Parity: 2,112/2,112 corpus agreement, 0 native-only FNs (both engines
+      3 FN / 91 FP vs expected), transform fixture passes; lib tests 626
+      passed, lib `--no-default-features` 482 passed, integration 60 passed.
+- [x] Verify: fmt, clippy `--lib --deny warnings` (default and no-default).
+- [x] Docs (`docs/suggestions_from_agents/wrapper-floor.md`) + CHANGELOG.

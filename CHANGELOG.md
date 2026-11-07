@@ -47,6 +47,30 @@ closing CVE-2026-78661.
   1.354 ms (from 1.61 ms); corpus parity 2,112/2,112. See
   `docs/design/engine-proxy-8k.md`.
 
+### Performance
+
+- Cut the fixed proxy and WAF-wrapper cost around the compiled engine. The
+  proxy stores the detected HTTP version borrowed instead of allocating a
+  `String` per request, and the native Rust engine now builds its phase-1
+  collections straight from the request `HeaderMap` and borrowed URI instead
+  of copying one `String` per header and one for the URI
+  (`RustEngine::evaluate_detailed_borrowed`; non-UTF-8 values keep the previous
+  lossy normalisation).
+- The heuristic content-inspection rules now run one ASCII case-insensitive
+  Aho–Corasick candidate pass per header per rule instead of one
+  required-literal search per pattern per header. Patterns outside the
+  candidate set provably cannot match and skip their regex; non-ASCII values
+  and always-matching literals are never narrowed. Decisions, order, reasons
+  and metrics are unchanged.
+- The upstream request builder no longer allocates a lowercase copy of every
+  forwarded header name for the hop-by-hop comparison, and formats the client
+  IP once instead of twice. On the reference loopback benchmark the proxy floor
+  drops ~10 % p50 and ~8 allocations per request; the default Rust-engine chain
+  drops 15–20 allocations per request.
+- Added `bodyless-bench --rust` (wrapper/content/engine attribution) and
+  `bench-subms --no-wasm` (skip the slow WASI reactor row). See
+  [`docs/suggestions_from_agents/wrapper-floor.md`](docs/suggestions_from_agents/wrapper-floor.md).
+
 ### Fixed
 
 - Restored the `--no-default-features` build by providing a gRPC stream

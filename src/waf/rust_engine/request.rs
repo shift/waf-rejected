@@ -9,6 +9,8 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
+use hyper::HeaderMap;
+
 use super::budget::Budget;
 use super::error::EngineError;
 use super::ir::{Collection, Selector, VariableSpec};
@@ -180,24 +182,84 @@ impl<'a> Collections<'a> {
         budget: &mut Budget,
         state: TxState,
     ) -> Result<Self, EngineError> {
-        let parsed = ParsedUri::parse(request.uri);
-        let mut headers = Vec::with_capacity(request.headers.len());
+        Self::build(
+            request.method,
+            request.uri,
+            request.http_version,
+            request
+                .headers
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_bytes())),
+            budget,
+            state,
+        )
+    }
+
+    /// Builds the phase-1 collection view straight from a hyper header map.
+    ///
+    /// The proxy already owns a parsed `HeaderMap`. Going through
+    /// [`EngineRequest`] would copy every header into an owned `String` first;
+    /// this entry point borrows the header names and values instead, so the
+    /// hot path allocates only the header vector. Non-UTF-8 values are
+    /// normalised with the same lossy conversion the adapter used, so rule
+    /// evaluation sees identical bytes.
+    pub fn new_from_header_map(
+        method: &'a str,
+        uri: &'a str,
+        http_version: &'a str,
+        headers: &'a HeaderMap,
+        budget: &mut Budget,
+        state: TxState,
+    ) -> Result<Self, EngineError> {
+        Self::build(
+            method,
+            uri,
+            http_version,
+            headers
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_bytes())),
+            budget,
+            state,
+        )
+    }
+
+    fn build<I>(
+        method: &'a str,
+        uri: &'a str,
+        http_version: &'a str,
+        headers_iter: I,
+        budget: &mut Budget,
+        state: TxState,
+    ) -> Result<Self, EngineError>
+    where
+        I: Iterator<Item = (&'a str, &'a [u8])>,
+    {
+        let parsed = ParsedUri::parse(uri);
+        let (lower, _) = headers_iter.size_hint();
+        let mut headers = Vec::with_capacity(lower);
         let mut reqbody_processor = String::new();
-        for (name, value) in request.headers {
-            headers.push(Entry {
-                key: Cow::Borrowed(name.as_str()),
-                value: Cow::Borrowed(value.as_bytes()),
-            });
+        for (name, value) in headers_iter {
+            let value: Cow<'a, [u8]> = if std::str::from_utf8(value).is_ok() {
+                Cow::Borrowed(value)
+            } else {
+                Cow::Owned(String::from_utf8_lossy(value).into_owned().into_bytes())
+            };
             if name.eq_ignore_ascii_case("content-type") {
-                if value.eq_ignore_ascii_case("application/x-www-form-urlencoded") {
-                    reqbody_processor = "URLENCODED".to_string();
-                } else if value
-                    .get(..19)
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("multipart/form-data"))
-                {
-                    reqbody_processor = "MULTIPART".to_string();
+                if let Ok(value_str) = std::str::from_utf8(&value) {
+                    if value_str.eq_ignore_ascii_case("application/x-www-form-urlencoded") {
+                        reqbody_processor = "URLENCODED".to_string();
+                    } else if value_str
+                        .get(..19)
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("multipart/form-data"))
+                    {
+                        reqbody_processor = "MULTIPART".to_string();
+                    }
                 }
             }
+            headers.push(Entry {
+                key: Cow::Borrowed(name),
+                value,
+            });
         }
         for header in &headers {
             budget.bytes(header.key.len() + header.value.len())?;
@@ -244,19 +306,13 @@ impl<'a> Collections<'a> {
             response_xml: Vec::new(),
             outbound_data_error: false,
             request_uri: parsed.request_uri,
-            request_uri_raw: Cow::Borrowed(request.uri.as_bytes()),
-            request_method: Cow::Borrowed(request.method.as_bytes()),
+            request_uri_raw: Cow::Borrowed(uri.as_bytes()),
+            request_method: Cow::Borrowed(method.as_bytes()),
             request_body: None,
             request_filename: parsed.path,
             request_basename: parsed.basename,
-            request_line: Cow::Owned(
-                format!(
-                    "{} {} {}",
-                    request.method, request.uri, request.http_version
-                )
-                .into_bytes(),
-            ),
-            request_protocol: Cow::Borrowed(request.http_version.as_bytes()),
+            request_line: Cow::Owned(format!("{method} {uri} {http_version}").into_bytes()),
+            request_protocol: Cow::Borrowed(http_version.as_bytes()),
             query_string: parsed.query,
             files_combined_size: 0,
             reqbody_processor,
@@ -304,11 +360,24 @@ impl<'a> Collections<'a> {
         request: &EngineRequest<'a>,
         budget: &mut Budget,
     ) -> Result<(), EngineError> {
+        self.process_body_bytes(request.body, budget)
+    }
+
+    /// Body-processor pass over raw body bytes.
+    ///
+    /// [`Self::process_body`] takes an [`EngineRequest`] for historical
+    /// reasons; the borrowed proxy path already has the body and calls this
+    /// directly.
+    pub fn process_body_bytes(
+        &mut self,
+        body: Option<&'a [u8]>,
+        budget: &mut Budget,
+    ) -> Result<(), EngineError> {
         if self.state.body_processed {
             return Ok(());
         }
         self.state.body_processed = true;
-        let Some(body) = request.body else {
+        let Some(body) = body else {
             return Ok(());
         };
         if body.is_empty() {

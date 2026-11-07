@@ -159,28 +159,29 @@ impl RustEngineRule {
 }
 
 /// Evaluates a request against the native engine.
+///
+/// The request head is borrowed from the `RequestContext`; only a URI that is
+/// not in origin-form (absolute-form, with a scheme/authority) needs a
+/// temporary `String`.
 fn evaluate_request(engine: &RustEngine, ctx: &RequestContext) -> Result<Decision, EngineError> {
-    let uri = ctx.uri.to_string();
-    let headers: Vec<(String, String)> = ctx
-        .headers
-        .iter()
-        .map(|(name, value)| {
-            (
-                name.as_str().to_string(),
-                String::from_utf8_lossy(value.as_bytes()).into_owned(),
-            )
-        })
-        .collect();
-    let body = ctx.body.as_deref();
-    let request = EngineRequest {
-        method: ctx.method.as_str(),
-        uri: &uri,
-        http_version: &ctx.http_version,
-        headers: &headers,
-        body,
+    let mut uri_buf = String::new();
+    let uri: &str = match ctx.uri.path_and_query() {
+        Some(path_and_query) if ctx.uri.scheme().is_none() && ctx.uri.authority().is_none() => {
+            path_and_query.as_str()
+        }
+        _ => {
+            uri_buf.push_str(&ctx.uri.to_string());
+            &uri_buf
+        }
     };
     engine
-        .evaluate_detailed(&request)
+        .evaluate_detailed_borrowed(
+            ctx.method.as_str(),
+            uri,
+            &ctx.http_version,
+            &ctx.headers,
+            ctx.body.as_deref(),
+        )
         .map(|outcome| outcome.decision)
 }
 

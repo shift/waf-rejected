@@ -19,6 +19,83 @@ pub struct ContentInspectionRule {
     gates: Vec<Option<RequiredLiterals>>,
     high_gates: Vec<Option<RequiredLiterals>>,
     low_gates: Vec<Option<RequiredLiterals>>,
+    /// One multi-pattern automaton over every high-priority gate literal.
+    #[cfg(feature = "rust-engine")]
+    header_matcher: Option<HeaderCandidates>,
+}
+
+/// Multi-pattern candidate prefilter for header inspection.
+///
+/// The per-pattern [`RequiredLiterals`] gate runs one search per literal. A
+/// request hits every enabled content rule, so a bodyless request paid that
+/// cost once per rule and once per header. This automaton scans a header value
+/// once and reports which patterns have a required literal present. It is a
+/// sound over-approximation (case-insensitive for every literal), so a pattern
+/// outside the candidate set provably cannot match and its regex is skipped.
+#[cfg(feature = "rust-engine")]
+struct HeaderCandidates {
+    ac: aho_corasick::AhoCorasick,
+    /// Pattern index for each automaton pattern id.
+    patterns: Vec<usize>,
+    /// Patterns whose gate has an always-matching (empty) literal.
+    always: u64,
+}
+
+#[cfg(feature = "rust-engine")]
+impl HeaderCandidates {
+    fn build(gates: &[Option<RequiredLiterals>]) -> Option<Self> {
+        let mut literals = Vec::new();
+        let mut owners = Vec::new();
+        let mut always = 0u64;
+        for (index, gate) in gates.iter().enumerate() {
+            let Some(gate) = gate else { continue };
+            for (literal, _case_insensitive) in gate.literals() {
+                if literal.is_empty() {
+                    if index < 64 {
+                        always |= 1u64 << index;
+                    }
+                    continue;
+                }
+                literals.push(literal.clone());
+                owners.push(index);
+            }
+        }
+        if literals.is_empty() {
+            return None;
+        }
+        let ac = aho_corasick::AhoCorasickBuilder::new()
+            .ascii_case_insensitive(true)
+            .build(&literals)
+            .ok()?;
+        Some(Self {
+            ac,
+            patterns: owners,
+            always,
+        })
+    }
+
+    /// Fill a candidate bitmask per header, in `HeaderMap` iteration order.
+    fn fill_masks(&self, headers: &hyper::HeaderMap, masks: &mut [u64]) {
+        for (index, (_, value)) in headers.iter().enumerate() {
+            let Some(slot) = masks.get_mut(index) else {
+                break;
+            };
+            let Ok(value) = value.to_str() else { continue };
+            // The per-pattern gate treats a non-ASCII haystack as "cannot rule
+            // out" (Unicode case folding). Keep that: mark every pattern a
+            // candidate so no regex is skipped.
+            if !value.is_ascii() {
+                *slot = u64::MAX;
+                continue;
+            }
+            for matched in self.ac.find_overlapping_iter(value.as_bytes()) {
+                let pattern = self.patterns[matched.pattern().as_usize()];
+                if pattern < 64 {
+                    *slot |= 1u64 << pattern;
+                }
+            }
+        }
+    }
 }
 
 fn gates_for(patterns: &[ThreatPattern]) -> Vec<Option<RequiredLiterals>> {
@@ -237,6 +314,8 @@ impl ContentInspectionRule {
         let gates = gates_for(&patterns);
         let high_gates = gates_for(&high_priority);
         let low_gates = gates_for(&low_priority);
+        #[cfg(feature = "rust-engine")]
+        let header_matcher = HeaderCandidates::build(&high_gates);
 
         Self {
             name: name.to_string(),
@@ -249,6 +328,8 @@ impl ContentInspectionRule {
             gates,
             high_gates,
             low_gates,
+            #[cfg(feature = "rust-engine")]
+            header_matcher,
         }
     }
 
@@ -257,6 +338,8 @@ impl ContentInspectionRule {
         let gates = gates_for(&patterns);
         let high_gates = gates_for(&high_priority);
         let low_gates = gates_for(&low_priority);
+        #[cfg(feature = "rust-engine")]
+        let header_matcher = HeaderCandidates::build(&high_gates);
 
         Self {
             name: name.to_string(),
@@ -269,6 +352,8 @@ impl ContentInspectionRule {
             gates,
             high_gates,
             low_gates,
+            #[cfg(feature = "rust-engine")]
+            header_matcher,
         }
     }
 
@@ -298,6 +383,12 @@ impl ContentInspectionRule {
         }
         self.patterns.push(pattern);
         self.gates.push(gate);
+        // The automaton covers the old pattern set; fall back to the
+        // per-pattern literal gates instead of rebuilding on mutation.
+        #[cfg(feature = "rust-engine")]
+        {
+            self.header_matcher = None;
+        }
     }
 
     /// Performance optimization: categorize patterns by priority
@@ -493,25 +584,66 @@ impl WafRule for ContentInspectionRule {
 
         // Check headers (optimized for performance)
         if self.inspect_headers {
+            #[cfg(feature = "rust-engine")]
+            let header_matcher = self.header_matcher.as_ref();
+            #[cfg(feature = "rust-engine")]
+            let mut stack_masks = [0u64; 16];
+            #[cfg(feature = "rust-engine")]
+            let mut heap_masks: Vec<u64> = Vec::new();
+            #[cfg(feature = "rust-engine")]
+            let candidate_masks: Option<&[u64]> = match header_matcher {
+                Some(matcher) => {
+                    let len = ctx.headers.len();
+                    if len <= stack_masks.len() {
+                        let masks = &mut stack_masks[..len];
+                        matcher.fill_masks(&ctx.headers, masks);
+                        Some(&*masks)
+                    } else {
+                        heap_masks.resize(len, 0);
+                        matcher.fill_masks(&ctx.headers, &mut heap_masks);
+                        Some(heap_masks.as_slice())
+                    }
+                }
+                None => None,
+            };
+
             for (index, pattern) in self.high_priority_patterns.iter().enumerate() {
                 if !pattern.check_headers {
                     continue;
                 }
                 let gate = self.high_gates.get(index).and_then(Option::as_ref);
-                for (header_name, header_value) in ctx.headers.iter() {
-                    if let Ok(header_str) = header_value.to_str() {
-                        if gate.is_some_and(|gate| !gate.matches(header_str.as_bytes())) {
-                            continue;
+                for (header_index, (header_name, header_value)) in ctx.headers.iter().enumerate() {
+                    #[cfg(not(feature = "rust-engine"))]
+                    let _ = header_index;
+                    let Ok(header_str) = header_value.to_str() else {
+                        continue;
+                    };
+                    #[cfg(feature = "rust-engine")]
+                    let candidate = match (candidate_masks, header_matcher) {
+                        // A pattern with no required literal always runs. A
+                        // pattern in the automaton set needs a literal hit (or
+                        // an always-matching empty literal).
+                        (Some(masks), Some(matcher)) if index < 64 && gate.is_some() => {
+                            matcher.always & (1u64 << index) != 0
+                                || masks
+                                    .get(header_index)
+                                    .is_some_and(|mask| mask & (1u64 << index) != 0)
                         }
-                        if pattern.pattern.is_match(header_str) {
-                            return Decision::Block {
-                                status: self.severity_to_status(&pattern.severity),
-                                reason: format!(
-                                    "Content inspection: {} detected in header {}",
-                                    pattern.name, header_name
-                                ),
-                            };
-                        }
+                        _ => gate.is_none_or(|gate| gate.matches(header_str.as_bytes())),
+                    };
+                    #[cfg(not(feature = "rust-engine"))]
+                    let candidate = gate.is_none_or(|gate| gate.matches(header_str.as_bytes()));
+                    if !candidate {
+                        continue;
+                    }
+                    if pattern.pattern.is_match(header_str) {
+                        return Decision::Block {
+                            status: self.severity_to_status(&pattern.severity),
+                            reason: format!(
+                                "Content inspection: {} detected in header {}",
+                                pattern.name, header_name
+                            ),
+                        };
                     }
                 }
             }
@@ -761,6 +893,26 @@ mod tests {
             }
             _ => panic!("Expected header XSS to be blocked"),
         }
+    }
+
+    #[test]
+    fn test_header_candidate_prefilter_is_case_insensitive() {
+        let pattern = ThreatPattern {
+            name: "Header XSS ci".to_string(),
+            pattern: Regex::new(r"(?i)<script").unwrap(),
+            severity: ThreatSeverity::High,
+            attack_type: AttackType::XssAttack,
+            check_uri: false,
+            check_headers: true,
+            check_body: false,
+        };
+        let rule = ContentInspectionRule::with_custom_patterns("Header Rule", vec![pattern]);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-custom-header", "PREFIX <ScRiPt>".parse().unwrap());
+        let ctx = create_test_context("/", Some(headers));
+
+        assert!(matches!(rule.evaluate(&ctx), Decision::Block { .. }));
     }
 
     #[test]

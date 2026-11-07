@@ -1548,7 +1548,7 @@ impl WafProxyService {
                 req.uri().clone(),
                 req.headers().clone(),
                 None,
-                http_version.to_string(),
+                http_version,
             );
             match state.waf_engine.evaluate_shared(&upgrade_context).await {
                 Decision::Allow => {}
@@ -1613,7 +1613,7 @@ impl WafProxyService {
                                 parts.uri.clone(),
                                 parts.headers.clone(),
                                 None,
-                                http_version.to_string(),
+                                http_version,
                             )
                         });
                         let response_inspection =
@@ -1912,7 +1912,7 @@ impl WafProxyService {
             uri,
             headers,
             Some(body_bytes.len()),
-            http_version.to_string(),
+            http_version,
         )
         .with_body(Some(body_bytes.clone()));
 
@@ -1936,7 +1936,7 @@ impl WafProxyService {
                         parts.uri.clone(),
                         parts.headers.clone(),
                         request_context.body_size,
-                        http_version.to_string(),
+                        http_version,
                     )
                 });
                 let response_inspection =
@@ -2763,27 +2763,34 @@ impl WafProxyService {
         // fields for gRPC: dropping them silently breaks trailing status.
         let connection_nominated = connection_nominated_headers(&parts.headers);
         let mut has_te = false;
+        // Hop-by-hop and proxy-owned headers are compared case-insensitively
+        // without allocating a lowercase copy per forwarded header.
+        let skip_header = |key: &hyper::header::HeaderName| {
+            let name = key.as_str();
+            const FIXED: [&str; 9] = [
+                "host",
+                "connection",
+                "proxy-connection",
+                "upgrade",
+                "transfer-encoding",
+                "keep-alive",
+                "x-forwarded-for",
+                "x-real-ip",
+                "x-forwarded-proto",
+            ];
+            FIXED
+                .iter()
+                .any(|candidate| name.eq_ignore_ascii_case(candidate))
+                || connection_nominated
+                    .iter()
+                    .any(|nominated| name.eq_ignore_ascii_case(nominated))
+        };
         for (key, value) in parts.headers {
             if let Some(key) = key {
-                let key_str = key.as_str().to_ascii_lowercase();
-                if matches!(
-                    key_str.as_str(),
-                    "host"
-                        | "connection"
-                        | "proxy-connection"
-                        | "upgrade"
-                        | "transfer-encoding"
-                        | "keep-alive"
-                        | "x-forwarded-for"
-                        | "x-real-ip"
-                        | "x-forwarded-proto"
-                ) || connection_nominated
-                    .iter()
-                    .any(|nominated| nominated == &key_str)
-                {
+                if skip_header(&key) {
                     continue;
                 }
-                if key_str == "te" {
+                if key.as_str().eq_ignore_ascii_case("te") {
                     // `TE` is connection-scoped; only gRPC's `trailers` value is
                     // meaningful end-to-end (and the only value HTTP/2 allows).
                     let trailer_te = value.to_str().ok().is_some_and(|value| {
@@ -2813,9 +2820,11 @@ impl WafProxyService {
         }
 
         // The WAF is authoritative for client identity.
+        let client_ip_header = HeaderValue::from_str(&client_ip.to_string())
+            .unwrap_or(HeaderValue::from_static("unknown"));
         proxy_req = proxy_req
-            .header("x-forwarded-for", client_ip.to_string())
-            .header("x-real-ip", client_ip.to_string())
+            .header("x-forwarded-for", client_ip_header.clone())
+            .header("x-real-ip", client_ip_header)
             .header("x-forwarded-proto", if is_https { "https" } else { "http" })
             .header(
                 "x-waf-proxy",

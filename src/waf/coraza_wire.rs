@@ -512,7 +512,7 @@ mod tests {
 
         assert_eq!(value["method"], "POST");
         assert_eq!(value["uri"], "/submit");
-        assert_eq!(value["http_version"], ctx.http_version.as_str());
+        assert_eq!(value["http_version"], ctx.http_version.as_ref());
         assert_eq!(value["body_size"], body.len());
         assert_eq!(value["body_original_size"], body.len());
         assert_eq!(value["body"], "a=1&b=2");

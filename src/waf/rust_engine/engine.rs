@@ -261,13 +261,59 @@ impl RustEngine {
             .with(|cell| cell.borrow_mut().tx_state.take())
             .unwrap_or_default();
         tx_state.reset();
-        let mut tx = Collections::new_with_state(request, &mut budget, tx_state)?;
+        let tx = Collections::new_with_state(request, &mut budget, tx_state)?;
         #[cfg(feature = "engine-profile")]
         super::profile::record(
             super::profile::Category::Parse,
             parse_sample.0,
             parse_sample.1,
         );
+        self.evaluate_collections(tx, &mut budget, request.body)
+    }
+
+    /// Evaluates a request whose head is already borrowed from the proxy.
+    ///
+    /// Identical to [`Self::evaluate_detailed`], but the collection view is
+    /// built straight from the hyper request fields. The proxy path never
+    /// materialises an owned URI string or owned header pairs.
+    pub fn evaluate_detailed_borrowed<'a>(
+        &self,
+        method: &'a str,
+        uri: &'a str,
+        http_version: &'a str,
+        headers: &'a hyper::HeaderMap,
+        body: Option<&'a [u8]>,
+    ) -> Result<Outcome, EngineError> {
+        #[cfg(feature = "engine-profile")]
+        let parse_sample = super::profile::sample();
+        let mut budget = Budget::new(self.limits);
+        let mut tx_state = SCRATCH
+            .with(|cell| cell.borrow_mut().tx_state.take())
+            .unwrap_or_default();
+        tx_state.reset();
+        let tx = Collections::new_from_header_map(
+            method,
+            uri,
+            http_version,
+            headers,
+            &mut budget,
+            tx_state,
+        )?;
+        #[cfg(feature = "engine-profile")]
+        super::profile::record(
+            super::profile::Category::Parse,
+            parse_sample.0,
+            parse_sample.1,
+        );
+        self.evaluate_collections(tx, &mut budget, body)
+    }
+
+    fn evaluate_collections<'a>(
+        &self,
+        mut tx: Collections<'a>,
+        budget: &mut Budget,
+        body: Option<&'a [u8]>,
+    ) -> Result<Outcome, EngineError> {
         let mut state = EvalState::default();
         let mut matched_rules = Vec::new();
         let mut captures: Captures = std::array::from_fn(|_| Vec::new());
@@ -300,7 +346,7 @@ impl RustEngine {
             let phase1 = self.run_phase(
                 Phase::RequestHeaders,
                 &mut tx,
-                &mut budget,
+                budget,
                 &mut state,
                 &mut matched_rules,
                 &mut captures,
@@ -318,7 +364,7 @@ impl RustEngine {
 
             #[cfg(feature = "engine-profile")]
             let body_sample = super::profile::sample();
-            tx.process_body(request, &mut budget)?;
+            tx.process_body_bytes(body, budget)?;
             #[cfg(feature = "engine-profile")]
             super::profile::record(
                 super::profile::Category::Parse,
@@ -329,7 +375,7 @@ impl RustEngine {
             let phase2 = self.run_phase(
                 Phase::RequestBody,
                 &mut tx,
-                &mut budget,
+                budget,
                 &mut state,
                 &mut matched_rules,
                 &mut captures,
@@ -2404,6 +2450,34 @@ SecRule TX:BLOCKING_INBOUND_ANOMALY_SCORE "@ge %{tx.inbound_anomaly_score_thresh
             Decision::Block { status: 403, .. }
         ));
         assert_eq!(engine.evaluate(&request("/?q=good")), Decision::Allow);
+    }
+
+    #[test]
+    fn borrowed_header_map_matches_engine_request() {
+        let engine = engine();
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-test", hyper::header::HeaderValue::from_static("keep"));
+        headers.insert("cookie", hyper::header::HeaderValue::from_static("a=b"));
+
+        let borrowed = engine
+            .evaluate_detailed_borrowed("GET", "/?q=evil", "HTTP/1.1", &headers, None)
+            .expect("borrowed evaluation");
+        let owned_headers = vec![
+            ("x-test".to_string(), "keep".to_string()),
+            ("cookie".to_string(), "a=b".to_string()),
+        ];
+        let request = EngineRequest {
+            method: "GET",
+            uri: "/?q=evil",
+            http_version: "HTTP/1.1",
+            headers: &owned_headers,
+            body: None,
+        };
+        let owned = engine
+            .evaluate_detailed(&request)
+            .expect("owned evaluation");
+        assert_eq!(borrowed.decision, owned.decision);
+        assert_eq!(borrowed.matched_rules, owned.matched_rules);
     }
 
     #[test]

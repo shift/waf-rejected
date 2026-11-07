@@ -172,6 +172,11 @@ struct Cli {
     /// rules disabled, to isolate their cost from the engine's.
     #[arg(long)]
     no_content_inspection: bool,
+
+    /// Skip the L3 WASI reactor row. Useful on a shared host: the Wasm backend
+    /// is two to three orders of magnitude slower and dominates the run time.
+    #[arg(long)]
+    no_wasm: bool,
 }
 
 impl Cli {
@@ -1274,18 +1279,20 @@ fn main() -> Result<()> {
         }
 
         if cli.wants("l3") {
-            let config = wasm_config(upstream, 4, cli.eval_timeout_ms);
-            rows.extend(
-                runtime
-                    .block_on(run_proxy_layer(
-                        &cli,
-                        config,
-                        "L3-proxy",
-                        "wasm",
-                        cli.requests.min(50),
-                    ))
-                    .context("run L3 wasm proxy layer")?,
-            );
+            if !cli.no_wasm {
+                let config = wasm_config(upstream, 4, cli.eval_timeout_ms);
+                rows.extend(
+                    runtime
+                        .block_on(run_proxy_layer(
+                            &cli,
+                            config,
+                            "L3-proxy",
+                            "wasm",
+                            cli.requests.min(50),
+                        ))
+                        .context("run L3 wasm proxy layer")?,
+                );
+            }
 
             #[cfg(all(feature = "coraza-native", unix))]
             if let Some(socket) = cli.native_socket.as_deref() {

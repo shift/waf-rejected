@@ -1096,6 +1096,15 @@ pub struct RequiredLiterals {
 }
 
 impl RequiredLiterals {
+    /// The required literal alternatives, with their ASCII case-folding flag.
+    ///
+    /// Exposed so a caller can build a single multi-pattern prefilter over all
+    /// patterns instead of running one search per literal. The set is a
+    /// disjunction: a value that matches the regex contains at least one.
+    pub fn literals(&self) -> &[(Vec<u8>, bool)] {
+        &self.literals
+    }
+
     /// True when at least one required literal occurs in `haystack`.
     ///
     /// Non-ASCII haystacks always return `true`: Unicode case folding could map

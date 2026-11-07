@@ -105,6 +105,7 @@ pub mod protobuf;
 
 use bytes::Bytes;
 use hyper::{HeaderMap, Method, Uri};
+use std::borrow::Cow;
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -171,7 +172,10 @@ pub struct RequestContext {
     pub body_size: Option<usize>,
     pub body: Option<Bytes>,
     pub timestamp: Instant,
-    pub http_version: String,
+    /// HTTP version string. The proxy has a `&'static str` from the negotiated
+    /// connection and stores it borrowed, so the hot path does not allocate
+    /// one `String` per request.
+    pub http_version: Cow<'static, str>,
 }
 
 impl RequestContext {
@@ -190,7 +194,7 @@ impl RequestContext {
             body_size,
             body: None,
             timestamp: Instant::now(),
-            http_version: "1.1".to_string(), // Default to HTTP/1.1
+            http_version: Cow::Borrowed("1.1"), // Default to HTTP/1.1
         }
     }
 
@@ -201,7 +205,7 @@ impl RequestContext {
         uri: Uri,
         headers: HeaderMap,
         body_size: Option<usize>,
-        http_version: String,
+        http_version: impl Into<Cow<'static, str>>,
     ) -> Self {
         Self {
             client_ip,
@@ -211,7 +215,7 @@ impl RequestContext {
             body_size,
             body: None,
             timestamp: Instant::now(),
-            http_version,
+            http_version: http_version.into(),
         }
     }
 

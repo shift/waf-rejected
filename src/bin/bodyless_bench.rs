@@ -41,6 +41,13 @@ struct Cli {
     #[arg(long)]
     profile: bool,
 
+    /// Also profile the default Rust-engine chain end to end. Builds three
+    /// engines (wrapper only, +content inspection, +engine) so the report can
+    /// attribute the wrapper, the heuristic header scans and the compiled
+    /// rule engine separately.
+    #[arg(long)]
+    rust: bool,
+
     /// Concurrency levels for the latency/throughput sweep.
     #[arg(long, default_value = "1,16,64")]
     concurrency: String,
@@ -119,6 +126,22 @@ fn bench_config(fast_allow: bool) -> Config {
         config.waf.fast_allow.enabled = true;
         config.waf.fast_allow.routes = vec!["GET /health".to_string()];
     }
+    config
+}
+
+/// Config for the native Rust engine chain, with inspection layers toggled so
+/// the profile can separate wrapper, heuristic scans and compiled engine.
+#[cfg(feature = "rust-engine")]
+fn rust_bench_config(content_inspection: bool, coraza: bool) -> Config {
+    let mut config = Config::default();
+    config.waf.coraza.backend = waf_ingress::config::CorazaBackend::Rust;
+    config.waf.coraza.enabled = coraza;
+    config.waf.coraza.fallback = waf_ingress::config::CorazaFallback::None;
+    config.waf.content_inspection.enabled = content_inspection;
+    config.waf.grpc.enabled = false;
+    config.waf.graphql.enabled = false;
+    config.waf.rate_limit.per_ip_max_requests = u32::MAX;
+    config.waf.rate_limit.global_max_requests = u32::MAX;
     config
 }
 
@@ -365,6 +388,77 @@ fn profile(
     );
 }
 
+/// Profile the default Rust-engine chain, separating the WAF wrapper from the
+/// heuristic content rules and the compiled engine.
+#[cfg(feature = "rust-engine")]
+fn profile_rust(samples: usize, warmup: usize) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let ctx = bodyless_context();
+    let wrapper = Arc::new(WafEngine::with_config(&rust_bench_config(false, false)));
+    let content = Arc::new(WafEngine::with_config(&rust_bench_config(true, false)));
+    let engine_only = Arc::new(WafEngine::with_config(&rust_bench_config(false, true)));
+    let full = Arc::new(WafEngine::with_config(&rust_bench_config(true, true)));
+
+    println!("\n== rust-engine chain profile (single-threaded, ns) ==");
+    println!(
+        "{:<30} {:>10} {:>10} {:>10} {:>10}",
+        "component", "p50", "p95", "p99", "mean"
+    );
+    let row = |name: &str, stats: Stats| {
+        println!(
+            "{:<30} {:>10} {:>10} {:>10} {:>10}",
+            name,
+            fmt_ns(stats.p50),
+            fmt_ns(stats.p95),
+            fmt_ns(stats.p99),
+            fmt_ns(stats.mean)
+        );
+    };
+    let run = |engine: &Arc<WafEngine>| {
+        measure_async(
+            &rt,
+            || async {
+                let decision = engine.evaluate_shared(&ctx).await;
+                black_box(decision);
+            },
+            warmup,
+            samples,
+        )
+    };
+
+    let wrapper_stats = run(&wrapper);
+    let content_stats = run(&content);
+    let engine_stats = run(&engine_only);
+    let full_stats = run(&full);
+    row("wrapper only (no rules)", wrapper_stats);
+    row("+ content inspection", content_stats);
+    row("+ rust engine", engine_stats);
+    row("full default chain", full_stats);
+    row(
+        "  content delta",
+        Stats {
+            p50: (content_stats.p50 - wrapper_stats.p50).max(0.0),
+            p95: (content_stats.p95 - wrapper_stats.p95).max(0.0),
+            p99: (content_stats.p99 - wrapper_stats.p99).max(0.0),
+            mean: (content_stats.mean - wrapper_stats.mean).max(0.0),
+            min: (content_stats.min - wrapper_stats.min).max(0.0),
+        },
+    );
+    row(
+        "  engine delta",
+        Stats {
+            p50: (full_stats.p50 - content_stats.p50).max(0.0),
+            p95: (full_stats.p95 - content_stats.p95).max(0.0),
+            p99: (full_stats.p99 - content_stats.p99).max(0.0),
+            mean: (full_stats.mean - content_stats.mean).max(0.0),
+            min: (full_stats.min - content_stats.min).max(0.0),
+        },
+    );
+}
+
 async fn run_worker(
     engine: Arc<WafEngine>,
     ctx: Arc<RequestContext>,
@@ -516,6 +610,11 @@ fn main() {
             cli.samples,
             cli.warmup.min(cli.samples),
         );
+    }
+
+    #[cfg(feature = "rust-engine")]
+    if cli.rust {
+        profile_rust(cli.samples, cli.warmup.min(cli.samples));
     }
 
     let levels: Vec<usize> = cli
