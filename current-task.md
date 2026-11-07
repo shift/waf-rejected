@@ -1257,8 +1257,14 @@ Baseline `main` = e05d918: bodyless 0.373 ms, 4 KiB 0.924 ms, 8 KiB
 - [x] Verify: fmt, clippy `--lib`, lib tests (626), `--no-default-features`
       lib (482), integration, release ignored Coraza, h2 gRPC e2e, feature
       matrix quick, `nix build .#waf-ingress`, SBOM, reactor size.
-- [ ] Build binary/sidecar/image artifacts + SBOM; `verify-release.sh`.
-- [ ] Public orphan snapshot, ruleset disable/force-push/restore, tag
-      `v0.1.0-beta.16` and pre-release with assets.
+- [x] Built binary/sidecar/image artifacts + SBOM; both the local and the
+      downloaded-release runs of `verify-release.sh --deep-image` pass.
+- [x] Public orphan snapshot `c177904`, ruleset 26690602 disabled for the
+      force-push and restored to `active`; tag `v0.1.0-beta.16` and
+      pre-release with 14 assets published.
+- [x] Release commit `9203229`; local checks and the uploaded assets verified.
+      Worktrees cleaned; GHCR untouched.
 - [ ] Confirm public CI (Feature Matrix, Release, CodeQL, Production
-      Deployment) on the release commit; clean worktrees.
+      Deployment) on the public release commit `c177904`. Release and CodeQL
+      were in progress; Production Deployment fails at its documented
+      secret/kubeconfig preflight, as in beta 15.
