@@ -449,4 +449,4 @@ still blocks.
 - `native/coraza-sidecar/bench_test.go` — `BenchmarkEvaluateEarlyBlocking`.
 - `docs/coraza-native-sidecar.md` — flag and performance note.
 - `docs/suggestions_from_agents/crs-performance.md` — this report.
-- `CHANGELOG.md`, `current-task.md` — release/task log.
+- `CHANGELOG.md` — release log.
