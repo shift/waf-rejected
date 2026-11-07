@@ -84,14 +84,14 @@ github.com/valllabh/ocsf-schema-golang/ocsf/v1_2_0/events/application
 github.com/valllabh/ocsf-schema-golang/ocsf/v1_2_0/events/application/enums
 github.com/valllabh/ocsf-schema-golang/ocsf/v1_2_0/objects
 github.com/valllabh/ocsf-schema-golang/ocsf/v1_2_0/objects/enums
-# golang.org/x/net v0.60.0
+# golang.org/x/net v0.62.0
 ## explicit; go 1.26.0
 golang.org/x/net/html
 golang.org/x/net/html/atom
-# golang.org/x/sync v0.23.0
+# golang.org/x/sync v0.24.0
 ## explicit; go 1.26.0
 golang.org/x/sync/singleflight
-# golang.org/x/text v0.42.0
+# golang.org/x/text v0.43.0
 ## explicit; go 1.26.0
 golang.org/x/text/internal/language
 golang.org/x/text/internal/language/compact

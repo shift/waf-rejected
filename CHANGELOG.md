@@ -17,7 +17,16 @@ End-to-end p50 is 0.924 ms at 4 KiB (from 1.09 ms), 1.354 ms at 8 KiB (from
 fixes the `--no-default-features` build (gRPC stream-inspector stub), removes
 the vulnerable OpenTelemetry SDK in favour of the `opentelemetry` 0.33 API, and
 makes the public workflows resilient (Nix-based SBOM, opt-in non-blocking GHCR
-push, fixable-only Trivy gate, SARIF permissions, kube preflight gating).
+push, fixable-only Trivy gate, SARIF permissions, kube preflight gating). The
+Coraza reactor and native sidecar are rebuilt with `golang.org/x/net` 0.62.0,
+closing CVE-2026-78661.
+
+### Security
+
+- Rebuilt the Coraza WASI reactor and native sidecar with
+  `golang.org/x/net` 0.62.0 (from 0.60.0), resolving CVE-2026-78661
+  (`golang.org/x/net/html` denial of service). The vendored Coraza tree and
+  module checksums were regenerated; no WAF rule behaviour changed.
 
 ### Performance
 
