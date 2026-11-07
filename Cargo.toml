@@ -1,0 +1,567 @@
+[package]
+name = "waf-ingress"
+version = "0.1.0-beta.15"
+edition = "2021"
+authors = ["WAF-Rejected contributors"]
+description = "High-Performance Rust-Based WAF Ingress"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/shift/waf-rejected"
+homepage = "https://github.com/shift/waf-rejected"
+
+[[bin]]
+name = "waf-ingress"
+path = "src/main.rs"
+
+[[bin]]
+name = "waf-events-query"
+path = "src/bin/waf-events-query.rs"
+required-features = ["export-sled"]
+
+[[bin]]
+name = "create_sample_db"
+path = "src/bin/create_sample_db.rs"
+required-features = ["export-sled"]
+
+[[bin]]
+name = "storage_adapter_test"
+path = "src/bin/storage_adapter_test.rs"
+
+[[bin]]
+name = "io_performance_test"
+path = "src/bin/io_performance_test.rs"
+
+[[bin]]
+name = "network_io_performance_test" 
+path = "src/bin/network_io_performance_test.rs"
+
+[[bin]]
+name = "grpc-allowlist"
+path = "src/bin/grpc-allowlist.rs"
+
+[[bin]]
+name = "graphql-allowlist"
+path = "src/bin/graphql-allowlist.rs"
+required-features = ["wasm-reactor"]
+
+[[bin]]
+name = "load-validate"
+path = "src/bin/load_validate.rs"
+
+[[bin]]
+name = "crs_corpus"
+path = "src/bin/crs_corpus.rs"
+
+[[bin]]
+name = "hyperscan-bench"
+path = "src/bin/hyperscan_bench.rs"
+required-features = ["hyperscan-eval"]
+
+
+[[bin]]
+name = "fastpath_bench"
+path = "src/bin/fastpath_bench.rs"
+required-features = ["fastpath"]
+
+[[bin]]
+name = "coraza_abi_bench"
+path = "src/bin/coraza_abi_bench.rs"
+required-features = ["wasm-reactor"]
+
+[[bin]]
+name = "native_detect_bench"
+path = "src/bin/native_detect_bench.rs"
+required-features = ["native-detect"]
+
+
+[[bin]]
+name = "memory-soak"
+path = "src/bin/memory_soak.rs"
+required-features = ["wasm-reactor"]
+
+[[bin]]
+name = "rule_accounting"
+path = "src/bin/rule_accounting.rs"
+
+
+[[bin]]
+name = "rust-engine-parity"
+path = "src/bin/rust_engine_parity.rs"
+required-features = ["rust-engine"]
+
+# Serial vs parallel ARGS candidate evaluation prototype. Non-default feature.
+[[bin]]
+name = "parallel-args-bench"
+path = "src/bin/parallel_args_bench.rs"
+required-features = ["rust-engine", "parallel-args"]
+
+# Layered sub-millisecond budget benchmark. Native rows need `coraza-native`
+# and a running sidecar; wasm rows need the default `wasm-reactor` feature.
+#   cargo run --release --features wasm-reactor,coraza-native --bin bench-subms
+[[bin]]
+name = "bench-subms"
+path = "src/bin/bench_subms.rs"
+required-features = ["coraza-native"]
+
+# Loopback echo benchmark comparing the default tokio path against the
+# io_uring fd path. Requires the non-default feature.
+[[bin]]
+name = "io-uring-network-bench"
+path = "src/bin/io_uring_network_bench.rs"
+required-features = ["io-uring"]
+
+[dependencies]
+# Async runtime and HTTP
+tokio = { version = "1.0", features = ["full"] }
+# Raw syscalls for the optional io_uring network backend.
+libc = "0.2"
+hyper = { version = "1.0", features = ["full", "server", "client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+
+# WebSocket support
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", features = ["sink"] }
+
+# Tower middleware stack
+tower = { version = "0.4", features = ["full"] }
+tower-http = { version = "0.5", features = ["trace", "cors", "add-extension"] }
+
+# TLS support
+rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2.0"
+webpki-roots = "1"
+socket2 = "0.6"
+
+# HTTP connector for clients
+hyper-rustls = { version = "0.27", features = ["http1", "http2"] }
+
+# HTTP/3 (QUIC) support, enabled with the `http3` feature
+# NOTE: quinn 0.11.18 does not exist on crates.io; 0.11.12 is the latest
+# release and requires quinn-proto ^0.11.18. The proto crate is pinned to
+# 0.11.18 in Cargo.lock.
+quinn = { version = "0.11.12", optional = true, default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+h3 = { version = "0.0.8", optional = true }
+h3-quinn = { version = "0.0.10", optional = true }
+
+# WebTransport (WebTransport over HTTP/3), enabled with the `webtransport`
+# feature. Uses the ring crypto provider and quinn re-export so the ALPN and
+# rustls provider match the HTTP/3 listener.
+wtransport = { version = "0.7.2", optional = true, default-features = false, features = ["ring", "quinn"] }
+
+# Logging and tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Configuration and serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+config = "0.14"
+toml = "0.8"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# HTTP utilities
+http = "1.0"
+bytes = "1.0"
+# uuid moved to additional dependencies section
+
+# Async utilities
+futures = "0.3"
+pin-project = "1.0"
+parking_lot = "0.12"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# ModSecurity WASM Go integration
+
+# WebAssembly runtime for the experimental reactor ABI. Only pulled in by the
+# non-default `wasm-reactor` feature. `p1` provides the WASI preview1 imports
+# used by the Go/Coraza reactor; `wat` keeps the in-tree WAT spike loadable.
+wasmtime = { version = "49.0", optional = true, default-features = false, features = ["std", "runtime", "cranelift", "wat", "parallel-compilation", "async", "component-model"] }
+wasmtime-wasi = { version = "49.0", optional = true, default-features = false, features = ["p1"] }
+
+# Bounded request-body decompression (gzip/deflate via flate2, brotli via brotli)
+flate2 = "1.1"
+brotli = "7.0"
+
+# Streaming body processing
+async-stream = "0.3"
+
+# Enhanced JSON handling for WASM calls
+serde_bytes = "0.11"
+
+# File watching for rule reloading  
+# notify = "6.0" # Moved to additional dependencies section
+
+# Redis client for rate limiting
+
+# Additional dependencies for new features
+regex = "1.10"
+memchr = "2.7"
+# Multi-pattern matcher used by the experimental CRS literal prefilter
+# (`crs-prefilter`). Already in the lockfile as a `regex` transitive dep.
+aho-corasick = { version = "1.1", optional = true }
+# Keyed xxh3-128 (secret mode, SIMD) for the experimental allow-verdict cache.
+# Non-default feature `allow-cache`; see
+# docs/design/allow-cache.md.
+xxhash-rust = { version = "0.8", features = ["xxh3"], optional = true }
+
+# Precompiled DFA regex sets for the experimental native engine kernel
+# (`engine-kernel`). Already in the lockfile as a `regex` transitive dep.
+regex-automata = { version = "0.4", optional = true }
+once_cell = "1.19"
+uuid = { version = "1.6", features = ["v4", "serde"] }
+notify = "6.1"
+urlencoding = "2.1"
+async-trait = "0.1"
+
+# Development-only dependencies
+
+# WebSocket handshake dependencies
+sha1 = "0.10"
+sha2 = "0.10"
+base64 = "0.22"
+hex = "0.4"
+# Constant-time comparison for API-key digests.
+subtle = "2"
+
+# OpenTelemetry API for security event export. The SDK (and therefore the OTLP
+# exporter and any TracerProvider/baggage extractor) is intentionally not a
+# dependency: the exporter only builds spans through the global API and defers
+# provider installation to the embedding application.
+opentelemetry = { version = "0.33", optional = true, default-features = false, features = ["trace"] }
+
+# Embedded database for persistence before K/V integration
+sled = { version = "0.34", optional = true }
+
+# High-performance embedded database (Phase 2)
+redb = { version = "3.0", optional = true }
+
+# CLI utilities
+clap = { version = "4.0", features = ["derive"] }
+
+# Random number generation for testing
+rand = "0.8"
+
+# System information
+num_cpus = "1.0"
+
+# Optional global allocators for performance benchmarking. Non-default.
+mimalloc = { version = "0.1", optional = true }
+tikv-jemallocator = { version = "0.6", optional = true }
+
+# Optional CPU affinity/pinning for proxy worker threads. Non-default.
+core_affinity = { version = "0.8", optional = true }
+
+# Memory mapping for optimized WASM loading
+
+# Security modules dependencies
+ipnetwork = "0.20"
+maxminddb = "0.27"
+
+# Threat intelligence integration
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+[dev-dependencies]
+# Testing framework
+proptest = "1"
+testcontainers = "0.15"
+tokio-test = "0.4"
+wiremock = "0.6"
+tempfile = "3.0"
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+# Self-signed certificate generation for TLS WebSocket upstream tests
+rcgen = "0.14"
+# WebTransport client used by the feature-gated integration tests. The
+# dangerous-configuration feature enables the self-signed test client only.
+wtransport = { version = "0.7.2", default-features = false, features = ["ring", "quinn", "dangerous-configuration"] }
+
+[features]
+default = ["export-system", "websocket", "wasm-reactor", "rust-engine"]
+integration-tests = []
+# Legacy component-ABI integration. Intentionally empty and NOT supported:
+# the historical `wasm` module is not compiled, so enabling this feature does
+# not build. Use `wasm-reactor` (the live Coraza WASI reactor) instead.
+wasm-waf = []
+# Request-in/decision-out WASM reactor ABI (wasmtime host) that runs the
+# real Coraza/CRS module before the built-in heuristic rules. Enabled by
+# default; `--no-default-features` or `waf.coraza.enabled = false` opts out.
+# See docs/coraza-wasi-reactor.md.
+wasm-reactor = ["dep:wasmtime", "dep:wasmtime-wasi"]
+# Experimental native Go Coraza sidecar client over a Unix domain socket.
+# Non-default: select with `waf.coraza.backend = "native"`. The sidecar lives
+# in native/coraza-sidecar and is built separately. See
+# docs/coraza-native-sidecar.md.
+coraza-native = []
+# Native Rust engine replacement. Non-default until the engine workstream lands
+# and the guarantee gates (accounting, differential, determinism, bounds,
+# fail-closed) pass against it. Enabling this feature makes the engine
+# guarantees CI job blocking for the Rust differential target.
+native-engine = []
+# Experimental required-literal prefilter for CRS request bodies. Non-default:
+# it is an opt-in evaluation mode until the detection-parity corpus proves it
+# on the deployed rule set. See docs/design/crs-prefilter.md.
+crs-prefilter = ["dep:aho-corasick"]
+# Experimental Vectorscan/Hyperscan multi-pattern evaluation for CRS request
+# bodies. Non-default: links the system `libhs` (nixpkgs `vectorscan`) and
+# implies the literal-prefilter artifact/transforms. See
+# docs/design/hyperscan-evaluation.md.
+hyperscan-eval = ["crs-prefilter"]
+
+# Research prototype: compiled Rust request prefilter that can prove a request
+# clean and skip Coraza. Non-default; see
+# docs/design/fastpath-engine.md.
+fastpath = ["dep:aho-corasick"]
+
+# Experimental content-addressed allow-verdict cache. Non-default and opt-in:
+# it only memoises the verdict of pure content rules for a short TTL and never
+# caches blocks. See docs/design/allow-cache.md.
+allow-cache = ["dep:xxhash-rust"]
+
+# Experimental native Rust WAF evaluation kernel (prototype, non-default).
+# Demonstrates the execution model for a future Coraza replacement: parsed
+# request state, per-value transform cache, compiled matcher DAG, anomaly
+# scoring and early exit. See docs/design/engine-kernel.md.
+engine-kernel = ["dep:aho-corasick", "dep:regex-automata"]
+
+# Native (Rust) ports of Coraza's `@detectSQLi` and `@detectXSS` operators,
+# with decision parity pinned against the CRS corpus. Non-default: the request
+# path keeps using Coraza until a caller opts in. See
+# docs/design/native-detect.md.
+native-detect = []
+
+
+# Native Rust replacement for the Coraza request engine (core vertical slice).
+# Compiled by default and the default `waf.coraza.backend`. Coraza remains the
+# reference implementation and an explicit fallback. See
+# docs/design/rust-engine.md.
+rust-engine = ["dep:aho-corasick", "native-detect"]
+# Compile-in hot-loop instrumentation for the native Rust engine. Non-default
+# and absent from production builds; exposes `RustEngine::evaluate_profiled`.
+# See docs/design/engine-hotloop.md.
+engine-profile = []
+# Experimental candidate-level ARGS parallelism for the native CRS engine. Not
+# part of the default request path; see
+# docs/design/parallel-args.md.
+parallel-args = []
+# Optional global allocator selection for benchmarking. Non-default; the
+# system allocator remains the default. See docs/design/alloc-tuning.md.
+alloc-mimalloc = ["dep:mimalloc"]
+alloc-jemalloc = ["dep:tikv-jemallocator"]
+
+# Optional CPU affinity/pinning for proxy worker threads. Non-default and
+# config-gated; see docs/design/alloc-tuning.md.
+cpu-pinning = ["dep:core_affinity"]
+# Protocol support features
+websocket = []
+# HTTP/3 over QUIC. Not part of default features: it pulls in quinn/h3 and
+# requires TLS 1.3 with certificates configured.
+http3 = ["dep:quinn", "dep:h3", "dep:h3-quinn"]
+# WebTransport over HTTP/3 on a dedicated UDP listener. Not part of default
+# features: it requires TLS 1.3 with certificates configured.
+webtransport = ["dep:wtransport"]
+# Security features
+geoip = []
+# Export system features
+export-system = ["sled"]
+export-otel = ["opentelemetry"]
+export-sled = ["sled"]
+export-redb = ["redb"]
+# Reserved; io_uring backend is a stub in Beta.
+io-uring = []
+# AI/ML threat detection features (heuristic implementation, no heavy ML deps)
+ai-threat-detection = []
+# Compliance features
+compliance = ["sled"]
+
+# Security modules performance benchmarks
+[[bench]]
+name = "security_performance"
+harness = false
+
+# Per-IP rate-limiter contention/cardinality benchmark (baseline vs sharded).
+#   cargo bench --bench rate_limit_shard -- baseline
+#   cargo bench --bench rate_limit_shard -- sharded
+[[bench]]
+name = "rate_limit_shard"
+harness = false
+
+# Opt-in HTTP/2 and upstream-pool tuning benchmark.
+#   cargo bench --bench http2_tuning -- --tuned
+[[bench]]
+name = "http2_tuning"
+harness = false
+
+# Coraza WASI reactor benchmarks; only built with the non-default feature.
+#   cargo bench --features wasm-reactor --bench coraza
+[[bench]]
+name = "coraza"
+harness = false
+required-features = ["wasm-reactor"]
+
+# gRPC field-content scanning (content_scan on/off) benchmarks.
+#   cargo bench --features wasm-reactor --bench grpc_content
+[[bench]]
+name = "grpc_content"
+harness = false
+required-features = ["wasm-reactor"]
+
+# Allow-verdict cache replay benchmark (research prototype).
+#   cargo run --release --example allow_cache_bench \
+#     --features wasm-reactor,allow-cache
+[[example]]
+name = "allow_cache_bench"
+required-features = ["wasm-reactor", "allow-cache"]
+
+[[example]]
+name = "allow_cache_microbench"
+required-features = ["allow-cache"]
+
+[[example]]
+name = "coraza_backend_bench"
+required-features = ["wasm-reactor", "coraza-native"]
+
+[[example]]
+name = "coraza_ipc_profile"
+required-features = ["coraza-native"]
+
+[[example]]
+name = "graphql_inspection"
+required-features = ["wasm-reactor"]
+
+
+# Native Rust CRS engine microbenchmarks (bodyless / 1 / 4 / 8 KiB).
+#   cargo bench --features rust-engine --bench rust_engine
+[[bench]]
+name = "rust_engine"
+harness = false
+required-features = ["rust-engine"]
+
+# wasmtime compiles to native code once per module; optimising it in debug
+# builds keeps `cargo test --features wasm-reactor` responsive without
+# affecting the rest of the development profile.
+[profile.dev.package.wasmtime]
+opt-level = 3
+
+[profile.dev.package.wasmtime-internal-cranelift]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.bench]
+opt-level = 3
+lto = true
+codegen-units = 1
+debug = true
+
+[[bin]]
+name = "enterprise_performance_test"
+path = "src/bin/enterprise_performance_test.rs"
+
+[[bin]]
+name = "enterprise_security_test"
+path = "src/bin/enterprise_security_test.rs"
+
+[[bin]]
+name = "enterprise_compliance_test"
+path = "src/bin/enterprise_compliance_test.rs"
+
+[[bin]]
+name = "enterprise_availability_test"  
+path = "src/bin/enterprise_availability_test.rs"
+
+[[bin]]
+name = "enterprise_modsecurity_test"
+path = "src/bin/enterprise_modsecurity_test.rs"
+
+[[bin]]
+name = "bodyless-bench"
+path = "src/bin/bodyless_bench.rs"
+
+[[bin]]
+name = "progressive_load_test"
+path = "src/bin/progressive_load_test.rs"
+
+[[bin]]
+name = "echo_backend"
+path = "src/bin/echo_backend.rs"
+
+[[bin]]
+name = "end_to_end_test"
+path = "src/bin/end_to_end_test.rs"
+
+[[bin]]
+name = "advanced_test_backend"
+path = "src/bin/advanced_test_backend.rs"
+
+[[bin]]
+name = "comprehensive_waf_test"
+path = "src/bin/comprehensive_waf_test.rs"
+
+[[bin]]
+name = "simple_multi_protocol_test"
+path = "src/bin/simple_multi_protocol_test.rs"
+
+[[bin]]
+name = "phase4_comprehensive_test"
+path = "src/bin/phase4_comprehensive_test.rs"
+
+[[bin]]
+name = "phase4_standalone_test"
+path = "src/bin/phase4_standalone_test.rs"
+
+[[bin]]
+name = "benchmark_core"
+path = "src/bin/benchmark_core.rs"
+
+# Offline CRS literal-extraction tool. Emits rules/crs/prefilter.json and the
+# human-readable summary. Requires the non-default `crs-prefilter` feature.
+[[bin]]
+name = "crs-prefilter-extract"
+path = "src/bin/crs_prefilter_extract.rs"
+required-features = ["crs-prefilter"]
+
+# Prefilter latency / hit-rate / detection-parity harness. The sidecar half
+# needs `coraza-native` in addition to `crs-prefilter`.
+[[bin]]
+name = "crs-prefilter-bench"
+path = "src/bin/crs_prefilter_bench.rs"
+required-features = ["crs-prefilter"]
+
+# Native engine kernel prototype benchmark (p50/p95/p99, MB/s, alloc/request).
+[[bin]]
+name = "engine-kernel-bench"
+path = "src/bin/engine_kernel_bench.rs"
+required-features = ["engine-kernel"]
+
+# Native engine kernel soundness harness over the pinned CRS corpus.
+[[bin]]
+name = "engine-kernel-corpus"
+path = "src/bin/engine_kernel_corpus.rs"
+required-features = ["engine-kernel"]
+
+# Engine-level benchmark for the performance regression gate. Measures the
+# Coraza WASI reactor, the native Rust CRS engine and the experimental kernel
+# behind the same request set. See benchmarks/perf-gate/ and
+# docs/design/perf-gate.md.
+[[bin]]
+name = "perf-gate-bench"
+path = "src/bin/perf_gate_bench.rs"
+required-features = ["wasm-reactor", "rust-engine", "engine-kernel"]
+
+
+# Transform-pipeline latency and allocation harness (p50/p99, allocs/request).
+[[bin]]
+name = "transform-bench"
+path = "src/bin/transform_bench.rs"
+required-features = ["crs-prefilter"]
