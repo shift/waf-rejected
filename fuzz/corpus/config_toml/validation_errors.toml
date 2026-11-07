@@ -1,0 +1,15 @@
+[waf.rate_limit]
+per_ip_enabled = true
+per_ip_max_requests = 0
+per_ip_window_secs = 0
+global_enabled = true
+global_max_requests = 0
+global_window_secs = 0
+
+[server]
+max_body_size = 0
+request_timeout_secs = 0
+
+[security.auth]
+enabled = true
+api_keys = []

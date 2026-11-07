@@ -1,0 +1,58 @@
+bind_addr = "127.0.0.1:8080"
+health_bind_addr = "127.0.0.1:8081"
+upstream_uri = "http://127.0.0.1:3000"
+
+[server]
+max_connections = 1000
+trusted_proxies = []
+request_timeout_secs = 30
+keep_alive_timeout_secs = 90
+enable_http2 = true
+enable_http3 = false
+supported_http_versions = ["1.0", "1.1", "2"]
+max_body_size = 10485760
+
+[logging]
+level = "info"
+json_format = false
+
+[waf]
+enabled = true
+
+[waf.rate_limit]
+per_ip_enabled = true
+per_ip_max_requests = 100
+per_ip_window_secs = 60
+global_enabled = true
+global_max_requests = 10000
+global_window_secs = 60
+
+[waf.security_events]
+enabled = true
+format = "json"
+min_threat_level = "medium"
+enable_cef = true
+cef_output_file = "./logs/security_events.cef"
+cef_device_vendor = "WAF-Rejected"
+cef_device_product = "Security WAF"
+cef_device_version = "1.0.0"
+enable_otel = false
+enable_sled = true
+sled_db_path = "./data/waf_security_events.sled"
+sled_max_events = 100000
+sled_compress = false
+
+[waf.content_inspection]
+enabled = true
+inspect_headers = true
+inspect_body = true
+max_body_size = 10485760
+threat_patterns = ["sql_injection", "xss", "command_injection", "path_traversal"]
+
+[waf.geo_blocking]
+enabled = false
+blocked_countries = []
+blocked_regions = []
+block_tor = false
+block_vpn = false
+block_datacenter = false

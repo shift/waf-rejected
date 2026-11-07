@@ -1,0 +1,343 @@
+# WAF-Rejected high-throughput profile: native Coraza sidecar in the same pod.
+#
+#   kubectl apply -f deploy/kubernetes/native-performance.yaml
+#
+# The proxy and sidecar share an emptyDir at /run/waf. The pod's fsGroup makes
+# that directory group-writable by uid/gid 1000, matching the 0660 socket. The
+# sidecar image ships the CRS bundle read-only at /usr/share/waf/coraza; the
+# sidecar has a read-only root filesystem and no capabilities.
+#
+# This profile is opt-in. The default configuration still uses the wasm
+# backend. Replace the upstream URI and image tags for your environment.
+# The ConfigMap mirrors config/performance-native.toml; keep them in sync.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: waf-native
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: waf-native-config
+  namespace: waf-native
+data:
+  config.toml: |
+    bind_addr = "0.0.0.0:8080"
+    health_bind_addr = "0.0.0.0:8081"
+    # Replace with the in-cluster Service of the protected application.
+    upstream_uri = "http://upstream.default.svc.cluster.local:8080"
+
+    [proxy]
+    upstream_url = "http://upstream.default.svc.cluster.local:8080"
+    bind_addr = "0.0.0.0:8080"
+    timeout_seconds = 30
+    max_request_size = 1048576
+
+    [server]
+    max_connections = 8192
+    trusted_proxies = []
+    request_timeout_secs = 30
+    keep_alive_timeout_secs = 90
+    enable_http2 = true
+    enable_http3 = false
+    supported_http_versions = ["1.0", "1.1", "2"]
+    max_body_size = 1048576
+    grpc_max_stream_bytes = 4194304
+    grpc_max_stream_seconds = 300
+    grpc_aware_rejections = true
+
+    [logging]
+    level = "info"
+    json_format = true
+
+    [waf]
+    enabled = true
+    fail_mode = "closed"
+    upstream_timeout_ms = 30000
+
+    [waf.coraza]
+    enabled = true
+    backend = "native"
+    native_socket_path = "/run/waf/coraza.sock"
+    max_payload_bytes = 65536
+    max_inspect_bytes = 65536
+    oversize_action = "reject"
+    eval_timeout_ms = 5000
+    pool_size = 8
+
+    [waf.admission]
+    enabled = true
+    heavy_permits = 4
+    queue_timeout_ms = 500
+    max_queued = 256
+
+    [waf.rate_limit]
+    per_ip_enabled = true
+    per_ip_max_requests = 6000
+    per_ip_window_secs = 60
+    global_enabled = true
+    global_max_requests = 100000
+    global_window_secs = 60
+
+    [waf.security_events]
+    enabled = true
+    format = "json"
+    min_threat_level = "medium"
+    enable_cef = false
+    enable_otel = false
+    enable_sled = false
+
+    [waf.content_inspection]
+    enabled = true
+    inspect_headers = true
+    inspect_body = true
+    max_body_size = 65536
+    threat_patterns = ["sql_injection", "xss", "command_injection", "path_traversal"]
+
+    [waf.geo_blocking]
+    enabled = false
+    blocked_countries = []
+    blocked_regions = []
+    block_tor = false
+    block_vpn = false
+    block_datacenter = false
+
+    [waf.grpc]
+    enabled = true
+    method_allowlist = []
+    max_message_bytes = 4194304
+    max_frames = 64
+    content_scan = "strings"
+    max_content_scan_bytes = 65536
+
+    [waf.graphql]
+    enabled = true
+    body_scan = "crs"
+    operation_allowlist = []
+    max_body_bytes = 8388608
+    max_query_bytes = 1048576
+    max_variables_bytes = 1048576
+    max_variables = 128
+    max_depth = 128
+    max_aliases = 1024
+    max_fields = 8192
+    allow_mutations = true
+    allow_subscriptions = true
+
+    [security.auth]
+    enabled = false
+    api_keys = []
+    header_name = "X-API-Key"
+    require_https = false
+
+    [security.ai]
+    enabled = false
+    threat_threshold = 0.8
+    timeout_ms = 5000
+
+    [security.compliance]
+    enabled = false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: waf-native
+  namespace: waf-native
+  labels:
+    app.kubernetes.io/name: waf-native
+    app.kubernetes.io/component: ingress
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: waf-native
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: waf-native
+        app.kubernetes.io/component: ingress
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: waf-native
+      containers:
+        - name: waf-proxy
+          image: ghcr.io/shift/waf-rejected:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: RUST_LOG
+              value: info
+            - name: WAF_CONFIG_FILE
+              value: /etc/waf/config.toml
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: health
+              containerPort: 8081
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: health
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: health
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: health
+            periodSeconds: 5
+            failureThreshold: 24
+          resources:
+            requests:
+              cpu: 500m
+              memory: 128Mi
+            limits:
+              cpu: "4"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: coraza-run
+              mountPath: /run/waf
+              readOnly: true
+            - name: config
+              mountPath: /etc/waf/config.toml
+              subPath: config.toml
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: data
+              mountPath: /var/lib/waf
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]
+
+        # Native Coraza sidecar. It shares the pod network namespace but only
+        # listens on the emptyDir Unix socket; it must never listen on TCP.
+        - name: coraza-sidecar
+          image: ghcr.io/shift/waf-rejected-coraza-sidecar:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - --socket
+            - /run/waf/coraza.sock
+            - --rules
+            - /usr/share/waf/coraza/crs/crs.conf
+            - --max-body
+            - "65536"
+            - --max-headers
+            - "100"
+            - --max-header-bytes
+            - "65536"
+            - --max-conns
+            - "128"
+            - --timeout
+            - 5s
+            - --grace
+            - 10s
+          readinessProbe:
+            exec:
+              command:
+                - /usr/local/bin/coraza-sidecar
+                - --probe
+                - --socket
+                - /run/waf/coraza.sock
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command:
+                - /usr/local/bin/coraza-sidecar
+                - --probe
+                - --socket
+                - /run/waf/coraza.sock
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "1"
+              memory: 256Mi
+            limits:
+              cpu: "4"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: coraza-run
+              mountPath: /run/waf
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: coraza-run
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: config
+          configMap:
+            name: waf-native-config
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: data
+          emptyDir:
+            sizeLimit: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: waf-native
+  namespace: waf-native
+  labels:
+    app.kubernetes.io/name: waf-native
+spec:
+  selector:
+    app.kubernetes.io/name: waf-native
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+    - name: health
+      port: 8081
+      targetPort: health
+---
+# Keep at least one pod serving while nodes drain or roll. With replicas: 2,
+# minAvailable: 1 permits one voluntary disruption at a time.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: waf-native
+  namespace: waf-native
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: waf-native
