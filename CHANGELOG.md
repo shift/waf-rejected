@@ -213,6 +213,11 @@ tooling, and a CycloneDX SBOM with per-asset checksums.
 
 ### Fixed
 
+- Native-engine gRPC field-content scanning now decodes the serialised Coraza
+  payload instead of re-wrapping it as a form body. Benign declared fields are
+  no longer blocked by SQLi-looking text in the synthetic request envelope
+  (for example the method path), and the real HTTP/2 gRPC end-to-end suite
+  passes with the default Rust backend.
 - The Release workflow's SBOM step expected `cargo-cyclonedx` to write
   `.cdx.json`, but 0.5.9 writes `.json`; the shared script now renames the
   output and always writes the checksum. This fixes the previously skipped

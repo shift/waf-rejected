@@ -250,48 +250,55 @@ impl ResponseEvaluator for RustEngineResponseEvaluator {
 
 /// gRPC field-content scanner for the default Rust backend.
 ///
-/// The raw protobuf never reaches the engine; the gRPC inspector hands over
-/// the same synthetic `f0=...&f1=...` form payload the Coraza scanner used.
+/// The gRPC inspector hands over the serialised Coraza payload for the
+/// synthetic `f0=...&f1=...` form request. The WASI reactor parses that JSON
+/// inside the guest; the native engine has no guest, so it decodes the same
+/// payload here and evaluates the synthetic request directly. Wrapping the
+/// JSON as a form body would inspect the serialised envelope instead of the
+/// field values and could block benign content on the embedded method path.
 pub struct RustEngineContentScanner {
     engine: Arc<RustEngine>,
 }
 
+#[derive(serde::Deserialize)]
+struct ContentScanPayload {
+    method: String,
+    uri: String,
+    http_version: String,
+    headers: Vec<(String, String)>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    body_encoding: Option<String>,
+}
+
 impl crate::waf::grpc::GrpcContentScanner for RustEngineContentScanner {
     fn scan(&self, payload: &[u8]) -> Result<Decision, String> {
-        let mut headers = hyper::HeaderMap::new();
-        headers.insert(
-            hyper::header::CONTENT_TYPE,
-            hyper::header::HeaderValue::from_static("application/x-www-form-urlencoded"),
-        );
-        headers.insert(
-            hyper::header::HOST,
-            hyper::header::HeaderValue::from_static("grpc-content-scan.invalid"),
-        );
-        headers.insert(
-            hyper::header::USER_AGENT,
-            hyper::header::HeaderValue::from_static("waf-grpc-content-scan/1.0"),
-        );
-        headers.insert(
-            hyper::header::ACCEPT,
-            hyper::header::HeaderValue::from_static("*/*"),
-        );
-        // A POST without Content-Length trips CRS protocol rule 920180.
-        headers.insert(
-            hyper::header::CONTENT_LENGTH,
-            hyper::header::HeaderValue::from_str(&payload.len().to_string())
-                .map_err(|err| format!("failed to build gRPC content-scan length: {err}"))?,
-        );
+        use base64::Engine as _;
 
-        let ctx = RequestContext::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-            hyper::Method::POST,
-            hyper::Uri::from_static("/__grpc__/content-scan"),
-            headers,
-            Some(payload.len()),
-        )
-        .with_body(Some(bytes::Bytes::copy_from_slice(payload)));
+        let payload: ContentScanPayload = serde_json::from_slice(payload)
+            .map_err(|err| format!("failed to decode gRPC content-scan payload: {err}"))?;
+        let body = match (payload.body, payload.body_encoding.as_deref()) {
+            (Some(body), Some("base64")) => Some(
+                base64::engine::general_purpose::STANDARD
+                    .decode(body)
+                    .map_err(|err| format!("failed to decode gRPC content-scan body: {err}"))?,
+            ),
+            (Some(body), _) => Some(body.into_bytes()),
+            (None, _) => None,
+        };
 
-        evaluate_request(&self.engine, &ctx).map_err(|err| err.to_string())
+        let request = EngineRequest {
+            method: &payload.method,
+            uri: &payload.uri,
+            http_version: &payload.http_version,
+            headers: &payload.headers,
+            body: body.as_deref(),
+        };
+        self.engine
+            .evaluate_detailed(&request)
+            .map(|outcome| outcome.decision)
+            .map_err(|err| err.to_string())
     }
 }
 
@@ -438,5 +445,38 @@ mod adapter_tests {
             .with_fallback(Box::new(SharedFallback(Arc::clone(&fallback))));
         assert_eq!(rule.evaluate(&context()), Decision::Allow);
         assert_eq!(fallback.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn content_scanner_decodes_the_serialised_payload() {
+        use crate::waf::grpc::GrpcContentScanner as _;
+
+        let engine = RustEngine::from_conf_str(
+            r#"SecRule ARGS "@rx attack" "id:1001,phase:2,deny,status:403""#,
+            ".",
+            CompilePolicy::Report,
+        )
+        .expect("test rule compiles");
+        let scanner = RustEngineRule::new(Arc::new(engine)).content_scanner();
+
+        let payload = |body: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "method": "POST",
+                "uri": "/__grpc__/helloworld.Greeter/Sqli",
+                "http_version": "HTTP/2.0",
+                "headers": [["content-type", "application/x-www-form-urlencoded"]],
+                "body_size": body.len(),
+                "body_original_size": body.len(),
+                "body_encoding": "utf8",
+                "body": body,
+            }))
+            .unwrap()
+        };
+
+        assert!(matches!(
+            scanner.scan(&payload("f0=attack")).unwrap(),
+            Decision::Block { .. }
+        ));
+        assert_eq!(scanner.scan(&payload("f0=alice")).unwrap(), Decision::Allow);
     }
 }
