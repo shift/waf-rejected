@@ -111,10 +111,24 @@ that declare the environment and would not be seen by `preflight`.
 
 | Name | Kind | Required by | Purpose |
 | --- | --- | --- | --- |
-| `STAGING_KUBE_CONFIG` | Secret | `deploy-staging` | Base64-encoded kubeconfig for the staging cluster |
-| `PRODUCTION_KUBE_CONFIG` | Secret | `deploy-production`, `rollback` | Base64-encoded kubeconfig for the production cluster |
-| `CACHIX_AUTH_TOKEN` | Secret | `test` | Push access to the `waf-rejected` Cachix cache; optional for read-only/anonymous cache use |
-| `PUSH_IMAGE` | Repository variable | `build-image` | Set to `true` to enable GHCR publishing |
+| `STAGING_KUBE_CONFIG` | Secret (optional) | `deploy-staging` | Base64-encoded kubeconfig for the staging cluster; missing means the job skips |
+| `PRODUCTION_KUBE_CONFIG` | Secret (optional) | `deploy-production`, `rollback` | Base64-encoded kubeconfig for the production cluster; missing means the jobs skip |
+| `CACHIX_AUTH_TOKEN` | Secret (optional) | `test` | Push access to the `waf-rejected` Cachix cache. Missing means the build uses the default Nix substituters only |
+| `PUSH_IMAGE` | Repository variable (optional) | `build-image` | Set to `true` to enable GHCR publishing |
+
+No secret is required for the pipeline to pass: `security-scan`, `test` and
+`build-image` always run. The only mandatory capability is the default
+`GITHUB_TOKEN` (`contents: read`), which every workflow receives.
+
+### Optional Cachix cache
+
+`test` installs Nix unconditionally with `cachix/install-nix-action` and then
+runs `cachix/cachix-action` only when the token exists. Because GitHub does not
+expose `secrets` to a step-level `if`, `preflight` publishes
+`cachix_configured`; the cache step is gated on that output and marked
+`continue-on-error` so an unreachable or non-writable cache cannot fail the
+build. With no token the job runs plain `nix build`/`nix develop` against the
+public substituters — slower on a cold cache, but functionally identical.
 
 The deploy jobs also reference the `staging` and `production` GitHub
 environments, so environment protection rules (required reviewers, wait
@@ -137,6 +151,8 @@ manual `workflow_dispatch` inputs.
 | `sbom` fails with `nix: command not found` | The job installs Nix with `cachix/install-nix-action`. Check that the action step was not skipped. |
 | SARIF upload fails with `Resource not accessible by integration` | The job is missing `security-events: write`, or code scanning is disabled for the repository. |
 | Deploy jobs report "skipped" | `preflight` did not find the matching repository/organization kubeconfig secret. Add it, or accept that deployment is disabled. |
+| `test` logs "CACHIX_AUTH_TOKEN is not configured" | Expected on forks and unconfigured repositories. The build continues with public substituters; add the secret to speed it up. |
+| Security scan produces SARIF but the upload is skipped | `upload-sarif` runs with `if: always()`; the job still needs `security-events: write`, which it declares, and code scanning must be enabled. |
 | Trivy blocks a release | At least one fixable `HIGH`/`CRITICAL` finding exists. Upgrade or remove the dependency; unfixed findings do not block. |
 
 Release and production workflows intentionally have no `workflow_dispatch`
