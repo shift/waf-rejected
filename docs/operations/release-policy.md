@@ -41,6 +41,7 @@ Verify downloaded assets in this order:
 A failed checksum or attestation means the file must not be deployed. Report it
 through the private channel in [`SECURITY.md`](../../SECURITY.md).
 
-While GitHub Actions is billing-blocked, releases are built locally and have no
-provenance attestation. Record that fact in the release notes; checksums and
-`scripts/verify-release.sh` still apply.
+Releases published by the tag-driven `Release` workflow carry a provenance
+attestation. Locally built releases do not; record that fact in the release
+notes. Checksums and `scripts/verify-release.sh` still apply. See
+[`ci.md`](ci.md) for triggers, GHCR publishing and fallbacks.

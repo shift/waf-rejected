@@ -8,9 +8,9 @@
 # checks (cargo-deny), Helm chart validation and container image build are
 # layered on top.
 #
-# This is the local equivalent of the GitHub Actions workflows. Actions is
-# billing-blocked, so this script (and `scripts/ci-feature-matrix.sh`) is the
-# source of truth for CI.
+# This is the local equivalent of the GitHub Actions workflows. It remains the
+# fastest way to reproduce CI locally; `scripts/ci-feature-matrix.sh` mirrors
+# the feature matrix workflow.
 #
 # Usage:
 #   ./scripts/ci-local.sh

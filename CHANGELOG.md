@@ -4,6 +4,21 @@ All notable changes to WAF-Rejected are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- Public GitHub Actions workflows no longer fail on missing infrastructure:
+  - `release.yml` installs Nix in the `sbom` job, makes GHCR publishing opt-in
+    through the `PUSH_IMAGE` repository variable while still building and
+    attaching the image tarball, and blocks releases only on fixable
+    `HIGH`/`CRITICAL` Trivy findings (`ignore-unfixed: true`).
+  - `production-deployment.yml` requests `security-events: write` for SARIF
+    uploads and skips deploy/rollback when the staging or production
+    kubeconfig secret is absent, using a `preflight` job because secrets are
+    not available to job-level `if` expressions.
+  - Added [`docs/operations/ci.md`](docs/operations/ci.md) covering triggers,
+    permissions, required secrets/variables, the GHCR fallback and the Trivy
+    policy.
+
 ## [0.1.0-beta.14] - 2026-11-07
 
 ### Release summary

@@ -31,11 +31,13 @@ built by the GitHub Release workflow also carry a build provenance attestation.
 
 ## Registry publishing (manual)
 
-The Release workflow pushes the tagged image to GHCR. If registry publishing is
-unavailable, the image tarball attached to the release is the supported
-fallback: load it with `docker load` or `podman load` as shown below. The same
-image can be built and pushed manually from a machine with registry
-credentials:
+The Release workflow pushes the tagged image to GHCR only when the repository
+variable `PUSH_IMAGE=true`; see [`ci.md`](ci.md#ghcr-publishing-is-opt-in). If
+registry publishing is unavailable (for example the workflow token lacks
+package write access and the push is rejected with HTTP 403), the image tarball
+attached to the release is the supported fallback: load it with `docker load`
+or `podman load` as shown below. The same image can be built and pushed
+manually from a machine with registry credentials:
 
 ```bash
 VERSION=0.1.0-beta.14

@@ -199,16 +199,18 @@ through `aquasecurity/trivy-action` in `.github/workflows/release.yml`:
 Both scans:
 
 - report `HIGH` and `CRITICAL` findings only;
-- fail the job when any finding is present (`exit-code: 1`), including findings
-  without an upstream fix (`ignore-unfixed: false`);
+- fail the job only when a finding has an upstream fix available
+  (`exit-code: 1`, `ignore-unfixed: true`);
+- report findings without a fix in SARIF without blocking the release;
 - emit SARIF to the repository's code-scanning dashboard with separate
   `trivy-filesystem` and `trivy-image` categories, even when the scan fails.
 
-`build-release` depends on both scan jobs, so a failing scan blocks the release.
-The jobs request `contents: read` and `security-events: write`; the latter is
-required to upload SARIF. If the repository has code scanning disabled, the
-scan still blocks the release even though the SARIF upload step reports an
-error.
+`build-release` depends on both scan jobs, so a fixable `HIGH`/`CRITICAL`
+finding blocks the release. Unfixed advisories must still be triaged and
+recorded here. The jobs request `contents: read` and `security-events: write`;
+the latter is required to upload SARIF. If the repository has code scanning
+disabled, the SARIF upload step reports an error; the scan result itself still
+gates the release. See [`ci.md`](ci.md#vulnerability-policy).
 
 ### Running Trivy locally
 
@@ -224,14 +226,14 @@ missing, use the Nix shell:
 ```bash
 # Filesystem/dependency scan (same thresholds as CI)
 nix shell nixpkgs#trivy -c trivy fs \
-  --scanners vuln --severity HIGH,CRITICAL --exit-code 1 .
+  --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 .
 
 # Release image scan from the published tag, a locally built image, or a
 # release tarball (`trivy image --input waf-rejected-<version>-image.tar.gz`)
 nix shell nixpkgs#trivy -c trivy image \
-  --severity HIGH,CRITICAL --exit-code 1 ghcr.io/shift/waf-rejected:<tag>
+  --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 ghcr.io/shift/waf-rejected:<tag>
 nix shell nixpkgs#trivy -c trivy image \
-  --severity HIGH,CRITICAL --exit-code 1 waf-rejected:local-ci
+  --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 waf-rejected:local-ci
 ```
 
 Trivy downloads its vulnerability database on first use; on an air-gapped host,

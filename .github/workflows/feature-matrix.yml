@@ -6,7 +6,8 @@ name: Feature Matrix
 #   ./scripts/ci-feature-matrix.sh
 #   ./scripts/run-crs-corpus.sh --engine both
 #   ./scripts/check-engine-guarantees.sh
-# `workflow_dispatch` remains the manual trigger for when Actions is re-enabled.
+# `workflow_dispatch` remains available for on-demand runs (including the
+# optional corpus and engine-guarantee jobs).
 #
 # Guards against feature-combination regressions (for example a test module
 # that only compiles with `coraza-native`, which the default feature set did

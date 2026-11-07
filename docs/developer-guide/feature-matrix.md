@@ -11,10 +11,11 @@ with `cargo test --features coraza-native`.
 `scripts/ci-feature-matrix.sh` and `.github/workflows/feature-matrix.yml` run
 the same combinations so the gap cannot reopen.
 
-GitHub Actions is currently billing-blocked. The local gate is
-`./scripts/ci-local.sh`; it runs fmt, clippy (including all targets), tests,
-this feature matrix, shipped-config validation, the 16-case CRS smoke corpus
-and `nix build .#waf-ingress`. The `workflow_dispatch` inputs in
+The workflow runs on public GitHub Actions for pushes and pull requests to
+`main`. The local gate remains `./scripts/ci-local.sh`; it runs fmt, clippy
+(including all targets), tests, this feature matrix, shipped-config
+validation, the 16-case CRS smoke corpus and `nix build .#waf-ingress`. The
+`workflow_dispatch` inputs in
 `.github/workflows/feature-matrix.yml` map to the optional local scripts
 `scripts/run-crs-corpus.sh` and `scripts/check-engine-guarantees.sh`.
 

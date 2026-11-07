@@ -71,7 +71,7 @@ Checksums and attestations are complementary: the `.sha256` file detects
 corruption, the attestation binds the artifact to this repository's release
 pipeline.
 
-Local releases built while GitHub Actions is billing-blocked have no
+Local releases built without the Release workflow have no provenance
 attestation. In that case `scripts/verify-release.sh` still validates the
 checksums, SBOM, module digest, tarball contents, `--version` and health smoke
 test; record in the release notes that provenance attestations are absent.
@@ -94,9 +94,9 @@ curl -o /dev/null -w '%{http_code}\n' -X POST --data '<script>alert(1)</script>'
 - [ ] Commit release version and changelog.
 - [ ] Tag `v0.1.0-beta.14`.
 - [ ] Push branch and tag.
-- [ ] Build the local release assets with
-      `./create_release_artifacts.sh <version>` (GitHub Actions is currently
-      billing-blocked; local builds are the supported path).
+- [ ] Let the `Release` workflow publish the assets, or build them locally
+      with `./create_release_artifacts.sh <version>` if Actions or GHCR is
+      unavailable. See [`ci.md`](ci.md) for the GHCR fallback.
 - [ ] Confirm the release contains every asset:
       - `waf-rejected-v<version>-x86_64-linux.tar.gz` (binary tarball,
         includes `wasm/coraza_reactor.wasm`, `wasm/LICENSE-CRS`,

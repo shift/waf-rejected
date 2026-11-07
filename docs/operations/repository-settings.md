@@ -78,8 +78,9 @@ The active ruleset `main-protection` targets `refs/heads/main` and enforces:
 - Review conversations must be resolved before merge.
 - Stale approvals are dismissed on new pushes.
 - No required approving reviews, so a sole maintainer can still merge.
-- No required status checks while GitHub Actions is billing-blocked. Add them
-  once CI is restored; otherwise every PR would be unmergeable.
+- Required status checks are not configured yet. Add the `fmt + clippy`,
+  `test --lib` and security-scan checks once the public workflows have run
+  cleanly on `main`; see [`ci.md`](ci.md).
 
 Reproduce:
 
