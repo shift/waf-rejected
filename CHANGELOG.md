@@ -222,9 +222,8 @@ tooling, and a CycloneDX SBOM with per-asset checksums.
   `.cdx.json`, but 0.5.9 writes `.json`; the shared script now renames the
   output and always writes the checksum. This fixes the previously skipped
   CycloneDX asset.
-- Documented the GHCR limitation caused by GitHub Actions billing and added a
-  manual `podman push` / `docker push` procedure plus the image-tarball
-  fallback in `docs/operations/container.md`.
+- Added the GHCR publishing procedure and the image-tarball fallback to
+  `docs/operations/container.md`.
 
 ### Fixed
 

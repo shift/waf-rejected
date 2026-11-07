@@ -12,7 +12,7 @@ The image is a Debian slim runtime with the `waf-ingress` binary, the bundled
 | Item | Value |
 |---|---|
 | Registry image | `ghcr.io/shift/waf-rejected` |
-| Tag convention | `v<version>`, for example `v0.1.0-beta.13` |
+| Tag convention | `v<version>`, for example `v0.1.0-beta.14` |
 | Tarball convention | `waf-rejected-<version>-image.tar.gz` |
 | Checksum asset | `waf-rejected-<version>-image.tar.gz.sha256` |
 | Proxy port | `8080` (`bind_addr`) |
@@ -27,22 +27,18 @@ Tags are mutable; a digest is not. Pin by digest for anything that matters.
 
 Every tagged release publishes the image tarball, the binary tarball and the
 CycloneDX SBOM, each with a matching `<asset>.sha256` checksum file. Releases
-built by the GitHub Release workflow also carry a build provenance attestation;
-local releases built while Actions is billing-blocked do not.
+built by the GitHub Release workflow also carry a build provenance attestation.
 
 ## Registry publishing (manual)
 
-**Current limitation:** GitHub Actions is billing-blocked, so the Release
-workflow's `build-image` job cannot push to GHCR. A release may therefore have
-no `ghcr.io/shift/waf-rejected:v<version>` tag. The image tarball attached to
-the release is the supported fallback: load it with `docker load` or
-`podman load` as shown below.
-
-Do not block a release on the GHCR tag. If registry publishing is required,
-build and push the image manually from a machine with registry credentials:
+The Release workflow pushes the tagged image to GHCR. If registry publishing is
+unavailable, the image tarball attached to the release is the supported
+fallback: load it with `docker load` or `podman load` as shown below. The same
+image can be built and pushed manually from a machine with registry
+credentials:
 
 ```bash
-VERSION=0.1.0-beta.13
+VERSION=0.1.0-beta.14
 IMAGE=ghcr.io/shift/waf-rejected
 
 # Build the same image as the Release workflow.
@@ -78,13 +74,13 @@ manifest, and `--deep-image` also checks the reactor digest inside the image.
 
 ```bash
 # Verify the asset against the checksum published with the release
-sha256sum --check waf-rejected-0.1.0-beta.13-image.tar.gz.sha256
+sha256sum --check waf-rejected-0.1.0-beta.14-image.tar.gz.sha256
 
 # Verify the tarball was built by this repository's Release workflow
-gh attestation verify waf-rejected-0.1.0-beta.13-image.tar.gz --repo shift/waf-rejected
+gh attestation verify waf-rejected-0.1.0-beta.14-image.tar.gz --repo shift/waf-rejected
 
-docker load -i waf-rejected-0.1.0-beta.13-image.tar.gz
-# Loaded image: ghcr.io/shift/waf-rejected:v0.1.0-beta.13
+docker load -i waf-rejected-0.1.0-beta.14-image.tar.gz
+# Loaded image: ghcr.io/shift/waf-rejected:v0.1.0-beta.14
 ```
 
 The provenance attestation is published for the image tarball, the binary
@@ -96,21 +92,21 @@ Use the asset name shown on the release page if it differs from the convention
 above. Podman uses the same archive:
 
 ```bash
-podman load -i waf-rejected-0.1.0-beta.13-image.tar.gz
+podman load -i waf-rejected-0.1.0-beta.14-image.tar.gz
 ```
 
-Alternatively pull from the registry, if the tag was published manually (see
+Alternatively pull from the registry (see
 [Registry publishing](#registry-publishing-manual)):
 
 ```bash
-docker pull ghcr.io/shift/waf-rejected:v0.1.0-beta.13
+docker pull ghcr.io/shift/waf-rejected:v0.1.0-beta.14
 ```
 
 If the release notes list a digest, confirm the loaded image matches it:
 
 ```bash
 docker image inspect --format '{{index .RepoDigests 0}}' \
-  ghcr.io/shift/waf-rejected:v0.1.0-beta.13
+  ghcr.io/shift/waf-rejected:v0.1.0-beta.14
 ```
 
 An image loaded from a local tarball may not carry a `RepoDigests` entry until
@@ -192,9 +188,9 @@ curl -o /dev/null -w '%{http_code}\n' \
 ## Pin by digest
 
 ```bash
-docker pull ghcr.io/shift/waf-rejected:v0.1.0-beta.13
+docker pull ghcr.io/shift/waf-rejected:v0.1.0-beta.14
 docker image inspect --format '{{index .RepoDigests 0}}' \
-  ghcr.io/shift/waf-rejected:v0.1.0-beta.13
+  ghcr.io/shift/waf-rejected:v0.1.0-beta.14
 # ghcr.io/shift/waf-rejected@sha256:...
 ```
 
@@ -241,7 +237,7 @@ Service should expose only `8080`.
 5. Record the new digest in your inventory.
 
 ```bash
-docker pull ghcr.io/shift/waf-rejected:v0.1.0-beta.13
+docker pull ghcr.io/shift/waf-rejected:v0.1.0-beta.14
 docker stop waf-rejected && docker rm waf-rejected
 docker run -d --name waf-rejected ... ghcr.io/shift/waf-rejected@sha256:<new-digest>
 ```

@@ -25,7 +25,7 @@ WAF-Rejected is a high-performance, enterprise-grade Web Application Firewall (W
 - **Lint check**: `nix develop -c cargo clippy -- --deny warnings`
 
 ### Current Development Status
-- **Release line**: `0.1.0-beta.13` plus Unreleased changes.
+- **Release line**: `0.1.0-beta.14` plus Unreleased changes.
 - **Default engine**: native Rust CRS engine (`rust-engine`); Coraza 3.3.3 WASI
   reactor is the reference and explicit `backend = "wasm"` switch-back.
 - **Security status**: see the control matrix in
