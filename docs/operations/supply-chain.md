@@ -151,11 +151,11 @@ Generate the release SBOM with the repository script:
 
 ```bash
 # From the Nix dev shell (cargo-cyclonedx is a dev-shell dependency)
-./scripts/generate-sbom.sh 0.1.0-beta.15
+./scripts/generate-sbom.sh 0.1.0-beta.16
 
 # Outside the dev shell the script falls back to a pinned nixpkgs invocation
 nix shell nixpkgs#cargo-cyclonedx nixpkgs#cargo nixpkgs#jq \
-  -c ./scripts/generate-sbom.sh 0.1.0-beta.15
+  -c ./scripts/generate-sbom.sh 0.1.0-beta.16
 ```
 
 The script writes `waf-rejected-<version>.cdx.json` and

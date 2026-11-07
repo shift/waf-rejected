@@ -4,6 +4,54 @@ All notable changes to WAF-Rejected are documented here.
 
 ## [Unreleased]
 
+## [0.1.0-beta.16] - 2026-11-08
+
+### Release summary
+
+Beta 16 removes the remaining fixed wrapper and proxy allocation cost around the
+compiled engine. End-to-end p50 is **0.315 ms bodyless**, **0.454 ms** at 1 KiB,
+**0.810 ms** at 4 KiB and **1.234 ms** at 8 KiB (p99 0.440 / 0.606 / 0.920 /
+1.372 ms), down from 0.346 / 0.523 / 0.858 / 1.284 ms on the same host; the 4
+and 8 KiB targets are met and bodyless is within ~15 µs of its target at the
+median. Corpus agreement is **2,112/2,112** with no detection changes. The
+release includes the beta 15 release commit, the `golang.org/x/net` 0.62.0
+Coraza reactor/native-sidecar rebuild and the release-workflow Trivy scope fix.
+
+### Performance
+
+- The proxy stores the detected HTTP version borrowed (`Cow<'static, str>`)
+  instead of allocating a `String` per request, and the native Rust engine
+  builds its phase-1 collections straight from the request `HeaderMap` and
+  borrowed URI instead of copying every header name/value and the URI
+  (`RustEngine::evaluate_detailed_borrowed`). Non-UTF-8 values keep the previous
+  lossy normalisation.
+- Heuristic content-inspection rules now run one ASCII case-insensitive
+  Aho–Corasick candidate pass per header per rule instead of one
+  required-literal search per pattern per header. Patterns outside the
+  candidate set provably cannot match and skip their regex; non-ASCII values
+  and always-matching literals are never narrowed.
+- The upstream request builder no longer allocates a lowercase copy of every
+  forwarded header name for the hop-by-hop comparison, and formats the client
+  IP once instead of twice. This drops the proxy floor to ~0.104 ms bodyless
+  and removes ~8 allocations per request (15–20 for the full Rust chain).
+- End-to-end p50: bodyless 0.315 ms (from 0.346), 1 KiB 0.454 (0.523), 4 KiB
+  0.810 (0.858), 8 KiB 1.234 (1.284); p99 0.440 / 0.606 / 0.920 / 1.372 ms.
+  Corpus parity 2,112/2,112. See
+  [`docs/design/wrapper-floor.md`](docs/design/wrapper-floor.md).
+
+### Security
+
+- Rebuilt the Coraza WASI reactor and native sidecar with
+  `golang.org/x/net` 0.62.0 (from 0.60.0), resolving CVE-2026-78661
+  (`golang.org/x/net/html` denial of service). The vendored Coraza tree and
+  module checksums were regenerated; no WAF rule behaviour changed.
+
+### Fixed
+
+- Scoped the release workflow's Trivy filesystem gate to `scanners: vuln` so
+  test-only TLS keys under `src/` are not reported as blocking secret findings;
+  dependency/OS `HIGH`/`CRITICAL` findings still gate the release.
+
 ## [0.1.0-beta.15] - 2026-11-07
 
 ### Release summary

@@ -1246,3 +1246,19 @@ Baseline `main` = e05d918: bodyless 0.373 ms, 4 KiB 0.924 ms, 8 KiB
       passed, lib `--no-default-features` 482 passed, integration 60 passed.
 - [x] Verify: fmt, clippy `--lib --deny warnings` (default and no-default).
 - [x] Docs (`docs/suggestions_from_agents/wrapper-floor.md`) + CHANGELOG.
+
+## Release 0.1.0-beta.16 (`release/v0.1.0-beta.16`)
+
+- [x] Bump Cargo.toml/Cargo.lock and version references to 0.1.0-beta.16;
+      Helm chart version refreshed from the stale beta.10 value.
+- [x] CHANGELOG `[0.1.0-beta.16] - 2026-11-08`: wrapper/proxy p50 0.315 /
+      0.454 / 0.810 / 1.234 ms, p99 0.440 / 0.606 / 0.920 / 1.372 ms, corpus
+      2,112/2,112, x/net 0.62.0 reactor rebuild and Trivy scope fix.
+- [x] Verify: fmt, clippy `--lib`, lib tests (626), `--no-default-features`
+      lib (482), integration, release ignored Coraza, h2 gRPC e2e, feature
+      matrix quick, `nix build .#waf-ingress`, SBOM, reactor size.
+- [ ] Build binary/sidecar/image artifacts + SBOM; `verify-release.sh`.
+- [ ] Public orphan snapshot, ruleset disable/force-push/restore, tag
+      `v0.1.0-beta.16` and pre-release with assets.
+- [ ] Confirm public CI (Feature Matrix, Release, CodeQL, Production
+      Deployment) on the release commit; clean worktrees.

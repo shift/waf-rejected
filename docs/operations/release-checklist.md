@@ -3,7 +3,7 @@
 Tag naming, signing and asset-verification rules are in
 [`release-policy.md`](release-policy.md).
 
-## Beta 0.1.0-beta.15
+## Beta 0.1.0-beta.16
 
 ### Verification
 
@@ -79,7 +79,7 @@ test; record in the release notes that provenance attestations are absent.
 ### Smoke test
 
 ```bash
-./result/bin/waf-ingress --version   # waf-ingress 0.1.0-beta.15
+./result/bin/waf-ingress --version   # waf-ingress 0.1.0-beta.16
 WAF_CONFIG_FILE=config.toml ./result/bin/waf-ingress
 curl -f http://127.0.0.1:8081/health
 curl -f http://127.0.0.1:8081/metrics
@@ -90,9 +90,9 @@ curl -o /dev/null -w '%{http_code}\n' -X POST --data '<script>alert(1)</script>'
 ### Publishing
 
 - [ ] Confirm `Cargo.toml`, `CHANGELOG.md`, the tag and the README/support
-      matrix all name the same version (`0.1.0-beta.15` today).
+      matrix all name the same version (`0.1.0-beta.16` today).
 - [ ] Commit release version and changelog.
-- [ ] Tag `v0.1.0-beta.15`.
+- [ ] Tag `v0.1.0-beta.16`.
 - [ ] Push branch and tag.
 - [ ] Let the `Release` workflow publish the assets, or build them locally
       with `./create_release_artifacts.sh <version>` if Actions or GHCR is
