@@ -4,6 +4,22 @@ All notable changes to WAF-Rejected are documented here.
 
 ## [Unreleased]
 
+## [0.1.0-beta.14] - 2026-11-07
+
+### Release summary
+
+Beta 14 closes the November 2026 external security audit. All High, Medium and
+Low findings are fixed: request framing and protocol handling (HTTP/1.x,
+HTTP/2, HTTP/3, gRPC and WebSocket), auth rate limiting, forwarding-header
+parsing, constant-time API-key comparison, HTTP/3 admission bounds and
+allow-cache protocol checks. Upstream response inspection is now available as
+an opt-in native-engine feature (`waf.response_inspection`), disabled by
+default. Dependabot alerts were remediated by upgrading Coraza to 3.8.1 and
+the Go toolchain to 1.26, leaving zero known vulnerable Rust or Go modules in
+the release SBOM. The release also adds repository hardening (rulesets,
+CODEOWNERS, security policy, community files), reproducible CI/release
+tooling, and a CycloneDX SBOM with per-asset checksums.
+
 ### Added
 
 - Opt-in upstream response inspection (`waf.response_inspection`) wired into
