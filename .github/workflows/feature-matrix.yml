@@ -1,0 +1,190 @@
+name: Feature Matrix
+
+# The local equivalent of this workflow (including the `workflow_dispatch`
+# opt-in jobs) is:
+#   ./scripts/ci-local.sh
+#   ./scripts/ci-feature-matrix.sh
+#   ./scripts/run-crs-corpus.sh --engine both
+#   ./scripts/check-engine-guarantees.sh
+# `workflow_dispatch` remains the manual trigger for when Actions is re-enabled.
+#
+# Guards against feature-combination regressions (for example a test module
+# that only compiles with `coraza-native`, which the default feature set did
+# not catch). Mirrors scripts/ci-feature-matrix.sh so the same combinations
+# run locally without GitHub Actions.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_crs_corpus:
+        description: "Run the optional CRS detection corpus (wasm + native parity)"
+        type: boolean
+        default: false
+      run_engine_guarantees:
+        description: "Run accounting + differential + determinism engine gates"
+        type: boolean
+        default: false
+      engine_feature:
+        description: "Require the native Rust engine (blocking differential target)"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "src/engine/**"
+      - "rules/crs/rule-manifest.json"
+      - "tests/corpus/engine/**"
+      - "tests/**"
+      - "benches/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "flake.nix"
+      - "flake.lock"
+      - "rust-toolchain.toml"
+      - "scripts/ci-feature-matrix.sh"
+      - "scripts/run-crs-corpus.sh"
+      - "scripts/vendor-crs-corpus.sh"
+      - "scripts/convert-crs-corpus.py"
+      - "scripts/check-engine-guarantees.sh"
+      - ".github/workflows/feature-matrix.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "src/engine/**"
+      - "rules/crs/rule-manifest.json"
+      - "tests/corpus/engine/**"
+      - "tests/**"
+      - "benches/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "flake.nix"
+      - "flake.lock"
+      - "rust-toolchain.toml"
+      - "scripts/ci-feature-matrix.sh"
+      - "scripts/run-crs-corpus.sh"
+      - "scripts/vendor-crs-corpus.sh"
+      - "scripts/convert-crs-corpus.py"
+      - "scripts/check-engine-guarantees.sh"
+      - ".github/workflows/feature-matrix.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: feature-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt-clippy:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Nix
+        uses: cachix/install-nix-action@v25
+      - name: Check formatting
+        run: nix develop -c cargo fmt -- --check
+      - name: Clippy (default features)
+        run: nix develop -c cargo clippy --lib -- --deny warnings
+
+  lib-tests:
+    name: test --lib (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            args: ""
+          - name: wasm-reactor
+            args: "--features wasm-reactor"
+          - name: wasm-reactor,coraza-native
+            args: "--features wasm-reactor,coraza-native"
+          - name: no-default-features
+            args: "--no-default-features"
+          - name: no-default-features,wasm-reactor
+            args: "--no-default-features --features wasm-reactor"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Nix
+        uses: cachix/install-nix-action@v25
+      - name: Run library tests
+        run: nix develop -c cargo test --lib ${{ matrix.args }}
+
+  compile:
+    name: check ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: all-targets + wasm-reactor,coraza-native
+            args: "--all-targets --features wasm-reactor,coraza-native"
+          - name: all-targets + http3,webtransport,wasm-reactor
+            args: "--all-targets --features http3,webtransport,wasm-reactor"
+          - name: all-targets + ai-threat-detection
+            args: "--all-targets --features ai-threat-detection"
+          - name: bin graphql-allowlist + wasm-reactor
+            args: "--bin graphql-allowlist --features wasm-reactor"
+          - name: bin grpc-allowlist + wasm-reactor
+            args: "--bin grpc-allowlist --features wasm-reactor"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Nix
+        uses: cachix/install-nix-action@v25
+      - name: Check target compilation
+        run: nix develop -c cargo check ${{ matrix.args }}
+
+  crs-corpus:
+    name: CRS detection corpus (optional)
+    # Opt-in only: ignored on push/pull_request and on a default manual run.
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.run_crs_corpus == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Nix
+        uses: cachix/install-nix-action@v25
+      - name: Run CRS corpus (wasm + native parity)
+        run: ./scripts/run-crs-corpus.sh --engine both --json target/crs-corpus.json
+      - name: Upload corpus report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crs-corpus-report
+          path: target/crs-corpus.json
+          if-no-files-found: ignore
+
+  engine-guarantees:
+    name: Engine guarantees (optional)
+    # Opt-in only. Accounting and Coraza determinism are always enforced by the
+    # script; the native Rust differential becomes blocking when engine_feature
+    # is enabled.
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.run_engine_guarantees == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      ENGINE_FEATURE: ${{ github.event.inputs.engine_feature == 'true' && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Nix
+        uses: cachix/install-nix-action@v25
+      - name: Run engine guarantees
+        run: ./scripts/check-engine-guarantees.sh
+      - name: Upload guarantee reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-guarantees-report
+          path: target/engine-guarantees/
+          if-no-files-found: ignore

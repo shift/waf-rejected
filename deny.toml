@@ -1,0 +1,78 @@
+# cargo-deny supply-chain policy for WAF-Rejected.
+#
+# Enforced locally by `scripts/ci-local.sh` and in CI by
+# `.github/workflows/production-deployment.yml`. See
+# `docs/operations/supply-chain.md` for the rationale behind each section.
+#
+# Run: nix shell nixpkgs#cargo-deny nixpkgs#cargo -c cargo deny check
+
+[graph]
+# Check the full dependency graph for every target we ship (Linux containers
+# plus developer machines), so platform-specific crates are also audited.
+targets = []
+all-features = false
+no-default-features = false
+
+[advisories]
+version = 2
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Vulnerabilities are denied (default). Unmaintained/yanked crates only fail
+# when they affect crates we depend on directly; transitive warnings are
+# reported but do not break the build.
+unmaintained = "workspace"
+yanked = "warn"
+ignore = [
+    # rustls-pemfile 2.2.0 is the newest release; the crate is archived and the
+    # advisory has no upgrade path. It is a direct dependency of the ingress
+    # (src/waf/tls_config.rs, src/proxy/http3.rs) for PEM certificate parsing.
+    # Accepted risk: parsing only, no network input beyond operator-provided
+    # TLS material. Follow-up: migrate to rustls-pki-types `PemObject`.
+    { id = "RUSTSEC-2025-0134", reason = "no fixed release; PEM parsing only, migration tracked" },
+]
+
+[licenses]
+version = 2
+# Permissive licences plus the weak-copyleft and notice-style licences that
+# already appear in the dependency tree. Anything else must be reviewed.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "OpenSSL",
+    "bzip2-1.0.6",
+    # Mozilla CA root data shipped by webpki-roots (permissive, data only).
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+# The allowlist is a standing policy: entries are pre-approved for future
+# dependencies even when the current tree does not exercise them (e.g. Zlib,
+# OpenSSL, MPL-2.0, bzip2-1.0.6), so do not fail on unused allowances.
+unused-allowed-license = "allow"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = [
+    # crates.io only. cargo-deny normalises the sparse index
+    # (sparse+https://index.crates.io/) to this canonical git index URL, so a
+    # single entry covers both cargo protocols.
+    "https://github.com/rust-lang/crates.io-index",
+]
+allow-git = []
