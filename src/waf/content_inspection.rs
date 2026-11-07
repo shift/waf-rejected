@@ -1,3 +1,4 @@
+use crate::waf::prefilter_extract::{required_literals, RequiredLiterals};
 use crate::waf::{Decision, RequestContext, WafRule};
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -12,6 +13,19 @@ pub struct ContentInspectionRule {
     // Performance optimization: cache compiled patterns by priority
     high_priority_patterns: Vec<ThreatPattern>,
     low_priority_patterns: Vec<ThreatPattern>,
+    /// Sound disjunctive-literal prechecks parallel to `patterns` /
+    /// `high_priority_patterns` / `low_priority_patterns`. A `None` entry means
+    /// "no gate, always run the regex".
+    gates: Vec<Option<RequiredLiterals>>,
+    high_gates: Vec<Option<RequiredLiterals>>,
+    low_gates: Vec<Option<RequiredLiterals>>,
+}
+
+fn gates_for(patterns: &[ThreatPattern]) -> Vec<Option<RequiredLiterals>> {
+    patterns
+        .iter()
+        .map(|pattern| required_literals(pattern.pattern.as_str()))
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -220,6 +234,9 @@ impl ContentInspectionRule {
     pub fn new(name: &str) -> Self {
         let patterns = COMMON_PATTERNS.clone();
         let (high_priority, low_priority) = Self::categorize_patterns(&patterns);
+        let gates = gates_for(&patterns);
+        let high_gates = gates_for(&high_priority);
+        let low_gates = gates_for(&low_priority);
 
         Self {
             name: name.to_string(),
@@ -229,11 +246,17 @@ impl ContentInspectionRule {
             patterns,
             high_priority_patterns: high_priority,
             low_priority_patterns: low_priority,
+            gates,
+            high_gates,
+            low_gates,
         }
     }
 
     pub fn with_custom_patterns(name: &str, patterns: Vec<ThreatPattern>) -> Self {
         let (high_priority, low_priority) = Self::categorize_patterns(&patterns);
+        let gates = gates_for(&patterns);
+        let high_gates = gates_for(&high_priority);
+        let low_gates = gates_for(&low_priority);
 
         Self {
             name: name.to_string(),
@@ -243,6 +266,9 @@ impl ContentInspectionRule {
             patterns,
             high_priority_patterns: high_priority,
             low_priority_patterns: low_priority,
+            gates,
+            high_gates,
+            low_gates,
         }
     }
 
@@ -258,16 +284,20 @@ impl ContentInspectionRule {
     }
 
     pub fn add_pattern(&mut self, pattern: ThreatPattern) {
+        let gate = required_literals(pattern.pattern.as_str());
         // Categorize new pattern for performance
         match pattern.severity {
             ThreatSeverity::Critical | ThreatSeverity::High => {
                 self.high_priority_patterns.push(pattern.clone());
+                self.high_gates.push(gate.clone());
             }
             ThreatSeverity::Medium | ThreatSeverity::Low => {
                 self.low_priority_patterns.push(pattern.clone());
+                self.low_gates.push(gate.clone());
             }
         }
         self.patterns.push(pattern);
+        self.gates.push(gate);
     }
 
     /// Performance optimization: categorize patterns by priority
@@ -296,7 +326,7 @@ impl ContentInspectionRule {
     /// otherwise encodings such as `UNION+SELECT` or `%3Cscript%3E` bypass
     /// inspection.
     fn fast_check_content(&self, content: &str) -> Option<(&ThreatPattern, String)> {
-        Self::find_match(&self.high_priority_patterns, content)
+        Self::find_match(&self.high_priority_patterns, &self.high_gates, content)
     }
 
     fn check_content(&self, content: &str) -> Option<(&ThreatPattern, String)> {
@@ -304,34 +334,54 @@ impl ContentInspectionRule {
         if let Some(result) = self.fast_check_content(content) {
             return Some(result);
         }
-        Self::find_match(&self.low_priority_patterns, content)
+        Self::find_match(&self.low_priority_patterns, &self.low_gates, content)
     }
 
     /// Check both the raw value and its percent-decoded form. Attackers often
     /// encode quote/space/angle-bracket characters to bypass naive rules.
     fn check_with_decoding(&self, content: &str, full: bool) -> Option<(&ThreatPattern, String)> {
-        let check = |value: &str| {
-            if full {
-                self.check_content(value)
-            } else {
-                self.fast_check_content(value)
-            }
-        };
-
-        if let Some(found) = check(content) {
+        if let Some(found) =
+            Self::find_match(&self.high_priority_patterns, &self.high_gates, content)
+        {
             return Some(found);
+        }
+        if full {
+            if let Some(found) =
+                Self::find_match(&self.low_priority_patterns, &self.low_gates, content)
+            {
+                return Some(found);
+            }
         }
         if let Some(decoded) = percent_decode(content) {
             if decoded != content {
-                return check(&decoded);
+                if let Some(found) =
+                    Self::find_match(&self.high_priority_patterns, &self.high_gates, &decoded)
+                {
+                    return Some(found);
+                }
+                if full {
+                    return Self::find_match(
+                        &self.low_priority_patterns,
+                        &self.low_gates,
+                        &decoded,
+                    );
+                }
             }
         }
         None
     }
 
     fn inspect_body(&self, content: &str) -> Option<(&ThreatPattern, String)> {
-        for pattern in &self.patterns {
+        for (index, pattern) in self.patterns.iter().enumerate() {
             if !pattern.check_body {
+                continue;
+            }
+            if self
+                .gates
+                .get(index)
+                .and_then(Option::as_ref)
+                .is_some_and(|gate| !gate.matches(content.as_bytes()))
+            {
                 continue;
             }
             if let Some(matched) = pattern.pattern.find(content) {
@@ -343,9 +393,17 @@ impl ContentInspectionRule {
 
     fn find_match<'a>(
         patterns: &'a [ThreatPattern],
+        gates: &[Option<RequiredLiterals>],
         content: &str,
     ) -> Option<(&'a ThreatPattern, String)> {
-        for pattern in patterns {
+        for (index, pattern) in patterns.iter().enumerate() {
+            if gates
+                .get(index)
+                .and_then(Option::as_ref)
+                .is_some_and(|gate| !gate.matches(content.as_bytes()))
+            {
+                continue;
+            }
             if let Some(matched) = pattern.pattern.find(content) {
                 return Some((pattern, limited_match_text(matched.as_str()).to_string()));
             }
@@ -435,12 +493,16 @@ impl WafRule for ContentInspectionRule {
 
         // Check headers (optimized for performance)
         if self.inspect_headers {
-            for pattern in &self.high_priority_patterns {
+            for (index, pattern) in self.high_priority_patterns.iter().enumerate() {
                 if !pattern.check_headers {
                     continue;
                 }
+                let gate = self.high_gates.get(index).and_then(Option::as_ref);
                 for (header_name, header_value) in ctx.headers.iter() {
                     if let Ok(header_str) = header_value.to_str() {
+                        if gate.is_some_and(|gate| !gate.matches(header_str.as_bytes())) {
+                            continue;
+                        }
                         if pattern.pattern.is_match(header_str) {
                             return Decision::Block {
                                 status: self.severity_to_status(&pattern.severity),

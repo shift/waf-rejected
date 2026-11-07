@@ -205,10 +205,13 @@ fn is_grpc_request(request: &RequestContext) -> bool {
 /// `Trailer` is deliberately absent: it is an end-to-end field announcing
 /// trailing headers and is required for gRPC over HTTP/1.1.
 pub(crate) fn is_hop_by_hop_header(name: &str) -> bool {
-    matches!(
-        name,
-        "connection" | "proxy-connection" | "keep-alive" | "transfer-encoding" | "upgrade"
-    )
+    // Case-insensitive so callers can pass the wire name without allocating a
+    // lowercase copy on the response hot path.
+    name.eq_ignore_ascii_case("connection")
+        || name.eq_ignore_ascii_case("proxy-connection")
+        || name.eq_ignore_ascii_case("keep-alive")
+        || name.eq_ignore_ascii_case("transfer-encoding")
+        || name.eq_ignore_ascii_case("upgrade")
 }
 
 /// Collect the lower-case field names nominated by every `Connection` header.
@@ -3191,8 +3194,7 @@ impl WafProxyService {
         // `trailer` announces trailing fields and is preserved.
         for (key, value) in headers {
             if let Some(key) = key {
-                let name = key.as_str().to_ascii_lowercase();
-                if !is_hop_by_hop_header(&name) {
+                if !is_hop_by_hop_header(key.as_str()) {
                     response_builder = response_builder.header(key, value);
                 }
             }

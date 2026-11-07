@@ -100,6 +100,10 @@ pub(crate) struct GateGroup {
     pub(crate) automaton: AhoCorasick,
     /// Pattern index -> mask of gate ids.
     pub(crate) pattern_rules: Vec<GateMask>,
+    /// Bit `phase.number() - 1` set when a rule in that phase references one
+    /// of this group's gates. Groups that no rule in the current phase needs
+    /// are not scanned.
+    pub(crate) phases: u8,
 }
 
 /// One rule whose ordered-subsequence prerequisite was proven from its regex.
@@ -114,6 +118,8 @@ pub(crate) struct SubsequenceRule {
 pub(crate) struct SubsequenceGroup {
     pub(crate) plan: Vec<u32>,
     pub(crate) rules: Vec<SubsequenceRule>,
+    /// Phases whose rules use one of these gates.
+    pub(crate) phases: u8,
 }
 
 /// Compiled per-rule gates shared by every request on an engine.
@@ -204,18 +210,24 @@ pub fn attach(program: &mut Program) -> Result<Option<Arc<GateSet>>, String> {
 
     // Only positive regex operators that exist in this program are eligible.
     let mut eligible = BTreeSet::new();
+    // Phase of every rule that may be gated, for per-phase group pruning.
+    let mut rule_phase: BTreeMap<u32, u8> = BTreeMap::new();
     // Regex-only rules that are candidates for an ordered-subsequence gate.
     // They use no transforms, so the extracted prerequisite applies directly
     // to the candidate bytes; the analysis is restricted to the named RCE
     // rules, where the filler-heavy command regexes live.
     let mut subsequence_sources: BTreeMap<u32, &str> = BTreeMap::new();
-    for items in [
+    for (phase_index, items) in [
         &program.phase1,
         &program.phase2,
         &program.phase3,
         &program.phase4,
         &program.phase5,
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let phase_bit = 1u8 << phase_index;
         for item in items {
             let ProgramItem::Rule(group) = item else {
                 continue;
@@ -229,6 +241,7 @@ pub fn attach(program: &mut Program) -> Result<Option<Arc<GateSet>>, String> {
                 };
                 if !operator.negated && matches!(operator.kind, OperatorKind::Rx(_)) {
                     eligible.insert(id);
+                    rule_phase.insert(id, phase_bit);
                     if super::subsequence::is_target_rule(id) && rule.transforms.is_empty() {
                         subsequence_sources.insert(id, operator.argument.as_str());
                     }
@@ -358,11 +371,13 @@ pub fn attach(program: &mut Program) -> Result<Option<Arc<GateSet>>, String> {
     for ((plan, case_insensitive), patterns) in merged {
         let mut literals = Vec::with_capacity(patterns.len());
         let mut masks = Vec::with_capacity(patterns.len());
+        let mut phases = 0u8;
         for (literal, ids) in patterns {
             let mut mask = GateMask::default();
-            for id in ids {
-                if let Some(gate) = gate_for_rule.get(&id) {
+            for id in &ids {
+                if let Some(gate) = gate_for_rule.get(id) {
                     mask.set(*gate);
+                    phases |= rule_phase.get(id).copied().unwrap_or(0);
                 }
             }
             if mask != GateMask::default() {
@@ -382,6 +397,7 @@ pub fn attach(program: &mut Program) -> Result<Option<Arc<GateSet>>, String> {
             plan,
             automaton,
             pattern_rules: masks,
+            phases,
         });
     }
 
@@ -407,7 +423,16 @@ pub fn attach(program: &mut Program) -> Result<Option<Arc<GateSet>>, String> {
     let subsequence_groups: Vec<SubsequenceGroup> = subsequence_groups
         .into_iter()
         .filter(|(_, rules)| !rules.is_empty())
-        .map(|(plan, rules)| SubsequenceGroup { plan, rules })
+        .map(|(plan, rules)| {
+            let phases = rules.iter().fold(0u8, |mask, rule| {
+                mask | rule_phase.get(&rule.id).copied().unwrap_or(0)
+            });
+            SubsequenceGroup {
+                plan,
+                rules,
+                phases,
+            }
+        })
         .collect();
     if groups.is_empty() && subsequence_groups.is_empty() {
         return Ok(None);

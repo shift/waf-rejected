@@ -49,7 +49,9 @@ pub mod prefilter;
 #[cfg(feature = "engine-kernel")]
 pub mod engine_kernel;
 /// Offline extractor that emits `rules/crs/prefilter.json`.
-#[cfg(any(feature = "crs-prefilter", feature = "fastpath"))]
+///
+/// Always compiled: the default Rust engine reuses its conservative
+/// required-literal analysis for the heuristic content-inspection rules.
 pub mod prefilter_extract;
 
 /// Experimental Vectorscan/Hyperscan multi-pattern scanner (non-default).
@@ -118,6 +120,11 @@ use crate::config::Config;
 
 #[cfg(feature = "wasm-waf")]
 use crate::wasm::{SecurityDecision as WasmDecision, WasmEngine, WasmRequestContext};
+
+/// Maximum body size whose native Rust engine scan runs inline on the async
+/// worker instead of the blocking pool. Above this the scan is offloaded so a
+/// pathological request cannot park a runtime worker.
+const INLINE_HEAVY_MAX_BYTES: usize = 64 * 1024;
 
 /// Direct Coraza backend handle used for gRPC field-content scanning.
 #[cfg(feature = "wasm-reactor")]
@@ -353,6 +360,11 @@ pub struct WafEngine {
     /// Bounds concurrent heavy (CRS body) inspections so cheap traffic keeps
     /// at least one reactor worker.
     admission: AdmissionController,
+    /// True when the configured inspection backend is the native Rust engine.
+    /// Its body scans are sub-millisecond for normal request sizes, so running
+    /// them inline avoids a `spawn_blocking` hop and a `RequestContext` clone;
+    /// large bodies are still offloaded (see `INLINE_HEAVY_MAX_BYTES`).
+    inline_heavy: bool,
     /// Shared runtime metrics, when the caller supplied them.
     metrics: Option<Arc<crate::metrics::Metrics>>,
     /// Experimental content-addressed allow-verdict cache (`allow-cache`).
@@ -440,6 +452,7 @@ impl Clone for WafEngine {
             #[cfg(feature = "ai-threat-detection")]
             ai_detector: self.ai_detector.clone(),
             admission: self.admission.clone(),
+            inline_heavy: self.inline_heavy,
             metrics: self.metrics.clone(),
             #[cfg(feature = "allow-cache")]
             allow_cache: self.allow_cache.clone(),
@@ -473,6 +486,7 @@ impl WafEngine {
             #[cfg(feature = "ai-threat-detection")]
             ai_detector: None,
             admission: AdmissionController::disabled(),
+            inline_heavy: false,
             metrics: None,
             #[cfg(feature = "allow-cache")]
             allow_cache: None,
@@ -536,6 +550,8 @@ impl WafEngine {
                 config.waf.coraza.resolved_pool_size(),
                 metrics.clone(),
             ),
+            inline_heavy: config.waf.coraza.enabled
+                && config.waf.coraza.backend == crate::config::CorazaBackend::Rust,
             metrics,
             #[cfg(feature = "allow-cache")]
             allow_cache: None,
@@ -1801,7 +1817,19 @@ impl WafEngine {
             // p95 at concurrency 64 for no throughput gain, because the extra
             // thread hop and the deeper queue cost more than the parked worker
             // does at sub-millisecond inspection times.
-            if cost == admission::InspectionCost::Cheap {
+            //
+            // The native Rust engine is also cheap in absolute terms, so its
+            // normal-size body scans stay inline as well: the `spawn_blocking`
+            // hand-off plus the owned `RequestContext` clone otherwise cost
+            // more than the scan itself. Large bodies keep the blocking-pool
+            // path so a pathological payload cannot park a runtime worker.
+            let inline_body = self.inline_heavy
+                && request
+                    .body
+                    .as_ref()
+                    .map_or(request.body_size.unwrap_or(0), |body| body.len())
+                    <= INLINE_HEAVY_MAX_BYTES;
+            if cost == admission::InspectionCost::Cheap || inline_body {
                 let outcome = self.evaluate_core(request);
                 drop(guard);
                 return self.finish(request, outcome).await;

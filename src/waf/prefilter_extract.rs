@@ -1084,6 +1084,95 @@ struct RegexParser {
     extended: bool,
 }
 
+/// A disjunctive required-literal precheck for one regex.
+///
+/// Built by the same conservative extractor that produces the CRS artifact:
+/// every value the pattern can match contains at least one literal. `matches`
+/// therefore never rules out a real match; a `false` result means the caller
+/// may skip the regex.
+#[derive(Debug, Clone)]
+pub struct RequiredLiterals {
+    literals: Vec<(Vec<u8>, bool)>,
+}
+
+impl RequiredLiterals {
+    /// True when at least one required literal occurs in `haystack`.
+    ///
+    /// Non-ASCII haystacks always return `true`: Unicode case folding could map
+    /// a non-ASCII scalar to an ASCII literal and this precheck only folds
+    /// ASCII, so the regex must decide. The search is allocation-free; the
+    /// literals are short, so a windowed ASCII-case-insensitive compare is
+    /// cheaper than lowercasing a multi-KiB body per pattern.
+    pub fn matches(&self, haystack: &[u8]) -> bool {
+        if !haystack.is_ascii() {
+            return true;
+        }
+        self.literals.iter().any(|(literal, case_insensitive)| {
+            if *case_insensitive {
+                contains_ascii_case_insensitive(haystack, literal)
+            } else {
+                memchr::memmem::find(haystack, literal).is_some()
+            }
+        })
+    }
+}
+
+fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
+    let Some(&first) = needle.first() else {
+        return true;
+    };
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    let (lower, upper) = if first.is_ascii_alphabetic() {
+        (first.to_ascii_lowercase(), first.to_ascii_uppercase())
+    } else {
+        (first, first)
+    };
+    let mut start = 0usize;
+    while let Some(offset) = memchr::memchr2(lower, upper, &haystack[start..]) {
+        let position = start + offset;
+        if position + needle.len() <= haystack.len()
+            && haystack[position..position + needle.len()].eq_ignore_ascii_case(needle)
+        {
+            return true;
+        }
+        start = position + 1;
+    }
+    false
+}
+
+/// Extracts a sound disjunctive literal precheck from one raw `@rx` pattern.
+///
+/// Returns `None` when the pattern cannot be parsed by the conservative
+/// extractor or has no useful mandatory literal; callers then run the regex.
+pub fn required_literals(pattern: &str) -> Option<RequiredLiterals> {
+    let set = extract_regex_literals(pattern).ok()?;
+    // The precheck folds ASCII only. A non-ASCII literal could be matched
+    // through Unicode case folding, and dropping it from the disjunction would
+    // be unsound, so such patterns stay ungated.
+    if set.iter().any(|literal| !literal.text.is_ascii()) {
+        return None;
+    }
+    let literals: Vec<(Vec<u8>, bool)> = set
+        .into_iter()
+        .filter(|literal| !literal.text.is_empty())
+        .map(|literal| {
+            let bytes = if literal.ci {
+                literal.text.to_ascii_lowercase().into_bytes()
+            } else {
+                literal.text.into_bytes()
+            };
+            (bytes, literal.ci)
+        })
+        .collect();
+    if literals.is_empty() {
+        None
+    } else {
+        Some(RequiredLiterals { literals })
+    }
+}
+
 /// Extracts a disjunctive literal set from an `@rx` pattern.
 ///
 /// Every value matched by the pattern contains at least one returned literal.

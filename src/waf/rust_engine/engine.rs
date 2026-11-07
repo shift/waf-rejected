@@ -282,6 +282,21 @@ impl RustEngine {
                     .map(regex::bytes::Regex::capture_locations);
             }
 
+            // The transform cache is scoped to the whole transaction, not one
+            // phase: headers inspected in phase 1 are often re-read by phase 2
+            // rules, and their bytes cannot change. TX/MATCHED_VARS values are
+            // evaluated through the uncached path because they do change.
+            scratch
+                .cache
+                .begin_request(self.program.transform_prefixes.len());
+            let limits = budget.limits();
+            scratch.cache.set_bounds(
+                limits.max_value_bytes,
+                limits.max_total_bytes.saturating_mul(2),
+            );
+            scratch.value_ids.clear();
+            scratch.charged_transform_bytes = scratch.cache.transform_bytes();
+
             let phase1 = self.run_phase(
                 Phase::RequestHeaders,
                 &mut tx,
@@ -387,6 +402,21 @@ impl RustEngine {
                     .as_ref()
                     .map(regex::bytes::Regex::capture_locations);
             }
+
+            // The transform cache is scoped to the whole transaction, not one
+            // phase: headers inspected in phase 1 are often re-read by phase 2
+            // rules, and their bytes cannot change. TX/MATCHED_VARS values are
+            // evaluated through the uncached path because they do change.
+            scratch
+                .cache
+                .begin_request(self.program.transform_prefixes.len());
+            let limits = budget.limits();
+            scratch.cache.set_bounds(
+                limits.max_value_bytes,
+                limits.max_total_bytes.saturating_mul(2),
+            );
+            scratch.value_ids.clear();
+            scratch.charged_transform_bytes = scratch.cache.transform_bytes();
 
             let phase1 = self.run_phase(
                 Phase::RequestHeaders,
@@ -577,17 +607,8 @@ impl RustEngine {
         captures: &mut Captures,
         scratch: &mut Scratch,
     ) -> Result<Option<Decision>, EngineError> {
-        scratch
-            .cache
-            .begin_request(self.program.transform_prefixes.len());
-        let limits = budget.limits();
-        scratch.cache.set_bounds(
-            limits.max_value_bytes,
-            limits.max_total_bytes.saturating_mul(2),
-        );
-        scratch.value_ids.clear();
-        scratch.charged_transform_bytes = scratch.cache.transform_bytes();
         scratch.gate_masks.begin();
+        state.phase_mask = 1u8 << (phase.number() - 1);
         #[cfg(feature = "hyperscan-eval")]
         {
             let words = self
@@ -886,7 +907,7 @@ impl RustEngine {
                 if let Some(gate) = rule.gate {
                     #[cfg(feature = "engine-profile")]
                     let gate_sample = super::profile::sample();
-                    let mask = self.gate_mask(candidate, scratch, budget)?;
+                    let mask = self.gate_mask(candidate, scratch, budget, state)?;
                     #[cfg(feature = "engine-profile")]
                     super::profile::record(
                         super::profile::Category::Gate,
@@ -991,31 +1012,38 @@ impl RustEngine {
             } else {
                 #[cfg(feature = "engine-profile")]
                 let transform_sample = super::profile::sample();
-                let value: &[u8] = match candidate.cache_id {
-                    Some(id) => {
-                        let range = resolve_cached(
-                            &mut scratch.cache,
-                            &mut scratch.value_ids,
-                            &self.program.transform_prefixes,
-                            self.program
-                                .transform_prefixes
-                                .plan(usize::from(rule.pipeline)),
-                            id,
-                            &candidate.value,
-                            &mut scratch.charged_transform_bytes,
-                            budget,
-                        )?;
-                        scratch.cache.bytes(range)
-                    }
-                    None => {
-                        transform_into(
-                            &candidate.value,
-                            pipeline,
-                            budget,
-                            &mut scratch.uncached,
-                            &mut scratch.uncached_tmp,
-                        )?;
-                        &scratch.uncached
+                let value: &[u8] = if pipeline.is_empty() {
+                    // Identity chain: borrow the candidate bytes. Registering
+                    // them in the transform arena would copy the whole value
+                    // (4-8 KiB bodies) for no benefit.
+                    &candidate.value
+                } else {
+                    match candidate.cache_id {
+                        Some(id) => {
+                            let range = resolve_cached(
+                                &mut scratch.cache,
+                                &mut scratch.value_ids,
+                                &self.program.transform_prefixes,
+                                self.program
+                                    .transform_prefixes
+                                    .plan(usize::from(rule.pipeline)),
+                                id,
+                                &candidate.value,
+                                &mut scratch.charged_transform_bytes,
+                                budget,
+                            )?;
+                            scratch.cache.bytes(range)
+                        }
+                        None => {
+                            transform_into(
+                                &candidate.value,
+                                pipeline,
+                                budget,
+                                &mut scratch.uncached,
+                                &mut scratch.uncached_tmp,
+                            )?;
+                            &scratch.uncached
+                        }
                     }
                 };
                 #[cfg(feature = "engine-profile")]
@@ -1320,6 +1348,7 @@ impl RustEngine {
         candidate: &Candidate<'_>,
         scratch: &mut Scratch,
         budget: &mut Budget,
+        state: &EvalState,
     ) -> Result<Option<GateMask>, EngineError> {
         let Some(value_id) = candidate.cache_id else {
             return Ok(None);
@@ -1332,17 +1361,24 @@ impl RustEngine {
         }
         let mut mask = GateMask::default();
         for group in gates.groups() {
-            let range = resolve_cached(
-                &mut scratch.cache,
-                &mut scratch.value_ids,
-                &self.program.transform_prefixes,
-                &group.plan,
-                value_id,
-                &candidate.value,
-                &mut scratch.charged_transform_bytes,
-                budget,
-            )?;
-            let bytes = scratch.cache.bytes(range);
+            if state.phase_mask != 0 && group.phases != 0 && group.phases & state.phase_mask == 0 {
+                continue;
+            }
+            let bytes = if group.plan.is_empty() {
+                &candidate.value[..]
+            } else {
+                let range = resolve_cached(
+                    &mut scratch.cache,
+                    &mut scratch.value_ids,
+                    &self.program.transform_prefixes,
+                    &group.plan,
+                    value_id,
+                    &candidate.value,
+                    &mut scratch.charged_transform_bytes,
+                    budget,
+                )?;
+                scratch.cache.bytes(range)
+            };
             if !group.automaton.is_match(bytes) {
                 continue;
             }
@@ -1359,17 +1395,27 @@ impl RustEngine {
         // alternatives, so every subsequence bit is set (the rule runs).
         if candidate.value.len() >= MIN_SUBSEQUENCE_BYTES {
             for group in gates.subsequence_groups() {
-                let range = resolve_cached(
-                    &mut scratch.cache,
-                    &mut scratch.value_ids,
-                    &self.program.transform_prefixes,
-                    &group.plan,
-                    value_id,
-                    &candidate.value,
-                    &mut scratch.charged_transform_bytes,
-                    budget,
-                )?;
-                let bytes = scratch.cache.bytes(range);
+                if state.phase_mask != 0
+                    && group.phases != 0
+                    && group.phases & state.phase_mask == 0
+                {
+                    continue;
+                }
+                let bytes = if group.plan.is_empty() {
+                    &candidate.value[..]
+                } else {
+                    let range = resolve_cached(
+                        &mut scratch.cache,
+                        &mut scratch.value_ids,
+                        &self.program.transform_prefixes,
+                        &group.plan,
+                        value_id,
+                        &candidate.value,
+                        &mut scratch.charged_transform_bytes,
+                        budget,
+                    )?;
+                    scratch.cache.bytes(range)
+                };
                 let mut present = [0u64; 4];
                 for &byte in bytes {
                     present[usize::from(byte) >> 6] |= 1u64 << (byte & 63);
@@ -1804,7 +1850,12 @@ fn eval_operator(
         return false;
     };
     let ctx = OpContext { data, state };
-    operator.evaluate(value, &ctx, capture, captures, scratch, capture_locations)
+    #[cfg(feature = "engine-profile")]
+    let started = std::time::Instant::now();
+    let result = operator.evaluate(value, &ctx, capture, captures, scratch, capture_locations);
+    #[cfg(feature = "engine-profile")]
+    super::profile::record_rule(rule.id, started.elapsed());
+    result
 }
 
 struct OpContext<'a, 'b> {
@@ -2283,6 +2334,9 @@ struct EvalState {
     removed_targets: Vec<RemovedTarget>,
     status: Option<u16>,
     allow: bool,
+    /// Bit `phase.number() - 1` for the phase currently running. Used to skip
+    /// gate groups that no rule in this phase references.
+    phase_mask: u8,
     operator_evaluations: u64,
     regex_evaluations_skipped: u64,
     /// Vectorscan database scans performed for the candidate pass.

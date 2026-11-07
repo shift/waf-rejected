@@ -507,6 +507,7 @@ fn profile(args: &Args, engine: &RustEngine) -> Result<(), String> {
             let _ = engine.evaluate(&request);
         }
         let mut total = Report::default();
+        let mut rule_ns: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
         for _ in 0..args.reps.max(1) {
             let (_, report) = engine.evaluate_profiled(&request);
             total.parse_ns += report.parse_ns;
@@ -518,6 +519,9 @@ fn profile(args: &Args, engine: &RustEngine) -> Result<(), String> {
             total.captures_ns += report.captures_ns;
             total.regex_evaluations += report.regex_evaluations;
             total.regex_skipped += report.regex_skipped;
+            for (id, ns) in report.rule_ns {
+                *rule_ns.entry(id).or_default() += ns;
+            }
         }
         let reps = args.reps.max(1) as f64;
         println!(
@@ -533,6 +537,21 @@ fn profile(args: &Args, engine: &RustEngine) -> Result<(), String> {
             total.regex_evaluations as f64 / reps,
             total.regex_skipped as f64 / reps,
         );
+        let mut rules: Vec<(u32, u64)> = rule_ns.into_iter().collect();
+        rules.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        let top: Vec<String> = rules
+            .iter()
+            .take(12)
+            .map(|(id, ns)| {
+                let name = if *id == u32::MAX {
+                    "no-id".to_string()
+                } else {
+                    id.to_string()
+                };
+                format!("{name}:{:.0}", *ns as f64 / reps)
+            })
+            .collect();
+        println!("  top rules (ns/req): {}", top.join(" "));
     }
     println!(
         "note: `xform` is transform cache misses + pipeline application; `regex` is\

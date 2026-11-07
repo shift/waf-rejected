@@ -24,6 +24,23 @@ release also adds repository hardening (rulesets,
 CODEOWNERS, security policy, community files), reproducible CI/release
 tooling, and a CycloneDX SBOM with per-asset checksums.
 
+### Performance
+
+- Cut end-to-end latency for the default Rust engine at 4/8 KiB: `ARGS` and
+  `ARGS_GET`/`ARGS_POST` (and the matching name collections) now share one
+  transform-cache/gate identity per argument, identity-pipeline candidates are
+  borrowed instead of copied into the transform arena, the transform cache is
+  reused across request phases, and literal/subsequence gate groups are pruned
+  per phase. Normal-size Rust-engine body scans now run inline instead of a
+  `spawn_blocking` hop plus an owned `RequestContext` clone (bodies above
+  64 KiB still offload).
+- The heuristic content-inspection rules now consult the same conservative
+  required-literal extractor used for the CRS artifact before running a regex.
+  A missing literal proves the pattern cannot match, so benign 4/8 KiB bodies
+  skip the expensive scans without weakening detection. Proxy responses no
+  longer allocate a lowercase copy of every header name for the hop-by-hop
+  check. See `docs/suggestions_from_agents/engine-proxy-8k.md`.
+
 ### Added
 
 - Opt-in upstream response inspection (`waf.response_inspection`) wired into

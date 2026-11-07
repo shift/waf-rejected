@@ -167,6 +167,11 @@ struct Cli {
     /// Write the measured rows and gates as JSON.
     #[arg(long)]
     json_out: Option<PathBuf>,
+
+    /// Also measure the Rust backend with the heuristic content-inspection
+    /// rules disabled, to isolate their cost from the engine's.
+    #[arg(long)]
+    no_content_inspection: bool,
 }
 
 impl Cli {
@@ -1012,7 +1017,7 @@ async fn run_proxy_layer(
         );
     }
 
-    for size in [SizeClass::Bodyless, SizeClass::K1] {
+    for size in SIZES {
         let (stats, rps, errors) =
             measure_concurrent(&client, &base, size, cli.concurrency, cli.per_worker).await?;
         rows.push(
@@ -1091,8 +1096,18 @@ fn tail_gate(rows: &[Row], backend: &str, size: &str) -> GateResult {
 fn gate_results(rows: &[Row]) -> Vec<GateResult> {
     let mut gates = Vec::new();
     for backend in ["wasm", "native", "rust"] {
-        for (size, limit) in [("bodyless", 0.5), ("1 KiB", 0.8), ("4 KiB", 1.5)] {
-            gates.push(gate(rows, backend, size, limit));
+        let limits: &[(&str, f64)] = if backend == "rust" {
+            &[
+                ("bodyless", 0.3),
+                ("1 KiB", 0.8),
+                ("4 KiB", 0.9),
+                ("8 KiB", 1.3),
+            ]
+        } else {
+            &[("bodyless", 0.5), ("1 KiB", 0.8), ("4 KiB", 1.5)]
+        };
+        for (size, limit) in limits {
+            gates.push(gate(rows, backend, size, *limit));
         }
         for size in ["bodyless", "1 KiB", "4 KiB", "8 KiB"] {
             gates.push(tail_gate(rows, backend, size));
@@ -1302,6 +1317,22 @@ fn main() -> Result<()> {
                         ))
                         .context("run L3 rust proxy layer")?,
                 );
+
+                if cli.no_content_inspection {
+                    let mut config = rust_config(upstream, cli.eval_timeout_ms);
+                    config.waf.content_inspection.enabled = false;
+                    rows.extend(
+                        runtime
+                            .block_on(run_proxy_layer(
+                                &cli,
+                                config,
+                                "L3-proxy",
+                                "rust-nocheck",
+                                cli.requests.min(50),
+                            ))
+                            .context("run L3 rust proxy layer without content inspection")?,
+                    );
+                }
             }
         }
     }

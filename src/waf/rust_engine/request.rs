@@ -1000,7 +1000,7 @@ impl<'a> RequestData<'a> {
                 collection,
                 key: Some(Cow::Borrowed(entry.key.as_ref())),
                 value: Cow::Borrowed(entry.value.as_ref()),
-                cache_id: Some(entry_cache_id(collection, index)),
+                cache_id: Some(entry_cache_id_split(collection, first.len(), index)),
             });
         }
         Ok(())
@@ -1025,7 +1025,7 @@ impl<'a> RequestData<'a> {
                 collection,
                 key: Some(Cow::Borrowed(entry.key.as_ref())),
                 value: Cow::Borrowed(entry.key.as_ref().as_bytes()),
-                cache_id: Some(entry_cache_id(collection, index)),
+                cache_id: Some(entry_cache_id_split(collection, first.len(), index)),
             });
         }
         Ok(())
@@ -1281,6 +1281,24 @@ impl TxState {
 }
 
 /// Stable cache id for an entry in a keyed collection.
+///
+/// `ARGS` / `ARGS_NAMES` concatenate the GET and POST collections. They must
+/// share the cache id of the underlying entry rather than allocating a third
+/// identity for the same bytes: otherwise a rule set that targets both `ARGS`
+/// and `ARGS_POST` transforms the same argument twice and runs the literal gate
+/// twice. `first_len` is the length of the GET slice.
+fn entry_cache_id_split(collection: Collection, first_len: usize, index: usize) -> u32 {
+    match collection {
+        Collection::Args if index < first_len => entry_cache_id(Collection::ArgsGet, index),
+        Collection::Args => entry_cache_id(Collection::ArgsPost, index - first_len),
+        Collection::ArgsNames if index < first_len => {
+            entry_cache_id(Collection::ArgsGetNames, index)
+        }
+        Collection::ArgsNames => entry_cache_id(Collection::ArgsPostNames, index - first_len),
+        _ => entry_cache_id(collection, index),
+    }
+}
+
 fn entry_cache_id(collection: Collection, index: usize) -> u32 {
     let base = match collection {
         Collection::Args | Collection::ArgsGet => 0,

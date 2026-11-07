@@ -1119,7 +1119,41 @@ updated. No defaults, versions, transforms, prefilter, proxy or Coraza changes.
   `docs/operations/performance-*.md` keep their original wasm-era numbers with
   scope notes rather than being rewritten.
 
+## perf: 4/8 KiB end-to-end engine + proxy (`perf/8k`)
+
+Branch `perf/8k` (worktree `.worktrees/perf-8k`, base `main` = `20afbaf`).
+Goal: end-to-end p50 < 0.9 ms at 4 KiB, < 1.3 ms at 8 KiB, < 0.3 ms
+bodyless, with p99 reported and detection parity unchanged.
+
+### Plan
+
+- [x] Profile bodyless/1/4/8 KiB end-to-end (proxy floor L2 vs WAF L3) and
+      per engine phase (`engine-profile`, top rules).
+- [x] Share transform/gate identities between `ARGS` and `ARGS_{GET,POST}`
+      (and the name collections) so the same argument bytes are transformed
+      and gate-scanned once.
+- [x] Prune literal/subsequence gate groups by phase.
+- [x] Borrow identity-pipeline candidates instead of copying them into the
+      transform arena (body-sized copies).
+- [x] Run native-engine body scans inline instead of `spawn_blocking` for
+      normal-size bodies (removes the task hop and `RequestContext` clone).
+- [x] Proxy: stop lowercasing every response header name for the hop-by-hop
+      check.
+- [x] Re-measure p50/p99 with `rust-engine-parity --bench` and
+      `bench-subms`; document residuals.
+  - Final: e2e p50 4 KiB 0.924 ms (target < 0.9, missed by 24 µs), 8 KiB
+    1.354 ms (< 1.3, missed by 54 µs), bodyless 0.373 ms (< 0.3, missed).
+    p99: 1.013 / 1.439 / 0.468 ms. Proxy floor 0.126–0.153 ms.
+    Engine p50: 115 / 281 / 556 / 941 µs (bodyless/1/4/8).
+  - Content-inspection literal gates are worth ~33 µs (4 KiB) and ~68 µs
+    (8 KiB); before them the same e2e rows were 0.953 / 1.408 ms.
+- [x] Parity: corpus **2,112/2,112** (100 %, 0 native-only FNs); transform
+      fixture 7,320/7,320 (lib tests 623 passed).
+- [x] fmt, lib tests (623), integration (60), clippy `--deny warnings`, docs +
+      CHANGELOG.
+
 ## perf: ordered-subsequence gate for RCE regexes (`perf/rce-gate`)
+
 
 Branch `perf/rce-gate` (worktree `.worktrees/rce-gate`, base `02497de`). The
 filler-tolerant RCE command rules 932125/230/235/250/260/370/380 have no
