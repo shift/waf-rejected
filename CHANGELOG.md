@@ -19,6 +19,19 @@ All notable changes to WAF-Rejected are documented here.
     permissions, required secrets/variables, the GHCR fallback and the Trivy
     policy.
 
+### Security
+
+- Resolved CVE-2026-48504 / GHSA-w9wp-h8wv-79jx. The unused
+  `opentelemetry_sdk` 0.20.0 dependency has been removed from the graph and the
+  `opentelemetry` API crate upgraded to 0.33.1. The `export-otel` feature now
+  compiles and emits spans through a globally installed 0.33 tracer provider;
+  no SDK provider or baggage extractor ships with the binary. The previous
+  `export-otel` feature did not compile (`OpenTelemetryExporter` was not
+  defined and the tracer object was not object-safe). **Breaking:** the SDK is
+  no longer a transitive dependency of `export-otel`/`export-system` and
+  `export-system` no longer enables OpenTelemetry; downstream users must add
+  `opentelemetry_sdk` 0.33 themselves and install a provider.
+
 ## [0.1.0-beta.14] - 2026-11-07
 
 ### Release summary

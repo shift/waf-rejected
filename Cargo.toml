@@ -230,9 +230,11 @@ hex = "0.4"
 # Constant-time comparison for API-key digests.
 subtle = "2"
 
-# OpenTelemetry dependencies for security event export (simplified)
-opentelemetry = { version = "0.20", optional = true }
-opentelemetry_sdk = { version = "0.20", optional = true }
+# OpenTelemetry API for security event export. The SDK (and therefore the OTLP
+# exporter and any TracerProvider/baggage extractor) is intentionally not a
+# dependency: the exporter only builds spans through the global API and defers
+# provider installation to the embedding application.
+opentelemetry = { version = "0.33", optional = true, default-features = false, features = ["trace"] }
 
 # Embedded database for persistence before K/V integration
 sled = { version = "0.34", optional = true }
@@ -366,8 +368,8 @@ webtransport = ["dep:wtransport"]
 # Security features
 geoip = []
 # Export system features
-export-system = ["sled", "opentelemetry", "opentelemetry_sdk"]
-export-otel = ["opentelemetry", "opentelemetry_sdk"]
+export-system = ["sled"]
+export-otel = ["opentelemetry"]
 export-sled = ["sled"]
 export-redb = ["redb"]
 # Reserved; io_uring backend is a stub in Beta.

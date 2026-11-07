@@ -6,22 +6,21 @@
 use super::{ExportResult, SecurityEventExporter};
 use crate::waf::security_events::{SecurityEvent, ThreatLevel, WafDecision};
 use async_trait::async_trait;
-use opentelemetry::trace::{SpanBuilder, SpanKind, Status, TraceContextExt, Tracer};
+use opentelemetry::trace::{Span, SpanBuilder, SpanKind, Status, Tracer};
 use opentelemetry::{global, Context, KeyValue};
-use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, warn};
 
 /// OpenTelemetry exporter for security events
-pub struct OtelExporter {
-    tracer: Box<dyn Tracer + Send + Sync>,
+pub struct OpenTelemetryExporter {
+    tracer: global::BoxedTracer,
     service_name: String,
     service_version: String,
     export_traces: bool,
     export_logs: bool,
 }
 
-impl OtelExporter {
+impl OpenTelemetryExporter {
     /// Create a new OpenTelemetry exporter
     pub fn new(
         service_name: Option<String>,
@@ -32,11 +31,13 @@ impl OtelExporter {
         let service_name = service_name.unwrap_or_else(|| "waf-rejected".to_string());
         let service_version = service_version.unwrap_or_else(|| "1.0.0".to_string());
 
-        // Get global tracer
+        // Resolve the globally installed tracer once. The default no-op
+        // provider is used until the embedding application installs an SDK
+        // provider; this crate deliberately does not depend on the SDK.
         let tracer = global::tracer("waf-security-events");
 
         Self {
-            tracer: Box::new(tracer),
+            tracer,
             service_name,
             service_version,
             export_traces,
@@ -48,7 +49,7 @@ impl OtelExporter {
     async fn export_as_span(&self, event: &SecurityEvent) -> ExportResult {
         let span_name = format!("waf_security_event_{}", event.decision);
 
-        let mut span_builder = SpanBuilder::from_name(span_name)
+        let span_builder = SpanBuilder::from_name(span_name)
             .with_kind(SpanKind::Server)
             .with_start_time(self.timestamp_to_system_time(event.timestamp))
             .with_attributes(self.build_span_attributes(event));
@@ -61,7 +62,7 @@ impl OtelExporter {
             WafDecision::Monitor => Status::Ok,
         };
 
-        let span = self
+        let mut span = self
             .tracer
             .build_with_context(span_builder, &Context::current());
         span.set_status(span_status);
@@ -90,7 +91,6 @@ impl OtelExporter {
         // For now, use structured tracing instead of OpenTelemetry logs API
         // This provides similar functionality with better compatibility
 
-        let attributes = self.build_log_attributes(event);
         let severity = self.get_log_severity_text(&event.threat_level);
 
         match severity {
@@ -241,12 +241,6 @@ impl OtelExporter {
         attributes
     }
 
-    /// Build log attributes from security event (similar to span but focused on logging)
-    fn build_log_attributes(&self, event: &SecurityEvent) -> Vec<KeyValue> {
-        // Reuse span attributes as they're comprehensive
-        self.build_span_attributes(event)
-    }
-
     /// Convert chrono DateTime to SystemTime for OpenTelemetry
     fn timestamp_to_system_time(&self, timestamp: chrono::DateTime<chrono::Utc>) -> SystemTime {
         UNIX_EPOCH
@@ -280,7 +274,7 @@ impl OtelExporter {
 }
 
 #[async_trait]
-impl SecurityEventExporter for OtelExporter {
+impl SecurityEventExporter for OpenTelemetryExporter {
     async fn export_event(&self, event: &SecurityEvent) -> ExportResult {
         let mut results = Vec::new();
 
@@ -365,7 +359,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_otel_export() {
-        let exporter = OtelExporter::new(
+        let exporter = OpenTelemetryExporter::new(
             Some("test-waf".to_string()),
             Some("1.0.0".to_string()),
             true,
@@ -404,7 +398,7 @@ mod tests {
 
     #[test]
     fn test_attribute_sanitization() {
-        let exporter = OtelExporter::new(None, None, true, true);
+        let exporter = OpenTelemetryExporter::new(None, None, true, true);
 
         let sanitized = exporter.sanitize_attribute_key("Test-Key With Spaces!");
         assert_eq!(sanitized, "test_key_with_spaces_");

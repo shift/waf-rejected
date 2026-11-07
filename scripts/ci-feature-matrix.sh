@@ -111,6 +111,7 @@ STAGES=(
   "check-all-targets+coraza-native|cargo check --all-targets --features wasm-reactor,coraza-native|check --all-targets --features wasm-reactor,coraza-native"
   "check-all-targets+http3+webtransport|cargo check --all-targets --features http3,webtransport,wasm-reactor|check --all-targets --features http3,webtransport,wasm-reactor"
   "check-all-targets+ai-threat-detection|cargo check --all-targets --features ai-threat-detection|check --all-targets --features ai-threat-detection"
+  "check-all-targets+export-otel|cargo check --all-targets --features export-otel|check --all-targets --features export-otel"
   "check-bin-graphql-allowlist|cargo check --bin graphql-allowlist --features wasm-reactor|check --bin graphql-allowlist --features wasm-reactor"
   "check-bin-grpc-allowlist|cargo check --bin grpc-allowlist --features wasm-reactor|check --bin grpc-allowlist --features wasm-reactor"
 )

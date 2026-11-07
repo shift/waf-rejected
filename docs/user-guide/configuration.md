@@ -358,6 +358,12 @@ sled_max_events = 100000
 sled_compress = false
 ```
 
+`enable_otel` requires a build with `--features export-otel`. The exporter
+creates spans through the global OpenTelemetry tracer, so the embedding
+application must install a matching `opentelemetry_sdk` 0.33 `TracerProvider`
+before constructing the WAF. The SDK is intentionally not a dependency of
+WAF-Rejected; with the default provider the exporter is a no-op.
+
 ### `[waf.content_inspection]`
 
 Built-in heuristic inspection for URIs, headers and request bodies. This runs in

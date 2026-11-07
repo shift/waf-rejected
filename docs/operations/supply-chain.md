@@ -87,16 +87,21 @@ reactor was rebuilt with Go 1.26.10 and its digest updated.
 `No vulnerabilities found` for both Go modules. The reactor and sidecar were
 rebuilt with the updated toolchain.
 
-**Open Rust advisory (OpenTelemetry SDK).** Dependabot reports one open
-moderate advisory: `opentelemetry_sdk` 0.20.0, CVE-2026-48504 /
-GHSA-w9wp-h8wv-79jx, unbounded memory allocation while extracting W3C Baggage.
-The patched release is 0.32.1 (8 KiB value cap, first 64 list members). The
-crate is pulled in by the default `export-system` feature transitively through
-`opentelemetry`, but the binary never installs an SDK `TracerProvider` and
-never calls baggage extraction, so the vulnerable code path is not reachable
-from the request pipeline. Upgrading `opentelemetry`/`opentelemetry_sdk` from
-0.20 to 0.32 is a breaking API migration tracked as a follow-up; do not ship a
-build that enables an SDK baggage propagator until it lands.
+**OpenTelemetry SDK advisory (resolved).** Dependabot reported one moderate
+advisory: `opentelemetry_sdk` 0.20.0, CVE-2026-48504 / GHSA-w9wp-h8wv-79jx,
+unbounded memory allocation while extracting W3C Baggage. The old tree pulled
+the SDK in through `opentelemetry` even though the binary never installed an SDK
+`TracerProvider` and never called baggage extraction. The `export-otel`
+exporter only creates spans through the global API, so the remediation removes
+`opentelemetry_sdk` from the dependency graph entirely and upgrades the API
+crate `opentelemetry` from 0.20.0 to 0.33.1 (the current release superseding the
+0.32.1 fix line). There is no `opentelemetry-otlp` dependency in this tree;
+export to a collector is performed by a provider installed by the embedding
+application. `export-system` no longer enables OpenTelemetry transitively.
+Embedders that want spans install their own matching 0.33 SDK provider before
+constructing the WAF; with the default provider the exporter is a no-op. No SDK
+provider or baggage propagator ships with the binary, so CVE-2026-48504 is no
+longer reachable and no affected crate remains in `Cargo.lock`.
 
 ### Licences
 
