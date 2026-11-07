@@ -54,16 +54,30 @@ jobs:
   # Build and test
   test:
     runs-on: ubuntu-latest
-    needs: security-scan
+    needs: [security-scan, preflight]
     steps:
     - uses: actions/checkout@v4
     - name: Install Nix
       uses: cachix/install-nix-action@v25
+    # Cachix is an optional accelerator, not a requirement. GitHub does not
+    # expose `secrets` to a step/job `if`, so `preflight` publishes whether
+    # CACHIX_AUTH_TOKEN exists. Without it the build runs against the public
+    # substituters supplied by install-nix-action. `continue-on-error` keeps a
+    # cache/auth failure from failing the build.
     - name: Cache Nix store
+      if: needs.preflight.outputs.cachix_configured == 'true'
+      continue-on-error: true
       uses: cachix/cachix-action@v14
       with:
         name: waf-rejected
         authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+    - name: Report Cachix status
+      run: |
+        if [ "${{ needs.preflight.outputs.cachix_configured }}" = "true" ]; then
+          echo "::notice::CACHIX_AUTH_TOKEN is configured; the waf-rejected cache is used when writable."
+        else
+          echo "::notice::CACHIX_AUTH_TOKEN is not configured; building with the default Nix substituters only."
+        fi
     - name: Check formatting
       run: nix develop -c cargo fmt -- --check
     - name: Clippy
@@ -143,14 +157,22 @@ jobs:
     outputs:
       staging_configured: ${{ steps.check.outputs.staging }}
       production_configured: ${{ steps.check.outputs.production }}
+      cachix_configured: ${{ steps.check.outputs.cachix }}
     steps:
     - name: Check deployment credentials
       id: check
       env:
         STAGING_KUBE_CONFIG: ${{ secrets.STAGING_KUBE_CONFIG }}
         PRODUCTION_KUBE_CONFIG: ${{ secrets.PRODUCTION_KUBE_CONFIG }}
+        CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
       run: |
         set -euo pipefail
+        if [ -n "${CACHIX_AUTH_TOKEN}" ]; then
+          echo "cachix=true" >> "${GITHUB_OUTPUT}"
+        else
+          echo "cachix=false" >> "${GITHUB_OUTPUT}"
+          echo "::notice::CACHIX_AUTH_TOKEN is not configured; the Nix build will not use the waf-rejected Cachix cache."
+        fi
         if [ -n "${STAGING_KUBE_CONFIG}" ]; then
           echo "staging=true" >> "${GITHUB_OUTPUT}"
         else
