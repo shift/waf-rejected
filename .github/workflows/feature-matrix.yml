@@ -1,7 +1,7 @@
 name: Feature Matrix
 
-# GitHub Actions is currently billing-blocked. The local equivalent of this
-# workflow (including the `workflow_dispatch` opt-in jobs) is:
+# The local equivalent of this workflow (including the `workflow_dispatch`
+# opt-in jobs) is:
 #   ./scripts/ci-local.sh
 #   ./scripts/ci-feature-matrix.sh
 #   ./scripts/run-crs-corpus.sh --engine both

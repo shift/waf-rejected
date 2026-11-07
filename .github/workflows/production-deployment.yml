@@ -1,7 +1,7 @@
 name: Production Deployment Pipeline
 
-# GitHub Actions is currently billing-blocked. Run the build/test half of this
-# pipeline locally with `./scripts/ci-local.sh`; deployment steps still require
+# Run the build/test half of this pipeline locally with `./scripts/ci-local.sh`;
+# deployment steps still require
 # cluster credentials and are not reproduced locally. `workflow_dispatch` is
 # intentionally not enabled because this pipeline deploys on push.
 

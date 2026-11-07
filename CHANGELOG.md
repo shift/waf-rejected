@@ -239,8 +239,8 @@ tooling, and a CycloneDX SBOM with per-asset checksums.
   `cargo check --all-targets` works with the default feature set.
 - `scripts/ci-local.sh` now runs the full local gate: fmt, all-targets clippy,
   tests, the cross-feature matrix, shipped-config validation, the CRS smoke
-  corpus and `nix build .#waf-ingress`. GitHub Actions remains billing-blocked;
-  the workflows document their local equivalents.
+  corpus and `nix build .#waf-ingress`. GitHub Actions runs the same gate in
+  CI; `scripts/ci-local.sh` mirrors it for local runs.
 
 ## [0.1.0-beta.13] - 2026-11-03
 
