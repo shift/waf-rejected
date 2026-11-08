@@ -227,6 +227,52 @@ fn bounded_queue_drop_newest_keeps_the_oldest_items() {
 }
 
 #[test]
+fn queue_pressure_under_failure_stays_bounded() {
+    let mut config = enabled_config();
+    config.event_queue_capacity = 8;
+    config.counter_queue_capacity = 8;
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let state = Arc::new(DistributedState::from_config(&config));
+        let controller = DistributedController::with_sources(
+            &config,
+            Arc::clone(&state),
+            Arc::new(LocalPolicySource),
+            Arc::new(LocalReputationSource),
+            Arc::new(LocalRateLimitSync::default()),
+            Arc::new(LocalEventSink::default()),
+            Arc::new(CountingRegistry {
+                calls: Arc::new(AtomicU64::new(0)),
+                fail: true,
+            }),
+        );
+        // Do not spawn: the consumer is unavailable, so every push exercises
+        // the full-queue path while the control plane is down.
+        let handle = controller.handle();
+        for index in 0..10_000 {
+            handle.enqueue_event(sample_event_with_id(index));
+            handle.enqueue_counter(super::traits::CounterDelta {
+                policy_id: "per_ip".to_string(),
+                window_start_unix: 0,
+                shard: 0,
+                key_hash: [0; 16],
+                consumed: 1,
+                rejected: 0,
+                clock_offset_ms: 0,
+            });
+        }
+        for (name, depth) in handle.queue_depths() {
+            assert!(depth <= 8, "{name} queue grew past its bound: {depth}");
+        }
+        assert_eq!(state.metrics().queue_dropped(), 20_000 - 16);
+        assert!(
+            state.metrics().reconnects() == 0,
+            "controller was not spawned"
+        );
+    });
+}
+
+#[test]
 fn reconnect_backoff_doubles_and_caps() {
     let mut backoff = Duration::from_millis(100);
     let max = Duration::from_secs(1);
@@ -411,6 +457,16 @@ use super::grpc::DistriWafClient;
 struct MockWaf {
     events: AtomicU64,
     counters: AtomicU64,
+    /// Deliberate control-plane stall for the non-blocking request-path test.
+    rpc_delay_ms: u64,
+}
+
+impl MockWaf {
+    async fn stall(&self) {
+        if self.rpc_delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(self.rpc_delay_ms)).await;
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -421,6 +477,7 @@ impl DistriWafService for MockWaf {
         &self,
         request: tonic::Request<RegisterRequest>,
     ) -> Result<tonic::Response<RegisterResponse>, tonic::Status> {
+        self.stall().await;
         let node = request
             .into_inner()
             .node
@@ -438,6 +495,7 @@ impl DistriWafService for MockWaf {
         &self,
         request: tonic::Request<super::distri_waf::HeartbeatRequest>,
     ) -> Result<tonic::Response<super::distri_waf::HeartbeatResponse>, tonic::Status> {
+        self.stall().await;
         let request = request.into_inner();
         if request.node_id != "node-a" {
             return Err(tonic::Status::not_found("unknown node"));
@@ -552,6 +610,90 @@ impl DistriWafService for MockWaf {
             ..Default::default()
         }))
     }
+}
+
+/// A deliberately slow control plane must not add latency to request
+/// evaluation. The controller is stuck in a 750 ms registration RPC while the
+/// engine evaluates requests; the request path only reads atomics.
+#[test]
+fn slow_endpoint_does_not_block_request_evaluation() {
+    use tonic::transport::Server;
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(DistriWafServer::new(MockWaf {
+                    rpc_delay_ms: 750,
+                    ..Default::default()
+                }))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+
+        let mut off = crate::config::Config::default();
+        off.waf.rate_limit.per_ip_enabled = false;
+        off.waf.rate_limit.global_enabled = false;
+
+        let mut on = off.clone();
+        on.waf.distributed = DistributedConfig {
+            enabled: true,
+            node_id: "node-slow".to_string(),
+            region: "eu-west-1".to_string(),
+            endpoints: vec![format!("http://{address}")],
+            heartbeat_interval_secs: 1,
+            request_timeout_ms: 2_000,
+            ..DistributedConfig::default()
+        };
+
+        let off_engine = WafEngine::with_config(&off);
+        let on_engine = WafEngine::with_config(&on);
+        let state = on_engine
+            .distributed_state()
+            .expect("enabled config exposes a state handle")
+            .clone();
+        let handle =
+            DistributedController::from_config_with_state(&on.waf.distributed, Arc::clone(&state))
+                .unwrap()
+                .spawn();
+
+        // Let the controller enter the slow registration RPC.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let ctx = RequestContext::new(
+            IpAddr::from([127, 0, 0, 1]),
+            hyper::Method::GET,
+            "/health".parse().unwrap(),
+            hyper::HeaderMap::new(),
+            None,
+        );
+
+        let started = Instant::now();
+        let mut slowest = Duration::ZERO;
+        for _ in 0..10 {
+            let sample = Instant::now();
+            let on_decision = on_engine.evaluate(&ctx).await;
+            slowest = slowest.max(sample.elapsed());
+            let off_decision = off_engine.evaluate(&ctx).await;
+            assert_eq!(on_decision, off_decision);
+        }
+        let total = started.elapsed();
+
+        assert!(
+            slowest < Duration::from_millis(100),
+            "request evaluation waited on the control plane: slowest {slowest:?}"
+        );
+        assert!(
+            total < Duration::from_millis(500),
+            "10 request evaluations took {total:?} while the endpoint stalled"
+        );
+
+        handle.shutdown().await;
+        server.abort();
+    });
 }
 
 #[test]

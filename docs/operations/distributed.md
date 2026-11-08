@@ -190,6 +190,14 @@ The reputation fixture is written directly into the server's sled namespace
 before the server opens it, because the v1 WAF-node contract has no
 reputation-write RPC.
 
+## Performance
+
+The controller never runs on the request path. `scripts/bench-distributed.sh`
+measures the real proxy with the feature disabled, with an unreachable
+endpoint, and with an endpoint that accepts connections but never responds.
+Recorded p50/p95/p99, throughput, allocations, controller CPU and cache costs
+are in [distributed-performance.md](distributed-performance.md).
+
 ## Rollout
 
 1. Build with `--features distri-kv` and leave `enabled = false`. Confirm

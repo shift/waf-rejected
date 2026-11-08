@@ -177,6 +177,19 @@ struct Cli {
     /// is two to three orders of magnitude slower and dominates the run time.
     #[arg(long)]
     no_wasm: bool,
+
+    /// Enable `[waf.distributed]` and start the controller on the proxy's
+    /// shared state. Requires the non-default `distri-kv` feature.
+    #[cfg(feature = "distri-kv")]
+    #[arg(long)]
+    distributed: bool,
+
+    /// Control-plane endpoint used with `--distributed`. The default is a
+    /// deliberately unreachable loopback port so fallback behaviour is
+    /// exercised without a cluster.
+    #[cfg(feature = "distri-kv")]
+    #[arg(long, default_value = "http://127.0.0.1:1")]
+    distributed_endpoint: String,
 }
 
 impl Cli {
@@ -310,6 +323,7 @@ struct Row {
     stats: Stats,
     alloc_bytes: Option<f64>,
     alloc_calls: Option<f64>,
+    throughput_rps: Option<f64>,
     errors: usize,
     note: String,
 }
@@ -323,6 +337,7 @@ impl Row {
             stats,
             alloc_bytes: None,
             alloc_calls: None,
+            throughput_rps: None,
             errors: 0,
             note: String::new(),
         }
@@ -336,6 +351,11 @@ impl Row {
 
     fn with_errors(mut self, errors: usize) -> Self {
         self.errors = errors;
+        self
+    }
+
+    fn with_throughput(mut self, rps: f64) -> Self {
+        self.throughput_rps = Some(rps);
         self
     }
 
@@ -485,6 +505,48 @@ fn rust_config(upstream: SocketAddr, eval_timeout_ms: u64) -> Config {
     config.waf.coraza.backend = CorazaBackend::Rust;
     config.waf.coraza.fallback = waf_ingress::config::CorazaFallback::None;
     config
+}
+
+/// Apply the benchmark's distributed scenario to a proxy config. The engine
+/// builds its `DistributedState` from this block; the controller is spawned
+/// per proxy layer once the service exists.
+#[cfg(feature = "distri-kv")]
+fn apply_distributed(cli: &Cli, config: &mut Config) {
+    if !cli.distributed {
+        return;
+    }
+    config.waf.distributed.enabled = true;
+    config.waf.distributed.node_id = "bench-node".to_string();
+    config.waf.distributed.region = "bench".to_string();
+    config.waf.distributed.endpoints = vec![cli.distributed_endpoint.clone()];
+    config.waf.distributed.fallback = waf_ingress::config::DistributedFallbackMode::LocalOnly;
+    config.waf.distributed.heartbeat_interval_secs = 1;
+    config.waf.distributed.request_timeout_ms = 200;
+    config.waf.distributed.shadow = true;
+}
+
+/// Total process CPU time. Comparing the disabled/enabled runs attributes any
+/// difference to the controller and shared state without a second sampler.
+#[cfg(unix)]
+fn process_cpu_ms() -> f64 {
+    // SAFETY: `getrusage` only writes into the supplied, zeroed `rusage`.
+    unsafe {
+        let mut usage: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut usage) == 0 {
+            let user =
+                usage.ru_utime.tv_sec as f64 * 1_000.0 + usage.ru_utime.tv_usec as f64 / 1_000.0;
+            let system =
+                usage.ru_stime.tv_sec as f64 * 1_000.0 + usage.ru_stime.tv_usec as f64 / 1_000.0;
+            user + system
+        } else {
+            0.0
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn process_cpu_ms() -> f64 {
+    0.0
 }
 
 #[cfg(all(feature = "coraza-native", unix))]
@@ -1005,7 +1067,20 @@ async fn run_proxy_layer(
     backend: &'static str,
     alloc_reps: usize,
 ) -> Result<Vec<Row>> {
+    #[cfg(feature = "distri-kv")]
+    let distributed_config = cli.distributed.then(|| config.waf.distributed.clone());
     let (proxy_addr, _service) = spawn_proxy(config).await?;
+    #[cfg(feature = "distri-kv")]
+    let distributed_handle = match (&distributed_config, _service.distributed_state()) {
+        (Some(config), Some(state)) => Some(
+            waf_ingress::waf::distributed::DistributedController::from_config_with_state(
+                config, state,
+            )
+            .context("build the distributed controller")?
+            .spawn(),
+        ),
+        _ => None,
+    };
     let base = format!("http://{proxy_addr}");
     let client = http_client();
     let mut rows = Vec::new();
@@ -1028,11 +1103,17 @@ async fn run_proxy_layer(
         rows.push(
             Row::new(layer, backend, size.label(), stats)
                 .with_errors(errors)
+                .with_throughput(rps)
                 .with_note(format!(
                     "c={} throughput {:.0} req/s, non-200 {errors}",
                     cli.concurrency, rps
                 )),
         );
+    }
+
+    #[cfg(feature = "distri-kv")]
+    if let Some(handle) = distributed_handle {
+        handle.shutdown().await;
     }
 
     Ok(rows)
@@ -1227,6 +1308,7 @@ fn print_budget(rows: &[Row]) {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let cpu_started_ms = process_cpu_ms();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -1248,6 +1330,16 @@ fn main() -> Result<()> {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "not supplied (native rows skipped)".to_string())
     );
+    #[cfg(feature = "distri-kv")]
+    println!(
+        "- distributed: {} ({})",
+        if cli.distributed {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        cli.distributed_endpoint
+    );
     println!();
 
     let mut rows = Vec::new();
@@ -1265,6 +1357,8 @@ fn main() -> Result<()> {
         if cli.wants("l2") {
             let mut config = base_config(upstream, cli.eval_timeout_ms);
             config.waf.enabled = false;
+            #[cfg(feature = "distri-kv")]
+            apply_distributed(&cli, &mut config);
             rows.extend(
                 runtime
                     .block_on(run_proxy_layer(
@@ -1281,6 +1375,12 @@ fn main() -> Result<()> {
         if cli.wants("l3") {
             if !cli.no_wasm {
                 let config = wasm_config(upstream, 4, cli.eval_timeout_ms);
+                #[cfg(feature = "distri-kv")]
+                let config = {
+                    let mut config = config;
+                    apply_distributed(&cli, &mut config);
+                    config
+                };
                 rows.extend(
                     runtime
                         .block_on(run_proxy_layer(
@@ -1297,6 +1397,12 @@ fn main() -> Result<()> {
             #[cfg(all(feature = "coraza-native", unix))]
             if let Some(socket) = cli.native_socket.as_deref() {
                 let config = native_config(upstream, socket, 4, cli.eval_timeout_ms);
+                #[cfg(feature = "distri-kv")]
+                let config = {
+                    let mut config = config;
+                    apply_distributed(&cli, &mut config);
+                    config
+                };
                 rows.extend(
                     runtime
                         .block_on(run_proxy_layer(
@@ -1313,6 +1419,12 @@ fn main() -> Result<()> {
             #[cfg(feature = "rust-engine")]
             {
                 let config = rust_config(upstream, cli.eval_timeout_ms);
+                #[cfg(feature = "distri-kv")]
+                let config = {
+                    let mut config = config;
+                    apply_distributed(&cli, &mut config);
+                    config
+                };
                 rows.extend(
                     runtime
                         .block_on(run_proxy_layer(
@@ -1328,6 +1440,8 @@ fn main() -> Result<()> {
                 if cli.no_content_inspection {
                     let mut config = rust_config(upstream, cli.eval_timeout_ms);
                     config.waf.content_inspection.enabled = false;
+                    #[cfg(feature = "distri-kv")]
+                    apply_distributed(&cli, &mut config);
                     rows.extend(
                         runtime
                             .block_on(run_proxy_layer(
@@ -1348,12 +1462,16 @@ fn main() -> Result<()> {
     print_budget(&rows);
     let gates = gate_results(&rows);
     print_gates(&gates);
+    let process_cpu_ms = process_cpu_ms() - cpu_started_ms;
+    println!();
+    println!("- process CPU time: {process_cpu_ms:.0} ms");
 
     if let Some(path) = cli.json_out.as_deref() {
         let payload = json!({
             "schema": 1,
             "samples": cli.samples,
             "requests": cli.requests,
+            "process_cpu_ms": process_cpu_ms,
             "rows": rows.iter().map(|row| json!({
                 "layer": row.layer,
                 "backend": row.backend,
@@ -1366,6 +1484,7 @@ fn main() -> Result<()> {
                 "max_ms": row.stats.max_ms,
                 "alloc_bytes_per_op": row.alloc_bytes,
                 "allocs_per_op": row.alloc_calls,
+                "throughput_rps": row.throughput_rps,
                 "non_200": row.errors,
                 "note": row.note,
             })).collect::<Vec<_>>(),

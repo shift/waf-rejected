@@ -102,6 +102,13 @@ name = "bench-subms"
 path = "src/bin/bench_subms.rs"
 required-features = ["coraza-native"]
 
+# Request-side policy/reputation cache latency. Requires the non-default
+# `distri-kv` feature; see scripts/bench-distributed.sh.
+[[bin]]
+name = "distributed-cache-bench"
+path = "src/bin/distributed_cache_bench.rs"
+required-features = ["distri-kv"]
+
 # Loopback echo benchmark comparing the default tokio path against the
 # io_uring fd path. Requires the non-default feature.
 [[bin]]
