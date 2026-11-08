@@ -37,11 +37,21 @@ region = "eu-west-1"
 policy_scope = "default"
 endpoints = ["https://dkv-eu.example:7443"]
 fallback = "local_only"
+# Optional bearer token for clusters whose DistriWaf service uses token auth.
+auth_token = ""
+# This node's own gRPC ingest endpoint advertised to the cluster. Required by
+# the v1 contract; empty falls back to the first control-plane endpoint.
+advertise_endpoint = "https://waf-eu-1.example:9443"
 ```
 
 `node_id` and `region` are required once any endpoint is configured; the gRPC
 `Register`/`Heartbeat` calls need a stable identity. Leaving `endpoints = []`
 keeps the controller on the `LocalOnly` sources even with `enabled = true`.
+`auth_token` is sent as `authorization: Bearer <token>` on every RPC. It is a
+secret and is not written to startup logs; it is not a substitute for TLS on an
+untrusted network.
+`advertise_endpoint` must be the node's own reachable ingest endpoint when
+`Discover` consumers need to call it.
 
 Build with the feature:
 
@@ -94,7 +104,9 @@ is dropped on retryable statuses, so the controller reconnects with exponential
 backoff. `https://` endpoints use tonic's rustls transport with the webpki
 roots; `http://` is accepted for sidecar/plaintext deployments. Mutual TLS is
 not configured by this client yet — terminate it in the local sidecar and use
-`http://` to that sidecar, or add TLS identity in a future revision.
+`http://` to that sidecar, or add TLS identity in a future revision. When the
+DistriWaf service uses its bearer-token mode, set `auth_token`; the production
+default (mTLS/SPIFFE) is unchanged.
 
 The bindings are vendored (`src/waf/distributed/distri_waf.rs`) so builds do
 not need `protoc`. Regenerate from shift/distri-kv `proto/distri_waf.proto`
@@ -140,6 +152,41 @@ task to finish.
 - A higher policy generation atomically invalidates all prior entries.
 - Explicitly blocked entries are reported as `Blocked`, so a caller can make a
   fail-closed decision without pretending the entry is fresh.
+
+## End-to-end verification
+
+`scripts/test-distri-e2e.sh` builds the real server from
+`shift/distri-kv@9079588` (the complete `waf.distri.v1` contract) into
+`/tmp/opencode/dkv-e2e`, builds `waf-ingress` with `--features
+distri-kv,export-sled`, and runs the ignored tests in
+`tests/integration/distri_e2e.rs`. The server checkout is never modified.
+
+```bash
+scripts/test-distri-e2e.sh
+# or, with an existing build:
+DISTRI_KV_SERVER_BIN=/path/to/distri-kv-server \
+  nix develop -c cargo test --features distri-kv,export-sled \
+  --test integration distri_e2e -- --ignored --test-threads=1
+```
+
+The harness starts every component on ephemeral ports in a temporary
+directory. It does **not** disable server auth: the server runs its real
+bearer-token mode with a per-run token written to a temp file, and the WAF
+config carries the same `auth_token`. Ephemeral TLS certificates are not
+needed because both processes use the plaintext listener and the token is the
+authenticated credential; production mTLS/SPIFFE remains the default.
+
+| Test | Verifies |
+| --- | --- |
+| `waf_client_registers_heartbeats_and_ingests` | `Register`/`Heartbeat` succeed, `Discover` lists the node, a seeded reputation entry round-trips, and security events plus counter deltas (including `batch_id` dedupe) are accepted |
+| `policy_generation_change_invalidates_waf_cache` | The controller fetches generation 1, then generation 2 after `ActivatePolicy`, and the versioned cache records an invalidation |
+| `proxy_registers_and_applies_policy_generations` | The real `waf-ingress` process connects, appears in `distri_waf_connected_nodes`, serves traffic, and advances `waf_distributed_policy_generation` after activation |
+| `local_only_keeps_serving_while_cluster_is_down` | With an unreachable endpoint, `waf_distributed_fallback_activations_total` increments and the proxy still returns `200` |
+| `fallback_modes_are_explicit` | `local_only` → local decision, `fail_open` → allow, `fail_closed` → block for unanswered shared lookups |
+
+The reputation fixture is written directly into the server's sled namespace
+before the server opens it, because the v1 WAF-node contract has no
+reputation-write RPC.
 
 ## Rollout
 

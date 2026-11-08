@@ -965,6 +965,17 @@ pub struct DistributedConfig {
     /// `https://dkv-eu.example:7443`). Empty is valid in `local_only` mode.
     pub endpoints: Vec<String>,
 
+    /// Optional bearer token sent as `authorization: Bearer <token>` on every
+    /// DistriWaf RPC. Required when the cluster's DistriWaf service uses
+    /// bearer-token auth (for example behind a TLS-terminating sidecar).
+    /// Empty means no credential is attached. Treat this value as a secret.
+    pub auth_token: String,
+
+    /// This node's gRPC ingest endpoint advertised in `Register`
+    /// (`NodeMetadata.endpoint`). The contract requires a non-empty value;
+    /// when this is empty the first control-plane endpoint is advertised.
+    pub advertise_endpoint: String,
+
     /// Behaviour when the cluster is unavailable. Default `local_only`.
     pub fallback: DistributedFallbackMode,
 
@@ -1010,6 +1021,8 @@ impl Default for DistributedConfig {
             region: String::new(),
             policy_scope: "default".to_string(),
             endpoints: Vec::new(),
+            auth_token: String::new(),
+            advertise_endpoint: String::new(),
             fallback: DistributedFallbackMode::LocalOnly,
             policy_cache_ttl_secs: 300,
             reputation_cache_ttl_secs: 300,
@@ -1043,6 +1056,43 @@ impl DistributedConfig {
         }
         if self.policy_scope.len() > 128 {
             anyhow::bail!("waf.distributed.policy_scope must be at most 128 characters");
+        }
+        if self.auth_token.len() > 4096 {
+            anyhow::bail!("waf.distributed.auth_token must be at most 4096 characters");
+        }
+        if !self.auth_token.is_empty()
+            && !self
+                .auth_token
+                .bytes()
+                .all(|byte| (0x21..=0x7e).contains(&byte))
+        {
+            anyhow::bail!(
+                "waf.distributed.auth_token must contain only printable ASCII without spaces"
+            );
+        }
+        if !self.auth_token.is_empty() && self.endpoints.is_empty() {
+            anyhow::bail!(
+                "waf.distributed.auth_token requires at least one waf.distributed.endpoints entry"
+            );
+        }
+        if !self.advertise_endpoint.trim().is_empty() {
+            let uri = self
+                .advertise_endpoint
+                .parse::<http::Uri>()
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "invalid waf.distributed.advertise_endpoint '{}': {error}",
+                        self.advertise_endpoint
+                    )
+                })?;
+            if !matches!(uri.scheme_str(), Some("https") | Some("http"))
+                || uri.authority().is_none()
+            {
+                anyhow::bail!(
+                    "waf.distributed.advertise_endpoint '{}' must be an absolute http(s) URL",
+                    self.advertise_endpoint
+                );
+            }
         }
         if !self.endpoints.is_empty() && self.node_id.trim().is_empty() {
             anyhow::bail!(

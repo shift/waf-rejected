@@ -22,6 +22,15 @@ All notable changes to WAF-Rejected are documented here.
   `waf_distributed_policy_generation`, cache hit/miss/stale/blocked,
   queue depth/drops, reconnects and fallback activations. See
   [`docs/operations/distributed.md`](docs/operations/distributed.md).
+- Real end-to-end coverage against `shift/distri-kv@9079588`:
+  `tests/integration/distri_e2e.rs` (ignored by default) starts the actual
+  server on ephemeral ports with its bearer-token auth enabled and verifies
+  registration/heartbeats, policy fetch and generation invalidation,
+  reputation, event/counter ingestion, proxy traffic, and `local_only`
+  survival during an outage. `scripts/test-distri-e2e.sh` builds the pinned
+  server and runs the suite. New `waf.distributed.auth_token` bearer
+  credential and `waf.distributed.advertise_endpoint` settings support this
+  without weakening the production mTLS/SPIFFE default.
 
 ### Changed
 

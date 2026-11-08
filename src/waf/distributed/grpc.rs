@@ -55,6 +55,8 @@ pub struct DistriWafClient {
     node_id: String,
     region: String,
     policy_scope: String,
+    advertise_endpoint: String,
+    auth_token: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
     epoch: AtomicU64,
     sequence: AtomicU64,
     policy_generation: AtomicU64,
@@ -76,6 +78,23 @@ impl DistriWafClient {
         } else {
             config.policy_scope.clone()
         };
+        let advertise_endpoint = if config.advertise_endpoint.trim().is_empty() {
+            config.endpoints.first().cloned().unwrap_or_default()
+        } else {
+            config.advertise_endpoint.clone()
+        };
+        let auth_token = if config.auth_token.is_empty() {
+            None
+        } else {
+            let value = format!("Bearer {}", config.auth_token);
+            Some(
+                tonic::metadata::MetadataValue::try_from(value).map_err(|error| {
+                    DistributedError::invalid(format!(
+                        "invalid waf.distributed.auth_token: {error}"
+                    ))
+                })?,
+            )
+        };
         Ok(Self {
             endpoints: config.endpoints.clone(),
             next_endpoint: AtomicUsize::new(0),
@@ -84,6 +103,8 @@ impl DistriWafClient {
             node_id: config.node_id.clone(),
             region: config.region.clone(),
             policy_scope,
+            advertise_endpoint,
+            auth_token,
             epoch: AtomicU64::new(1),
             sequence: AtomicU64::new(0),
             policy_generation: AtomicU64::new(0),
@@ -155,6 +176,11 @@ impl DistriWafClient {
     fn request<T>(&self, message: T) -> Request<T> {
         let mut request = Request::new(message);
         request.set_timeout(self.request_timeout);
+        if let Some(token) = &self.auth_token {
+            request
+                .metadata_mut()
+                .insert("authorization", token.clone());
+        }
         request
     }
 
@@ -196,7 +222,7 @@ impl DistriWafClient {
             version: node.version.clone(),
             build_commit: String::new(),
             capabilities: vec!["waf".to_string()],
-            endpoint: String::new(),
+            endpoint: self.advertise_endpoint.clone(),
             labels: Default::default(),
             epoch,
             policy_generation: self.policy_generation.load(Ordering::Acquire),
@@ -454,8 +480,7 @@ impl EventSink for DistriWafClient {
             .map(|event| event_to_proto(event, &region))
             .collect();
         let stream = futures::stream::iter(messages);
-        let mut request = Request::new(stream);
-        request.set_timeout(self.request_timeout);
+        let request = self.request(stream);
         let response = self.client().await?.ingest_events(request).await;
         let summary = self.finish(response).await?;
         if summary.retry_after_ms > 0 {

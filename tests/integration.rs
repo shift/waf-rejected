@@ -33,6 +33,13 @@ mod https_upstream_tests;
 #[path = "integration/http2_tuning_tests.rs"]
 mod http2_tuning_tests;
 
+// Real distri-kv end-to-end tests. Ignored by default; run
+// `scripts/test-distri-e2e.sh`. `export-sled` provides the reputation fixture
+// writer and the WAF's own sled exporter is not otherwise required.
+#[cfg(all(feature = "distri-kv", feature = "export-sled"))]
+#[path = "integration/distri_e2e.rs"]
+mod distri_e2e;
+
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 #[path = "integration/io_uring_proxy_bench.rs"]
 mod io_uring_proxy_bench;
