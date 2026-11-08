@@ -99,6 +99,10 @@ pub struct Metrics {
     response_skipped_streaming_total: AtomicU64,
     response_skipped_unsupported_total: AtomicU64,
     response_body_truncated_total: AtomicU64,
+    /// Attached distributed fabric handle, when compiled and enabled.
+    #[cfg(feature = "distri-kv")]
+    distributed:
+        std::sync::RwLock<Option<std::sync::Arc<crate::waf::distributed::DistributedState>>>,
 }
 
 impl Default for Metrics {
@@ -190,6 +194,20 @@ impl Metrics {
             response_skipped_streaming_total: AtomicU64::new(0),
             response_skipped_unsupported_total: AtomicU64::new(0),
             response_body_truncated_total: AtomicU64::new(0),
+            #[cfg(feature = "distri-kv")]
+            distributed: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// Attach the distributed fabric state so `/metrics` includes the
+    /// `waf_distributed_*` families. A no-op unless the feature is compiled.
+    #[cfg(feature = "distri-kv")]
+    pub fn set_distributed_state(
+        &self,
+        state: std::sync::Arc<crate::waf::distributed::DistributedState>,
+    ) {
+        if let Ok(mut slot) = self.distributed.write() {
+            *slot = Some(state);
         }
     }
 
@@ -976,6 +994,23 @@ impl Metrics {
              waf_uptime_seconds {}\n",
             self.uptime_seconds(),
         ));
+
+        #[cfg(feature = "distri-kv")]
+        if let Some(state) = self
+            .distributed
+            .read()
+            .ok()
+            .and_then(|slot| slot.as_ref().cloned())
+        {
+            crate::waf::distributed::metrics::render_prometheus(
+                &mut out,
+                state.connected(),
+                state.heartbeat_age(),
+                state.policy_generation(),
+                state.metrics(),
+                &[],
+            );
+        }
 
         out
     }

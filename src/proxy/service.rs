@@ -992,6 +992,11 @@ impl WafProxyService {
             )));
         }
 
+        #[cfg(feature = "distri-kv")]
+        if let Some(state) = waf_engine.distributed_state() {
+            metrics.set_distributed_state(Arc::clone(state));
+        }
+
         // Initialize high-performance buffer pool for zero-allocation HTTP processing
         let buffer_pool = BufferPool::new();
         info!(
@@ -1151,6 +1156,13 @@ impl WafProxyService {
     /// Shared runtime metrics, also served by the health service.
     pub fn metrics(&self) -> Arc<Metrics> {
         Arc::clone(&self.metrics)
+    }
+
+    /// The engine's distributed fabric handle, when compiled and enabled.
+    /// The server uses it to share one handle with the controller.
+    #[cfg(feature = "distri-kv")]
+    pub fn distributed_state(&self) -> Option<Arc<crate::waf::distributed::DistributedState>> {
+        self.waf_engine.distributed_state().cloned()
     }
 
     /// Start the proxy server with optimized concurrency

@@ -4,6 +4,25 @@ All notable changes to WAF-Rejected are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- WAF-side distributed security fabric behind the non-default `distri-kv`
+  Cargo feature: `[waf.distributed]` config with values validation,
+  `PolicySource`/`ReputationSource`/`RateLimitSync`/`EventSink`/`NodeRegistry`
+  trait boundaries, `LocalOnly` implementations that preserve today's
+  behaviour, a TTL + generation policy/reputation cache with explicit
+  fresh/stale/blocked states, bounded event/counter queues with drop
+  accounting, and an async controller with reconnect/backoff and graceful
+  shutdown. A tonic `DistriWafClient` implements the `waf.distri.v1` contract
+  from shift/distri-kv (vendored proto/bindings, no build-time `protoc`), with
+  per-RPC deadlines, channel invalidation and a mock-server test. Defaults are
+  unchanged (`enabled = false`, `fallback = "local_only"`), and enabling the
+  feature without a cluster does not alter request decisions. New metrics:
+  `waf_distributed_connected`, `waf_distributed_heartbeat_age_seconds`,
+  `waf_distributed_policy_generation`, cache hit/miss/stale/blocked,
+  queue depth/drops, reconnects and fallback activations. See
+  [`docs/operations/distributed.md`](docs/operations/distributed.md).
+
 ### Changed
 
 - Canonicalized the OCI package as `ghcr.io/shift/waf-rejected-waf`. GHCR

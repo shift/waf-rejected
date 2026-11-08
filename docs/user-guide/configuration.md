@@ -558,6 +558,41 @@ proxy listener, so they do not need a fast-allow entry.
 
 Requires at least one route; duplicate or malformed routes abort start-up.
 
+### `[waf.distributed]` — opt-in, non-default build feature
+
+Client for the distri-kv security fabric. Requires a build with the
+non-default `distri-kv` feature. Defaults are off and `local_only`, so an
+existing config and an existing build behave exactly as before. The client
+implements the `waf.distri.v1.DistriWaf` contract; `LocalOnly` sources are used
+when no endpoint is configured. See
+[distributed operations](../operations/distributed.md).
+
+```toml
+[waf.distributed]
+enabled = false                  # master switch
+node_id = ""                     # required when endpoints are set
+region = "eu-west-1"             # required when endpoints are set
+policy_scope = "default"         # GetPolicy scope
+endpoints = []                   # e.g. ["https://dkv-eu.example:7443"]
+fallback = "local_only"          # local_only | fail_open | fail_closed
+policy_cache_ttl_secs = 300
+reputation_cache_ttl_secs = 300
+max_stale_secs = 900
+heartbeat_interval_secs = 10
+request_timeout_ms = 2000        # gRPC deadline and connect timeout
+event_queue_capacity = 8192
+counter_queue_capacity = 4096
+reconnect_initial_backoff_ms = 100
+reconnect_max_backoff_ms = 30000
+shadow = true                    # observe/log derived actions, never enforce
+```
+
+`fail_open` and `fail_closed` are rejected without at least one endpoint.
+Endpoints must be absolute `http(s)` URLs; `node_id` and `region` must be
+non-empty once any endpoint is configured. Unknown keys are rejected. The
+`fallback` setting only governs shared-data lookups; it is independent of
+`waf.fail_mode`, which governs WAF engine errors.
+
 ### `[waf.wasm]` — legacy, feature-gated
 
 Parsed on every build for compatibility, but only effective in builds with the

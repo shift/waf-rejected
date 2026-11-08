@@ -26,6 +26,11 @@ pub mod wasm_reactor;
 #[cfg(feature = "allow-cache")]
 pub mod allow_cache;
 
+/// Distributed security fabric client scaffold (non-default `distri-kv`
+/// feature). See `docs/operations/distributed.md`.
+#[cfg(feature = "distri-kv")]
+pub mod distributed;
+
 /// Shared, bounded, allocation-free transform pipeline used by the prefilter
 /// and the native engine.
 /// Compiled for unit tests even without the feature so parity tests always run.
@@ -371,6 +376,10 @@ pub struct WafEngine {
     inline_heavy: bool,
     /// Shared runtime metrics, when the caller supplied them.
     metrics: Option<Arc<crate::metrics::Metrics>>,
+    /// Distributed fabric handle (`distri-kv` feature). `None` unless
+    /// `waf.distributed.enabled` is set, so current behaviour is unchanged.
+    #[cfg(feature = "distri-kv")]
+    distributed: Option<Arc<distributed::DistributedState>>,
     /// Experimental content-addressed allow-verdict cache (`allow-cache`).
     #[cfg(feature = "allow-cache")]
     allow_cache: Option<Arc<allow_cache::AllowCache>>,
@@ -458,6 +467,8 @@ impl Clone for WafEngine {
             admission: self.admission.clone(),
             inline_heavy: self.inline_heavy,
             metrics: self.metrics.clone(),
+            #[cfg(feature = "distri-kv")]
+            distributed: self.distributed.clone(),
             #[cfg(feature = "allow-cache")]
             allow_cache: self.allow_cache.clone(),
             fast_allow: Arc::clone(&self.fast_allow),
@@ -492,6 +503,8 @@ impl WafEngine {
             admission: AdmissionController::disabled(),
             inline_heavy: false,
             metrics: None,
+            #[cfg(feature = "distri-kv")]
+            distributed: None,
             #[cfg(feature = "allow-cache")]
             allow_cache: None,
             fast_allow: Arc::new(fast_allow::FastAllow::disabled()),
@@ -528,6 +541,13 @@ impl WafEngine {
             }
         };
 
+        #[cfg(feature = "distri-kv")]
+        let distributed = config.waf.distributed.enabled.then(|| {
+            Arc::new(distributed::DistributedState::from_config(
+                &config.waf.distributed,
+            ))
+        });
+
         let mut engine = Self {
             rules: Arc::new(RwLock::new(Vec::new())),
             event_logger: SecurityEventLogger::new(config.waf.security_events.clone()),
@@ -557,6 +577,8 @@ impl WafEngine {
             inline_heavy: config.waf.coraza.enabled
                 && config.waf.coraza.backend == crate::config::CorazaBackend::Rust,
             metrics,
+            #[cfg(feature = "distri-kv")]
+            distributed,
             #[cfg(feature = "allow-cache")]
             allow_cache: None,
             fast_allow,
@@ -992,18 +1014,22 @@ impl WafEngine {
             let refill = (config.waf.rate_limit.per_ip_max_requests as f64 / window as f64)
                 .ceil()
                 .max(1.0) as u32;
-            self.add_rule(
-                RateLimiter::new(
-                    "per_ip_rate_limit",
-                    config.waf.rate_limit.per_ip_max_requests.max(1),
-                    refill,
-                    std::time::Duration::from_secs(window),
-                )
-                .with_limits(
-                    config.waf.rate_limit.max_tracked_ips,
-                    config.waf.rate_limit.capacity_policy,
-                ),
+            let limiter = RateLimiter::new(
+                "per_ip_rate_limit",
+                config.waf.rate_limit.per_ip_max_requests.max(1),
+                refill,
+                std::time::Duration::from_secs(window),
+            )
+            .with_limits(
+                config.waf.rate_limit.max_tracked_ips,
+                config.waf.rate_limit.capacity_policy,
             );
+            #[cfg(feature = "distri-kv")]
+            let limiter = match &self.distributed {
+                Some(state) => limiter.with_distributed_state(Arc::clone(state)),
+                None => limiter,
+            };
+            self.add_rule(limiter);
         }
         if config.waf.rate_limit.global_enabled {
             let window = config.waf.rate_limit.global_window_secs.max(1);
@@ -2118,6 +2144,14 @@ impl WafEngine {
         if let Some(cache) = &self.allow_cache {
             cache.invalidate();
         }
+    }
+
+    /// The distributed fabric handle, when the `distri-kv` feature is compiled
+    /// in and `waf.distributed.enabled` is true. `None` is the default and
+    /// means the engine is entirely process-local.
+    #[cfg(feature = "distri-kv")]
+    pub fn distributed_state(&self) -> Option<&Arc<distributed::DistributedState>> {
+        self.distributed.as_ref()
     }
 
     /// Reload gRPC/GraphQL descriptor-backed policy and invalidate the

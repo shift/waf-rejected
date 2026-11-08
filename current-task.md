@@ -1,3 +1,44 @@
+# Delegated: WAF-side distributed integration scaffold (`.worktrees/distri-client`)
+
+**Branch:** `feat/distri-kv-client` (base `main` = `be2324e`).
+**Status:** scaffold committed in `bd9102e`; gRPC client and verification in
+the follow-up commit. Defaults unchanged (`enabled = false`,
+`fallback = "local_only"`).
+
+## Plan
+
+- [x] Non-default `distri-kv` feature and `src/waf/distributed/` module.
+- [x] `DistributedConfig` (`[waf.distributed]`) with defaults (`enabled=false`)
+      and strict validation, plus startup logging.
+- [x] Trait boundaries: `PolicySource`, `ReputationSource`, `RateLimitSync`,
+      `EventSink`, `NodeRegistry`.
+- [x] `LocalOnly` implementations that preserve today's behaviour.
+- [x] Async controller skeleton: bounded queues, drop policy, backpressure,
+      graceful shutdown, reconnect/backoff, metrics, generation invalidation.
+- [x] Policy/reputation TTL cache with explicit fresh/stale/blocked/miss.
+- [x] `DistributedState` attached to `WafEngine` and per-IP `RateLimiter`
+      (only when the feature and config enable it).
+- [x] Prometheus metrics for connection, heartbeat age, generation, cache,
+      queue depth/drops, reconnects, fallback activations.
+- [x] Tests: config validation, local-only parity, cache TTL/invalidation,
+      queue backpressure, fallback modes, shutdown, no-cluster decisions.
+- [x] Docs `docs/operations/distributed.md`, configuration reference,
+      CHANGELOG.
+- [x] Verify fmt, lib tests with/without `distri-kv`, clippy, `nix build
+      .#waf-ingress`.
+- [x] Tonic client (`grpc.rs`) against the vendored `waf.distri.v1` contract
+      for register/heartbeat/policy/reputation/counters/events, with per-RPC
+      deadlines, channel invalidation/reconnect and `local_only` fallback.
+- [x] Mock in-process tonic server test covering register, heartbeat, policy
+      and reputation round trips.
+- [x] Server spawns the controller with the engine's shared state when the
+      feature and config enable it; graceful shutdown drains the queues.
+
+**Cross-repo note:** `distri-kv-client` on shift/distri-kv@9079588 only exposes
+the `distri_kv` service, not `DistriWaf`; a path/git dependency therefore
+cannot supply this client. The generated bindings are vendored from
+`proto/distri_waf.proto` instead, so builds need no `protoc`.
+
 # P0-09: Beta Release (current: 0.1.0-beta.13) (NORTH STAR)
 
 ## Config strictness (`fix/config-strictness`)

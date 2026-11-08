@@ -277,6 +277,11 @@ pub struct RateLimiter {
     refill_rate: u32,
     window_size: Duration,
     enabled: bool,
+    /// Distributed fabric handle (`distri-kv` feature). When present, the
+    /// correlation feedback multiplier adjusts new/updated bucket limits.
+    /// `None` (the default) keeps the exact pre-existing arithmetic.
+    #[cfg(feature = "distri-kv")]
+    distributed: Option<Arc<crate::waf::distributed::DistributedState>>,
     /// Deterministic cleanup trigger; replaces a per-request RNG draw.
     evaluations: AtomicU64,
 }
@@ -294,8 +299,41 @@ impl RateLimiter {
             refill_rate,
             window_size,
             enabled: true,
+            #[cfg(feature = "distri-kv")]
+            distributed: None,
             evaluations: AtomicU64::new(0),
         }
+    }
+
+    /// Attach the distributed fabric handle. Only the correlation feedback
+    /// multiplier is read; enforcement stays local. Callers only do this when
+    /// `waf.distributed.enabled` is true.
+    #[cfg(feature = "distri-kv")]
+    pub fn with_distributed_state(
+        mut self,
+        state: Arc<crate::waf::distributed::DistributedState>,
+    ) -> Self {
+        self.distributed = Some(state);
+        self
+    }
+
+    #[cfg(feature = "distri-kv")]
+    pub fn distributed_state(&self) -> Option<&Arc<crate::waf::distributed::DistributedState>> {
+        self.distributed.as_ref()
+    }
+
+    /// Capacity/refill after the distributed feedback multiplier, if any.
+    fn effective_limits(&self) -> (u32, u32) {
+        #[cfg(feature = "distri-kv")]
+        if let Some(state) = &self.distributed {
+            let multiplier = state.rate_limit_multiplier();
+            if (multiplier - 1.0).abs() > f32::EPSILON {
+                let capacity = ((self.capacity as f32) / multiplier) as u32;
+                let refill = ((self.refill_rate as f32) / multiplier) as u32;
+                return (capacity.max(1), refill.max(1));
+            }
+        }
+        (self.capacity, self.refill_rate)
     }
 
     /// Override the tracked-IP cap and the behaviour at capacity.
@@ -315,10 +353,16 @@ impl RateLimiter {
         let evaluations = self.evaluations.fetch_add(1, Ordering::Relaxed);
         self.buckets.maybe_cleanup(evaluations);
 
+        let (capacity, refill_rate) = self.effective_limits();
         let decision = self.buckets.access(
             client_ip,
-            || TokenBucket::new(self.capacity, self.refill_rate),
+            || TokenBucket::new(capacity, refill_rate),
             |bucket| {
+                if bucket.capacity != capacity || bucket.refill_rate != refill_rate {
+                    bucket.capacity = capacity;
+                    bucket.refill_rate = refill_rate;
+                    bucket.tokens = bucket.tokens.min(capacity);
+                }
                 if bucket.try_consume(1) {
                     debug!(
                         "Rate limit check passed for {}, {} tokens remaining",

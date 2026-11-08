@@ -862,6 +862,10 @@ pub struct WafConfig {
     /// enabled, only the explicitly listed `"METHOD /path"` routes skip
     /// per-request inspection.
     pub fast_allow: WafFastAllowConfig,
+
+    /// Distributed security fabric client (`distri-kv` build feature).
+    /// Disabled by default; see `docs/operations/distributed.md`.
+    pub distributed: DistributedConfig,
 }
 
 /// Opt-in allow-verdict cache.
@@ -903,6 +907,208 @@ impl Default for AllowCacheConfig {
             max_body_bytes: 64 * 1024,
             routes: Vec::new(),
         }
+    }
+}
+
+/// Availability/security trade-off when the regional distri-kv cluster is
+/// unreachable. This is independent of `waf.fail_mode`, which governs WAF
+/// engine errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DistributedFallbackMode {
+    /// Keep using process-local state. The cluster is never on the decision
+    /// path, so an outage never changes a request decision. Default.
+    #[default]
+    LocalOnly,
+    /// Allow shared-data lookups that cannot be answered (availability-first).
+    FailOpen,
+    /// Block shared-data lookups that cannot be answered (security-first).
+    FailClosed,
+}
+
+impl DistributedFallbackMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalOnly => "local_only",
+            Self::FailOpen => "fail_open",
+            Self::FailClosed => "fail_closed",
+        }
+    }
+}
+
+/// Distributed security fabric client (`[waf.distributed]`).
+///
+/// Off by default. Enabling this section only has an effect in a build that
+/// compiles the non-default `distri-kv` feature; without it the configuration
+/// is still parsed and validated so shipped configs remain forward
+/// compatible, and startup logs a warning. An enabled section without a
+/// reachable cluster is valid: the default `fallback = "local_only"` keeps
+/// every decision process-local.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DistributedConfig {
+    /// Master switch. `false` (default) is byte-for-byte local behaviour.
+    pub enabled: bool,
+
+    /// Stable node identity. Empty lets the operator or a future client
+    /// generate and persist one; it never gates request processing.
+    pub node_id: String,
+
+    /// Failure/consistency domain, for example `eu-west-1`.
+    pub region: String,
+
+    /// Policy scope requested from the cluster (`GetPolicy`). Empty selects
+    /// `default`.
+    pub policy_scope: String,
+
+    /// Regional bootstrap endpoints (for example
+    /// `https://dkv-eu.example:7443`). Empty is valid in `local_only` mode.
+    pub endpoints: Vec<String>,
+
+    /// Behaviour when the cluster is unavailable. Default `local_only`.
+    pub fallback: DistributedFallbackMode,
+
+    /// Lifetime of a cached policy/allowlist generation, in seconds.
+    pub policy_cache_ttl_secs: u64,
+
+    /// Lifetime of a cached reputation entry, in seconds.
+    pub reputation_cache_ttl_secs: u64,
+
+    /// How long a stale entry may still be served before it is treated as a
+    /// miss. `0` disables stale serving.
+    pub max_stale_secs: u64,
+
+    /// Controller heartbeat interval, in seconds.
+    pub heartbeat_interval_secs: u64,
+
+    /// Background RPC timeout. Never applied on the request path.
+    pub request_timeout_ms: u64,
+
+    /// Bounded security-event queue capacity. Overflow drops, never blocks.
+    pub event_queue_capacity: usize,
+
+    /// Bounded rate-limit counter-delta queue capacity. Overflow drops,
+    /// never blocks.
+    pub counter_queue_capacity: usize,
+
+    /// Initial reconnect backoff, in milliseconds.
+    pub reconnect_initial_backoff_ms: u64,
+
+    /// Maximum reconnect backoff, in milliseconds.
+    pub reconnect_max_backoff_ms: u64,
+
+    /// Canary safety net: connect, observe and log, but never enforce derived
+    /// actions. Default `true`.
+    pub shadow: bool,
+}
+
+impl Default for DistributedConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            node_id: String::new(),
+            region: String::new(),
+            policy_scope: "default".to_string(),
+            endpoints: Vec::new(),
+            fallback: DistributedFallbackMode::LocalOnly,
+            policy_cache_ttl_secs: 300,
+            reputation_cache_ttl_secs: 300,
+            max_stale_secs: 900,
+            heartbeat_interval_secs: 10,
+            request_timeout_ms: 2000,
+            event_queue_capacity: 8192,
+            counter_queue_capacity: 4096,
+            reconnect_initial_backoff_ms: 100,
+            reconnect_max_backoff_ms: 30_000,
+            shadow: true,
+        }
+    }
+}
+
+impl DistributedConfig {
+    /// Validate the distributed block. `enabled = false` performs no checks
+    /// beyond the types, so existing configs are unaffected.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.node_id.len() > 128 {
+            anyhow::bail!("waf.distributed.node_id must be at most 128 characters");
+        }
+        if self.node_id.chars().any(char::is_whitespace) {
+            anyhow::bail!("waf.distributed.node_id must not contain whitespace");
+        }
+        if self.region.len() > 64 {
+            anyhow::bail!("waf.distributed.region must be at most 64 characters");
+        }
+        if self.policy_scope.len() > 128 {
+            anyhow::bail!("waf.distributed.policy_scope must be at most 128 characters");
+        }
+        if !self.endpoints.is_empty() && self.node_id.trim().is_empty() {
+            anyhow::bail!(
+                "waf.distributed.node_id must be set when waf.distributed.endpoints is not empty"
+            );
+        }
+        if !self.endpoints.is_empty() && self.region.trim().is_empty() {
+            anyhow::bail!(
+                "waf.distributed.region must be set when waf.distributed.endpoints is not empty"
+            );
+        }
+        if self.endpoints.len() > 32 {
+            anyhow::bail!("waf.distributed.endpoints must contain at most 32 entries");
+        }
+        for endpoint in &self.endpoints {
+            let uri = endpoint.parse::<http::Uri>().map_err(|error| {
+                anyhow::anyhow!("invalid waf.distributed.endpoints entry '{endpoint}': {error}")
+            })?;
+            if !matches!(uri.scheme_str(), Some("https") | Some("http"))
+                || uri.authority().is_none()
+            {
+                anyhow::bail!(
+                    "waf.distributed.endpoints entry '{endpoint}' must be an absolute http(s) URL"
+                );
+            }
+        }
+        if self.endpoints.is_empty() && self.fallback != DistributedFallbackMode::LocalOnly {
+            anyhow::bail!(
+                "waf.distributed.fallback = \"{}\" requires at least one \
+                 waf.distributed.endpoints entry",
+                self.fallback.as_str()
+            );
+        }
+        if self.policy_cache_ttl_secs == 0 {
+            anyhow::bail!("waf.distributed.policy_cache_ttl_secs must be greater than zero");
+        }
+        if self.reputation_cache_ttl_secs == 0 {
+            anyhow::bail!("waf.distributed.reputation_cache_ttl_secs must be greater than zero");
+        }
+        if self.heartbeat_interval_secs == 0 {
+            anyhow::bail!("waf.distributed.heartbeat_interval_secs must be greater than zero");
+        }
+        if self.request_timeout_ms == 0 {
+            anyhow::bail!("waf.distributed.request_timeout_ms must be greater than zero");
+        }
+        for (name, capacity) in [
+            ("event_queue_capacity", self.event_queue_capacity),
+            ("counter_queue_capacity", self.counter_queue_capacity),
+        ] {
+            if capacity == 0 {
+                anyhow::bail!("waf.distributed.{name} must be greater than zero");
+            }
+            if capacity > 1_048_576 {
+                anyhow::bail!("waf.distributed.{name} must be at most 1048576");
+            }
+        }
+        if self.reconnect_initial_backoff_ms == 0 {
+            anyhow::bail!("waf.distributed.reconnect_initial_backoff_ms must be greater than zero");
+        }
+        if self.reconnect_max_backoff_ms < self.reconnect_initial_backoff_ms {
+            anyhow::bail!(
+                "waf.distributed.reconnect_max_backoff_ms must not be smaller than \
+                 reconnect_initial_backoff_ms"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -2170,6 +2376,7 @@ impl Default for WafConfig {
             admission: WafAdmissionConfig::default(),
             allow_cache: AllowCacheConfig::default(),
             fast_allow: WafFastAllowConfig::default(),
+            distributed: DistributedConfig::default(),
         }
     }
 }
@@ -2669,6 +2876,7 @@ impl Config {
         self.waf.response_inspection.validate()?;
         self.waf.grpc.validate()?;
         self.waf.graphql.validate()?;
+        self.waf.distributed.validate()?;
         if self.security.auth.enabled && self.security.auth.api_keys.is_empty() {
             anyhow::bail!("security.auth.enabled is true but security.auth.api_keys is empty");
         }
@@ -3684,5 +3892,95 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
         config.server.tls.tls13_tickets = 11;
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("tls13_tickets"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn distributed_defaults_are_off_and_local_only() {
+        let config = Config::default();
+        assert!(!config.waf.distributed.enabled);
+        assert_eq!(
+            config.waf.distributed.fallback,
+            DistributedFallbackMode::LocalOnly
+        );
+        assert_eq!(config.waf.distributed.heartbeat_interval_secs, 10);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn distributed_section_parses_and_validates() {
+        let config: Config = toml::from_str(
+            "[waf.distributed]\n\
+             enabled = true\n\
+             node_id = \"node-a\"\n\
+             region = \"eu-west-1\"\n\
+             endpoints = [\"https://dkv-eu.example:7443\"]\n\
+             fallback = \"local_only\"\n\
+             policy_cache_ttl_secs = 60\n\
+             reputation_cache_ttl_secs = 120\n\
+             heartbeat_interval_secs = 5\n\
+             request_timeout_ms = 500\n\
+             event_queue_capacity = 128\n\
+             counter_queue_capacity = 64\n",
+        )
+        .expect("distributed section parses");
+        assert!(config.waf.distributed.enabled);
+        assert_eq!(config.waf.distributed.endpoints.len(), 1);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn distributed_unknown_keys_are_rejected() {
+        let error = toml::from_str::<Config>("[waf.distributed]\nfallbak = \"local_only\"\n")
+            .expect_err("unknown key must be rejected");
+        assert!(error.message().contains("fallbak"));
+    }
+
+    #[test]
+    fn distributed_rejects_non_local_fallback_without_endpoints() {
+        let mut config = Config::default();
+        config.waf.distributed.enabled = true;
+        config.waf.distributed.fallback = DistributedFallbackMode::FailClosed;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("endpoints"), "unexpected error: {error}");
+
+        config.waf.distributed.fallback = DistributedFallbackMode::LocalOnly;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn distributed_rejects_bad_endpoint_and_zero_bounds() {
+        let mut config = Config::default();
+        config.waf.distributed.enabled = true;
+        config.waf.distributed.node_id = "node-a".to_string();
+        config.waf.distributed.region = "eu-west-1".to_string();
+        config.waf.distributed.endpoints = vec!["dkv-eu.example:7443".to_string()];
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("absolute http"), "unexpected error: {error}");
+
+        config.waf.distributed.node_id = String::new();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("node_id"), "unexpected error: {error}");
+        config.waf.distributed.node_id = "node-a".to_string();
+
+        config.waf.distributed.region = String::new();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("region"), "unexpected error: {error}");
+        config.waf.distributed.region = "eu-west-1".to_string();
+
+        config.waf.distributed.endpoints = Vec::new();
+        config.waf.distributed.heartbeat_interval_secs = 0;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("heartbeat_interval_secs"));
+
+        config.waf.distributed.heartbeat_interval_secs = 10;
+        config.waf.distributed.event_queue_capacity = 0;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("event_queue_capacity"));
+
+        config.waf.distributed.event_queue_capacity = 8192;
+        config.waf.distributed.reconnect_initial_backoff_ms = 1000;
+        config.waf.distributed.reconnect_max_backoff_ms = 500;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("reconnect_max_backoff_ms"));
     }
 }

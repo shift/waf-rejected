@@ -92,6 +92,40 @@ pub async fn run_with_config(config: Config) -> Result<(), Box<dyn Error>> {
     info!("  TLS enabled: {}", config.server.tls.enabled);
     info!("  Auth enabled: {}", config.security.auth.enabled);
 
+    let distributed = &config.waf.distributed;
+    if distributed.enabled {
+        info!(
+            "  Distributed: enabled (region='{}', node_id='{}', fallback='{}', endpoints={}, shadow={})",
+            distributed.region,
+            distributed.node_id,
+            distributed.fallback.as_str(),
+            distributed.endpoints.len(),
+            distributed.shadow
+        );
+        if distributed.endpoints.is_empty() {
+            warn!(
+                "waf.distributed.enabled with no endpoints: the node stays local; \
+                 fallback '{}' applies only to shared-data lookups",
+                distributed.fallback.as_str()
+            );
+        }
+        if distributed.fallback != crate::config::DistributedFallbackMode::LocalOnly {
+            warn!(
+                "waf.distributed.fallback = '{}' may block or allow shared-data lookups \
+                 when the cluster is unavailable; review docs/operations/distributed.md",
+                distributed.fallback.as_str()
+            );
+        }
+        if !cfg!(feature = "distri-kv") {
+            warn!(
+                "waf.distributed.enabled is set but this build was compiled without the \
+                 `distri-kv` feature; the client is inactive and all decisions remain local"
+            );
+        }
+    } else {
+        info!("  Distributed: disabled");
+    }
+
     if !config.waf.enabled {
         warn!("WAF is disabled in configuration; requests will be forwarded unfiltered");
     }
@@ -101,6 +135,31 @@ pub async fn run_with_config(config: Config) -> Result<(), Box<dyn Error>> {
 
     let proxy_service = WafProxyService::new(config.clone())
         .map_err(|e| format!("Failed to initialize proxy service: {}", e))?;
+
+    // The controller runs on its own task and never on the request path. It
+    // shares the engine's state handle so generation/connectivity changes are
+    // visible to `/metrics` and the rate limiter.
+    #[cfg(feature = "distri-kv")]
+    let distributed_handle = if config.waf.distributed.enabled {
+        match proxy_service.distributed_state() {
+            Some(state) => {
+                match crate::waf::distributed::DistributedController::from_config_with_state(
+                    &config.waf.distributed,
+                    state,
+                ) {
+                    Ok(controller) => Some(controller.spawn()),
+                    Err(error) => {
+                        warn!("Distributed controller disabled: {}", error);
+                        None
+                    }
+                }
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
     let health_service = HealthService::with_metrics(proxy_service.metrics());
 
     let health_addr = config.health_bind_addr;
@@ -127,6 +186,11 @@ pub async fn run_with_config(config: Config) -> Result<(), Box<dyn Error>> {
         _ = shutdown_signal() => {
             info!("Shutdown signal received");
         }
+    }
+
+    #[cfg(feature = "distri-kv")]
+    if let Some(handle) = distributed_handle {
+        handle.shutdown().await;
     }
 
     info!("WAF-Rejected shutdown complete");

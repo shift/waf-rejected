@@ -220,6 +220,10 @@ notify = "6.1"
 urlencoding = "2.1"
 async-trait = "0.1"
 
+# gRPC client for the distri-kv DistriWaf contract (`distri-kv` feature only).
+tonic = { version = "0.11", optional = true, features = ["tls", "tls-webpki-roots"] }
+prost = { version = "0.12", optional = true }
+
 # Development-only dependencies
 
 # WebSocket handshake dependencies
@@ -272,6 +276,7 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 proptest = "1"
 testcontainers = "0.15"
 tokio-test = "0.4"
+tokio-stream = { version = "0.1", features = ["net"] }
 wiremock = "0.6"
 tempfile = "3.0"
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
@@ -341,6 +346,11 @@ native-detect = []
 # reference implementation and an explicit fallback. See
 # docs/suggestions_from_agents/rust-engine.md.
 rust-engine = ["dep:aho-corasick", "native-detect"]
+# Distributed security fabric client (`[waf.distributed]`). Non-default. The
+# vendored `DistriWaf` contract from shift/distri-kv is implemented with a
+# minimal tonic client in `src/waf/distributed/grpc.rs`; the default remains
+# `local_only`. See docs/operations/distributed.md.
+distri-kv = ["dep:tonic", "dep:prost"]
 # Compile-in hot-loop instrumentation for the native Rust engine. Non-default
 # and absent from production builds; exposes `RustEngine::evaluate_profiled`.
 # See docs/suggestions_from_agents/engine-hotloop.md.
