@@ -1,15 +1,26 @@
 # ADR-0007: Distributed WAF security fabric over distri-kv
 
-- **Status:** Proposed
+- **Status:** Accepted (architecture decisions recorded in
+  [§11 ADR-0008](#11-decision-log-adr-0008); design only, not implemented)
 - **Date:** 2026-11-08
 - **Owners:** WAF architecture group, distri-kv maintainers
-- **Related:** [Security model](../architecture/security-model.md),
+- **Related:** [distri-kv capability audit](./distri-kv-audit.md),
+  [Security model](../architecture/security-model.md),
   [gRPC transport](../architecture/grpc-transport.md),
   [`Requests_For_WAF-Rejected.md`](../../Requests_For_WAF-Rejected.md),
   [`WAF_CODE_REQUEST.md`](../../WAF_CODE_REQUEST.md),
   [`docs/Optimizations.md`](../Optimizations.md)
 - **Implementation:** none in this change. This document defines the contract
-  that both repositories implement against.
+  that both repositories implement against. The distri-kv prerequisites are in
+  [§12.2](#122-build-and-contract-prerequisites-ordered); the end-to-end
+  dependency order is in [§15](#15-what-remains-before-implementation).
+
+> **Revision note (2026-11-08):** the architecture owner has resolved the open
+> questions. This revision replaces the former §11 question table with a formal
+> decision log (ADR-0008), sets the false-positive budget for automated
+> distributed blocks to **0%**, reconciles §12 with
+> [`distri-kv-audit.md`](./distri-kv-audit.md), and adds the dependency-ordered
+> remainder list in §15.
 
 ---
 
@@ -41,15 +52,26 @@ The core decision is a **two-plane split**:
 
 The invariant is: **a WAF node with a live local cache and no distri-kv
 connectivity must still enforce its last-known-good policy and local limits.**
-Consensus failures degrade freshness, not availability. The operator chooses
-the only availability/security tradeoff explicitly:
-`distributed.fallback_mode = "stale_allow" | "stale_block" | "local_only"`.
+Consensus failures degrade freshness, not availability. The default is
+`distributed.fallback_mode = "local_only"`; the other fallback modes are
+explicit opt-ins (see §5.6).
 
-The design uses distri-kv's two existing building blocks:
+The design intends to build on two distri-kv building blocks,
 `distributed_rate_limit.rs` (batched counter/delta replication) and
-`security_correlation.rs` (windowed event aggregation). Everything below the
-gRPC contract is therefore an adaptation of existing distri-kv internals, not
-a new consensus protocol.
+`security_correlation.rs` (windowed event aggregation). The
+[capability audit](./distri-kv-audit.md) shows that at commit `c6fd36d` these
+are **node-local libraries with no RPC, no replication and a broken build**, so
+the split below is a target design, not an integration against working
+capability (§12).
+
+**Global actions are conservative by construction.** No automated distributed
+block is permitted from heuristics, ML or anomaly scoring. A global block is
+applied only when it is either (a) an **exact-match deterministic indicator**
+from an operator-supplied blocklist or a known-bad hash/URL, or (b) a
+**heuristic candidate that an operator has explicitly approved**. Regional
+corroboration is a *detection* signal that raises confidence and alert
+priority; it never authorises an automatic global block. See §6.3, §6.4 and
+ADR-0008 D2/D6.
 
 ---
 
@@ -59,7 +81,7 @@ a new consensus protocol.
 
 | ID | Goal |
 |---|---|
-| G1 | **Global endpoints.** An IP blocked by any WAF node in a region is blocked by all nodes in that region within a bounded propagation target (p95 ≤ 5 s; see §4.6). |
+| G1 | **Regional endpoints.** An IP added to a regional blocklist by an operator or an exact-match deterministic indicator is enforced by all nodes in that region within a bounded propagation target (p95 ≤ 5 s; see §4.6). Heuristic indicators are propagated as alerts/throttles, never as automatic blocks. |
 | G2 | **Shared security data.** Threat intel, IP reputation, allow/block lists, ruleset versions and counters have one documented schema and one authority per object class. |
 | G3 | **No consensus in the hot path.** p99 added latency attributable to the distributed feature is ≤ 200 µs for cache hits and 0 for a miss that falls back to local state. No request waits on a Raft leader. |
 | G4 | **Availability under partition.** A WAF node keeps serving with last-known-good state. A regional distri-kv quorum loss never stops request processing. |
@@ -77,7 +99,7 @@ a new consensus protocol.
 | N4 | Exactly-once event delivery. | At-least-once with idempotent event IDs is sufficient for correlation; exactly-once would require distributed transactions on the hot path. |
 | N5 | Global, strongly consistent IP block decisions across all regions. | Cross-region linearizability costs a WAN round trip. Global blocks are versioned policy decisions with bounded asynchronous propagation. |
 | N6 | Storing full audit logs only in distri-kv. | distri-kv is not a WORM store. The existing exporters (`exporters/sled.rs`, `exporters/cef.rs`, `exporters/otel.rs`) remain the evidence path; distri-kv indexes for correlation. |
-| N7 | Multi-tenant isolation below the cluster boundary. | The first version is single-tenant per cluster. Tenancy is an open question (§11). |
+| N7 | Multi-tenant isolation below the cluster boundary. | The first version is single-tenant per cluster (ADR-0008 D7). |
 | N8 | Solving GeoIP database distribution. | GeoIP remains a local `.mmdb` file via `waf.geo_blocking`; only *derived* country/ASN reputation is shared. |
 
 ### 1.3 Latency budget
@@ -103,10 +125,14 @@ the only caller of the distri-kv client from within the WAF process.
 
 - A WAF node can be killed and restarted and re-registers within 10 s.
 - A regional distri-kv cluster can lose quorum for 30 minutes while WAF nodes
-  continue to serve with `stale_allow` or `stale_block` semantics.
+  continue to serve with `local_only` semantics (or an explicitly configured
+  `stale_*` mode) without dropping requests.
 - A new ruleset version is applied by 99% of regional WAF nodes within 30 s.
-- A confirmed malicious IP observed on 3 nodes reaches all regional nodes
+- An operator-approved or exact-IOC block is enforced by all regional nodes
   within 5 s p95 and all regions within 60 s p95.
+- A heuristic indicator observed on 3 nodes raises an alert and regional
+  throttle within 5 s p95; it does **not** become a block anywhere without
+  operator approval.
 - No request-handling task performs a network I/O operation outside upstream
   forwarding and response streaming.
 
@@ -170,12 +196,20 @@ the only caller of the distri-kv client from within the WAF process.
 
 A single global group gives linearizable blocklists but makes every region’s
 availability depend on WAN health and adds a WAN RTT to every control-plane
-operation. We choose **regional consistency + asynchronous global
-replication** because the security property we actually need is “bounded
-staleness with a visible version”, not linearizability. The tradeoff is
-explicit in §11 Q1; if the architecture team requires a single global
-authority, the protocol below still works with one group, only the replication
-section changes.
+operation. The architecture owner has decided on **regional cells plus an
+asynchronous global tier, with eventual global consistency** (ADR-0008 D1).
+Regional consistency is the strong domain; global state is versioned and
+eventually consistent. The combined behaviour required is “bounded staleness
+with a visible version”, not global linearizability.
+
+**Audit correction (§12):** distri-kv at `c6fd36d` does not provide this split.
+The deployed KV is a single Raft group over static peers; `MultiRaftCluster` is
+not instantiated and its partitions have no peers, so there is no
+regional/global tier and no dynamic membership (`ChangeConfig` is
+`unimplemented`). The two-tier topology is therefore a **build prerequisite**
+for distri-kv, not a configuration choice. If the tier cannot be built, v1
+degrades to a single regional group per deployment with no global tier, and
+cross-region sharing reverts to operator-pushed bundles.
 
 ### 2.4 Placement rules
 
@@ -401,6 +435,11 @@ IpReputation {
   `APPROVED`/`AUTO` entries; any `REJECTED` tombstone wins until expiry. This
   is LWW with a confidence tiebreak, implemented as a CRDT register; the
   merge is deterministic and order-independent.
+- **`AUTO` is not an authorisation to block.** `review_state = AUTO` only means
+  the reputation *record* was written without human review; it does not permit
+  an automatic distributed block (ADR-0008 D6). Reputation may drive local
+  throttling and alerts. A block requires `APPROVED` (operator) or an exact
+  deterministic IOC match.
 - **Allowlist precedence:** an explicit `pol/allow` entry always beats
   reputation if `ReputationPolicy.allow_overrides = true` (default true) and
   the entry is unexpired. This is the operator’s emergency brake.
@@ -412,6 +451,16 @@ IpReputation {
 
 This is the part most likely to be misunderstood, so it is specified
 explicitly.
+
+> **Audit status (2026-11-08): aspirational.** distri-kv at `c6fd36d` exposes
+> **no** batch/delta API. `DistributedRateLimitManager::check_rate_limit` is a
+> per-key, node-local token check backed by local sled; its `consensus` handle
+> is never read, the batch writer applies nothing, cache hits enqueue no
+> update, and sled ignores TTL. The `CounterDelta` shape below is a **new
+> contract to be built**, not a mapping of an existing one. Until the §12.2
+> prerequisites are met, rate-limit integration can only be `observe_only`, and
+> the only defensible use of the distri-kv code is as a local token-bucket
+> library.
 
 **Enforcement is local. Accounting is distributed.**
 
@@ -473,8 +522,8 @@ inputs. Examples: blocked-by-rule, events-ingested, correlation windows closed.
 | Object | Authoritative writer | Version | Propagation target |
 |---|---|---|---|
 | Policy bundle | control-plane operator/pipeline | per-scope `u64` | p99 ≤ 30 s regional |
-| Block/allow entry | operator API or approved correlation | per-key `u64` | p95 ≤ 5 s regional, ≤ 60 s global |
-| Reputation | correlation engine / feed | per-key `u64` | p95 ≤ 5 s regional |
+| Block/allow entry | operator API, or exact-match deterministic IOC | per-key `u64` | p95 ≤ 5 s regional, ≤ 60 s global |
+| Reputation | correlation engine / feed | per-key `u64` | p95 ≤ 5 s regional (throttle/alert input only) |
 | Rate counter | WAF nodes | PN-counter | flush 250 ms; convergence ≤ 2 s |
 | Node record | WAF node | `epoch` | heartbeat 10 s |
 | Event | WAF node | `event_id` (UUIDv7) | p95 ≤ 2 s |
@@ -597,8 +646,11 @@ zone = "eu-west-1a"
 node_id = ""                     # empty: generate and persist locally
 cluster_id = "waf-eu-prod"
 consistency_mode = "regional"    # regional | global
-fallback_mode = "local_only"     # local_only | stale_allow | stale_block | fail_closed
+fallback_mode = "local_only"     # local_only (default) | stale_allow | stale_block | fail_closed
 miss_policy = "local"            # local | allow | block
+cross_region_egress = "hashed_metadata"  # hashed_metadata (default) | none
+global_block_policy = "operator_approval_or_exact_ioc"
+                                 # operator_approval_or_exact_ioc (default) | operator_approval_only
 max_stale_secs = 900
 resync_interval_secs = 300
 request_timeout_ms = 2000         # background RPC only
@@ -641,6 +693,25 @@ max_counter_deltas_per_sec = 20000
 All keys are validated at startup (consistent with the strict-config work in
 `src/config.rs`); `deny_unknown_fields` applies. `enabled = false` must leave
 the existing local behaviour bit-for-bit unchanged.
+
+**Decision defaults (ADR-0008):**
+
+- `fallback_mode = "local_only"` is the only default. `stale_*` and
+  `fail_closed` must be chosen explicitly and documented in the runbook.
+- `cross_region_egress = "hashed_metadata"`: only hashed/aggregated metadata
+  may leave a region; raw events and raw IPs never do (§6.2, §9.4).
+- `global_block_policy = "operator_approval_or_exact_ioc"`: a global block is
+  applied only by operator approval or an exact-match deterministic IOC.
+- `auto_block_min_confidence` **does not exist for heuristics**. There is no
+  confidence threshold at which a heuristic, ML or anomaly signal may raise an
+  automatic global block, because the false-positive budget is 0% (§6.4).
+  A `min_block_confidence` key may only gate **alert/throttle** promotion, and
+  must be named accordingly (e.g. `alert_min_confidence`) to avoid implying an
+  automatic block path. If a future config carries
+  `auto_block_min_confidence`, validation must reject it as unsupported.
+
+There is deliberately **no** `max_false_positive_ratio` knob for automated
+derived blocks: with a 0% budget there is nothing to tune.
 
 ---
 
@@ -700,6 +771,14 @@ Body, query values, header values, cookies and authorization are never
 included. `path` is normalised and truncated; if `distributed.events.redact_path
 = true` (default in regulated deployments), only a route template is sent.
 
+**Cross-region egress (ADR-0008 D4):** `distributed.cross_region_egress =
+"hashed_metadata"`. Only hashed metadata (for example `ip_hash`, ASN/country
+buckets, rule IDs, coarse counters) may leave the region in which it was
+observed. Raw events, raw IPs and unhashed paths stay regional. When the
+setting is `none`, no security event crosses a region boundary at all;
+cross-region learning is limited to operator-pushed policy bundles.
+`raw_client_ip` must never be populated on a cross-region export.
+
 ### 6.3 Correlation and threat multipliers
 
 `security_correlation` owns the windowed aggregation. It produces:
@@ -719,35 +798,51 @@ ThreatAssessment {
 }
 ```
 
-Multiplier mapping (default, tunable in `RateLimitPolicy`):
+Action mapping (default, tunable in `RateLimitPolicy`). **The verdict may never
+authorise an automatic global block.** `BLOCK_CANDIDATE` is an *alert* state
+that requires operator approval; only exact-match deterministic indicators
+bypass the approval gate (ADR-0008 D2/D6).
 
-| Condition | Action |
-|---|---|
-| score ≥ 0.4 and distinct_nodes ≥ 2 | publish rate-limit multiplier `0.5` for 60 s |
-| score ≥ 0.6 and distinct_nodes ≥ 3 | publish `0.25` for 300 s; open incident |
-| score ≥ 0.8 and distinct_nodes ≥ 3 and confidence ≥ 0.8 | `BLOCK_CANDIDATE` → `AUTO` intel entry with `review_state = QUARANTINED` |
-| `BLOCK_CANDIDATE` corroborated by ≥ 3 regions or an operator approval | `review_state = APPROVED`, global block |
+| Condition | Action | Auto-enforced? |
+|---|---|---|
+| score ≥ 0.4 and distinct_nodes ≥ 2 | publish rate-limit multiplier `0.5` for 60 s (regional) | Yes — throttle only |
+| score ≥ 0.6 and distinct_nodes ≥ 3 | publish `0.25` for 300 s (regional); open incident | Yes — throttle only |
+| score ≥ 0.8 and distinct_nodes ≥ 3 and confidence ≥ 0.8 | emit `BLOCK_CANDIDATE` + alert with evidence; **no block** | No — operator approval required |
+| `BLOCK_CANDIDATE` corroborated by ≥ 3 regions | escalate alert priority; attach corroboration to the review queue | No — operator approval required |
+| exact match to operator-supplied blocklist / known-bad hash or URL | apply block at the configured scope | Yes — deterministic only |
+
+Corroboration is therefore a **detection and prioritisation** signal. It helps
+an analyst decide, and it raises the severity of an incident, but it does not
+authorise an automatic global block. The former rule (“corroborated by ≥ 3
+regions → `APPROVED`, global block”) is **withdrawn**.
 
 ### 6.4 Feedback loop and safeguards
 
-- **Poisoning:** a single node cannot create a global block. `AUTO` entries are
-  quarantined first; promotion requires corroboration or approval. Node
-  contributions are weighted by `node_trust` from the registry, and a node
-  whose recent events were rejected for malformed content loses weight.
+- **Poisoning:** a single node cannot create a global block, and neither can a
+  region. Heuristic signals are always quarantined as candidates; promotion
+  requires operator approval. Exact-match deterministic indicators are the
+  only automated path. Node contributions are weighted by `node_trust` from
+  the registry, and a node whose recent events were rejected for malformed
+  content loses weight.
 - **Replay:** `event_id` is globally unique and deduplicated in the window;
   events older than `max_event_age_secs` (default 300) are counted and dropped.
 - **Rate cap:** each node may submit at most `max_events_per_sec` (default
   2 000) and at most `max_intel_writes_per_min` (default 60) derived writes.
   Excess is `RESOURCE_EXHAUSTED`, not silently accepted.
-- **Confidence floor:** no `AUTO` block below `min_block_confidence` (default
-  0.8). Below the floor, only throttling is allowed.
+- **No confidence floor for blocks:** there is no confidence value at which a
+  heuristic becomes an automatic block. Confidence may only gate **throttle**
+  and **alert** escalation. Below the alert threshold, signals are observation
+  only.
+- **False-positive budget = 0% for automated distributed blocks.** This is a
+  hard rule, not a tunable: no heuristic, ML or anomaly-based global block may
+  be automated. Only exact-match deterministic indicators (operator-supplied
+  blocklists, known-bad hashes/URLs) or explicitly operator-approved blocks
+  may block. Everything else may only throttle locally or raise an alert. There
+  is no `max_false_positive_ratio` auto-demotion because there is no automated
+  heuristic block to demote.
 - **Allowlist wins:** `pol/allow` always suppresses a derived block.
 - **Kill switch:** `distributed.correlation.enabled = false` stops derived
   actions while leaving ingestion and observation on.
-- **False-positive budget:** a derived block that generates no further events
-  and is overridden by an operator is recorded; if the rate exceeds
-  `max_false_positive_ratio` (default 0.05) the engine automatically demotes to
-  `THROTTLE` and raises an incident.
 
 ### 6.5 Hysteresis and stability
 
@@ -771,8 +866,11 @@ a flapping global budget.
 
 ### 7.2 Service definitions
 
-The `.proto` below is a contract sketch, not yet generated. Field numbers are
-stable once published.
+The `.proto` below is the owned contract (ADR-0008 D5). It is **not yet
+generated**; field numbers are stable once published and are owned by
+WAF-Rejected. Operator approval of a heuristic block is a control-plane
+operation under the `waf.controller` role (§7.4) — it is deliberately not a
+WAF-node RPC, so a compromised node cannot approve its own block.
 
 ```proto
 syntax = "proto3";
@@ -879,7 +977,8 @@ message CounterDelta {
 - **Roles:**
   - `waf.node` — register/heartbeat/watch/ingest/lookup for its own region.
   - `waf.controller` — activate policy, write allow/block, read audit.
-  - `waf.correlator` — read events, write intel, promote quarantine.
+  - `waf.correlator` — read events, write intel, propose quarantine promotion
+    (an operator approves the block).
   - `waf.auditor` — read-only audit and registry.
 - **Optional bearer token:** for environments without mTLS, a JWT (EdDSA,
   10 min TTL) with `scope` claims and `node_id` binding. Both mechanisms are
@@ -1075,6 +1174,11 @@ policy; signed bundles and the allowlist kill switch bound that.
   `distributed.events.send_city = true`.
 - Retention: events 7 d default, audit 90 d, reputation 24 h max, counters 2×
   window.
+- **Cross-region egress is hashed-only** (`distributed.cross_region_egress =
+  "hashed_metadata"`, default). Raw events and raw IPs are regional; only
+  hashed/aggregated metadata crosses a region boundary. Hashes use a
+  per-region salt, so the same client cannot be trivially joined across
+  regions unless the operator deliberately shares the salt.
 
 ### 9.5 Audit trail
 
@@ -1114,7 +1218,7 @@ the system of record.
 | `distributed.events.enabled` | `false` | Event egress |
 | `distributed.ratelimit.enabled` | `false` | Counter deltas + multiplier |
 | `distributed.correlation.enabled` | `false` | Derived intel/actions |
-| `distributed.actions.enabled` | `false` | Allow correlation to *write* blocks |
+| `distributed.actions.enabled` | `false` | Allow correlation to apply *exact-match deterministic* blocks and operator-approved blocks; heuristics still cannot block |
 | `distributed.shadow` | `true` | Compute and log proposed actions, never enforce |
 
 `shadow = true` is the default even when `enabled = true`: the node connects,
@@ -1130,7 +1234,7 @@ This is the canary safety net.
 | P2 | Policy watch, `shadow` | 99% nodes on new generation ≤30 s; zero rejected bundles; rollback tested |
 | P3 | Event egress, `shadow` correlation | event loss <0.1% at p99; no PII in payloads; SIEM parity |
 | P4 | Rate-limit deltas, observation only | global aggregate within 10% of node sums; no enforcement |
-| P5 | Correlation actions, 1 region canary | false-positive ratio <5%; operator approval path works |
+| P5 | Correlation actions, 1 region canary | zero automated heuristic blocks; operator approval path works; exact-IOC path tested |
 | P6 | Global replication, 2 regions | cross-region block ≤60 s p95; regional autonomy drill passes |
 | P7 | Default-on for new deployments | runbooks, alarms, SLOs published |
 
@@ -1142,7 +1246,7 @@ requires 24 h of clean metrics and a rollback drill.
 - `distributed.actions.enabled = false` immediately stops derived enforcement.
 - `distributed.enabled = false` returns to the local path without restart
   (config reload for the distributed block only; the existing startup-only
-  config limitation is noted in §11 Q8).
+  config limitation is noted in ADR-0008 D8).
 - `distributed.fallback_mode = "local_only"` keeps the client connected but
   ignores shared blocks beyond local policy.
 - The last-known-good bundle remains on disk
@@ -1175,57 +1279,191 @@ requires 24 h of clean metrics and a rollback drill.
 
 ---
 
-## 11. Open questions and decisions for the architecture team
+## 11. Decision log (ADR-0008)
 
-| # | Question | Options | Recommendation |
-|---|---|---|---|
-| Q1 | Is a single global Raft group required for global blocks, or is regional consistency + async global replication acceptable? | (a) one global group (b) regional + async | **(b)**, because it preserves regional autonomy and hot-path latency; revisit if a regulator demands global linearizability |
-| Q2 | Who may create a global block without human approval? | (a) never (b) ≥3 regions corroboration (c) score threshold | **(b)** with a confidence ≥0.8 and an allowlist override |
-| Q3 | Is `stale_allow` or `stale_block` the default for public traffic? | availability-first vs security-first | **`local_only`** as the only safe default; operators choose the others explicitly |
-| Q4 | Data residency: may hashed IPs and events leave the region? | (a) never (b) hashed only (c) allowed with TTL | **(b)**; raw IPs stay regional |
-| Q5 | What is the distri-kv stability contract for `distributed_rate_limit.rs` and `security_correlation.rs`? | these are libraries today; are they versioned APIs? | Need a semver'd crate or a stable protobuf boundary before P4 |
-| Q6 | Maximum event volume per region and retention? | capacity planning | Need numbers from ops; design assumes ≤50k events/s regional |
-| Q7 | Multi-tenancy: one cluster per tenant or namespaces? | (a) cluster-per-tenant (b) scoped keys | **defer**; v1 single-tenant per cluster |
-| Q8 | Config hot reload beyond the distributed block? | existing config is startup-only | Distributed block needs reload for rollback; either add a reload path or require restart (document the outage) |
-| Q9 | Can WAF write reputation directly, or only the correlator? | direct vs brokered | **brokered** (correlator), to keep poisoning controls in one place |
-| Q10 | What is the accepted false-positive budget for an automatic global block? | policy | Proposal: <5% of derived blocks overridden within 24 h, else auto-demote |
-| Q11 | Clock source: NTP vs cloud metadata vs HLC-only? | infrastructure | NTP required; HLC is a merge aid, not a clock |
-| Q12 | Do we need a `grpc` service in the WAF or only a client? | client only vs expose control API | **client only** for v1; admin API is the control plane |
+**Status:** Accepted by the architecture owner, 2026-11-08. This section
+supersedes the former open-questions table. Where a decision changes earlier
+prose, the earlier text carries a dated note.
+
+### D1 — Topology: regional cells plus an asynchronous global tier
+
+- **Decision:** Deploy per-region cells with regional consistency. A global
+  tier may exist, but it is asynchronous and **global consistency is eventual**
+  only. There is no global linearizable group on any request or control path.
+- **Rationale:** preserves regional autonomy and the hot-path latency budget
+  (G3), and matches the failure model in §8.
+- **Consequences:** every global object carries a version and a visible
+  staleness; cross-region reads may lag. distri-kv must build the tier split
+  (§12.2 P1); it is not configurable today.
+- **Supersedes:** former Q1.
+
+### D2 — Global block authority (reconciles corroboration with approval)
+
+- **Decision:** A **global auto-block may never originate from a single
+  node**. Two paths exist:
+  1. **Heuristic path (never automatic):** regional quorum corroboration is
+     required to *detect and prioritise* a candidate, **and** operator
+     approval is required to apply any block. Corroboration does not authorise
+     an automatic global block.
+  2. **Deterministic path (may auto-apply):** an **exact match** to an
+     operator-supplied blocklist entry or a known-bad hash/URL may be applied
+     automatically, at the scope the operator configured.
+- **Rationale:** heuristics carry non-zero false-positive risk; an automatic
+  global block turns one bad signal into fleet-wide denial of service. Exact
+  deterministic IOCs have bounded, auditable provenance.
+- **Consequences:** `BLOCK_CANDIDATE` is an alert state, never an enforced
+  verdict. The former “≥ 3 regions ⇒ APPROVED global block” rule is withdrawn.
+  Operator approval is recorded in the audit chain with `approval_id`.
+- **Supersedes:** former Q2.
+
+### D3 — Fallback: `local_only` by default; keep scope tight
+
+- **Decision:** `distributed.fallback_mode = "local_only"` is the default and
+  the only recommended general mode. `stale_allow`, `stale_block` and
+  `fail_closed` are explicit opt-ins. The distri-kv integration stays focused
+  on the capabilities in this ADR; **no scope expansion** beyond what the
+  security fabric needs.
+- **Rationale:** availability without inventing policy; a partitioned node must
+  not silently change enforcement semantics.
+- **Consequences:** on partition, shared state stops refreshing and local
+  policy/limits continue. `stale_block` may keep existing blocks but must never
+  create new ones.
+- **Supersedes:** former Q3.
+
+### D4 — Cross-region egress: hashed metadata only
+
+- **Decision:** `distributed.cross_region_egress = "hashed_metadata"`. Only
+  hashed or aggregated metadata may leave a region: `ip_hash`, ASN/country
+  buckets, rule IDs, coarse counters. Raw events, raw IPs and unhashed paths
+  stay regional. `none` disables cross-region event flow entirely.
+- **Rationale:** data residency and PII minimisation; correlation still works
+  within a region and across regions on hashed/aggregated keys.
+- **Consequences:** no cross-region raw-event analysis; salts are per-region
+  by default. See §6.2 and §9.4.
+- **Supersedes:** former Q4.
+
+### D5 — `DistriWaf` contract ownership and versioning
+
+- **Decision:** **WAF-Rejected owns and versions the `DistriWaf` gRPC contract**
+  (`waf.distri.v1`, §7.2), including field numbers, semantics and compatibility
+  rules. distri-kv implements the server side against that contract. The
+  contract is the integration boundary; no shared source crate.
+- **Rationale:** one authority prevents a split wire format; a protocol
+  boundary also sidesteps the unresolved licence question (§12.1 item 6).
+- **Consequences:** breaking changes require a new package version
+  (`waf.distri.v2`) and a migration window. distri-kv's existing
+  `distri_kv.proto` is **not** the contract and must not be extended ad hoc.
+- **Supersedes:** former Q5 and Q12 (client-only remains: the WAF does not
+  serve the control API).
+
+### D6 — False-positive budget for automated distributed blocks: 0%
+
+- **Decision:** The accepted false-positive budget for **automated distributed
+  blocks is 0%**. No heuristic, ML or anomaly-based global block may be
+  automated. Only exact-match deterministic indicators or explicitly
+  operator-approved blocks may block. Everything else may only **throttle
+  locally** or **raise an alert**.
+- **Rationale:** an automated block is an availability decision applied to
+  third parties; at fleet scale even a small FP rate is unacceptable.
+- **Consequences:** there is no `auto_block_min_confidence` for heuristics and
+  no `max_false_positive_ratio` auto-demotion knob. Confidence thresholds may
+  gate alerts/throttles only.
+- **Reconciliation with D2:** corroboration is a *detection* input; approval is
+  the *authorisation* input; exact IOC matching is the only automated
+  authorisation. See §6.3, §6.4, §10.2 P5.
+- **Supersedes:** former Q10.
+
+### D7 — Tenancy deferred
+
+- **Decision:** v1 is single-tenant per cluster. Namespaced multi-tenancy is
+  out of scope.
+- **Supersedes:** former Q7.
+
+### D8 — Configuration reload
+
+- **Decision:** structural `[distributed]` changes require a restart in v1.
+  Only the safety switches `distributed.enabled`,
+  `distributed.actions.enabled` and `distributed.shadow` are hot-switchable;
+  the resulting restart, if any, is documented in the runbook.
+- **Rationale:** the existing config loader is startup-only; adding a general
+  reload path is a separate change.
+- **Consequences:** rollback of a bad bundle does not need a restart (it is a
+  control-plane `ActivatePolicy` CAS); changing endpoints/TLS does.
+- **Supersedes:** former Q8.
+
+### D9 — Reputation writes are brokered
+
+- **Decision:** WAF nodes never write reputation directly; the correlator
+  service is the only writer. Nodes contribute events.
+- **Rationale:** keeps poisoning controls, quarantine and rate caps in one
+  place.
+- **Supersedes:** former Q9.
+
+### D10 — Clocks
+
+- **Decision:** NTP is required on all nodes. HLC is a deterministic merge aid,
+  not a clock source. Offsets beyond `max_clock_skew_ms` quarantine deltas.
+- **Supersedes:** former Q11.
+
+### D11 — Residual prerequisites, not decisions
+
+Capacity numbers (regional event volume, retention sizing) and the distri-kv
+build/contract work are **prerequisites**, tracked in §12.2 and §15. They are
+not open architecture questions.
 
 ---
 
 ## 12. Reconciliation with the distri-kv audit
 
-`docs/design/distri-kv-audit.md` was not present when this ADR was written.
-**2026-11-08:** it now exists and has been applied below. Verified result:
-distri-kv at `c6fd36d` does not build, exposes no rate-limit/reputation/event
-RPC, and its "distributed" rate limiter never reads its consensus handle. The
-two-plane split in this ADR is therefore **forward-looking**, not an
-integration against existing capability; §4.4 and §6.3 remain aspirational
-until the distri-kv findings in §9 of the audit are closed.
+`docs/design/distri-kv-audit.md` was not present when this ADR was first
+written. It has now been read and applied. Verified result at commit `c6fd36d`:
+distri-kv **does not build**, exposes **no** rate-limit/reputation/event/RPC
+surface, and its “distributed” rate limiter never reads its consensus handle.
+The two-plane split in this ADR is therefore **forward-looking**, not an
+integration against existing capability. §4.4, §6.3 and the `DistriWaf`
+contract are a construction plan.
 
-The reconciliation checklist to apply when it lands:
+### 12.1 Reconciliation results (audit facts override this ADR)
 
-1. **API reality check.** Confirm whether `distributed_rate_limit.rs` exposes
-   a batch/delta API compatible with §7.2 `CounterDelta`. If it instead exposes
-   per-key `try_acquire`, mark §4.4 as *aspirational* and add an adapter.
-2. **Correlation API.** Confirm `security_correlation.rs` accepts external
-   events and exposes window aggregates. If it only correlates internally,
-   §6.3 needs a new ingest surface.
-3. **Geo APIs.** If distri-kv has no geo lookup, remove any assumption that it
-   supplies GeoIP; §9.4 and §10.4 already keep GeoIP local.
-4. **Consensus semantics.** Confirm the Multi-Raft partition model supports
-   the regional/global split in §2. If it is single-group only, §2.3 and Q1
-   must be revised.
-5. **Client API.** Confirm the gRPC surface and auth model in §7; if distri-kv
-   uses a different IDL, map the messages rather than inventing a second wire
-   format.
-6. **Licensing.** The collaboration documents note AGPL-3.0 on the distri-kv
-   side. Any shared crate must be checked before code is copied; this ADR
-   assumes a protocol boundary, not code reuse.
+| # | ADR assumption | Audit finding | Correction applied |
+|---|---|---|---|
+| 1 | §4.4 relies on batched counter/delta replication in `distributed_rate_limit.rs`. | `check_rate_limit` is per-key, node-local, sled-backed. There is no batch/delta API; the batch writer applies nothing; cache hits enqueue nothing; `consensus` is never read. | §4.4 marked **aspirational**. `IngestCounterDeltas` is a new contract, not a mapping. Rate-limit integration stays `observe_only` until rebuilt. |
+| 2 | §6.3 relies on `security_correlation.rs` accepting external events and exposing window aggregates. | Module **does not compile** (E0689 at `:219`); state is an in-process `HashMap`; no persistence, no RPC, no cross-node path; `get_threat_assessment` is per-IP per-process. | §6.3 requires a **new ingest + window-query surface**. The module is a reference algorithm only. |
+| 3 | §9.4/§10.4 assume distri-kv might supply geo data. | No GeoIP/ASN code and no `maxminddb` dependency. | Confirmed: GeoIP stays local. No ADR change needed beyond this note. |
+| 4 | §2/§2.3 assume a regional/global Multi-Raft split. | Deployed KV is a **single Raft group over static peers**. `MultiRaftCluster` is not instantiated and partitions have no peers; `ChangeConfig` is `unimplemented`, so membership is fixed at boot. | §2.3 revised: the tier split is a **build prerequisite**, not a config option. v1 fallback is one regional group, no global tier. |
+| 5 | §7 assumes a gRPC surface and auth model that distri-kv can serve. | `DistriKv` methods are stubs: `Get`/`Publish`/`Subscribe`/`Acknowledge`/`ChangeConfig` are `unimplemented`; `Mutate` returns fabricated success without writing; `Watch` returns an empty stream. There is no TLS/auth/SPIFFE. | The `DistriWaf` contract is **new** and owned here (ADR-0008 D5). Mapping `distri_kv.proto` is rejected because its semantics are unsafe (fake success / empty streams). |
+| 6 | Licensing allows code reuse. | Root `LICENSE` is MIT, with a separate `LICENSE-AGPL-3.0`; collaboration docs describe an AGPL side. | Confirmed: keep a **protocol boundary**, no shared source crate. This reinforces D5. |
+| 7 | `security_correlation` blocks produce enforcement. | “Block” maps to a clamped 10× refill slowdown; duration is ignored; distri-kv never denies traffic. | The WAF owns enforcement. §6.3 now states that only the WAF decides, and only on approval or exact IOC. |
 
-Where the audit contradicts this document, the audit’s verified facts win and
-this ADR is amended with a dated note.
+Where the audit and this document disagree, the audit’s verified facts win.
+
+### 12.2 Build and contract prerequisites (ordered)
+
+These must be true on the distri-kv side before the corresponding WAF phases
+can start. Each is an exit gate, not a suggestion.
+
+| P | Prerequisite | Blocks | Acceptance test |
+|---|---|---|---|
+| P0 | **Crate builds.** Restore/remove `k8s_auto_config`, repair or gate `synapse_gaming_*`, add `rand`, fix `security_correlation.rs:219`. | everything | `nix develop -c cargo check --workspace --all-targets` passes in distri-kv CI. |
+| P1 | **Replication is real and tiered.** Propose KV/security state through the Raft path; make partitions multi-node or document a single-group v1; wire `ChangeConfig` or document static membership. | §2, §4.4, §6 | A value written on node A is read on node B after leader commit; membership change tested; regional/global split either implemented or explicitly deferred. |
+| P2 | **`DistriWaf` contract published.** WAF-Rejected publishes `waf.distri.v1` (proto + semantics + versioning rules); distri-kv generates/implements the server stubs. | §7, P3–P6 | `buf breaking`/compat check in CI; generated client and server compile against the same tag. |
+| P3 | **Durable TTL and storage.** Sled ignores `put_with_ttl`; wire redb or implement expiry metadata + `delete_expired`; start `TtlManager`. | registry leases, reputation, counters | An entry expires and is reaped within the documented window; no unbounded batch-key growth. |
+| P4 | **Non-blocking hot path.** Move `StorageAdapter` calls off the async executor and replace the process-wide write lock with sharded cache. | rate-limit deltas | No blocking disk I/O inside async; per-check lock contention measured. |
+| P5 | **Failure-mode contract.** Return an explicit degraded mode rather than `Err(StorageError)`. | §5.6 | `local_only`/`stale_*` observable in the API and tests. |
+| P6 | **Authn/authz + TLS.** Add mTLS/SPIFFE (or the JWT fallback) to the client surface. | §7.4 | Unauthenticated client is rejected; role/region checks covered by tests. |
+| P7 | **Fix tests/benches.** Add `criterion`, repair `MultiRaftConfig` literals, split the suite so one syntax error cannot hide it. | CI confidence | `cargo test` and `cargo bench --no-run` pass. |
+
+### 12.3 Contract ownership rules (ADR-0008 D5)
+
+- The canonical contract lives in WAF-Rejected as `waf.distri.v1`.
+- Field numbers are never reused or renumbered. Removed fields are `reserved`.
+- Additive changes are backward-compatible within `v1`; semantic changes
+  (idempotency, ordering, error codes) are breaking and require `v2`.
+- distri-kv may add server-side internals freely, but the wire contract and
+  error semantics are defined here.
+- Every published version is tagged and cross-linked from
+  [`distri-kv-audit.md`](./distri-kv-audit.md) so both repositories reference
+  the same revision.
 
 ---
 
@@ -1253,18 +1491,26 @@ this ADR is amended with a dated note.
 
 ## 14. Decision record (summary)
 
-**Accepted for proposal:**
+**Accepted (ADR-0008, 2026-11-08):**
 
 1. Two-plane architecture: local enforcement, distributed control/observation.
-2. WAF nodes are clients, never Raft voters.
-3. Regional consistency with asynchronous global replication.
+2. Regional cells with an asynchronous global tier; global consistency is
+   eventual (D1).
+3. WAF nodes are clients, never Raft voters; WAF-Rejected owns and versions
+   the `DistriWaf` contract (D5).
 4. Local rate limiting + asynchronous delta accounting, with a hysteretic
    multiplier feedback loop.
 5. Versioned, signed, hash-chained policy bundles; generation-based cache
    invalidation.
-6. Correlation actions are quarantined and require corroboration or approval.
-7. mTLS + SPIFFE, per-node quotas, bounded queues, drop-telemetry-never-request.
-8. Explicit `fallback_mode`; default `local_only`; `stale_*` opt-in.
+6. **Global blocks require operator approval for heuristics; only exact-match
+   deterministic IOCs may auto-apply. Corroboration detects, it does not
+   authorise (D2, D6).**
+7. **False-positive budget for automated distributed blocks is 0% (D6).**
+8. mTLS + SPIFFE, per-node quotas, bounded queues, drop-telemetry-never-request.
+9. Explicit `fallback_mode`; default `local_only`; `stale_*` opt-in (D3).
+10. Cross-region egress is hashed metadata only (D4).
+11. Tenancy deferred; reputation writes brokered; NTP required; config
+    changes restart-only (D7–D10).
 
 **Rejected:**
 
@@ -1272,4 +1518,28 @@ this ADR is amended with a dated note.
 2. WAF nodes as consensus voters.
 3. Sending bodies/PII to distri-kv.
 4. Direct, unapproved global blocks from a single node.
-5. Using distri-kv as the only audit system of record.
+5. Automatic global blocks from heuristics, ML or anomaly scores at any
+   confidence — including “≥ 3 regions corroboration ⇒ auto-block”.
+6. Using distri-kv as the only audit system of record.
+7. Reusing distri-kv's `distri_kv.proto` as the WAF contract.
+
+---
+
+## 15. What remains before implementation
+
+Strict dependency order. Do not start a step until the previous one is
+accepted; later steps assume the earlier artefacts exist.
+
+| # | Step | Depends on | Exit criterion |
+|---|---|---|---|
+| 1 | **distri-kv build** — make the crate compile, tests parse, benches resolve; close audit §9 finding 0 and the test/bench item 9. |  | Workspace `cargo check`/`test` green in distri-kv CI. |
+| 2 | **`DistriWaf` contract** — publish `waf.distri.v1`, generate stubs, define error/idempotency semantics, freeze field numbers. | 1 | Contract tagged; client and server compile against it; compatibility check in CI. |
+| 3 | **Registry + reputation store** — node registration/heartbeat/lease, versioned reputation with TTL, watch + point-read. | 2 | Register→heartbeat→expire tested; reputation read/write with TTL; watch resume works. |
+| 4 | **Rate-limit deltas** — batch delta ingest, PN-counter merge, multiplier publication; `observe_only` first. | 2, 3 | Aggregate within 10% of node sums; no hot-path network call; failure mode returns `local_only`. |
+| 5 | **Event ingestion** — bounded `IngestEvents`, dedupe, windowed correlation, hashed cross-region egress. | 2, 3 | Event loss < 0.1% p99; no raw IP/PII crosses a region; correlation windows queryable. |
+| 6 | **WAF client** — `DistriExporter`, watch/resync, local reputation/ACL caches, config surface, metrics, shadow mode. | 3, 4, 5 | `distributed.enabled` round-trip; shadow actions logged; `local_only` verified with the cluster down. |
+
+Cross-cutting gates that apply to every step: the 0% FP rule (D6), hashed-only
+cross-region egress (D4), `local_only` default (D3), and the audit/protocol
+boundary (D5). Capacity numbers for event volume and retention remain an ops
+input required before step 5 is sized.

@@ -4,6 +4,22 @@ All notable changes to WAF-Rejected are documented here.
 
 ## [Unreleased]
 
+### Documentation
+
+- Recorded the distributed WAF architecture decisions as ADR-0008 in
+  [`docs/design/distributed-waf-architecture.md`](docs/design/distributed-waf-architecture.md).
+  Regional cells with an asynchronous, eventually consistent global tier;
+  global blocks require operator approval for heuristics (only exact-match
+  deterministic IOCs may auto-apply); 0% false-positive budget for automated
+  distributed blocks; `fallback = local_only`; hashed-metadata-only
+  cross-region egress; WAF-Rejected owns the versioned `DistriWaf` contract.
+- Reconciled the ADR against
+  [`docs/design/distri-kv-audit.md`](docs/design/distri-kv-audit.md): the
+  rate-limit/correlation capabilities are aspirational, the regional/global
+  tier is a build prerequisite, and the `distri_kv.proto` surface is not the
+  WAF contract. Added the ordered build/contract prerequisite checklist and a
+  dependency-ordered "what remains before implementation" section.
+
 ## [0.1.0-beta.16] - 2026-11-08
 
 ### Release summary

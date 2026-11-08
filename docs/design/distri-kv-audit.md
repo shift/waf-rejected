@@ -5,6 +5,10 @@
 - **Repository audited:** `/tmp/opencode/distri-kv`, commit `c6fd36d`
   (`Merge branch 'main' of https://github.com/shift/distri-kv`, 2025-12-16)
 - **Companion:** [ADR-0007: Distributed WAF security fabric over distri-kv](./distributed-waf-architecture.md)
+  — decisions are recorded as [ADR-0008](./distributed-waf-architecture.md#11-decision-log-adr-0008),
+  reconciliation in [§12](./distributed-waf-architecture.md#12-reconciliation-with-the-distri-kv-audit),
+  and the remaining dependency order in
+  [§15](./distributed-waf-architecture.md#15-what-remains-before-implementation).
 - **Licence:** `LICENSE` is MIT; `LICENSE-AGPL-3.0` is also present. Confirm before
   any code is copied.
 
@@ -611,6 +615,15 @@ The ADR's §12 checklist, answered from code:
 Dated note for the ADR: the assumptions that distri-kv already provides
 "batched counter/delta replication" and "windowed event aggregation" are not
 met by commit `c6fd36d`. They are useful starting points, not capabilities.
+
+**Update (2026-11-08):** ADR-0007 has been reconciled against this audit in its
+[§12](./distributed-waf-architecture.md#12-reconciliation-with-the-distri-kv-audit).
+All six items above are resolved as corrections: §4.4 is marked aspirational,
+§6.3 requires a new ingest/query surface, GeoIP is confirmed local, the
+regional/global tier is a build prerequisite, the `DistriWaf` contract is owned
+by WAF-Rejected, and licensing stays a protocol boundary. The ordered
+build/contract prerequisites are in
+[§12.2](./distributed-waf-architecture.md#122-build-and-contract-prerequisites-ordered).
 
 ---
 
