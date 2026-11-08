@@ -240,6 +240,9 @@ limits and CI guidance. Fuzzing is not part of `nix build`.
 - Kubernetes manifests: [`infrastructure/kubernetes`](infrastructure/kubernetes)
 - Helm chart: [`infrastructure/helm`](infrastructure/helm)
 - Monitoring: [`infrastructure/monitoring`](infrastructure/monitoring)
+- Distributed WAF + distri-kv regional cell (compose, Kubernetes, mTLS
+  certificates, smoke test): [`deploy/distributed`](deploy/distributed) and
+  [`docs/operations/distributed-deployment.md`](docs/operations/distributed-deployment.md)
 
 ## Security and support
 

@@ -8,7 +8,9 @@ caches, bounded queues, an async controller and a tonic client for the
 complete at `9079588`). The default remains `enabled = false` and
 `fallback = "local_only"`; no request path waits on the cluster. See
 [the audit](../design/distri-kv-audit.md) and
-[the architecture ADR](../design/distributed-waf-architecture.md).
+[the architecture ADR](../design/distributed-waf-architecture.md). Deployment
+artifacts and bootstrap/rotation/fallback procedures are in
+[distributed-deployment.md](distributed-deployment.md).
 
 ## What is compiled
 

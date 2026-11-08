@@ -43,6 +43,12 @@ fn config_files() -> Vec<PathBuf> {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|ext| ext.to_str()) == Some("toml") {
+                // `distri-regional.toml` is a distri-kv server example, not a
+                // WAF configuration; it is validated by the deployment smoke
+                // test and its own loader.
+                if path.file_name().and_then(|name| name.to_str()) == Some("distri-regional.toml") {
+                    continue;
+                }
                 files.push(path);
             }
         }

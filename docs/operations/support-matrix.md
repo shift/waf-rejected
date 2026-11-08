@@ -205,6 +205,23 @@ per second per core**. A 6-core host can sustain roughly 800 RPS of 1 KiB
 bodies, 100 RPS of 8 KiB bodies, or 13 RPS of 60 KiB bodies **if the sidecar
 owns every core**. Leave at least one core for the proxy, TLS and networking.
 
+### Distributed security fabric (`distri-kv`)
+
+- **Build:** non-default Cargo feature `distri-kv`.
+- **Config:** `[waf.distributed]`, off by default (`enabled = false`,
+  `fallback = "local_only"`).
+- **What it does:** compiles the WAF-side policy/reputation cache, bounded
+  event/counter queues, async controller and tonic `DistriWaf` client. The
+  request path always decides from local state; an unreachable regional cell
+  degrades freshness, not availability.
+- **Deployment:** compose and Kubernetes artifacts, local mTLS certificates
+  and a health/fallback smoke test are in [`deploy/distributed`](../../deploy/distributed);
+  see [`distributed-deployment.md`](distributed-deployment.md).
+- **Limits:** the WAF client does not yet attach bearer/SPIFFE metadata, and
+  `DistriWaf` state in distri-kv `9079588` is node-local until the Raft
+  proposal path lands. Keep `local_only` and verify the control plane
+  directly with `grpcurl` until both prerequisites are closed.
+
 ## Known limitations
 
 - Sub-millisecond latency is a **path** property: bodyless, allow-cache,

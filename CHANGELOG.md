@@ -32,6 +32,16 @@ All notable changes to WAF-Rejected are documented here.
   credential and `waf.distributed.advertise_endpoint` settings support this
   without weakening the production mTLS/SPIFFE default.
 
+- Distributed deployment artifacts in [`deploy/distributed`](deploy/distributed):
+  a compose stack with a 3-node distri-kv regional cell and two WAF nodes
+  (healthchecks, project-scoped volumes, certificate/token mounts,
+  `local_only` fallback), Kubernetes manifests (StatefulSet, Deployment,
+  Services, ConfigMaps, Secret placeholders, PDBs, required anti-affinity),
+  `Dockerfile.waf`/`Dockerfile.distri-kv`, local mTLS certificate generation,
+  example configs, and `scripts/demo-distributed.sh` for an isolated
+  health/metrics/policy/fallback smoke test. See
+  [`docs/operations/distributed-deployment.md`](docs/operations/distributed-deployment.md).
+
 ### Changed
 
 - Canonicalized the OCI package as `ghcr.io/shift/waf-rejected-waf`. GHCR
