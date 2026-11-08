@@ -249,11 +249,23 @@ fi
 if [[ "$DEEP_IMAGE" -eq 1 ]]; then
     MANIFEST="$(tar -xOf "$DIR/$IMAGE_TAR" manifest.json)"
     mapfile -t layers < <(jq -r '.[0].Layers[]' <<<"$MANIFEST")
+    # Docker/BuildKit may export layers as plain tar (classic docker save) or
+    # as gzip-compressed OCI blobs. Detect the magic bytes per layer so the
+    # deep check works with either archive layout.
+    decompress_layer() {
+        local magic
+        magic="$(tar -xOf "$DIR/$IMAGE_TAR" "$1" | head -c 2 | od -An -tx1 | tr -d ' \n')"
+        if [[ "$magic" == "1f8b" ]]; then
+            tar -xOf "$DIR/$IMAGE_TAR" "$1" | gzip -dc
+        else
+            tar -xOf "$DIR/$IMAGE_TAR" "$1"
+        fi
+    }
     found=0
     for layer in "${layers[@]}"; do
-        layer_list="$(tar -xOf "$DIR/$IMAGE_TAR" "$layer" | tar -tf - 2>/dev/null || true)"
+        layer_list="$(decompress_layer "$layer" | tar -tf - 2>/dev/null || true)"
         if grep -qx 'usr/share/waf/wasm/coraza_reactor.wasm' <<<"$layer_list"; then
-            image_sha="$(tar -xOf "$DIR/$IMAGE_TAR" "$layer" \
+            image_sha="$(decompress_layer "$layer" \
                 | tar -xOf - 'usr/share/waf/wasm/coraza_reactor.wasm' \
                 | sha256sum | awk '{print $1}')"
             [[ "$image_sha" == "$MODULE_SHA" ]] \
