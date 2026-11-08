@@ -1,0 +1,61 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-config
+  namespace: {{ .Release.Namespace }}
+data:
+  production.toml: |
+    bind_addr = "0.0.0.0:8080"
+    health_bind_addr = "0.0.0.0:8081"
+    upstream_uri = {{ .Values.upstream.url | quote }}
+
+    [server]
+    max_connections = 10000
+    request_timeout_secs = {{ .Values.upstream.timeout | default 30 }}
+    enable_http2 = true
+    enable_http3 = false
+    supported_http_versions = ["1.0", "1.1", "2"]
+    max_body_size = 10485760
+
+    [logging]
+    level = {{ .Values.logging.level | quote }}
+    json_format = true
+
+    [waf]
+    enabled = true
+
+    [waf.rate_limit]
+    per_ip_enabled = true
+    per_ip_max_requests = 100
+    per_ip_window_secs = 60
+    global_enabled = true
+    global_max_requests = 10000
+    global_window_secs = 60
+
+    [waf.security_events]
+    enabled = true
+    format = "json"
+    min_threat_level = "medium"
+    enable_cef = false
+    enable_otel = {{ .Values.logging.otel.enabled }}
+    enable_sled = {{ .Values.persistence.enabled }}
+    sled_db_path = "/var/lib/waf/data/waf_security_events.sled"
+
+    [waf.content_inspection]
+    enabled = true
+    inspect_headers = true
+    inspect_body = true
+    max_body_size = 10485760
+    threat_patterns = ["sql_injection", "xss", "command_injection", "path_traversal"]
+
+    [waf.wasm]
+    enabled = false
+
+    [security.auth]
+    enabled = {{ .Values.security.auth.enabled }}
+    api_keys = []
+    header_name = "X-API-Key"
+    require_https = {{ .Values.security.auth.requireHttps }}
+
+    [security.ai]
+    enabled = false
