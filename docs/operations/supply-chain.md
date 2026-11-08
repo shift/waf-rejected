@@ -236,7 +236,7 @@ nix shell nixpkgs#trivy -c trivy fs \
 # Release image scan from the published tag, a locally built image, or a
 # release tarball (`trivy image --input waf-rejected-<version>-image.tar.gz`)
 nix shell nixpkgs#trivy -c trivy image \
-  --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 ghcr.io/shift/waf-rejected:<tag>
+  --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 ghcr.io/shift/waf-rejected-waf:<tag>
 nix shell nixpkgs#trivy -c trivy image \
   --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 waf-rejected:local-ci
 ```

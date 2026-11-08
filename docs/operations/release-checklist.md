@@ -107,6 +107,7 @@ curl -o /dev/null -w '%{http_code}\n' -X POST --data '<script>alert(1)</script>'
         (standalone sidecar binary + CRS rules)
       - `waf-rejected-<version>-image.tar.gz` (prebuilt container image; this
         is the fallback when GHCR is unavailable)
+      - `image-digest.txt` (published digest reference, or the fallback note)
       - `waf-rejected-<version>.cdx.json` (CycloneDX SBOM, with the reactor
         file component, SHA-256 and Apache-2.0 licence note)
       - `waf-rejected-<version>-coraza_reactor.wasm` (standalone module)
@@ -114,13 +115,16 @@ curl -o /dev/null -w '%{http_code}\n' -X POST --data '<script>alert(1)</script>'
       - `waf-rejected-<version>-coraza-PROVENANCE.md`
       - `<asset>.sha256` for each of the assets above
 - [ ] Run `./scripts/verify-release.sh --dir <artifact-dir> --version <version>`
-      (add `--deep-image` to check the module digest inside the image, and
-      `--attestations` when the assets have GitHub attestations).
-- [ ] GHCR is currently blocked by GitHub Actions billing. Do **not** treat a
-      missing `ghcr.io/shift/waf-rejected:v<version>` tag as a release failure;
-      attach the image tarball instead. If registry publishing is required,
-      follow the manual `podman push` / `docker push` procedure in
-      [`container.md`](container.md#registry-publishing-manual).
+      (add `--deep-image` to check the module digest inside the image,
+      `--verify-registry` to resolve the published digest, and `--attestations`
+      when the assets have GitHub attestations).
+- [ ] Confirm the Release workflow pushed
+      `ghcr.io/shift/waf-rejected-waf:v<version>` and `:sha-<commit>` and that
+      the release body lists the `ghcr.io/shift/waf-rejected-waf@sha256:...`
+      reference from `image-digest.txt`. A rejected push is a warning, not a
+      release failure: keep the image tarball as the fallback. Never publish
+      under the repository-named `ghcr.io/shift/waf-rejected` package, which
+      rejects blob uploads with HTTP 403.
 - [ ] Verify build provenance for each asset when attestations exist:
       `gh attestation verify <asset> --repo shift/waf-rejected`.
 - [ ] Publish the GitHub pre-release with the known-limitations section from

@@ -99,17 +99,21 @@ jobs:
       contents: read
       packages: write
     env:
-      # Publishing is opt-in for the same reason as the Release workflow:
-      # the default GITHUB_TOKEN may not have package write access. Set the
-      # repository variable PUSH_IMAGE=true to publish. Pull requests always
-      # build only, which also catches Dockerfile regressions.
+      # Canonical OCI package name, shared with release.yml and
+      # publish-image.yml. It differs from the repository name because GHCR
+      # rejected blob uploads for `ghcr.io/shift/waf-rejected` with HTTP 403.
+      IMAGE_NAME: ghcr.io/shift/waf-rejected-waf
+      # Snapshot publishing stays opt-in: the default GITHUB_TOKEN may not have
+      # package write access. Set the repository variable PUSH_IMAGE=true to
+      # publish. Pull requests always build only, which also catches Dockerfile
+      # regressions.
       PUSH_IMAGE: ${{ vars.PUSH_IMAGE }}
     steps:
     - uses: actions/checkout@v4
     - name: Report registry publishing mode
       run: |
         if [ "${PUSH_IMAGE}" = "true" ] && [ "${GITHUB_EVENT_NAME}" != "pull_request" ]; then
-          echo "Publishing ${GITHUB_REPOSITORY} to GHCR"
+          echo "Publishing ${IMAGE_NAME} to GHCR"
         else
           echo "::notice::Registry push skipped (PUSH_IMAGE is not 'true' or this is a pull request). The image is still built."
         fi
@@ -128,8 +132,8 @@ jobs:
         push: false
         load: true
         tags: |
-          ghcr.io/${{ github.repository }}:latest
-          ghcr.io/${{ github.repository }}:${{ github.sha }}
+          ${{ env.IMAGE_NAME }}:latest
+          ${{ env.IMAGE_NAME }}:${{ github.sha }}
     # A registry 403 must not fail the build. Only attempt the push when
     # PUSH_IMAGE is enabled and this is not a pull request; a rejected push
     # leaves the locally built/loaded image available to later jobs.
@@ -138,7 +142,7 @@ jobs:
       run: |
         set -euo pipefail
         for tag in latest "${GITHUB_SHA}"; do
-          image="ghcr.io/${GITHUB_REPOSITORY,,}:${tag}"
+          image="${IMAGE_NAME}:${tag}"
           if docker push "${image}"; then
             echo "Pushed ${image}"
           else

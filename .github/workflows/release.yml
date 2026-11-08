@@ -21,23 +21,28 @@ jobs:
       contents: read
       packages: write
     env:
-      # GHCR publishing is opt-in. Set the repository variable PUSH_IMAGE to
-      # "true" once the workflow token (or a PAT) can write packages for this
-      # repository. When it is unset, or the registry rejects the push, the
-      # image is still built and attached to the release as a tarball; see
-      # docs/operations/ci.md and docs/operations/container.md.
+      # Canonical OCI package name. It is deliberately not the repository name:
+      # GHCR rejected blob uploads for `ghcr.io/shift/waf-rejected` with HTTP
+      # 403, while `ghcr.io/shift/waf-rejected-waf` publishes successfully.
+      # Keep this value in sync with publish-image.yml and the docs.
+      IMAGE_NAME: ghcr.io/shift/waf-rejected-waf
+      # Registry publishing is on by default for tag releases. Set the
+      # repository variable PUSH_IMAGE to "false" to disable it. A rejected
+      # push (HTTP 403) is a warning, never a release failure: the tarball
+      # below remains the supported artifact. See docs/operations/ci.md and
+      # docs/operations/container.md.
       PUSH_IMAGE: ${{ vars.PUSH_IMAGE }}
     steps:
       - uses: actions/checkout@v4
       - name: Report registry publishing mode
         run: |
-          if [ "${PUSH_IMAGE}" = "true" ]; then
-            echo "PUSH_IMAGE=true: publishing ${GITHUB_REPOSITORY} to GHCR"
+          if [ "${PUSH_IMAGE}" = "false" ]; then
+            echo "::notice::PUSH_IMAGE=false: skipping the GHCR push. The image tarball is still attached to the release."
           else
-            echo "::notice::PUSH_IMAGE is not 'true'; skipping the GHCR push. The image tarball is still attached to the release."
+            echo "Publishing ${IMAGE_NAME} to GHCR (set PUSH_IMAGE=false to disable)"
           fi
       - name: Log in to GHCR
-        if: env.PUSH_IMAGE == 'true'
+        if: env.PUSH_IMAGE != 'false'
         continue-on-error: true
         uses: docker/login-action@v3
         with:
@@ -51,28 +56,57 @@ jobs:
           push: false
           load: true
           tags: |
-            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+            ${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
       # A 403 from GHCR means the token cannot write packages (organization
       # policy or a fork/PR token). That must not block the release: the
-      # tarball below is the supported artifact. The attempt is still reported
+      # tarball below is the supported fallback. The attempt is still reported
       # as a warning so the registry problem is visible.
       - name: Push release image to GHCR
-        if: env.PUSH_IMAGE == 'true'
+        id: push
+        if: env.PUSH_IMAGE != 'false'
         continue-on-error: true
         run: |
           set -euo pipefail
-          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_REF_NAME}"
-          if docker push "${IMAGE}"; then
-            echo "Pushed ${IMAGE}"
+          TAG_REF="${IMAGE_NAME}:${GITHUB_REF_NAME}"
+          SHA_REF="${IMAGE_NAME}:sha-${GITHUB_SHA}"
+          if docker push "${TAG_REF}" && docker push "${SHA_REF}"; then
+            # Both tags point at the same manifest, so either RepoDigest is the
+            # immutable reference used in image-digest.txt and the release body.
+            DIGEST_REF="$(docker image inspect --format '{{index .RepoDigests 0}}' "${TAG_REF}")"
+            echo "digest=${DIGEST_REF}" >> "${GITHUB_OUTPUT}"
+            echo "Pushed ${DIGEST_REF}"
           else
             echo "::warning::GHCR rejected the image push. Verify the token has package write access. The image tarball remains the release fallback."
           fi
+      - name: Record image digest
+        id: digest
+        if: always()
+        env:
+          PUSHED_DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          TAG_REF="${IMAGE_NAME}:${GITHUB_REF_NAME}"
+          if [[ -n "${PUSHED_DIGEST}" ]]; then
+            printf '%s\n' "${PUSHED_DIGEST}" > image-digest.txt
+            echo "digest=${PUSHED_DIGEST}" >> "${GITHUB_OUTPUT}"
+          else
+            image_id="$(docker image inspect --format '{{.Id}}' "${TAG_REF}")"
+            {
+              echo "registry: not published"
+              echo "image: ${TAG_REF}"
+              echo "local-image-id: ${image_id}"
+              echo "fallback: waf-rejected-${VERSION}-image.tar.gz"
+            } > image-digest.txt
+            echo "::notice::No registry digest for this release; image-digest.txt records the tarball fallback."
+          fi
+          cat image-digest.txt
       - name: Export image tarball
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
-          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_REF_NAME}"
-          docker save "${IMAGE}" | gzip -9 > "waf-rejected-${VERSION}-image.tar.gz"
+          docker save "${IMAGE_NAME}:${GITHUB_REF_NAME}" | gzip -9 > "waf-rejected-${VERSION}-image.tar.gz"
           test -s "waf-rejected-${VERSION}-image.tar.gz"
           ls -l "waf-rejected-${VERSION}-image.tar.gz"
       - name: Upload image artifact
@@ -80,6 +114,12 @@ jobs:
         with:
           name: image
           path: waf-rejected-*-image.tar.gz
+          if-no-files-found: error
+      - name: Upload image digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-digest
+          path: image-digest.txt
           if-no-files-found: error
 
   sbom:
@@ -198,6 +238,11 @@ jobs:
         with:
           name: image
           path: image
+      - name: Download image digest
+        uses: actions/download-artifact@v4
+        with:
+          name: image-digest
+          path: image-digest
       - name: Install Nix
         uses: cachix/install-nix-action@v25
       - name: Build release binary
@@ -248,6 +293,7 @@ jobs:
           tar -czf "dist/waf-rejected-v${VERSION}-coraza-sidecar-x86_64-linux.tar.gz" \
             -C result-sidecar bin share
           cp "image/waf-rejected-${VERSION}-image.tar.gz" dist/
+          cp "image-digest/image-digest.txt" dist/
           cp "sbom/waf-rejected-${VERSION}.cdx.json" dist/
           cp wasm/coraza_reactor/coraza_reactor.wasm \
             "dist/waf-rejected-${VERSION}-coraza_reactor.wasm"
@@ -260,6 +306,7 @@ jobs:
             "waf-rejected-v${VERSION}-x86_64-linux.tar.gz" \
             "waf-rejected-v${VERSION}-coraza-sidecar-x86_64-linux.tar.gz" \
             "waf-rejected-${VERSION}-image.tar.gz" \
+            "image-digest.txt" \
             "waf-rejected-${VERSION}.cdx.json" \
             "waf-rejected-${VERSION}-coraza_reactor.wasm" \
             "waf-rejected-${VERSION}-coraza-LICENSE" \
@@ -275,19 +322,53 @@ jobs:
             dist/waf-rejected-v*-x86_64-linux.tar.gz
             dist/waf-rejected-v*-coraza-sidecar-x86_64-linux.tar.gz
             dist/waf-rejected-*-image.tar.gz
+            dist/image-digest.txt
             dist/waf-rejected-*.cdx.json
             dist/waf-rejected-*-coraza_reactor.wasm
             dist/waf-rejected-*-coraza-LICENSE
             dist/waf-rejected-*-coraza-PROVENANCE.md
+      - name: Prepare release body
+        run: |
+          set -euo pipefail
+          DIGEST_REF="$(grep -E '^ghcr\.io/[^[:space:]]+@sha256:[0-9a-f]{64}$' image-digest/image-digest.txt | head -n1 || true)"
+          {
+            echo "## Container image"
+            echo
+            if [[ -n "${DIGEST_REF}" ]]; then
+              echo "Published to GHCR under the canonical package name:"
+              echo
+              echo '```'
+              echo "${DIGEST_REF}"
+              echo '```'
+              echo
+              echo "Pin this digest in deployments. The human-readable tag is also"
+              echo "available, but tags are mutable and digests are not."
+              echo
+              echo "Verify it with:"
+              echo
+              echo '```bash'
+              echo "./scripts/verify-release.sh --dir . --version ${GITHUB_REF_NAME#v} --verify-registry"
+              echo '```'
+            else
+              echo "The registry image was not published for this release (PUSH_IMAGE=false"
+              echo "or the push was rejected). Use the attached"
+              echo "\`waf-rejected-${GITHUB_REF_NAME#v}-image.tar.gz\` tarball; \`image-digest.txt\`"
+              echo "records the local image ID and the fallback."
+            fi
+          } > release-body.md
+          cat release-body.md
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
           prerelease: true
           generate_release_notes: true
+          append_body: true
+          body_path: release-body.md
           files: |
             dist/waf-rejected-v*-x86_64-linux.tar.gz
             dist/waf-rejected-v*-coraza-sidecar-x86_64-linux.tar.gz
             dist/waf-rejected-*-image.tar.gz
+            dist/image-digest.txt
             dist/waf-rejected-*.cdx.json
             dist/waf-rejected-*-coraza_reactor.wasm
             dist/waf-rejected-*-coraza-LICENSE

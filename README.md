@@ -1,6 +1,8 @@
 # WAF-Rejected
 
-**Current Beta:** `0.1.0-beta.16` · prebuilt image tarball attached to the GitHub release
+**Current Beta:** `0.1.0-beta.16` · image
+`ghcr.io/shift/waf-rejected-waf:v0.1.0-beta.16` · tarball attached to the
+GitHub release
 
 A Rust reverse-proxy web application firewall. Requests are inspected by a
 configurable rule chain (SQL injection, XSS, command injection, path traversal,
@@ -220,6 +222,19 @@ limits and CI guidance. Fuzzing is not part of `nix build`.
 ## Deployment
 
 - Docker: `docker build -t waf-rejected .`
+- Published image: `ghcr.io/shift/waf-rejected-waf:v<version>`, for example:
+
+  ```bash
+  docker pull ghcr.io/shift/waf-rejected-waf:v0.1.0-beta.16
+  docker run -p 8080:8080 -p 8081:8081 \
+    ghcr.io/shift/waf-rejected-waf@sha256:<digest>
+  ```
+
+  The `-waf` suffix is deliberate: it is the canonical GHCR package, chosen
+  because the repository-named package rejected blob uploads with HTTP 403.
+  Tag releases publish it by default; `image-digest.txt` on the release
+  records the immutable digest. When registry publishing was disabled or
+  rejected, load the attached `waf-rejected-<version>-image.tar.gz` instead.
 - Released image tarball, digest pinning, upgrade and rollback:
   [`docs/operations/container.md`](docs/operations/container.md)
 - Kubernetes manifests: [`infrastructure/kubernetes`](infrastructure/kubernetes)

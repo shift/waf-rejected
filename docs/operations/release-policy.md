@@ -27,8 +27,19 @@ release steps remain in [`release-checklist.md`](release-checklist.md).
 ## Assets and verification
 
 Each release publishes the binary tarball, the Coraza sidecar tarball, the
-container image tarball, the CycloneDX SBOM, the standalone reactor module and
-a `.sha256` file for every asset.
+container image tarball, a CycloneDX SBOM, the standalone reactor module, an
+`image-digest.txt` and a `.sha256` file for every asset.
+
+The canonical container package is `ghcr.io/shift/waf-rejected-waf`. It
+differs from the repository name (`shift/waf-rejected`) because GHCR rejected
+blob uploads for the repository-named package with HTTP 403. Do not rewrite
+workflow image names or deployment manifests to `ghcr.io/shift/waf-rejected`;
+published digests live under `-waf`.
+
+`image-digest.txt` contains the immutable
+`ghcr.io/shift/waf-rejected-waf@sha256:...` reference when the image was
+published. If registry publishing was disabled or rejected, it records
+`registry: not published`, the local image ID and the tarball fallback.
 
 Verify downloaded assets in this order:
 
@@ -37,6 +48,8 @@ Verify downloaded assets in this order:
    `gh attestation verify <asset> --repo shift/waf-rejected`.
 3. Run the local verifier:
    `./scripts/verify-release.sh --dir <artifact-dir> --version <version>`.
+4. Verify the registry digest when the image was published:
+   `./scripts/verify-release.sh --dir <artifact-dir> --version <version> --verify-registry`.
 
 A failed checksum or attestation means the file must not be deployed. Report it
 through the private channel in [`SECURITY.md`](../../SECURITY.md).

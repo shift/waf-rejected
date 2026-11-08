@@ -17,6 +17,7 @@ nix shell nixpkgs#actionlint -c actionlint .github/workflows/*.yml
 | Workflow | Trigger | Jobs | Write permissions |
 | --- | --- | --- | --- |
 | `release.yml` | Push of a `v*` tag | `build-image`, `sbom`, `trivy-filesystem`, `trivy-image`, `build-release` | `contents: write` (release), `packages: write` (image), `security-events: write` (SARIF), `id-token`/`attestations` (provenance) |
+| `publish-image.yml` | Manual dispatch with a release tag | `publish` | `packages: write` (image) |
 | `production-deployment.yml` | Push and pull request to `main` or `production` | `security-scan`, `test`, `build-image`, `preflight`, `deploy-staging`, `deploy-production`, `rollback` | `security-events: write` (SARIF), `packages: write` (image) |
 | `feature-matrix.yml` | Push/PR to `main` for Rust and rule paths; manual dispatch | `fmt-clippy`, `lib-tests`, `compile`, optional corpus/engine jobs | None |
 | CodeQL | GitHub default code scanning setup | Managed by GitHub | Managed by GitHub |
@@ -34,7 +35,9 @@ tag.
 The jobs produce:
 
 - `build-image` — builds the container image, exports a loadable
-  `waf-rejected-<version>-image.tar.gz`, and optionally pushes to GHCR.
+  `waf-rejected-<version>-image.tar.gz`, pushes the canonical
+  `ghcr.io/shift/waf-rejected-waf` package by default, and records the
+  resulting digest in `image-digest.txt`.
 - `sbom` — installs Nix and runs `scripts/generate-sbom.sh` inside
   `nix develop`, then uploads the CycloneDX SBOM and its checksum.
 - `trivy-filesystem` — scans the checkout and dependency manifests.
@@ -43,37 +46,59 @@ The jobs produce:
   every asset with a `.sha256`, attests build provenance, and publishes the
   GitHub pre-release.
 
-### GHCR publishing is opt-in
+### GHCR publishing
 
-The workflow's `GITHUB_TOKEN` needs package write access for the repository,
-and organization policy can still reject the push with HTTP 403. Publishing is
-therefore controlled by the repository variable `PUSH_IMAGE`:
+Tag releases publish `ghcr.io/shift/waf-rejected-waf` by default, with both
+the release tag (`v<version>`) and `sha-<commit>` tags. This canonical package
+name is deliberately **not** `ghcr.io/shift/waf-rejected`: the
+repository-named package rejected blob uploads with HTTP 403, while the `-waf`
+package accepts the same image. Keep `-waf` in every workflow, script and
+deployment manifest.
+
+Set `PUSH_IMAGE=false` to disable registry publishing:
 
 ```bash
-# Enable registry publishing for this repository.
-gh variable set PUSH_IMAGE --body true --repo shift/waf-rejected
+# Disable publishing (the image tarball remains a release asset).
+gh variable set PUSH_IMAGE --body false --repo shift/waf-rejected
 
-# Disable it again (the image tarball remains a release asset).
+# Re-enable it (the default).
 gh variable delete PUSH_IMAGE --repo shift/waf-rejected
 ```
 
-When `PUSH_IMAGE` is unset or not exactly `true`:
+When `PUSH_IMAGE=false`:
 
 - the GHCR login and push steps are skipped;
 - the image is still built and exported;
 - `waf-rejected-<version>-image.tar.gz` is attached to the release and covered
-  by the provenance attestation and checksums.
+  by the provenance attestation and checksums;
+- `image-digest.txt` records `registry: not published` and the local image ID.
 
-When `PUSH_IMAGE=true`, the workflow attempts the push but treats a rejected
-push as a warning. A missing package-write capability or an organization
-policy that returns HTTP 403 therefore cannot block the release: the tarball
-is still attached. Inspect the run log for the
+The push treats a rejected upload as a warning. A missing package-write
+capability or an organization policy that returns HTTP 403 therefore cannot
+block the release: the tarball is still attached. Inspect the run log for the
 `GHCR rejected the image push` warning and fix the credential before expecting
 the image in the registry.
 
-The tarball is the supported fallback: `docker load`/`podman load` it as
-described in [`container.md`](container.md#load-the-released-tarball). If the
-registry accepts the push, publish the immutable digest in the release notes.
+On success, `build-image` writes the immutable
+`ghcr.io/shift/waf-rejected-waf@sha256:...` reference to `image-digest.txt`,
+uploads it as the `image-digest` artifact, and `build-release` attaches it to
+the release and appends it to the release body. The tarball remains the
+supported fallback: `docker load`/`podman load` it as described in
+[`container.md`](container.md#load-the-released-tarball). Verify a published
+digest with:
+
+```bash
+./scripts/verify-release.sh --dir .release-assets --version <version> \
+  --verify-registry
+```
+
+### Manual image publish
+
+`publish-image.yml` is a `workflow_dispatch` fallback for re-publishing an
+existing release tag without re-running the whole release. It builds the same
+Dockerfile and pushes the same canonical package and tags
+(`ghcr.io/shift/waf-rejected-waf:<tag>` and `:sha-<commit>`). It does not
+modify release assets or `image-digest.txt`.
 
 ### Vulnerability policy
 
@@ -114,7 +139,7 @@ that declare the environment and would not be seen by `preflight`.
 | `STAGING_KUBE_CONFIG` | Secret (optional) | `deploy-staging` | Base64-encoded kubeconfig for the staging cluster; missing means the job skips |
 | `PRODUCTION_KUBE_CONFIG` | Secret (optional) | `deploy-production`, `rollback` | Base64-encoded kubeconfig for the production cluster; missing means the jobs skip |
 | `CACHIX_AUTH_TOKEN` | Secret (optional) | `test` | Push access to the `waf-rejected` Cachix cache. Missing means the build uses the default Nix substituters only |
-| `PUSH_IMAGE` | Repository variable (optional) | `build-image` | Set to `true` to enable GHCR publishing |
+| `PUSH_IMAGE` | Repository variable (optional) | `build-image` | Tag releases publish by default; set to `false` to disable. Snapshot publishing stays opt-in with `true` |
 
 No secret is required for the pipeline to pass: `security-scan`, `test` and
 `build-image` always run. The only mandatory capability is the default
@@ -147,7 +172,7 @@ manual `workflow_dispatch` inputs.
 
 | Symptom | Cause and action |
 | --- | --- |
-| GHCR push returns `403 Forbidden` | The token cannot write packages, or organization policy blocks it. Leave `PUSH_IMAGE` unset; use the released image tarball. |
+| GHCR push returns `403 Forbidden` | The token cannot write packages, or organization policy blocks it. The release continues with the image tarball and `image-digest.txt` marking the fallback; fix the package write credential before the next tag. Do not switch back to `ghcr.io/shift/waf-rejected`, which rejects blob uploads. |
 | `sbom` fails with `nix: command not found` | The job installs Nix with `cachix/install-nix-action`. Check that the action step was not skipped. |
 | SARIF upload fails with `Resource not accessible by integration` | The job is missing `security-events: write`, or code scanning is disabled for the repository. |
 | Deploy jobs report "skipped" | `preflight` did not find the matching repository/organization kubeconfig secret. Add it, or accept that deployment is disabled. |

@@ -4,8 +4,30 @@ All notable changes to WAF-Rejected are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- Canonicalized the OCI package as `ghcr.io/shift/waf-rejected-waf`. GHCR
+  rejected blob uploads for the repository-named
+  `ghcr.io/shift/waf-rejected` package with HTTP 403; the `-waf` package
+  accepted the beta 16 image. Tag releases now publish both the `v<version>`
+  and `sha-<commit>` tags by default, with `PUSH_IMAGE=false` as the disable
+  override. The Release workflow records the immutable
+  `ghcr.io/shift/waf-rejected-waf@sha256:...` reference in `image-digest.txt`,
+  attaches it to the release and appends it to the release body. The image
+  tarball remains the fallback when publishing is disabled or rejected.
+- Added `.github/workflows/publish-image.yml` for manual re-publishing of a
+  release tag under the same canonical package name and tags.
+- `scripts/verify-release.sh --verify-registry` checks the registry digest
+  from `image-digest.txt` (or `--image-digest`) when network access and a
+  container CLI are available.
+
 ### Documentation
 
+- Documented the canonical `ghcr.io/shift/waf-rejected-waf` image name and why
+  it differs from the repository name in `README.md`,
+  `docs/operations/container.md`, `docs/operations/ci.md`,
+  `docs/operations/release-policy.md`, `docs/operations/release-checklist.md`
+  and `docs/operations/supply-chain.md`.
 - Recorded the distributed WAF architecture decisions as ADR-0008 in
   [`docs/design/distributed-waf-architecture.md`](docs/design/distributed-waf-architecture.md).
   Regional cells with an asynchronous, eventually consistent global tier;

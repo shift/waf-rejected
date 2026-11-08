@@ -5,10 +5,18 @@
 #   ./scripts/verify-release.sh --dir .release-assets --version 0.1.0-beta.13
 #   ./scripts/verify-release.sh --tag v0.1.0-beta.13
 #   ./scripts/verify-release.sh --dir dist --version 0.1.0-beta.13 --no-smoke
+#   ./scripts/verify-release.sh --dir dist --version 0.1.0-beta.13 \
+#       --verify-registry
 #
 # With --tag/--version and no --dir, the assets are downloaded with
 # `gh release download`. With --dir, the script validates a local artifact
 # directory (for example the output of create_release_artifacts.sh).
+#
+# --verify-registry checks the immutable container reference recorded in
+# image-digest.txt (or supplied with --image-digest) against the registry. It
+# is optional because it needs network access and a container CLI. Use
+# --registry-image to verify a mirror instead of the canonical
+# ghcr.io/shift/waf-rejected-waf package.
 #
 # Checks:
 #   - every required asset and its .sha256 file is present and matches;
@@ -19,6 +27,8 @@
 #     provenance and native sidecar;
 #   - the sidecar tarball contains the binary and CRS bundle;
 #   - the image tarball is a valid gzip archive with a Docker manifest;
+#   - with --verify-registry, the image-digest.txt reference resolves in the
+#     registry and names the canonical package;
 #   - the binary reports the expected --version and answers /health.
 set -euo pipefail
 
@@ -29,12 +39,15 @@ VERSION=""
 SMOKE=1
 DEEP_IMAGE=0
 ATTESTATIONS=0
+VERIFY_REGISTRY=0
+REGISTRY_IMAGE="ghcr.io/shift/waf-rejected-waf"
+IMAGE_DIGEST=""
 KEEP=0
 TMP=""
 WAF_PID=""
 
 usage() {
-    sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 cleanup() {
@@ -43,7 +56,9 @@ cleanup() {
         wait "$WAF_PID" 2>/dev/null || true
     fi
     if [[ -n "$TMP" && "$KEEP" -eq 0 ]]; then
-        rm -rf "$TMP"
+        # Release tarballs preserve read-only directories from the Nix store.
+        chmod -R u+w "$TMP" 2>/dev/null || true
+        rm -rf "$TMP" || true
     fi
 }
 trap cleanup EXIT
@@ -66,6 +81,9 @@ while [[ $# -gt 0 ]]; do
         --no-smoke) SMOKE=0; shift ;;
         --deep-image) DEEP_IMAGE=1; shift ;;
         --attestations) ATTESTATIONS=1; shift ;;
+        --verify-registry) VERIFY_REGISTRY=1; shift ;;
+        --registry-image) REGISTRY_IMAGE="${2:?--registry-image needs ghcr.io/owner/name}"; shift 2 ;;
+        --image-digest) IMAGE_DIGEST="${2:?--image-digest needs sha256:<64 hex> or ghcr.io/owner/name@sha256:<64 hex>}"; shift 2 ;;
         --keep) KEEP=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) fail "unknown argument: $1 (try --help)" ;;
@@ -202,6 +220,31 @@ jq -e 'type == "array" and length > 0 and (.[0].Layers | length > 0)' \
     < <(tar -xOf "$DIR/$IMAGE_TAR" manifest.json) >/dev/null \
     || fail "image manifest is not a Docker save manifest"
 ok "image tarball gzip and manifest"
+
+# --- optional registry digest ---------------------------------------------
+if [[ "$VERIFY_REGISTRY" -eq 1 ]]; then
+    command -v docker >/dev/null 2>&1 \
+        || fail "docker is required for --verify-registry"
+    if [[ -z "$IMAGE_DIGEST" ]]; then
+        [[ -s "$DIR/image-digest.txt" ]] \
+            || fail "--verify-registry needs image-digest.txt or --image-digest"
+        IMAGE_DIGEST="$(grep -E '^ghcr\.io/[^[:space:]]+@sha256:[0-9a-f]{64}$' \
+            "$DIR/image-digest.txt" | head -n1 || true)"
+        [[ -n "$IMAGE_DIGEST" ]] \
+            || fail "image-digest.txt does not contain a ghcr.io digest reference"
+    fi
+    case "$IMAGE_DIGEST" in
+        sha256:*) IMAGE_DIGEST="${REGISTRY_IMAGE}@${IMAGE_DIGEST}" ;;
+    esac
+    [[ "$IMAGE_DIGEST" =~ ^[^[:space:]]+@sha256:[0-9a-f]{64}$ ]] \
+        || fail "image digest is not a registry reference: $IMAGE_DIGEST"
+    if [[ -n "$REGISTRY_IMAGE" && "$IMAGE_DIGEST" != "${REGISTRY_IMAGE}@"* ]]; then
+        fail "image digest $IMAGE_DIGEST does not use ${REGISTRY_IMAGE}"
+    fi
+    docker manifest inspect "$IMAGE_DIGEST" >/dev/null \
+        || fail "registry image does not resolve: $IMAGE_DIGEST"
+    ok "registry image $IMAGE_DIGEST"
+fi
 
 if [[ "$DEEP_IMAGE" -eq 1 ]]; then
     MANIFEST="$(tar -xOf "$DIR/$IMAGE_TAR" manifest.json)"
