@@ -28,8 +28,8 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/${{ github.repository }}:${{ inputs.tag }}
-            ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+            ghcr.io/shift/waf-rejected-waf:${{ inputs.tag }}
+            ghcr.io/shift/waf-rejected-waf:sha-${{ github.sha }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ inputs.tag }}
