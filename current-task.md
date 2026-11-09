@@ -1318,7 +1318,7 @@ Base `main` = `31c56af`. Headline: distributed WAF is end-to-end validated.
       Feature Matrix (manual dispatch) success, CodeQL success, Production
       Deployment success (deploy jobs skipped without staging/production
       credentials), Release success.
-- [ ] Clean worktrees; leave `main` clean.
+- [x] Clean worktrees; `main` clean at `31c56af` (release branch `e7c9f55`).
 
 ## Release 0.1.0-beta.16 (`release/v0.1.0-beta.16`)
 
