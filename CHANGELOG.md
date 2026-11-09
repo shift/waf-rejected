@@ -6,6 +6,17 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Added
 
+- Hardened distributed client (`feat/distri-auth`): mutual TLS client
+  certificates, CA overrides, SPIFFE identity metadata and JWT-SVID bearer
+  fallback, with plaintext required to be explicitly opted in; Ed25519 policy
+  bundle verification with content-hash, key-id, generation and hash-chain
+  continuity checks (unsigned/broken bundles rejected and counted); shared
+  rate-limit leases acquired asynchronously from a bounded queue and consumed
+  alongside local token buckets, failing closed for expired shared budget
+  while preserving local-only behaviour; bounded event/counter egress with
+  stable UUIDv5 counter batch ids for idempotent retries. New config keys and
+  lease metrics are documented in `docs/operations/distributed.md`.
+
 - WAF-side distributed security fabric behind the non-default `distri-kv`
   Cargo feature: `[waf.distributed]` config with values validation,
   `PolicySource`/`ReputationSource`/`RateLimitSync`/`EventSink`/`NodeRegistry`

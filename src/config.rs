@@ -971,6 +971,68 @@ pub struct DistributedConfig {
     /// Empty means no credential is attached. Treat this value as a secret.
     pub auth_token: String,
 
+    /// SPIFFE workload identity asserted in request metadata
+    /// (`x-spiffe-id` by default). Empty disables identity metadata. This is
+    /// an assertion consumed only after mTLS; it is never trusted on its own.
+    pub spiffe_id: String,
+
+    /// Metadata key used to carry `spiffe_id`. Must be a lowercase HTTP/2
+    /// metadata name. Defaults to `x-spiffe-id`.
+    pub spiffe_metadata_key: String,
+
+    /// Optional SPIFFE JWT-SVID (or deployment-issued JWT) attached as
+    /// `authorization: Bearer <token>` when `auth_token` is empty. Treat it as
+    /// a secret; it is never logged.
+    pub spiffe_jwt: String,
+
+    /// PEM CA bundle used to verify the distri-kv server certificate for
+    /// `https://` endpoints. Empty uses the system/webpki roots.
+    pub tls_ca_cert_path: String,
+
+    /// PEM client certificate for mutual TLS. Requires `tls_client_key_path`.
+    pub tls_client_cert_path: String,
+
+    /// PEM private key for `tls_client_cert_path`.
+    pub tls_client_key_path: String,
+
+    /// Override the TLS SNI/verification name when the endpoint host does not
+    /// match the server certificate.
+    pub tls_server_name: String,
+
+    /// Explicitly permit `http://` endpoints (for a local TLS-terminating
+    /// sidecar only). Off by default: plaintext control-plane transport is
+    /// never implied by an `http://` URL.
+    pub allow_insecure_transport: bool,
+
+    /// Verify the Ed25519 signature, content hash and hash chain of every
+    /// fetched policy bundle. Off is rejected unless explicitly set, because
+    /// unsigned policy must never be applied by accident.
+    pub require_policy_signature: bool,
+
+    /// Ed25519 public key for policy bundles, hex or base64 encoded (32 raw
+    /// bytes). Required when `require_policy_signature` is on.
+    pub policy_signing_public_key: String,
+
+    /// Expected policy signing key id. Empty accepts any verified key.
+    pub policy_signing_key_id: String,
+
+    /// Optional prerequisite policy hash for the first accepted bundle. Empty
+    /// accepts an empty `previous_hash` on first use; later bundles must chain.
+    pub policy_initial_hash: String,
+
+    /// Enable shared rate-limit leases. The local token bucket always remains
+    /// authoritative for local-only traffic.
+    pub leases_enabled: bool,
+
+    /// Requested lease TTL in milliseconds.
+    pub lease_ttl_ms: u64,
+
+    /// Maximum number of lease requests drained per background batch.
+    pub lease_batch_max: usize,
+
+    /// Bounded lease-request queue capacity. Overflow drops, never blocks.
+    pub lease_queue_capacity: usize,
+
     /// This node's gRPC ingest endpoint advertised in `Register`
     /// (`NodeMetadata.endpoint`). The contract requires a non-empty value;
     /// when this is empty the first control-plane endpoint is advertised.
@@ -1022,6 +1084,22 @@ impl Default for DistributedConfig {
             policy_scope: "default".to_string(),
             endpoints: Vec::new(),
             auth_token: String::new(),
+            spiffe_id: String::new(),
+            spiffe_metadata_key: "x-spiffe-id".to_string(),
+            spiffe_jwt: String::new(),
+            tls_ca_cert_path: String::new(),
+            tls_client_cert_path: String::new(),
+            tls_client_key_path: String::new(),
+            tls_server_name: String::new(),
+            allow_insecure_transport: false,
+            require_policy_signature: true,
+            policy_signing_public_key: String::new(),
+            policy_signing_key_id: String::new(),
+            policy_initial_hash: String::new(),
+            leases_enabled: false,
+            lease_ttl_ms: 5_000,
+            lease_batch_max: 64,
+            lease_queue_capacity: 4096,
             advertise_endpoint: String::new(),
             fallback: DistributedFallbackMode::LocalOnly,
             policy_cache_ttl_secs: 300,
@@ -1074,6 +1152,79 @@ impl DistributedConfig {
             anyhow::bail!(
                 "waf.distributed.auth_token requires at least one waf.distributed.endpoints entry"
             );
+        }
+        if !self.spiffe_id.is_empty() {
+            if !self.spiffe_id.starts_with("spiffe://") || self.spiffe_id.len() > 2048 {
+                anyhow::bail!(
+                    "waf.distributed.spiffe_id must be a spiffe:// URI of at most 2048 characters"
+                );
+            }
+            if self.endpoints.is_empty() {
+                anyhow::bail!(
+                    "waf.distributed.spiffe_id requires at least one waf.distributed.endpoints entry"
+                );
+            }
+        }
+        if self.spiffe_metadata_key.is_empty()
+            || !self
+                .spiffe_metadata_key
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            anyhow::bail!(
+                "waf.distributed.spiffe_metadata_key must be a lowercase HTTP/2 metadata name"
+            );
+        }
+        for (name, value) in [
+            ("spiffe_jwt", &self.spiffe_jwt),
+            ("tls_ca_cert_path", &self.tls_ca_cert_path),
+            ("tls_client_cert_path", &self.tls_client_cert_path),
+            ("tls_client_key_path", &self.tls_client_key_path),
+            ("tls_server_name", &self.tls_server_name),
+            ("policy_signing_public_key", &self.policy_signing_public_key),
+            ("policy_signing_key_id", &self.policy_signing_key_id),
+            ("policy_initial_hash", &self.policy_initial_hash),
+        ] {
+            if value.len() > 8192 {
+                anyhow::bail!("waf.distributed.{name} must be at most 8192 characters");
+            }
+        }
+        if self.tls_client_cert_path.is_empty() != self.tls_client_key_path.is_empty() {
+            anyhow::bail!(
+                "waf.distributed.tls_client_cert_path and tls_client_key_path must be set together"
+            );
+        }
+        if (!self.tls_client_cert_path.is_empty() || !self.tls_ca_cert_path.is_empty())
+            && self
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.starts_with("http://"))
+        {
+            anyhow::bail!(
+                "waf.distributed TLS client material cannot be used with an http:// endpoint"
+            );
+        }
+        if !self.allow_insecure_transport
+            && self
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.starts_with("http://"))
+        {
+            anyhow::bail!(
+                "waf.distributed.endpoints uses http:// but allow_insecure_transport is false; \
+                 use https:// or explicitly set allow_insecure_transport = true for a local sidecar"
+            );
+        }
+        if self.leases_enabled {
+            if self.lease_ttl_ms == 0 {
+                anyhow::bail!("waf.distributed.lease_ttl_ms must be greater than zero");
+            }
+            if self.lease_batch_max == 0 {
+                anyhow::bail!("waf.distributed.lease_batch_max must be greater than zero");
+            }
+            if self.lease_queue_capacity == 0 {
+                anyhow::bail!("waf.distributed.lease_queue_capacity must be greater than zero");
+            }
         }
         if !self.advertise_endpoint.trim().is_empty() {
             let uri = self
@@ -1141,6 +1292,7 @@ impl DistributedConfig {
         for (name, capacity) in [
             ("event_queue_capacity", self.event_queue_capacity),
             ("counter_queue_capacity", self.counter_queue_capacity),
+            ("lease_queue_capacity", self.lease_queue_capacity),
         ] {
             if capacity == 0 {
                 anyhow::bail!("waf.distributed.{name} must be greater than zero");

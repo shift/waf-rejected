@@ -481,6 +481,49 @@ pub struct CounterAck {
     #[prost(uint32, tag = "5")]
     pub retry_after_ms: u32,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AcquireLeaseRequest {
+    #[prost(uint32, tag = "1")]
+    pub contract_version: u32,
+    #[prost(string, tag = "2")]
+    pub node_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub epoch: u64,
+    #[prost(string, tag = "4")]
+    pub policy_id: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "5")]
+    pub window_start_unix: u32,
+    #[prost(uint32, tag = "6")]
+    pub shard: u32,
+    /// 128-bit key hash. Empty/zero means the global aggregate budget.
+    #[prost(bytes = "vec", tag = "7")]
+    pub key_hash: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "8")]
+    pub requested: u64,
+    /// Caller-provided idempotency key for retries.
+    #[prost(string, tag = "9")]
+    pub request_id: ::prost::alloc::string::String,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AcquireLeaseResponse {
+    #[prost(uint32, tag = "1")]
+    pub contract_version: u32,
+    #[prost(string, tag = "2")]
+    pub lease_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub granted: u64,
+    /// Server-authoritative remaining budget for this key at issue time.
+    #[prost(uint64, tag = "4")]
+    pub remaining: u64,
+    #[prost(uint64, tag = "5")]
+    pub expires_at_unix_ms: u64,
+    #[prost(bool, tag = "6")]
+    pub denied: bool,
+    #[prost(uint32, tag = "7")]
+    pub retry_after_ms: u32,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum NodeHealth {
@@ -857,6 +900,28 @@ pub mod distri_waf_client {
             ));
             self.inner.unary(req, path, codec).await
         }
+        /// Acquire a bounded shared rate-limit budget lease for one counter key.
+        /// Enforcement stays local; a denied/zero grant means the shared budget is
+        /// exhausted and the caller must fail closed for shared-only capacity.
+        pub async fn acquire_lease(
+            &mut self,
+            request: impl tonic::IntoRequest<super::AcquireLeaseRequest>,
+        ) -> std::result::Result<tonic::Response<super::AcquireLeaseResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::new(
+                    tonic::Code::Unknown,
+                    format!("Service was not ready: {}", e.into()),
+                )
+            })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/waf.distri.v1.DistriWaf/AcquireLease");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("waf.distri.v1.DistriWaf", "AcquireLease"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -921,6 +986,13 @@ pub mod distri_waf_server {
             &self,
             request: tonic::Request<super::CounterDeltas>,
         ) -> std::result::Result<tonic::Response<super::CounterAck>, tonic::Status>;
+        /// Acquire a bounded shared rate-limit budget lease for one counter key.
+        /// Enforcement stays local; a denied/zero grant means the shared budget is
+        /// exhausted and the caller must fail closed for shared-only capacity.
+        async fn acquire_lease(
+            &self,
+            request: tonic::Request<super::AcquireLeaseRequest>,
+        ) -> std::result::Result<tonic::Response<super::AcquireLeaseResponse>, tonic::Status>;
     }
     /// DistriWaf is the owned control-plane contract between WAF-Rejected nodes and
     /// a distri-kv regional cluster (ADR-0007, section 7).
@@ -1351,6 +1423,46 @@ pub mod distri_waf_server {
                     let fut = async move {
                         let inner = inner.0;
                         let method = IngestCounterDeltasSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/waf.distri.v1.DistriWaf/AcquireLease" => {
+                    #[allow(non_camel_case_types)]
+                    struct AcquireLeaseSvc<T: DistriWaf>(pub Arc<T>);
+                    impl<T: DistriWaf> tonic::server::UnaryService<super::AcquireLeaseRequest> for AcquireLeaseSvc<T> {
+                        type Response = super::AcquireLeaseResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::AcquireLeaseRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as DistriWaf>::acquire_lease(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = AcquireLeaseSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

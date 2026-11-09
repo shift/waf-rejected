@@ -222,7 +222,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"], optional = true }
 # (`engine-kernel`). Already in the lockfile as a `regex` transitive dep.
 regex-automata = { version = "0.4", optional = true }
 once_cell = "1.19"
-uuid = { version = "1.6", features = ["v4", "serde"] }
+uuid = { version = "1.6", features = ["v4", "v5", "serde"] }
 notify = "6.1"
 urlencoding = "2.1"
 async-trait = "0.1"
@@ -230,6 +230,8 @@ async-trait = "0.1"
 # gRPC client for the distri-kv DistriWaf contract (`distri-kv` feature only).
 tonic = { version = "0.11", optional = true, features = ["tls", "tls-webpki-roots"] }
 prost = { version = "0.12", optional = true }
+# Ed25519 verification for signed policy bundles (`distri-kv` only).
+ring = { version = "0.17", optional = true }
 
 # Development-only dependencies
 
@@ -357,7 +359,7 @@ rust-engine = ["dep:aho-corasick", "native-detect"]
 # vendored `DistriWaf` contract from shift/distri-kv is implemented with a
 # minimal tonic client in `src/waf/distributed/grpc.rs`; the default remains
 # `local_only`. See docs/operations/distributed.md.
-distri-kv = ["dep:tonic", "dep:prost"]
+distri-kv = ["dep:tonic", "dep:prost", "dep:ring"]
 # Compile-in hot-loop instrumentation for the native Rust engine. Non-default
 # and absent from production builds; exposes `RustEngine::evaluate_profiled`.
 # See docs/suggestions_from_agents/engine-hotloop.md.

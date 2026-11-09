@@ -229,6 +229,17 @@ pub trait RateLimitSync: Send + Sync {
     async fn flush(&self, deltas: &[CounterDelta]) -> Result<(), DistributedError>;
 }
 
+/// Asynchronous acquisition of shared rate-limit leases.
+#[async_trait]
+pub trait LeaseSource: Send + Sync {
+    /// Request a batch of leases. The controller calls this off the request
+    /// path; per-key failures are represented as denied grants.
+    async fn acquire_leases(
+        &self,
+        requests: &[super::leases::LeaseRequest],
+    ) -> Result<Vec<super::leases::LeaseGrant>, DistributedError>;
+}
+
 /// Security event egress path.
 #[async_trait]
 pub trait EventSink: Send + Sync {

@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::{DistributedConfig, DistributedFallbackMode};
 
+use super::leases::{LeaseConsume, LeaseKey, LeasePool, LeaseRequest, LeaseRequests};
 use super::metrics::DistributedMetrics;
 
 /// Decision to apply when shared data cannot be read.
@@ -40,6 +41,10 @@ pub struct DistributedState {
     heartbeat_interval: Duration,
     max_stale: Duration,
     last_heartbeat: Mutex<Option<Instant>>,
+    leases_enabled: bool,
+    lease_pool: LeasePool,
+    lease_requests: LeaseRequests,
+    policy_integrity_ok: AtomicBool,
     metrics: DistributedMetrics,
 }
 
@@ -58,6 +63,10 @@ impl DistributedState {
             heartbeat_interval: Duration::from_secs(config.heartbeat_interval_secs.max(1)),
             max_stale: Duration::from_secs(config.max_stale_secs),
             last_heartbeat: Mutex::new(None),
+            leases_enabled: config.leases_enabled,
+            lease_pool: LeasePool::new(),
+            lease_requests: LeaseRequests::new(config.lease_queue_capacity),
+            policy_integrity_ok: AtomicBool::new(true),
             metrics: DistributedMetrics::default(),
         }
     }
@@ -174,6 +183,72 @@ impl DistributedState {
 
     pub fn allows_without_cluster(&self) -> bool {
         self.unavailable_decision() == UnavailableDecision::Allow
+    }
+
+    /// Whether the most recently fetched policy bundle passed integrity
+    /// checks. A rejected bundle flips this to `false`; a verified bundle
+    /// restores it.
+    pub fn policy_integrity_ok(&self) -> bool {
+        self.policy_integrity_ok.load(Ordering::Acquire)
+    }
+
+    pub fn set_policy_integrity_ok(&self, ok: bool) {
+        self.policy_integrity_ok.store(ok, Ordering::Release);
+    }
+
+    pub fn leases_enabled(&self) -> bool {
+        self.leases_enabled
+    }
+
+    /// Non-blocking request for shared budget. Called only after the local
+    /// bucket is exhausted, and never awaited.
+    pub fn request_lease(&self, request: LeaseRequest) -> bool {
+        if !self.leases_enabled {
+            return false;
+        }
+        let accepted = self.lease_requests.try_push(request);
+        if !accepted {
+            self.metrics.record_lease_request_dropped();
+        }
+        accepted
+    }
+
+    pub fn lease_requests(&self) -> &LeaseRequests {
+        &self.lease_requests
+    }
+
+    pub fn apply_lease(&self, grant: super::leases::LeaseGrant) {
+        if grant.denied {
+            self.metrics.record_lease_denied();
+        } else {
+            self.metrics
+                .record_lease_granted(grant.remaining.max(grant.granted));
+        }
+        self.lease_pool.apply(grant, Instant::now());
+    }
+
+    /// Spend one unit of a cached lease. Returns `Unavailable` when there is
+    /// no lease, which the caller treats as fail-closed for the shared budget.
+    pub fn try_consume_lease(&self, key: &LeaseKey) -> LeaseConsume {
+        let outcome = self.lease_pool.try_consume(key);
+        match outcome {
+            LeaseConsume::Expired => {
+                self.metrics.record_lease_expired();
+                self.metrics.record_lease_fallback();
+            }
+            LeaseConsume::Unavailable => {
+                self.metrics.record_lease_fallback();
+            }
+            LeaseConsume::Exhausted => {
+                self.metrics.record_lease_denied();
+            }
+            LeaseConsume::Consumed { .. } => {}
+        }
+        outcome
+    }
+
+    pub fn lease_pool(&self) -> &LeasePool {
+        &self.lease_pool
     }
 
     pub fn metrics(&self) -> &DistributedMetrics {

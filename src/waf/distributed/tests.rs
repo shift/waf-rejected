@@ -33,6 +33,8 @@ fn enabled_config() -> DistributedConfig {
         reconnect_max_backoff_ms: 4,
         event_queue_capacity: 4,
         counter_queue_capacity: 4,
+        allow_insecure_transport: true,
+        require_policy_signature: false,
         ..DistributedConfig::default()
     }
 }
@@ -459,6 +461,8 @@ struct MockWaf {
     counters: AtomicU64,
     /// Deliberate control-plane stall for the non-blocking request-path test.
     rpc_delay_ms: u64,
+    lease_budget: AtomicU64,
+    spiffe_seen: std::sync::Mutex<Option<String>>,
 }
 
 impl MockWaf {
@@ -496,6 +500,12 @@ impl DistriWafService for MockWaf {
         request: tonic::Request<super::distri_waf::HeartbeatRequest>,
     ) -> Result<tonic::Response<super::distri_waf::HeartbeatResponse>, tonic::Status> {
         self.stall().await;
+        let spiffe = request
+            .metadata()
+            .get("x-spiffe-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        *self.spiffe_seen.lock().unwrap() = spiffe;
         let request = request.into_inner();
         if request.node_id != "node-a" {
             return Err(tonic::Status::not_found("unknown node"));
@@ -537,6 +547,13 @@ impl DistriWafService for MockWaf {
             version: 3,
             generation: 7,
             created_at_unix_ms: 1_700_000_000_000,
+            content_hash: {
+                let payload = PolicyPayload {
+                    ruleset_version: "crs-4.0".to_string(),
+                    ..Default::default()
+                };
+                super::policy_verify::payload_hash(&payload).to_vec()
+            },
             payload: Some(PolicyPayload {
                 ruleset_version: "crs-4.0".to_string(),
                 ..Default::default()
@@ -610,6 +627,45 @@ impl DistriWafService for MockWaf {
             ..Default::default()
         }))
     }
+
+    async fn acquire_lease(
+        &self,
+        request: tonic::Request<super::distri_waf::AcquireLeaseRequest>,
+    ) -> Result<tonic::Response<super::distri_waf::AcquireLeaseResponse>, tonic::Status> {
+        let request = request.into_inner();
+        let mut budget = self.lease_budget.load(Ordering::Relaxed);
+        let granted = loop {
+            if budget == 0 {
+                break 0;
+            }
+            let grant = budget.min(request.requested.max(1));
+            match self.lease_budget.compare_exchange_weak(
+                budget,
+                budget - grant,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break grant,
+                Err(actual) => budget = actual,
+            }
+        };
+        let expires = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 30_000;
+        Ok(tonic::Response::new(
+            super::distri_waf::AcquireLeaseResponse {
+                contract_version: 1,
+                lease_id: format!("lease-{}", request.request_id),
+                granted,
+                remaining: self.lease_budget.load(Ordering::Relaxed),
+                expires_at_unix_ms: expires,
+                denied: granted == 0,
+                retry_after_ms: 0,
+            },
+        ))
+    }
 }
 
 /// A deliberately slow control plane must not add latency to request
@@ -646,6 +702,8 @@ fn slow_endpoint_does_not_block_request_evaluation() {
             endpoints: vec![format!("http://{address}")],
             heartbeat_interval_secs: 1,
             request_timeout_ms: 2_000,
+            allow_insecure_transport: true,
+            require_policy_signature: false,
             ..DistributedConfig::default()
         };
 
@@ -719,6 +777,8 @@ fn grpc_client_round_trips_register_heartbeat_policy_and_reputation() {
             region: "eu-west-1".to_string(),
             policy_scope: "waf".to_string(),
             endpoints: vec![format!("http://{address}")],
+            allow_insecure_transport: true,
+            require_policy_signature: false,
             ..DistributedConfig::default()
         };
         let client = DistriWafClient::new(&config).unwrap();
@@ -773,4 +833,262 @@ fn grpc_client_round_trips_register_heartbeat_policy_and_reputation() {
 
         server.abort();
     });
+}
+
+// ---------------------------------------------------------------------------
+// Auth, policy integrity and leases
+// ---------------------------------------------------------------------------
+
+#[test]
+fn auth_config_requires_explicit_insecure_transport_and_tls_pairing() {
+    let mut config = DistributedConfig {
+        enabled: true,
+        node_id: "node-a".to_string(),
+        region: "eu-west-1".to_string(),
+        endpoints: vec!["http://dkv:7443".to_string()],
+        ..DistributedConfig::default()
+    };
+    assert!(config.validate().is_err(), "plaintext must be explicit");
+    config.allow_insecure_transport = true;
+    assert!(config.validate().is_ok());
+
+    config.endpoints = vec!["https://dkv:7443".to_string()];
+    config.tls_client_cert_path = "/tmp/client.pem".to_string();
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("tls_client_key_path"), "{error}");
+
+    config.tls_client_key_path = "/tmp/client.key".to_string();
+    config.spiffe_id = "not-a-spiffe-id".to_string();
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("spiffe_id"), "{error}");
+    config.spiffe_id = "spiffe://example.org/waf/node-a".to_string();
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn spiffe_and_bearer_metadata_are_attached_without_network() {
+    let config = DistributedConfig {
+        enabled: true,
+        node_id: "node-a".to_string(),
+        region: "eu-west-1".to_string(),
+        endpoints: vec!["https://dkv.example:7443".to_string()],
+        auth_token: "secret-token".to_string(),
+        spiffe_id: "spiffe://example.org/waf/node-a".to_string(),
+        require_policy_signature: false,
+        ..DistributedConfig::default()
+    };
+    let client = DistriWafClient::new(&config).unwrap();
+    let request = client.request(());
+    assert_eq!(
+        request.metadata().get("authorization").unwrap(),
+        "Bearer secret-token"
+    );
+    assert_eq!(
+        request.metadata().get("x-spiffe-id").unwrap(),
+        "spiffe://example.org/waf/node-a"
+    );
+}
+
+fn policy_keypair() -> (ring::signature::Ed25519KeyPair, String) {
+    use ring::signature::KeyPair as _;
+    let seed = [7u8; 32];
+    let pair = ring::signature::Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
+    let public = hex::encode(pair.public_key().as_ref());
+    (pair, public)
+}
+
+fn signed_bundle(
+    pair: &ring::signature::Ed25519KeyPair,
+    generation: u64,
+    previous_hash: Vec<u8>,
+) -> PolicyBundle {
+    let payload = PolicyPayload {
+        ruleset_version: format!("crs-{generation}"),
+        ..Default::default()
+    };
+    let content_hash = super::policy_verify::payload_hash(&payload).to_vec();
+    let signature = pair.sign(&content_hash).as_ref().to_vec();
+    PolicyBundle {
+        contract_version: 1,
+        schema_version: 1,
+        scope: "waf".to_string(),
+        version: generation,
+        generation,
+        created_at_unix_ms: 1,
+        previous_hash,
+        content_hash,
+        signature,
+        key_id: "key-1".to_string(),
+        payload: Some(payload),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn policy_signature_chain_and_generation_are_enforced() {
+    let (pair, public_key) = policy_keypair();
+    let config = DistributedConfig {
+        require_policy_signature: true,
+        policy_signing_public_key: public_key,
+        policy_signing_key_id: "key-1".to_string(),
+        ..DistributedConfig::default()
+    };
+    let verifier = super::policy_verify::PolicyVerifier::from_config(&config).unwrap();
+    let mut state = super::policy_verify::PolicyVerificationState::default();
+
+    let first = signed_bundle(&pair, 1, Vec::new());
+    assert!(verifier.verify(&first, &mut state).is_ok());
+
+    let mut tampered = signed_bundle(&pair, 2, first.content_hash.clone());
+    tampered.payload.as_mut().unwrap().ruleset_version = "evil".to_string();
+    assert!(verifier.verify(&tampered, &mut state).is_err());
+
+    let mut unsigned = signed_bundle(&pair, 2, first.content_hash.clone());
+    unsigned.signature.clear();
+    assert!(verifier.verify(&unsigned, &mut state).is_err());
+
+    let mut bad_chain = signed_bundle(&pair, 2, vec![9u8; 32]);
+    assert!(verifier.verify(&bad_chain, &mut state).is_err());
+
+    bad_chain.previous_hash = first.content_hash.clone();
+    assert!(verifier.verify(&bad_chain, &mut state).is_ok());
+    assert_eq!(state.generation(), 2);
+
+    let replay = signed_bundle(&pair, 2, first.content_hash.clone());
+    assert!(verifier.verify(&replay, &mut state).is_ok());
+
+    let older = signed_bundle(&pair, 1, Vec::new());
+    assert!(verifier.verify(&older, &mut state).is_err());
+}
+
+fn lease_config() -> DistributedConfig {
+    DistributedConfig {
+        enabled: true,
+        node_id: "node-a".to_string(),
+        region: "eu-west-1".to_string(),
+        endpoints: vec!["https://dkv.example:7443".to_string()],
+        leases_enabled: true,
+        shadow: false,
+        require_policy_signature: false,
+        lease_queue_capacity: 4,
+        ..DistributedConfig::default()
+    }
+}
+
+fn grant(key: &super::leases::LeaseKey, units: u64) -> super::leases::LeaseGrant {
+    super::leases::LeaseGrant {
+        lease_id: "lease".to_string(),
+        key: *key,
+        granted: units,
+        remaining: units,
+        expires_in: Duration::from_secs(30),
+        denied: false,
+    }
+}
+
+#[test]
+fn lease_exhaustion_is_shared_across_two_waf_instances() {
+    use crate::waf::WafRule as _;
+    let config = lease_config();
+    let state_a = Arc::new(DistributedState::from_config(&config));
+    let state_b = Arc::new(DistributedState::from_config(&config));
+    let ip: IpAddr = "198.51.100.7".parse().unwrap();
+    let key = super::leases::LeaseKey::new("per_ip_rate_limit", 0, {
+        use sha2::Digest as _;
+        let digest = sha2::Sha256::digest(match ip {
+            IpAddr::V4(v4) => v4.octets().to_vec(),
+            IpAddr::V6(v6) => v6.octets().to_vec(),
+        });
+        let mut hash = [0u8; 16];
+        hash.copy_from_slice(&digest[..16]);
+        hash
+    });
+
+    // The broker grants two units total, one per node, and nothing more.
+    state_a.apply_lease(grant(&key, 1));
+    state_b.apply_lease(grant(&key, 1));
+
+    let limiter_a = super::super::rate_limit::RateLimiter::new(
+        "per_ip_rate_limit",
+        1,
+        0,
+        Duration::from_secs(60),
+    )
+    .with_distributed_state(Arc::clone(&state_a));
+    let limiter_b = super::super::rate_limit::RateLimiter::new(
+        "per_ip_rate_limit",
+        1,
+        0,
+        Duration::from_secs(60),
+    )
+    .with_distributed_state(Arc::clone(&state_b));
+    let ctx = RequestContext::new(
+        ip,
+        hyper::Method::GET,
+        "/".parse().unwrap(),
+        hyper::HeaderMap::new(),
+        None,
+    );
+
+    assert!(matches!(limiter_a.evaluate(&ctx), Decision::Allow));
+    assert!(
+        matches!(limiter_a.evaluate(&ctx), Decision::Allow),
+        "lease unit"
+    );
+    assert!(matches!(
+        limiter_a.evaluate(&ctx),
+        Decision::RateLimit { .. }
+    ));
+    assert!(matches!(limiter_b.evaluate(&ctx), Decision::Allow));
+    assert!(
+        matches!(limiter_b.evaluate(&ctx), Decision::Allow),
+        "lease unit"
+    );
+    assert!(matches!(
+        limiter_b.evaluate(&ctx),
+        Decision::RateLimit { .. }
+    ));
+    assert!(state_a.metrics().lease_granted() >= 1);
+    assert!(state_b.metrics().lease_granted() >= 1);
+}
+
+#[test]
+fn expired_lease_fails_closed_but_keeps_local_behaviour() {
+    let config = lease_config();
+    let state = DistributedState::from_config(&config);
+    let key = super::leases::LeaseKey::new("per_ip_rate_limit", 0, [1u8; 16]);
+    state.apply_lease(super::leases::LeaseGrant {
+        lease_id: "lease".to_string(),
+        key,
+        granted: 5,
+        remaining: 5,
+        expires_in: Duration::from_millis(1),
+        denied: false,
+    });
+    std::thread::sleep(Duration::from_millis(5));
+    assert_eq!(
+        state.try_consume_lease(&key),
+        super::leases::LeaseConsume::Expired
+    );
+    assert_eq!(state.metrics().lease_expired(), 1);
+    assert!(state.metrics().lease_fallbacks() >= 1);
+}
+
+#[test]
+fn lease_request_queue_is_bounded_and_accounts_drops() {
+    let requests = super::leases::LeaseRequests::new(2);
+    for shard in 0..3 {
+        requests.try_push(super::leases::LeaseRequest {
+            policy_id: "per_ip".to_string(),
+            window_start_unix: 0,
+            shard,
+            key_hash: [shard as u8; 16],
+            requested: 1,
+        });
+    }
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.dropped(), 1);
+    let drained = requests.drain_batch(10);
+    assert_eq!(drained.len(), 2);
+    assert_eq!(drained[0].shard, 1, "oldest request was evicted");
 }

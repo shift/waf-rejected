@@ -41,6 +41,30 @@ endpoints = ["https://dkv-eu.example:7443"]
 fallback = "local_only"
 # Optional bearer token for clusters whose DistriWaf service uses token auth.
 auth_token = ""
+# SPIFFE workload identity asserted in request metadata. Only meaningful
+# after mTLS; treated as an assertion, not a credential on its own.
+spiffe_id = "spiffe://example.org/waf/waf-eu-1"
+# Optional SPIFFE JWT-SVID when bearer auth is used.
+spiffe_jwt = ""
+# Mutual TLS. Both client fields must be set together; the CA bundle overrides
+# the system roots for the control-plane server.
+tls_ca_cert_path = "/etc/waf/certs/ca.pem"
+tls_client_cert_path = "/etc/waf/certs/waf.pem"
+tls_client_key_path = "/etc/waf/certs/waf-key.pem"
+tls_server_name = ""
+# Plaintext is never implied by an http:// URL. Set true only for a local
+# TLS-terminating sidecar.
+allow_insecure_transport = false
+# Reject unsigned/bad-chain policy. The default is required verification.
+require_policy_signature = true
+policy_signing_public_key = "hex-or-base64-32-byte-ed25519-public-key"
+policy_signing_key_id = "regional-key-1"
+policy_initial_hash = ""
+# Shared rate-limit leases (off by default).
+leases_enabled = true
+lease_ttl_ms = 5000
+lease_batch_max = 64
+lease_queue_capacity = 4096
 # This node's own gRPC ingest endpoint advertised to the cluster. Required by
 # the v1 contract; empty falls back to the first control-plane endpoint.
 advertise_endpoint = "https://waf-eu-1.example:9443"
@@ -51,9 +75,77 @@ advertise_endpoint = "https://waf-eu-1.example:9443"
 keeps the controller on the `LocalOnly` sources even with `enabled = true`.
 `auth_token` is sent as `authorization: Bearer <token>` on every RPC. It is a
 secret and is not written to startup logs; it is not a substitute for TLS on an
-untrusted network.
-`advertise_endpoint` must be the node's own reachable ingest endpoint when
-`Discover` consumers need to call it.
+untrusted network. `spiffe_jwt` is used as the bearer token only when
+`auth_token` is empty, so an operator can deploy a short-lived JWT-SVID without
+copying a static token.
+
+### Authentication and transport security
+
+The production default is mutual TLS plus a SPIFFE identity assertion:
+
+- `https://` endpoints use tonic's rustls transport. Server certificates are
+  verified against `tls_ca_cert_path` when set, otherwise the system/webpki
+  roots. `tls_server_name` overrides SNI/verification for a non-matching host.
+- `tls_client_cert_path` + `tls_client_key_path` present the workload client
+  certificate. Setting only one is a configuration error.
+- `spiffe_id` must be a `spiffe://` URI and is attached as `x-spiffe-id` (or
+  the configured `spiffe_metadata_key`) on every RPC. The server must still
+  authorise it; the metadata is an assertion, not a bearer credential.
+- `http://` endpoints are rejected unless `allow_insecure_transport = true`.
+  That flag exists only for a local TLS-terminating sidecar.
+- At least one credential (bearer token, JWT-SVID, SPIFFE identity or client
+  certificate) is expected in production; the client logs a warning when none
+  is configured. No credential is enabled by default.
+
+### Policy integrity
+
+Every fetched `PolicyBundle` is verified before it can change the applied
+generation or rate-limit multiplier:
+
+1. The canonical payload SHA-256 must equal `content_hash` (32 bytes).
+2. A 64-byte Ed25519 `signature` over `content_hash` must verify against
+   `policy_signing_public_key`; `key_id` must match when configured.
+3. `generation` must not move backwards. A new generation must carry
+   `previous_hash` equal to the last accepted `content_hash`; replaying the
+   same generation requires identical content. `policy_initial_hash` pins the
+   first non-empty link when bootstrapping.
+4. Unsigned, tampered, out-of-order or broken-chain bundles are rejected with
+   `Invalid`, counted in `waf_distributed_policy_rejected_total`, and the last
+   verified policy stays applied. A rejected first bundle leaves
+   `DistributedState::policy_integrity_ok() == false`; the configured
+   `fallback` still governs shared-data callers (`local_only` keeps local
+   decisions, `fail_closed` denies shared-only capacity).
+
+With `require_policy_signature = true` (default), an empty or malformed key is
+a client construction error, so unsigned policy cannot be applied by accident.
+Disabling verification is an explicit, audited downgrade and still checks the
+content hash, generation and chain.
+
+### Rate-limit leases
+
+When `leases_enabled = true`, local token buckets remain the first tier. Once
+a local bucket is exhausted the request path may spend one unit from a cached
+lease for the same key (per-IP or global) and is allowed. If no lease is
+cached, the request performs only a non-blocking push into
+`lease_queue_capacity`; the controller drains at most `lease_batch_max`
+requests per heartbeat and calls `AcquireLease` off the request path. A full
+queue drops the oldest request and increments
+`waf_distributed_lease_request_dropped_total`.
+
+Consumption never extends a lease. An expired lease is removed lazily and the
+shared budget fails closed (requests over the local bucket are denied) while
+local-only traffic continues to behave exactly as before. Lease grants,
+expiry, denials and fallbacks are exported as metrics below. `shadow = true`
+keeps leases observable but does not enforce them.
+
+### Event and counter egress
+
+Security events keep the bounded `event_queue_capacity` queue, drop-oldest
+policy and `event_id` idempotency key. Counter deltas use
+`counter_queue_capacity` with the same drop policy; the client derives a stable
+UUIDv5 `batch_id` from `(node_id, epoch, deltas)`, so a retry of the same batch
+is deduplicated server-side without persisting a mapping. Queue overflow only
+drops telemetry and increments `waf_distributed_queue_dropped_total`.
 
 Build with the feature:
 
@@ -98,21 +190,22 @@ plane) are independent. Set and document both.
 | `NodeRegistry::heartbeat` | `Heartbeat` | Monotonic sequence; a `NotFound` lease triggers one re-register |
 | `PolicySource` | `GetPolicy` | Active bundle for `policy_scope`; bundle generation drives invalidation |
 | `ReputationSource` | `LookupReputation` | One address at a time; background only |
-| `RateLimitSync` | `IngestCounterDeltas` | One batch per flush, UUID batch id |
+| `RateLimitSync` | `IngestCounterDeltas` | One batch per flush, stable UUIDv5 batch id |
+| `LeaseSource` | `AcquireLease` | Batch drained from the bounded request queue; off the request path |
 | `EventSink` | `IngestEvents` | Client-streaming batch of body-free records |
 
 Every call carries `request_timeout_ms` as its gRPC deadline and the channel
 is dropped on retryable statuses, so the controller reconnects with exponential
-backoff. `https://` endpoints use tonic's rustls transport with the webpki
-roots; `http://` is accepted for sidecar/plaintext deployments. Mutual TLS is
-not configured by this client yet — terminate it in the local sidecar and use
-`http://` to that sidecar, or add TLS identity in a future revision. When the
-DistriWaf service uses its bearer-token mode, set `auth_token`; the production
-default (mTLS/SPIFFE) is unchanged.
+backoff. `https://` endpoints use tonic's rustls transport with the configured
+CA/client identity (or webpki roots); `http://` requires the explicit
+`allow_insecure_transport` opt-in. Mutual TLS and SPIFFE metadata are
+configured as described above; the production default is never plaintext or
+unauthenticated.
 
 The bindings are vendored (`src/waf/distributed/distri_waf.rs`) so builds do
-not need `protoc`. Regenerate from shift/distri-kv `proto/distri_waf.proto`
-with `tonic-build 0.11` when the contract changes.
+not need `protoc`. The WAF-side contract adds `AcquireLease` under the same
+`waf.distri.v1` package; regenerate from the coordinated `distri_waf.proto`
+with `tonic-build 0.11` when the server side lands.
 
 ## Metrics
 
@@ -133,6 +226,11 @@ with `tonic-build 0.11` when the contract changes.
 | `waf_distributed_fallback_activations_total` | counter | Outages where fallback applied |
 | `waf_distributed_policy_rejected_total` | counter | Rejected policy generations |
 | `waf_distributed_stale_policy_total` | counter | Policy reads past their freshness window |
+| `waf_distributed_lease_granted_units_total` | counter | Shared rate-limit units granted |
+| `waf_distributed_lease_expired_total` | counter | Leases removed after expiry |
+| `waf_distributed_lease_denied_total` | counter | Lease requests/spends denied |
+| `waf_distributed_lease_fallback_total` | counter | Shared-budget decisions without a lease |
+| `waf_distributed_lease_request_dropped_total` | counter | Lease requests evicted from the bounded queue |
 
 ## Queues and backpressure
 

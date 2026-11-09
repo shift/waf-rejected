@@ -26,8 +26,10 @@ pub mod controller;
 #[allow(clippy::all, missing_docs)]
 pub mod distri_waf;
 pub mod grpc;
+pub mod leases;
 pub mod local;
 pub mod metrics;
+pub mod policy_verify;
 pub mod state;
 pub mod traits;
 
@@ -41,13 +43,15 @@ pub use controller::{
     next_backoff, BoundedQueue, ControllerHandle, DistributedController, DropPolicy, PushOutcome,
 };
 pub use grpc::DistriWafClient;
+pub use leases::{LeaseConsume, LeaseGrant, LeaseKey, LeasePool, LeaseRequest, LeaseRequests};
 pub use local::{
     LocalEventSink, LocalNodeRegistry, LocalPolicySource, LocalRateLimitSync, LocalReputationSource,
 };
 pub use metrics::DistributedMetrics;
+pub use policy_verify::{payload_hash, PolicyVerificationState, PolicyVerifier};
 pub use state::{DistributedState, UnavailableDecision};
 pub use traits::{
     CounterDelta, DistributedError, DistributedErrorKind, EventDecision, EventSink,
-    EventThreatLevel, HeartbeatAck, NodeInfo, NodeRegistry, PolicySnapshot, PolicySource,
-    RateLimitSync, ReputationEntry, ReputationSource, SecurityEventRecord,
+    EventThreatLevel, HeartbeatAck, LeaseSource, NodeInfo, NodeRegistry, PolicySnapshot,
+    PolicySource, RateLimitSync, ReputationEntry, ReputationSource, SecurityEventRecord,
 };

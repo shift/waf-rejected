@@ -26,7 +26,7 @@ use super::local::{
 };
 use super::state::DistributedState;
 use super::traits::{
-    CounterDelta, DistributedError, EventSink, HeartbeatAck, NodeInfo, NodeRegistry,
+    CounterDelta, DistributedError, EventSink, HeartbeatAck, LeaseSource, NodeInfo, NodeRegistry,
     PolicySnapshot, PolicySource, RateLimitSync, ReputationEntry, ReputationSource,
     SecurityEventRecord,
 };
@@ -253,6 +253,7 @@ pub struct DistributedController {
     rate_limit_sync: Arc<dyn RateLimitSync>,
     event_sink: Arc<dyn EventSink>,
     registry: Arc<dyn NodeRegistry>,
+    lease_source: Option<Arc<dyn LeaseSource>>,
     events: Arc<BoundedQueue<SecurityEventRecord>>,
     counters: Arc<BoundedQueue<CounterDelta>>,
     policy_cache: Arc<VersionedCache<String, PolicySnapshot>>,
@@ -303,6 +304,7 @@ impl DistributedController {
             ));
         }
         let client = Arc::new(super::grpc::DistriWafClient::new(config)?);
+        let lease_source: Arc<dyn LeaseSource> = Arc::clone(&client) as Arc<dyn LeaseSource>;
         Ok(Self::with_sources(
             config,
             state,
@@ -311,7 +313,15 @@ impl DistributedController {
             Arc::clone(&client) as Arc<dyn RateLimitSync>,
             Arc::clone(&client) as Arc<dyn EventSink>,
             Arc::clone(&client) as Arc<dyn NodeRegistry>,
-        ))
+        )
+        .with_lease_source(lease_source))
+    }
+
+    /// Attach an asynchronous lease source. Off by default so local-only and
+    /// existing tests never construct a lease RPC.
+    pub fn with_lease_source(mut self, lease_source: Arc<dyn LeaseSource>) -> Self {
+        self.lease_source = Some(lease_source);
+        self
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -340,6 +350,7 @@ impl DistributedController {
             rate_limit_sync,
             event_sink,
             registry,
+            lease_source: None,
             events: Arc::new(BoundedQueue::new(
                 config.event_queue_capacity,
                 DropPolicy::DropOldest,
@@ -453,6 +464,7 @@ impl DistributedController {
 
                     self.flush_telemetry().await;
                     self.refresh_policy().await;
+                    self.refresh_leases().await;
                 }
             }
         }
@@ -495,6 +507,7 @@ impl DistributedController {
         let result = self.policy_source.current_policy().await;
         match result {
             Ok(snapshot) => {
+                self.state.set_policy_integrity_ok(true);
                 if snapshot.generation > self.state.policy_generation() {
                     self.apply_generation(snapshot.generation);
                 }
@@ -511,7 +524,43 @@ impl DistributedController {
             }
             Err(error) => {
                 self.state.metrics().record_stale_policy();
+                if error.kind == super::traits::DistributedErrorKind::Invalid {
+                    self.state.metrics().record_policy_rejected();
+                    self.state.set_policy_integrity_ok(false);
+                    tracing::warn!(%error, "policy bundle rejected by integrity checks");
+                }
                 self.on_offline(&error);
+            }
+        }
+    }
+
+    /// Drain the bounded lease-request queue and acquire grants off the
+    /// request path. A transport error is accounted once per batch; the
+    /// request path keeps failing closed for its shared budget.
+    async fn refresh_leases(&mut self) {
+        let Some(lease_source) = &self.lease_source else {
+            return;
+        };
+        if !self.state.leases_enabled() {
+            return;
+        }
+        self.state.lease_pool().sweep();
+        let requests = self
+            .state
+            .lease_requests()
+            .drain_batch(self.config.lease_batch_max.max(1));
+        if requests.is_empty() {
+            return;
+        }
+        match lease_source.acquire_leases(&requests).await {
+            Ok(grants) => {
+                for grant in grants {
+                    self.state.apply_lease(grant);
+                }
+            }
+            Err(error) => {
+                tracing::debug!(%error, "distributed lease acquisition failed; shared budget unavailable");
+                self.state.metrics().record_lease_fallback();
             }
         }
     }

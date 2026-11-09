@@ -87,8 +87,25 @@ node_id = "waf-1"
 region = "eu-west-1"
 policy_scope = "default"
 # Regional bootstrap endpoints. All configured endpoints are tried; the
-# controller reconnects with exponential backoff.
+# controller reconnects with exponential backoff. Use https:// with a CA
+# bundle and client certificate in production.
 endpoints = ["http://dkv-client:7443"]
+# Local demo only: this endpoint is plaintext behind a sidecar. Production
+# configs must use https:// and leave this false.
+allow_insecure_transport = true
+# Policy bundles are Ed25519-signed. Replace this placeholder with the
+# regional cluster's public key (hex or base64, 32 raw bytes); bundles that do
+# not verify are rejected.
+policy_signing_public_key = "0000000000000000000000000000000000000000000000000000000000000000"
+policy_signing_key_id = "placeholder-replace-me"
+# Mutual TLS / SPIFFE identity (production). Paths are unset in this demo.
+# tls_ca_cert_path = "/etc/waf/certs/ca.pem"
+# tls_client_cert_path = "/etc/waf/certs/waf.pem"
+# tls_client_key_path = "/etc/waf/certs/waf-key.pem"
+# spiffe_id = "spiffe://example.org/waf/waf-1"
+# Shared rate-limit leases are off by default; enable only with the real
+# cluster lease RPC available.
+leases_enabled = false
 # Never put consensus on the request path.
 fallback = "local_only"
 policy_cache_ttl_secs = 300

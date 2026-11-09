@@ -1036,11 +1036,17 @@ impl WafEngine {
             let refill = (config.waf.rate_limit.global_max_requests as f64 / window as f64)
                 .ceil()
                 .max(1.0) as u32;
-            self.add_rule(GlobalRateLimiter::new(
+            let limiter = GlobalRateLimiter::new(
                 "global_rate_limit",
                 config.waf.rate_limit.global_max_requests.max(1),
                 refill,
-            ));
+            );
+            #[cfg(feature = "distri-kv")]
+            let limiter = match &self.distributed {
+                Some(state) => limiter.with_distributed_state(Arc::clone(state)),
+                None => limiter,
+            };
+            self.add_rule(limiter);
         }
 
         // Add geographic blocking rules

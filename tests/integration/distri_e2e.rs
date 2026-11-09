@@ -321,6 +321,8 @@ api_key_file = "{token_path}"
             fallback,
             heartbeat_interval_secs: 1,
             request_timeout_ms: 1_000,
+            allow_insecure_transport: true,
+            require_policy_signature: false,
             reconnect_initial_backoff_ms: 100,
             reconnect_max_backoff_ms: 500,
             ..DistributedConfig::default()
@@ -659,6 +661,8 @@ endpoints = ["{endpoint}"]
 auth_token = "{token}"
 advertise_endpoint = "http://waf-e2e.invalid:9443"
 fallback = "{fallback}"
+allow_insecure_transport = true
+require_policy_signature = false
 heartbeat_interval_secs = 1
 request_timeout_ms = 1000
 policy_cache_ttl_secs = 300
@@ -852,6 +856,7 @@ fn fallback_modes_are_explicit() {
             node_id: NODE_ID.to_string(),
             region: REGION.to_string(),
             endpoints: vec!["http://127.0.0.1:1".to_string()],
+            allow_insecure_transport: true,
             fallback,
             ..DistributedConfig::default()
         };

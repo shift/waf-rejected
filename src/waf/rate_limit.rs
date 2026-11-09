@@ -14,6 +14,21 @@ use tracing::{debug, warn};
 /// cleanup or memory accounting expensive.
 pub const SHARD_COUNT: usize = 64;
 
+/// Stable 128-bit hash used as the shared lease key for a client address.
+#[cfg(feature = "distri-kv")]
+fn lease_key_hash(ip: IpAddr) -> [u8; 16] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    match ip {
+        IpAddr::V4(v4) => hasher.update(v4.octets()),
+        IpAddr::V6(v6) => hasher.update(v6.octets()),
+    }
+    let digest = hasher.finalize();
+    let mut hash = [0u8; 16];
+    hash.copy_from_slice(&digest[..16]);
+    hash
+}
+
 /// Default hard cap on the number of tracked client IPs per limiter.
 pub const DEFAULT_MAX_TRACKED_IPS: usize = 100_000;
 
@@ -336,6 +351,38 @@ impl RateLimiter {
         (self.capacity, self.refill_rate)
     }
 
+    /// Try the shared lease for an exhausted local bucket. The request path
+    /// never awaits: it spends a cached grant, or enqueues one bounded request
+    /// and fails closed for the shared budget.
+    #[cfg(feature = "distri-kv")]
+    fn try_shared_budget(&self, client_ip: IpAddr) -> Option<Decision> {
+        let state = self.distributed.as_ref()?;
+        if !state.leases_enabled() || state.shadow() {
+            return None;
+        }
+        let key_hash = lease_key_hash(client_ip);
+        let key = crate::waf::distributed::LeaseKey::new(&self.name, 0, key_hash);
+        match state.try_consume_lease(&key) {
+            crate::waf::distributed::LeaseConsume::Consumed { .. } => Some(Decision::Allow),
+            crate::waf::distributed::LeaseConsume::Unavailable
+            | crate::waf::distributed::LeaseConsume::Expired => {
+                state.request_lease(crate::waf::distributed::LeaseRequest {
+                    policy_id: self.name.clone(),
+                    window_start_unix: 0,
+                    shard: 0,
+                    key_hash,
+                    requested: u64::from(self.capacity.max(1)),
+                });
+                Some(Decision::RateLimit {
+                    reason: "Shared rate-limit budget unavailable or expired".to_string(),
+                })
+            }
+            crate::waf::distributed::LeaseConsume::Exhausted => Some(Decision::RateLimit {
+                reason: "Shared rate-limit budget exhausted".to_string(),
+            }),
+        }
+    }
+
     /// Override the tracked-IP cap and the behaviour at capacity.
     pub fn with_limits(mut self, max_tracked_ips: usize, capacity_policy: CapacityPolicy) -> Self {
         self.buckets = ShardedBuckets::new(max_tracked_ips, capacity_policy, self.window_size * 2);
@@ -383,6 +430,13 @@ impl RateLimiter {
             },
         );
 
+        #[cfg(feature = "distri-kv")]
+        if let Some(Decision::RateLimit { .. }) = decision {
+            if let Some(shared) = self.try_shared_budget(client_ip) {
+                return shared;
+            }
+        }
+
         decision.unwrap_or_else(|| {
             warn!(
                 "Per-IP rate limiter at capacity ({} tracked IPs); rejecting new IP {}",
@@ -425,6 +479,8 @@ pub struct GlobalRateLimiter {
     name: String,
     bucket: Arc<RwLock<TokenBucket>>,
     enabled: bool,
+    #[cfg(feature = "distri-kv")]
+    distributed: Option<Arc<crate::waf::distributed::DistributedState>>,
 }
 
 impl GlobalRateLimiter {
@@ -433,12 +489,51 @@ impl GlobalRateLimiter {
             name: name.to_string(),
             bucket: Arc::new(RwLock::new(TokenBucket::new(capacity, refill_rate))),
             enabled: true,
+            #[cfg(feature = "distri-kv")]
+            distributed: None,
         }
+    }
+
+    #[cfg(feature = "distri-kv")]
+    pub fn with_distributed_state(
+        mut self,
+        state: Arc<crate::waf::distributed::DistributedState>,
+    ) -> Self {
+        self.distributed = Some(state);
+        self
     }
 
     pub fn disabled(mut self) -> Self {
         self.enabled = false;
         self
+    }
+
+    #[cfg(feature = "distri-kv")]
+    fn try_shared_budget(&self) -> Option<Decision> {
+        let state = self.distributed.as_ref()?;
+        if !state.leases_enabled() || state.shadow() {
+            return None;
+        }
+        let key = crate::waf::distributed::LeaseKey::new(&self.name, 0, [0u8; 16]);
+        match state.try_consume_lease(&key) {
+            crate::waf::distributed::LeaseConsume::Consumed { .. } => Some(Decision::Allow),
+            crate::waf::distributed::LeaseConsume::Unavailable
+            | crate::waf::distributed::LeaseConsume::Expired => {
+                state.request_lease(crate::waf::distributed::LeaseRequest {
+                    policy_id: self.name.clone(),
+                    window_start_unix: 0,
+                    shard: 0,
+                    key_hash: [0u8; 16],
+                    requested: 1,
+                });
+                Some(Decision::RateLimit {
+                    reason: "Shared global rate-limit budget unavailable or expired".to_string(),
+                })
+            }
+            crate::waf::distributed::LeaseConsume::Exhausted => Some(Decision::RateLimit {
+                reason: "Shared global rate-limit budget exhausted".to_string(),
+            }),
+        }
     }
 
     fn check_global(&self) -> Decision {
@@ -451,6 +546,10 @@ impl GlobalRateLimiter {
             );
             Decision::Allow
         } else {
+            #[cfg(feature = "distri-kv")]
+            if let Some(shared) = self.try_shared_budget() {
+                return shared;
+            }
             warn!("Global rate limit exceeded");
             Decision::RateLimit {
                 reason: "Global rate limit exceeded".to_string(),

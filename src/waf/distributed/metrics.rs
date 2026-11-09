@@ -21,6 +21,11 @@ pub struct DistributedMetrics {
     pub(crate) fallback_activations: AtomicU64,
     pub(crate) policy_rejected: AtomicU64,
     pub(crate) stale_policy: AtomicU64,
+    pub(crate) lease_granted: AtomicU64,
+    pub(crate) lease_expired: AtomicU64,
+    pub(crate) lease_denied: AtomicU64,
+    pub(crate) lease_fallbacks: AtomicU64,
+    pub(crate) lease_request_dropped: AtomicU64,
 }
 
 impl DistributedMetrics {
@@ -68,6 +73,26 @@ impl DistributedMetrics {
         self.stale_policy.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_lease_granted(&self, units: u64) {
+        self.lease_granted.fetch_add(units, Ordering::Relaxed);
+    }
+
+    pub fn record_lease_expired(&self) {
+        self.lease_expired.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_lease_denied(&self) {
+        self.lease_denied.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_lease_fallback(&self) {
+        self.lease_fallbacks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_lease_request_dropped(&self) {
+        self.lease_request_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn cache_hits(&self) -> u64 {
         self.cache_hits.load(Ordering::Relaxed)
     }
@@ -110,6 +135,26 @@ impl DistributedMetrics {
 
     pub fn stale_policy(&self) -> u64 {
         self.stale_policy.load(Ordering::Relaxed)
+    }
+
+    pub fn lease_granted(&self) -> u64 {
+        self.lease_granted.load(Ordering::Relaxed)
+    }
+
+    pub fn lease_expired(&self) -> u64 {
+        self.lease_expired.load(Ordering::Relaxed)
+    }
+
+    pub fn lease_denied(&self) -> u64 {
+        self.lease_denied.load(Ordering::Relaxed)
+    }
+
+    pub fn lease_fallbacks(&self) -> u64 {
+        self.lease_fallbacks.load(Ordering::Relaxed)
+    }
+
+    pub fn lease_request_dropped(&self) -> u64 {
+        self.lease_request_dropped.load(Ordering::Relaxed)
     }
 }
 
@@ -190,13 +235,33 @@ pub fn render_prometheus(
          waf_distributed_policy_rejected_total {}\n\
          # HELP waf_distributed_stale_policy_total Policy reads that exceeded their freshness window.\n\
          # TYPE waf_distributed_stale_policy_total counter\n\
-         waf_distributed_stale_policy_total {}",
+         waf_distributed_stale_policy_total {}\n\
+         # HELP waf_distributed_lease_granted_units_total Shared rate-limit units granted in leases.\n\
+         # TYPE waf_distributed_lease_granted_units_total counter\n\
+         waf_distributed_lease_granted_units_total {}\n\
+         # HELP waf_distributed_lease_expired_total Leases removed because they expired.\n\
+         # TYPE waf_distributed_lease_expired_total counter\n\
+         waf_distributed_lease_expired_total {}\n\
+         # HELP waf_distributed_lease_denied_total Lease requests or spends denied by shared budget.\n\
+         # TYPE waf_distributed_lease_denied_total counter\n\
+         waf_distributed_lease_denied_total {}\n\
+         # HELP waf_distributed_lease_fallback_total Requests that fell back because no lease was available.\n\
+         # TYPE waf_distributed_lease_fallback_total counter\n\
+         waf_distributed_lease_fallback_total {}\n\
+         # HELP waf_distributed_lease_request_dropped_total Lease requests dropped from the bounded queue.\n\
+         # TYPE waf_distributed_lease_request_dropped_total counter\n\
+         waf_distributed_lease_request_dropped_total {}",
         metrics.queue_enqueued(),
         metrics.queue_dropped(),
         metrics.reconnects(),
         metrics.fallback_activations(),
         metrics.policy_rejected(),
         metrics.stale_policy(),
+        metrics.lease_granted(),
+        metrics.lease_expired(),
+        metrics.lease_denied(),
+        metrics.lease_fallbacks(),
+        metrics.lease_request_dropped(),
     );
     for (label, depth) in queues {
         let _ = writeln!(

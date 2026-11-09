@@ -40,6 +40,11 @@ service DistriWaf {
   // Apply a bounded batch of rate-limit counter deltas. Deduplicated by
   // batch_id for `counter_batch_dedup_ttl_secs`.
   rpc IngestCounterDeltas(CounterDeltas) returns (CounterAck);
+
+  // Acquire a bounded shared rate-limit budget lease for one counter key.
+  // Enforcement stays local; a denied/zero grant means the shared budget is
+  // exhausted and the caller must fail closed for shared-only capacity.
+  rpc AcquireLease(AcquireLeaseRequest) returns (AcquireLeaseResponse);
 }
 
 // ---------------------------------------------------------------------------
@@ -372,4 +377,29 @@ message CounterAck {
   uint64 duplicate = 3;
   uint64 applied_window = 4;
   uint32 retry_after_ms = 5;
+}
+
+message AcquireLeaseRequest {
+  uint32 contract_version = 1;
+  string node_id = 2;
+  uint64 epoch = 3;
+  string policy_id = 4;
+  uint32 window_start_unix = 5;
+  uint32 shard = 6;
+  // 128-bit key hash. Empty/zero means the global aggregate budget.
+  bytes key_hash = 7;
+  uint64 requested = 8;
+  // Caller-provided idempotency key for retries.
+  string request_id = 9;
+}
+
+message AcquireLeaseResponse {
+  uint32 contract_version = 1;
+  string lease_id = 2;
+  uint64 granted = 3;
+  // Server-authoritative remaining budget for this key at issue time.
+  uint64 remaining = 4;
+  uint64 expires_at_unix_ms = 5;
+  bool denied = 6;
+  uint32 retry_after_ms = 7;
 }
