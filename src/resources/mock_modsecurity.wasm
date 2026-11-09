@@ -1,0 +1,2 @@
+# This is a placeholder mock WASM file for development
+# In production, this would be a real ModSecurity WASM module compiled from Coraza

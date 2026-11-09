@@ -1,0 +1,36 @@
+name: Feature request
+description: Propose a feature or behaviour change
+labels: ["type:feat", "status:needs-review"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what blocks you today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security impact
+      description: Does this change inspection coverage, fail-open/fail-closed behaviour, defaults, or the trust model? If it weakens anything, say so explicitly.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I have read the support matrix and configuration reference.
+        - label: This is not a security vulnerability report.
+          required: true

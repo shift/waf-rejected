@@ -1,0 +1,84 @@
+# distri-kv regional cluster node.
+#
+# One file is shared by every node in the regional cell. The node identity,
+# bind address and peers are overridden by command line:
+#   distri-kv-server --config /etc/distri-kv/config.toml \
+#     --node-id 1 \
+#     --peers 1=dkv-1:8443,2=dkv-2:8443,3=dkv-3:8443
+#
+# gRPC (DistriKv + DistriWaf) listens on bind_address; the Raft service listens
+# on bind_address port + 1000. Metrics and health bind to 127.0.0.1 only, so
+# scrape/probe them from inside the pod/container (exec probes), not from a
+# remote host.
+#
+# SECURITY: `auth_enabled = true` selects the bearer-token path in
+# `WafAuthConfig::from_security`; the token file is mounted from a Secret.
+# For SPIFFE/mTLS, set `tls_enabled = true` and `mutual_tls = true` (and provide
+# the generated cert/key/CA files) and present the
+# `x-spiffe-id: spiffe://<trust-domain>/region/<region>/node/<node-id>`
+# metadata. The current WAF client does not attach either credential yet; see
+# docs/operations/distributed-deployment.md.
+
+[server]
+bind_address = "0.0.0.0:7443"
+admin_address = "0.0.0.0:7444"
+data_dir = "/var/lib/distri-kv"
+log_level = "info"
+json_logging = true
+
+[cluster]
+node_id = 1
+initial_cluster_size = 3
+election_timeout_ms = 300
+heartbeat_interval_ms = 50
+max_log_entries_per_batch = 1000
+snapshot_threshold = 10000
+enable_pre_vote = true
+jurisdictions = ["eu"]
+
+[storage]
+backend = "Sled"
+sync_writes = true
+compression = "Lz4"
+max_db_size_gb = 100
+auto_compaction = true
+compaction_schedule = "0 2 * * *"
+
+[multi_raft]
+initial_partitions = 16
+replication_factor = 3
+split_threshold_ops_per_sec = 10000
+merge_threshold_keys = 1000
+virtual_nodes_per_partition = 100
+auto_rebalancing = true
+rebalancing_interval_sec = 60
+
+[network]
+max_message_size_mb = 16
+connection_timeout_ms = 5000
+keep_alive_interval_ms = 30000
+concurrent_streams = 1000
+enable_compression = false
+tcp_nodelay = true
+connection_pool_size = 32
+
+[monitoring]
+metrics_enabled = true
+metrics_port = 9091
+health_check_port = 8082
+profiling_enabled = false
+metrics_interval_sec = 15
+enable_tracing = true
+trace_sampling_rate = 0.1
+
+[security]
+# Local/demo default: bearer token, because the WAF client cannot present
+# SPIFFE metadata yet. Switch to mTLS for a trusted sidecar/proxy deployment.
+tls_enabled = false
+cert_file = "/etc/distri-kv/certs/server.crt"
+key_file = "/etc/distri-kv/certs/server.key"
+ca_file = "/etc/distri-kv/certs/ca.crt"
+mutual_tls = false
+auth_enabled = true
+auth_provider = "ApiKey"
+api_key_file = "/etc/distri-kv/secrets/waf-token"
