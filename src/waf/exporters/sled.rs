@@ -177,8 +177,6 @@ impl SledExporter {
     ) -> Result<Vec<SecurityEvent>, Box<dyn std::error::Error + Send + Sync>> {
         let db = Arc::clone(&self.db);
         let tree_name = self.tree_name.clone();
-        let compress_events = self.compress_events;
-
         let start_key = start_timestamp.timestamp_millis().to_be_bytes().to_vec();
         let end_key = end_timestamp.timestamp_millis().to_be_bytes().to_vec();
 
@@ -359,8 +357,6 @@ impl SecurityEventExporter for SledExporter {
 
         let db = Arc::clone(&self.db);
         let tree_name = self.tree_name.clone();
-        let compress_events = self.compress_events;
-
         // Prepare batch data
         let mut batch_data = Vec::new();
         for event in events {
@@ -412,9 +408,8 @@ impl SecurityEventExporter for SledExporter {
         match self.get_tree() {
             Ok(tree) => {
                 // Try to get the length (lightweight operation)
-                match tree.len() {
-                    _ => true,
-                }
+                let _ = tree.len();
+                true
             }
             Err(e) => {
                 error!("Sled health check failed: {}", e);

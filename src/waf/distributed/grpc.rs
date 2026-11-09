@@ -28,7 +28,8 @@ use super::distri_waf::distri_waf_client::DistriWafClient as WafGrpcClient;
 use super::distri_waf::{
     self, AcquireLeaseRequest, AcquireLeaseResponse, CounterDelta as ProtoCounterDelta,
     CounterDeltas, GetPolicyRequest, HeartbeatRequest, HeartbeatResponse, LookupReputationRequest,
-    NodeHealth, NodeMetadata, PolicyBundle, RegisterRequest, ReputationResponse, SecurityEvent,
+    NodeHealth, NodeMetadata, PolicyBundle, RegisterRequest, ReleaseLeaseRequest,
+    ReleaseLeaseResponse, ReputationResponse, SecurityEvent,
 };
 use super::leases::{LeaseGrant, LeaseKey, LeaseRequest};
 use super::policy_verify::{PolicyVerificationState, PolicyVerifier};
@@ -670,13 +671,10 @@ impl LeaseSource for DistriWafClient {
             let rpc = self.request(AcquireLeaseRequest {
                 contract_version: CONTRACT_VERSION,
                 node_id: self.node_id.clone(),
-                epoch: self.epoch.load(Ordering::Acquire),
-                policy_id: request.policy_id.clone(),
-                window_start_unix: request.window_start_unix.min(u32::MAX as u64) as u32,
-                shard: request.shard,
-                key_hash: request.key_hash.to_vec(),
-                requested: request.requested,
-                request_id: uuid::Uuid::new_v4().to_string(),
+                bucket_key: request.bucket_key(),
+                requested_tokens: request.requested.min(u32::MAX as u64) as u32,
+                ttl_ms: self.lease_ttl_ms(),
+                idempotency_key: uuid::Uuid::new_v4().to_string(),
             });
             let response = match client.acquire_lease(rpc).await {
                 Ok(response) => response.into_inner(),
@@ -691,6 +689,41 @@ impl LeaseSource for DistriWafClient {
             grants.push(lease_from_response(self, request, response));
         }
         Ok(grants)
+    }
+}
+
+impl DistriWafClient {
+    fn lease_ttl_ms(&self) -> u32 {
+        self.lease_ttl.as_millis().clamp(100, 60_000) as u32
+    }
+
+    /// Return unused tokens to a shared bucket. The controller currently lets
+    /// the server reap unused grants at expiry; this entry point exists for
+    /// callers that want an immediate refund and for contract tests.
+    pub async fn release_lease(
+        &self,
+        bucket_key: &str,
+        remaining_tokens: u32,
+        idempotency_key: &str,
+    ) -> Result<ReleaseLeaseResponse, DistributedError> {
+        let mut client = self.client().await?;
+        let rpc = self.request(ReleaseLeaseRequest {
+            contract_version: CONTRACT_VERSION,
+            node_id: self.node_id.clone(),
+            bucket_key: bucket_key.to_string(),
+            remaining_tokens,
+            idempotency_key: idempotency_key.to_string(),
+        });
+        match client.release_lease(rpc).await {
+            Ok(response) => Ok(response.into_inner()),
+            Err(status) => {
+                let error = map_status(status);
+                if error.is_retryable() {
+                    self.invalidate_channel().await;
+                }
+                Err(error)
+            }
+        }
     }
 }
 
@@ -709,13 +742,14 @@ fn lease_from_response(
     } else {
         client.lease_ttl
     };
+    let granted = u64::from(response.granted_tokens);
     LeaseGrant {
-        lease_id: response.lease_id,
+        lease_id: response.idempotency_key,
         key: LeaseKey::new(&request.policy_id, request.shard, request.key_hash),
-        granted: response.granted,
-        remaining: response.remaining.max(response.granted),
+        granted,
+        remaining: granted,
         expires_in: expires_in.max(Duration::from_millis(1)),
-        denied: response.denied || response.granted == 0,
+        denied: !response.granted || granted == 0,
     }
 }
 

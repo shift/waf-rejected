@@ -1310,3 +1310,23 @@ Baseline `main` = e05d918: bodyless 0.373 ms, 4 KiB 0.924 ms, 8 KiB
       still fails at the `cachix-action` step because the `waf-rejected` cache
       is private/missing and no `CACHIX_AUTH_TOKEN` is configured; deploy jobs
       are skipped, as in beta 15. Both rulesets restored to `active`.
+
+## test: real distri-kv lease end-to-end (`test/distri-lease-e2e`)
+
+Delegated task; worktree only. Base `main` = 39f0020.
+
+- Built distri-kv server from `shift/distri-kv@69af979` into
+  `/tmp/opencode/dkv-lease-e2e` (source checkout not modified).
+- Fixed vendored `waf.distri.v1` AcquireLease/ReleaseLease parity: opaque
+  `bucket_key`, `requested_tokens`, `ttl_ms`, idempotency keys, release
+  messages, generated client/server bindings, and WAF mapping.
+- Policy content hash now uses the server's protobuf `PolicyPayload` encoding.
+- Added ignored e2e cases: two WAF instances sharing a bucket, grant/deny,
+  idempotent replay, expiry fail-closed, release refund, restart replay,
+  real server-key signature acceptance/tamper rejection, and local_only lease
+  fallback during an outage.
+- `scripts/test-distri-e2e.sh` pinned to 69af979 and runs the lease tests.
+- Docs: `docs/operations/distributed.md`, `docs/operations/distributed-performance.md`,
+  CHANGELOG.
+- Verified: fmt, lib tests with `distri-kv` (651 passed), full ignored e2e
+  (10 passed), clippy lib and integration `--deny warnings`, script run.

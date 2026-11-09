@@ -153,6 +153,42 @@ network call on a miss: the caller keeps the local decision in `local_only`
 mode. Generation invalidation is a single write-lock clear, not a per-entry
 walk.
 
+## Shared-budget lease cost and limits
+
+Leases are not on the hot path. A request either spends one cached unit
+(atomic decrement under the lease-pool mutex) or does one non-blocking
+`try_push` into the bounded request queue. It never performs an RPC. The
+controller drains at most `lease_batch_max` (default 64) requests per
+heartbeat and issues one `AcquireLease` per request; `lease_queue_capacity`
+(default 4096) bounds memory and drops the oldest request when full.
+
+The real-server end-to-end suite (`scripts/test-distri-e2e.sh`) proves the
+server semantics that set the limits: a bucket shared by two WAF instances
+cannot exceed its capacity, duplicate `idempotency_key` values return the
+original grant without a second debit, expired leases are reaped without a
+refund (fail closed), `ReleaseLease` refunds unused tokens, and lease state is
+replayed after a cluster restart. distri-kv defaults to 100 tokens per bucket,
+10 tokens/s refill, 1024 tokens per request, a 100–60 000 ms TTL clamp and a
+600 s idempotency window.
+
+Operational consequences:
+
+- Lease TTL is the refund latency for unused capacity because the controller
+  does not send `ReleaseLease` automatically. Long TTLs reduce RPC churn but
+  hold tokens; short TTLs increase `AcquireLease` rate. Keep
+  `lease_ttl_ms` comfortably below the server's 60 s maximum.
+- `lease_batch_max × heartbeat_interval` is the maximum grant rate per node.
+  If the request path drains a lease faster than that, it enqueues more work
+  but still fails closed until a new grant arrives; it does not wait.
+- Lease RPC failures are accounted once per batch
+  (`waf_distributed_lease_fallback_total`). Because the request path never
+  awaits, a refused, silent or slow cluster changes only shared-only
+  decisions and leaves local token buckets untouched.
+- A bucket's `remaining_tokens` is global unleased capacity, not this node's
+  spendable balance; the client uses `granted_tokens` locally. Dashboards
+  should track `lease_granted_units_total` and `lease_denied_total`, not the
+  response's `remaining_tokens` as a per-node gauge.
+
 ## Endpoint failure behaviour
 
 Exercise this with the controller tests:

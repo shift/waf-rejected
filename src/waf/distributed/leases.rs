@@ -49,8 +49,34 @@ pub struct LeaseRequest {
     pub requested: u64,
 }
 
-/// A granted lease. `remaining` is the server-authoritative remaining budget
-/// for this key when the grant was issued.
+impl LeaseRequest {
+    /// Canonical distri-kv `bucket_key`. The server contract identifies a
+    /// shared bucket by an opaque string, so the WAF's
+    /// `(policy_id, shard, key_hash)` tuple is length-prefixed and hashed to
+    /// avoid delimiter collisions between policies.
+    pub fn bucket_key(&self) -> String {
+        use sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        hasher.update((self.policy_id.len() as u64).to_le_bytes());
+        hasher.update(self.policy_id.as_bytes());
+        hasher.update(self.shard.to_le_bytes());
+        hasher.update(self.key_hash);
+        let digest = hasher.finalize();
+        let mut key = String::with_capacity(4 + digest.len() * 2);
+        key.push_str("v1-");
+        for byte in digest {
+            use std::fmt::Write as _;
+            let _ = write!(key, "{byte:02x}");
+        }
+        key
+    }
+}
+
+/// A granted lease. `granted` is the number of units leased to this node and
+/// `remaining` is the local spendable balance for this grant. distri-kv's
+/// `AcquireLeaseResponse.remaining_tokens` is the bucket's *unleased* balance,
+/// so it is deliberately not used as this node's spendable budget.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseGrant {
     pub lease_id: String,

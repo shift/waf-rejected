@@ -32,13 +32,15 @@ use tokio::net::{TcpListener, TcpStream};
 use waf_ingress::config::{DistributedConfig, DistributedFallbackMode};
 use waf_ingress::waf::distributed::distri_waf::distri_waf_client::DistriWafClient as RawWafClient;
 use waf_ingress::waf::distributed::distri_waf::{
-    ActivatePolicyRequest, CounterDelta as ProtoCounterDelta, CounterDeltas, DiscoverRequest,
-    LookupReputationRequest, PolicyBundle, PolicyPayload, ReputationEntry as ProtoReputationEntry,
+    AcquireLeaseRequest, ActivatePolicyRequest, CounterDelta as ProtoCounterDelta, CounterDeltas,
+    DiscoverRequest, GetPolicyRequest, LookupReputationRequest, PolicyBundle, PolicyPayload,
+    ReleaseLeaseRequest, ReputationEntry as ProtoReputationEntry,
 };
 use waf_ingress::waf::distributed::{
     CounterDelta, DistriWafClient, DistributedController, DistributedState, EventDecision,
-    EventSink, EventThreatLevel, NodeInfo, NodeRegistry, PolicySource, RateLimitSync,
-    ReputationSource, SecurityEventRecord, UnavailableDecision,
+    EventSink, EventThreatLevel, LeaseRequest, LeaseSource, NodeInfo, NodeRegistry, PolicySource,
+    PolicyVerificationState, PolicyVerifier, RateLimitSync, ReputationSource, SecurityEventRecord,
+    UnavailableDecision,
 };
 
 const REGION: &str = "e2e-region";
@@ -154,6 +156,8 @@ struct DkvServer {
     grpc: SocketAddr,
     metrics: SocketAddr,
     token: String,
+    binary: PathBuf,
+    policy_seed: Option<[u8; 32]>,
 }
 
 impl DkvServer {
@@ -161,6 +165,12 @@ impl DkvServer {
     /// reputation entry is written into the service's sled database before the
     /// server opens it (the contract has no WAF-node reputation write RPC).
     async fn start(seed_ip: Option<&str>) -> Self {
+        Self::start_with_policy_seed(seed_ip, None).await
+    }
+
+    /// Start with a deterministic Ed25519 policy-signing seed so the test can
+    /// derive the public key the real server advertises and signs with.
+    async fn start_with_policy_seed(seed_ip: Option<&str>, policy_seed: Option<[u8; 32]>) -> Self {
         let binary = server_binary();
         assert!(
             binary.is_file(),
@@ -260,14 +270,7 @@ api_key_file = "{token_path}"
         )
         .expect("write server config");
 
-        let log = std::fs::File::create(dir.path().join("distri-kv.log")).expect("create log");
-        let child = Command::new(&binary)
-            .arg("--config")
-            .arg(&config_path)
-            .stdout(Stdio::from(log.try_clone().expect("clone log")))
-            .stderr(Stdio::from(log))
-            .spawn()
-            .unwrap_or_else(|error| panic!("failed to start {}: {error}", binary.display()));
+        let child = spawn_server(&binary, &config_path, dir.path(), policy_seed);
 
         let mut server = Self {
             child,
@@ -275,30 +278,51 @@ api_key_file = "{token_path}"
             grpc,
             metrics,
             token,
+            binary,
+            policy_seed,
         };
+        server.wait_ready();
+        server
+    }
 
+    fn wait_ready(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
-            if let Some(status) = server.child.try_wait().expect("poll server") {
+            if let Some(status) = self.child.try_wait().expect("poll server") {
                 panic!(
                     "distri-kv-server exited early ({status}); log:\n{}",
-                    server.log()
+                    self.log()
                 );
             }
-            let grpc_ready = std::net::TcpStream::connect(server.grpc).is_ok();
-            let metrics_ready = std::net::TcpStream::connect(server.metrics).is_ok();
+            let grpc_ready = std::net::TcpStream::connect(self.grpc).is_ok();
+            let metrics_ready = std::net::TcpStream::connect(self.metrics).is_ok();
             if grpc_ready && metrics_ready {
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(
-            std::net::TcpStream::connect(server.grpc).is_ok(),
+            std::net::TcpStream::connect(self.grpc).is_ok(),
             "distri-kv-server did not listen on {}; log:\n{}",
-            server.grpc,
-            server.log()
+            self.grpc,
+            self.log()
         );
-        server
+    }
+
+    /// Kill and restart the server against the same data directory and ports.
+    /// A graceful shutdown is not required: the Raft log and applied state are
+    /// replayed from sled on startup.
+    fn restart(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let config_path = self.dir.path().join("distri-kv.toml");
+        self.child = spawn_server(
+            &self.binary,
+            &config_path,
+            self.dir.path(),
+            self.policy_seed,
+        );
+        self.wait_ready();
     }
 
     fn endpoint(&self) -> String {
@@ -330,10 +354,58 @@ api_key_file = "{token_path}"
     }
 }
 
+fn spawn_server(
+    binary: &Path,
+    config_path: &Path,
+    dir: &Path,
+    policy_seed: Option<[u8; 32]>,
+) -> Child {
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("distri-kv.log"))
+        .expect("open server log");
+    let mut command = Command::new(binary);
+    command
+        .arg("--config")
+        .arg(config_path)
+        .stdout(Stdio::from(log.try_clone().expect("clone log")))
+        .stderr(Stdio::from(log));
+    if let Some(seed) = policy_seed {
+        command
+            .env("DISTRIWAF_POLICY_SIGNING_KEY", hex(&seed))
+            .env("DISTRIWAF_POLICY_KEY_ID", "e2e-policy-key");
+    }
+    command
+        .spawn()
+        .unwrap_or_else(|error| panic!("failed to start {}: {error}", binary.display()))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// Derive the Ed25519 public key the server advertises for a signing seed.
+fn policy_public_key_hex(seed: &[u8; 32]) -> String {
+    use ring::signature::KeyPair as _;
+
+    let pair = ring::signature::Ed25519KeyPair::from_seed_unchecked(seed)
+        .expect("valid Ed25519 policy seed");
+    hex(pair.public_key().as_ref())
+}
+
 impl Drop for DkvServer {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if std::env::var_os("DISTRI_KV_DUMP_LOG").is_some() {
+            eprintln!("distri-kv server log:\n{}", self.log());
+        }
     }
 }
 
@@ -822,6 +894,331 @@ async fn local_only_keeps_serving_while_cluster_is_down() {
     );
 
     upstream_task.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Shared-budget leases against the real distri-kv server
+// ---------------------------------------------------------------------------
+
+fn lease_request(policy: &str, key_hash: [u8; 16], requested: u64) -> LeaseRequest {
+    LeaseRequest {
+        policy_id: policy.to_string(),
+        window_start_unix: 0,
+        shard: 0,
+        key_hash,
+        requested,
+    }
+}
+
+async fn acquire_raw(
+    server: &DkvServer,
+    node_id: &str,
+    bucket_key: &str,
+    requested_tokens: u32,
+    ttl_ms: u32,
+    idempotency_key: &str,
+) -> waf_ingress::waf::distributed::distri_waf::AcquireLeaseResponse {
+    raw_client(server)
+        .await
+        .acquire_lease(authed(
+            AcquireLeaseRequest {
+                contract_version: 1,
+                node_id: node_id.to_string(),
+                bucket_key: bucket_key.to_string(),
+                requested_tokens,
+                ttl_ms,
+                idempotency_key: idempotency_key.to_string(),
+            },
+            &server.token,
+        ))
+        .await
+        .expect("acquire lease")
+        .into_inner()
+}
+
+async fn release_raw(
+    server: &DkvServer,
+    node_id: &str,
+    bucket_key: &str,
+    remaining_tokens: u32,
+    idempotency_key: &str,
+) -> waf_ingress::waf::distributed::distri_waf::ReleaseLeaseResponse {
+    raw_client(server)
+        .await
+        .release_lease(authed(
+            ReleaseLeaseRequest {
+                contract_version: 1,
+                node_id: node_id.to_string(),
+                bucket_key: bucket_key.to_string(),
+                remaining_tokens,
+                idempotency_key: idempotency_key.to_string(),
+            },
+            &server.token,
+        ))
+        .await
+        .expect("release lease")
+        .into_inner()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a built distri-kv-server; run scripts/test-distri-e2e.sh"]
+async fn two_waf_instances_share_one_bucket_budget() {
+    let server = DkvServer::start(None).await;
+    let mut config_a = server.config(DistributedFallbackMode::LocalOnly);
+    config_a.node_id = "waf-lease-a".to_string();
+    config_a.leases_enabled = true;
+    config_a.lease_ttl_ms = 1_000;
+    let mut config_b = config_a.clone();
+    config_b.node_id = "waf-lease-b".to_string();
+
+    let client_a = DistriWafClient::new(&config_a).expect("build client a");
+    let client_b = DistriWafClient::new(&config_b).expect("build client b");
+    for (client, node_id) in [(&client_a, "waf-lease-a"), (&client_b, "waf-lease-b")] {
+        let node = NodeInfo {
+            node_id: node_id.to_string(),
+            region: REGION.to_string(),
+            version: "e2e".to_string(),
+            epoch: 0,
+        };
+        client.register(&node).await.expect("register lease node");
+    }
+
+    // The server's default shared bucket has capacity 100. A single node can
+    // drain it; the second node must observe the depleted shared bucket rather
+    // than a private, independent budget.
+    let request = lease_request("shared-e2e-bucket", [0x11; 16], 100);
+    let grant_a = client_a
+        .acquire_leases(std::slice::from_ref(&request))
+        .await
+        .expect("node a acquire")
+        .remove(0);
+    assert!(!grant_a.denied);
+    assert_eq!(
+        grant_a.granted, 100,
+        "node a should drain the shared bucket"
+    );
+
+    let grant_b = client_b
+        .acquire_leases(std::slice::from_ref(&request))
+        .await
+        .expect("node b acquire")
+        .remove(0);
+    assert!(
+        grant_b.granted < 100,
+        "node b must not get an independent 100-token bucket (got {})",
+        grant_b.granted
+    );
+    assert!(
+        grant_a.granted + grant_b.granted <= 110,
+        "shared capacity exceeded beyond the 10 tokens/s refill: {} + {}",
+        grant_a.granted,
+        grant_b.granted
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a built distri-kv-server; run scripts/test-distri-e2e.sh"]
+async fn lease_grant_deny_and_idempotent_retry() {
+    let server = DkvServer::start(None).await;
+    let bucket = "idempotency-e2e-bucket";
+
+    let first = acquire_raw(&server, NODE_ID, bucket, 10, 3_000, "idem-1").await;
+    assert!(first.granted);
+    assert_eq!(first.granted_tokens, 10);
+    assert_eq!(first.remaining_tokens, 90);
+
+    // Same idempotency key: the original grant is replayed without a debit.
+    let replay = acquire_raw(&server, NODE_ID, bucket, 10, 3_000, "idem-1").await;
+    assert!(replay.granted);
+    assert_eq!(replay.granted_tokens, 10);
+    assert_eq!(replay.remaining_tokens, 90);
+
+    // Drain the remaining 90, then a fresh request must be denied.
+    let rest = acquire_raw(&server, NODE_ID, bucket, 90, 3_000, "idem-2").await;
+    assert!(rest.granted);
+    assert_eq!(rest.granted_tokens, 90);
+    assert_eq!(rest.remaining_tokens, 0);
+    let denied = acquire_raw(&server, NODE_ID, bucket, 1, 3_000, "idem-3").await;
+    assert!(!denied.granted);
+    assert_eq!(denied.granted_tokens, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a built distri-kv-server; run scripts/test-distri-e2e.sh"]
+async fn lease_expiry_fails_closed_and_release_refunds() {
+    let server = DkvServer::start(None).await;
+
+    // Expired tokens are reaped without a refund: after a short lease, a large
+    // request can only use the still-unleased balance (plus refill), not the
+    // full capacity again.
+    let expiry_bucket = "expiry-e2e-bucket";
+    let expired = acquire_raw(&server, NODE_ID, expiry_bucket, 70, 100, "expiry-1").await;
+    assert_eq!(expired.granted_tokens, 70);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let after_expiry = acquire_raw(&server, NODE_ID, expiry_bucket, 100, 3_000, "expiry-2").await;
+    assert!(
+        after_expiry.granted_tokens < 50,
+        "expired lease must not be refunded (granted {})",
+        after_expiry.granted_tokens
+    );
+    assert!(
+        after_expiry.expired_leases >= 1,
+        "server should report the reaped expired lease"
+    );
+
+    // An explicit release returns unused tokens immediately.
+    let release_bucket = "release-e2e-bucket";
+    let leased = acquire_raw(&server, NODE_ID, release_bucket, 10, 3_000, "release-1").await;
+    assert_eq!(leased.granted_tokens, 10);
+    let released = release_raw(&server, NODE_ID, release_bucket, 10, "release-1").await;
+    assert_eq!(released.released_tokens, 10);
+    assert_eq!(released.remaining_tokens, 100);
+    let after_release =
+        acquire_raw(&server, NODE_ID, release_bucket, 100, 3_000, "release-2").await;
+    assert_eq!(
+        after_release.granted_tokens, 100,
+        "released tokens must be available again"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a built distri-kv-server; run scripts/test-distri-e2e.sh"]
+async fn lease_state_survives_cluster_restart() {
+    let mut server = DkvServer::start(None).await;
+    let bucket = "restart-e2e-bucket";
+
+    let initial = acquire_raw(&server, NODE_ID, bucket, 100, 60_000, "restart-1").await;
+    assert_eq!(initial.granted_tokens, 100);
+
+    // The test config uses sled's default background flush; give it a moment
+    // so the kill/restart exercises replay rather than an unflushed write.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    server.restart();
+
+    // State is replayed from the Raft log/sled. The bucket still holds the
+    // 60 s lease, so only refill accumulated during the restart is available;
+    // a reset server would hand out the full 100 again.
+    let after = acquire_raw(&server, NODE_ID, bucket, 100, 60_000, "restart-2").await;
+    assert!(
+        after.granted_tokens < 100,
+        "restart must not reset the shared lease bucket (granted {})",
+        after.granted_tokens
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a built distri-kv-server; run scripts/test-distri-e2e.sh"]
+async fn policy_signature_verification_uses_real_server_key() {
+    let seed = [0x5a; 32];
+    let server = DkvServer::start_with_policy_seed(None, Some(seed)).await;
+    activate_policy(&server, 1).await;
+
+    let mut raw = raw_client(&server).await;
+    let bundle = raw
+        .get_policy(authed(
+            GetPolicyRequest {
+                contract_version: 1,
+                scope: SCOPE.to_string(),
+                version: 0,
+            },
+            &server.token,
+        ))
+        .await
+        .expect("fetch signed policy")
+        .into_inner();
+    assert_eq!(bundle.key_id, "e2e-policy-key");
+    assert_eq!(bundle.signature.len(), 64);
+    assert_eq!(bundle.content_hash.len(), 32);
+
+    let mut config = server.config(DistributedFallbackMode::LocalOnly);
+    config.require_policy_signature = true;
+    config.policy_signing_public_key = policy_public_key_hex(&seed);
+    config.policy_signing_key_id = "e2e-policy-key".to_string();
+    let verifier = PolicyVerifier::from_config(&config).expect("build verifier");
+
+    let mut state = PolicyVerificationState::default();
+    verifier
+        .verify(&bundle, &mut state)
+        .expect("valid server signature must verify");
+    assert_eq!(state.generation(), 1);
+
+    let mut tampered_payload = bundle.clone();
+    tampered_payload
+        .payload
+        .as_mut()
+        .expect("payload")
+        .ruleset_version = "tampered".to_string();
+    let mut fresh = PolicyVerificationState::default();
+    assert!(
+        verifier.verify(&tampered_payload, &mut fresh).is_err(),
+        "tampered payload must be rejected"
+    );
+
+    let mut tampered_signature = bundle.clone();
+    tampered_signature.signature[0] ^= 0xff;
+    let mut fresh = PolicyVerificationState::default();
+    assert!(
+        verifier.verify(&tampered_signature, &mut fresh).is_err(),
+        "tampered signature must be rejected"
+    );
+
+    // The full WAF client must also accept the real server bundle.
+    let client = DistriWafClient::new(&config).expect("build WAF client");
+    let snapshot = client.current_policy().await.expect("verified policy");
+    assert_eq!(snapshot.generation, 1);
+    assert_eq!(snapshot.ruleset_version, "e2e-v1");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a built distri-kv-server; run scripts/test-distri-e2e.sh"]
+async fn local_only_lease_fallback_keeps_serving_when_server_dies() {
+    let server = DkvServer::start(None).await;
+    // An active policy keeps the controller "connected"; without one the
+    // policy refresh legitimately reports the cluster as unavailable.
+    activate_policy(&server, 1).await;
+    let mut config = server.config(DistributedFallbackMode::LocalOnly);
+    config.leases_enabled = true;
+    config.lease_ttl_ms = 1_000;
+    config.heartbeat_interval_secs = 1;
+    config.request_timeout_ms = 1_000;
+    config.reconnect_initial_backoff_ms = 50;
+    config.reconnect_max_backoff_ms = 200;
+
+    let state = Arc::new(DistributedState::from_config(&config));
+    let controller = DistributedController::from_config_with_state(&config, Arc::clone(&state))
+        .expect("build controller");
+    let handle = controller.spawn();
+
+    wait_until(
+        || async { state.connected() },
+        Duration::from_secs(20),
+        "controller to connect before the outage",
+    )
+    .await;
+
+    drop(server);
+
+    state.request_lease(lease_request("outage-e2e-bucket", [0x22; 16], 1));
+    wait_until(
+        || async { !state.connected() && state.metrics().lease_fallbacks() >= 1 },
+        Duration::from_secs(20),
+        "lease acquisition to fail over to local_only",
+    )
+    .await;
+
+    assert_eq!(state.unavailable_decision(), UnavailableDecision::LocalOnly);
+    assert!(!state.should_block_without_cluster());
+    assert!(!state.allows_without_cluster());
+    assert_eq!(
+        state.try_consume_lease(&waf_ingress::waf::distributed::LeaseKey::new(
+            "outage-e2e-bucket",
+            0,
+            [0x22; 16]
+        )),
+        waf_ingress::waf::distributed::LeaseConsume::Unavailable,
+        "shared budget must fail closed when the cluster is down"
+    );
+    handle.shutdown().await;
 }
 
 // ---------------------------------------------------------------------------

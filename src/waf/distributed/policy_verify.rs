@@ -201,26 +201,16 @@ impl PolicyVerifier {
     }
 }
 
-/// Deterministic SHA-256 over the canonical policy payload.
+/// SHA-256 over the canonical protobuf encoding of the policy payload.
+///
+/// This matches distri-kv's `compute_policy_content_hash`, which hashes
+/// `PolicyPayload::encode_to_vec()`. Using the same canonical form is required
+/// for a bundle signed by the server to verify in the WAF.
 pub fn payload_hash(payload: &PolicyPayload) -> [u8; CONTENT_HASH_LEN] {
-    let mut hasher = Sha256::new();
-    for field in [
-        payload.ruleset_uri.as_bytes(),
-        payload.ruleset_version.as_bytes(),
-        payload.compiled_artifact.as_bytes(),
-    ] {
-        hasher.update((field.len() as u64).to_le_bytes());
-        hasher.update(field);
-    }
-    let mut features: Vec<_> = payload.features.iter().collect();
-    features.sort_by(|left, right| left.0.cmp(right.0));
-    hasher.update((features.len() as u64).to_le_bytes());
-    for (name, enabled) in features {
-        hasher.update((name.len() as u64).to_le_bytes());
-        hasher.update(name.as_bytes());
-        hasher.update([u8::from(*enabled)]);
-    }
-    hasher.finalize().into()
+    use prost::Message as _;
+
+    let bytes = payload.encode_to_vec();
+    Sha256::digest(bytes).into()
 }
 
 fn decode_fixed<const N: usize>(value: &str, name: &str) -> Result<[u8; N], DistributedError> {

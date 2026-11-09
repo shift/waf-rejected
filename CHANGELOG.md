@@ -6,6 +6,18 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Added
 
+- Real-server shared-budget lease end-to-end coverage (`test/distri-lease-e2e`):
+  the vendored `waf.distri.v1` `AcquireLease`/`ReleaseLease` messages now match
+  shift/distri-kv `69af979` (opaque `bucket_key`, `requested_tokens`, `ttl_ms`,
+  idempotency keys and release refunds). Ignored e2e tests cover two WAF
+  instances sharing one bucket, grant/deny, idempotent retries, expiry
+  fail-closed, release refund, cluster restart replay, policy signatures from
+  the real server key, and `local_only` fallback during an outage. WAF policy
+  content hashing now uses the same protobuf encoding as the server, so
+  server-signed bundles verify without a second canonicalisation. Lease
+  semantics and limits are documented in `docs/operations/distributed.md` and
+  `docs/operations/distributed-performance.md`.
+
 - Hardened distributed client (`feat/distri-auth`): mutual TLS client
   certificates, CA overrides, SPIFFE identity metadata and JWT-SVID bearer
   fallback, with plaintext required to be explicitly opted in; Ed25519 policy

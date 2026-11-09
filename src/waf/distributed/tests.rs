@@ -638,7 +638,7 @@ impl DistriWafService for MockWaf {
             if budget == 0 {
                 break 0;
             }
-            let grant = budget.min(request.requested.max(1));
+            let grant = budget.min(u64::from(request.requested_tokens.max(1)));
             match self.lease_budget.compare_exchange_weak(
                 budget,
                 budget - grant,
@@ -657,12 +657,33 @@ impl DistriWafService for MockWaf {
         Ok(tonic::Response::new(
             super::distri_waf::AcquireLeaseResponse {
                 contract_version: 1,
-                lease_id: format!("lease-{}", request.request_id),
-                granted,
-                remaining: self.lease_budget.load(Ordering::Relaxed),
+                granted: granted > 0,
+                granted_tokens: granted as u32,
+                remaining_tokens: self.lease_budget.load(Ordering::Relaxed) as u32,
+                lease_tokens: granted as u32,
                 expires_at_unix_ms: expires,
-                denied: granted == 0,
+                bucket_key: request.bucket_key,
+                idempotency_key: request.idempotency_key,
                 retry_after_ms: 0,
+                expired_leases: 0,
+            },
+        ))
+    }
+
+    async fn release_lease(
+        &self,
+        request: tonic::Request<super::distri_waf::ReleaseLeaseRequest>,
+    ) -> Result<tonic::Response<super::distri_waf::ReleaseLeaseResponse>, tonic::Status> {
+        let request = request.into_inner();
+        let released = u64::from(request.remaining_tokens);
+        self.lease_budget.fetch_add(released, Ordering::Relaxed);
+        Ok(tonic::Response::new(
+            super::distri_waf::ReleaseLeaseResponse {
+                contract_version: 1,
+                released_tokens: request.remaining_tokens,
+                remaining_tokens: self.lease_budget.load(Ordering::Relaxed) as u32,
+                bucket_key: request.bucket_key,
+                expired_leases: 0,
             },
         ))
     }

@@ -41,10 +41,13 @@ service DistriWaf {
   // batch_id for `counter_batch_dedup_ttl_secs`.
   rpc IngestCounterDeltas(CounterDeltas) returns (CounterAck);
 
-  // Acquire a bounded shared rate-limit budget lease for one counter key.
-  // Enforcement stays local; a denied/zero grant means the shared budget is
-  // exhausted and the caller must fail closed for shared-only capacity.
+  // Acquire a bounded shared-budget token lease for a bucket key. Enforcement
+  // stays local; a denied grant means the shared bucket is exhausted.
   rpc AcquireLease(AcquireLeaseRequest) returns (AcquireLeaseResponse);
+
+  // Return unused leased tokens to the shared bucket. Zero revokes the lease
+  // without a refund; expired leases are reaped without a refund (fail closed).
+  rpc ReleaseLease(ReleaseLeaseRequest) returns (ReleaseLeaseResponse);
 }
 
 // ---------------------------------------------------------------------------
@@ -382,24 +385,54 @@ message CounterAck {
 message AcquireLeaseRequest {
   uint32 contract_version = 1;
   string node_id = 2;
-  uint64 epoch = 3;
-  string policy_id = 4;
-  uint32 window_start_unix = 5;
-  uint32 shard = 6;
-  // 128-bit key hash. Empty/zero means the global aggregate budget.
-  bytes key_hash = 7;
-  uint64 requested = 8;
-  // Caller-provided idempotency key for retries.
-  string request_id = 9;
+  // Stable bucket identifier, e.g. a hashed client IP or hashed route. Raw IPs
+  // do not need to cross the region boundary.
+  string bucket_key = 3;
+  // Tokens to lease. Clamped to the configured per-request maximum and to the
+  // bucket's shared capacity.
+  uint32 requested_tokens = 4;
+  // Lease lifetime. Clamped by the server to [100 ms, 60000 ms]; expired
+  // leases are reaped without a refund (fail closed).
+  uint32 ttl_ms = 5;
+  // Caller-supplied dedupe key. A retry with the same key returns the original
+  // grant without debiting the bucket again.
+  string idempotency_key = 6;
 }
 
 message AcquireLeaseResponse {
   uint32 contract_version = 1;
-  string lease_id = 2;
-  uint64 granted = 3;
-  // Server-authoritative remaining budget for this key at issue time.
-  uint64 remaining = 4;
-  uint64 expires_at_unix_ms = 5;
-  bool denied = 6;
-  uint32 retry_after_ms = 7;
+  // False when the shared bucket has no tokens left; `retry_after_ms` is then
+  // a refill estimate.
+  bool granted = 2;
+  uint32 granted_tokens = 3;
+  // Tokens still available in the shared bucket (not leased or consumed).
+  uint32 remaining_tokens = 4;
+  // Total tokens currently leased by this node for the bucket, including the
+  // grant in this response.
+  uint32 lease_tokens = 5;
+  uint64 expires_at_unix_ms = 6;
+  string bucket_key = 7;
+  string idempotency_key = 8;
+  uint32 retry_after_ms = 9;
+  // Expired leases reaped while applying this command, for observability.
+  uint32 expired_leases = 10;
+}
+
+message ReleaseLeaseRequest {
+  uint32 contract_version = 1;
+  string node_id = 2;
+  string bucket_key = 3;
+  // Unused tokens to return. Values above the recorded lease are capped at the
+  // lease amount. Zero revokes the lease without a refund.
+  uint32 remaining_tokens = 4;
+  string idempotency_key = 5;
+}
+
+message ReleaseLeaseResponse {
+  uint32 contract_version = 1;
+  uint32 released_tokens = 2;
+  // Tokens available in the shared bucket after the refund.
+  uint32 remaining_tokens = 3;
+  string bucket_key = 4;
+  uint32 expired_leases = 5;
 }

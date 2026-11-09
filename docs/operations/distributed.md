@@ -102,7 +102,10 @@ The production default is mutual TLS plus a SPIFFE identity assertion:
 Every fetched `PolicyBundle` is verified before it can change the applied
 generation or rate-limit multiplier:
 
-1. The canonical payload SHA-256 must equal `content_hash` (32 bytes).
+1. The canonical payload SHA-256 must equal `content_hash` (32 bytes). The
+   canonical form is the protobuf encoding of `PolicyPayload`, identical to
+   distri-kv's `compute_policy_content_hash`; a server-signed bundle and the
+   WAF verifier therefore agree without a second serialisation.
 2. A 64-byte Ed25519 `signature` over `content_hash` must verify against
    `policy_signing_public_key`; `key_id` must match when configured.
 3. `generation` must not move backwards. A new generation must carry
@@ -137,6 +140,40 @@ shared budget fails closed (requests over the local bucket are denied) while
 local-only traffic continues to behave exactly as before. Lease grants,
 expiry, denials and fallbacks are exported as metrics below. `shadow = true`
 keeps leases observable but does not enforce them.
+
+The WAF maps `LeaseRequest { policy_id, shard, key_hash }` onto the server's
+opaque `bucket_key` with a length-prefixed SHA-256, so two WAF nodes using the
+same policy/shard/key hash share exactly one server bucket. `AcquireLease`
+sends `requested_tokens` (the local bucket capacity or one unit for the global
+limiter) and `ttl_ms` from `lease_ttl_ms`; a fresh UUID is used as the
+`idempotency_key`. `granted_tokens` becomes the node's local spendable balance.
+The response's `remaining_tokens` is the bucket's *unleased* balance and is not
+mistaken for this node's budget.
+
+Server-side defaults apply in addition to WAF config:
+
+| Limit | distri-kv default |
+| --- | --- |
+| Shared bucket capacity | 100 tokens |
+| Refill | 10 tokens/s |
+| Max requested per RPC | 1024 tokens |
+| Lease TTL | clamped to 100–60 000 ms |
+| Idempotency dedupe | 600 s |
+
+Expired leases are reaped **without a refund**, so a node that loses its
+connection cannot recover the unused portion; the shared budget moves on by
+refill. `ReleaseLease` refunds unused tokens immediately (or revokes the lease
+with `remaining_tokens = 0`), and is idempotent on `(node_id, bucket_key,
+idempotency_key)`. The WAF client exposes `release_lease` for contract tests
+and future controller use; the background controller currently relies on lease
+expiry rather than issuing releases. Size `lease_ttl_ms` accordingly: shorter
+TTLs refund unused capacity sooner (through server expiry) but require more
+RPCs, while longer TTLs hold shared tokens for the whole lifetime.
+
+Lease processing is entirely off the request path. The request path spends a
+cached grant or enqueues one bounded request and fails closed for shared-only
+capacity. A slow or stopped cluster therefore cannot add request latency; it
+only stops new grants.
 
 ### Event and counter egress
 
@@ -191,7 +228,8 @@ plane) are independent. Set and document both.
 | `PolicySource` | `GetPolicy` | Active bundle for `policy_scope`; bundle generation drives invalidation |
 | `ReputationSource` | `LookupReputation` | One address at a time; background only |
 | `RateLimitSync` | `IngestCounterDeltas` | One batch per flush, stable UUIDv5 batch id |
-| `LeaseSource` | `AcquireLease` | Batch drained from the bounded request queue; off the request path |
+| `LeaseSource` | `AcquireLease` | Batch drained from the bounded request queue; idempotency key per RPC; off the request path |
+| `DistriWafClient::release_lease` | `ReleaseLease` | Immediate refund of unused tokens; idempotent on `(node_id, bucket_key, key)` |
 | `EventSink` | `IngestEvents` | Client-streaming batch of body-free records |
 
 Every call carries `request_timeout_ms` as its gRPC deadline and the channel
