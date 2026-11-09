@@ -1297,18 +1297,27 @@ Base `main` = `31c56af`. Headline: distributed WAF is end-to-end validated.
       security update.
 - [x] CHANGELOG `[0.1.0-beta.18] - 2026-11-09` with a fresh Unreleased
       section, distributed performance numbers and lease/server limits.
-- [ ] Verify: fmt, clippy `--lib` default + `distri-kv`, lib tests default +
-      `distri-kv`, `--no-default-features`, integration, ignored e2e (or
-      document if the server binary is unavailable), release ignored Coraza,
-      h2 gRPC e2e, feature-matrix quick, `nix build .#waf-ingress`, SBOM,
-      reactor size.
-- [ ] Build binary/sidecar/image artifacts + SBOM and image digest; verify
-      with `scripts/verify-release.sh --deep-image`.
-- [ ] Public orphan snapshot; disable ruleset 26690602, force-push, restore.
-- [ ] Tag `v0.1.0-beta.18`; publish public pre-release with assets and notes.
-- [ ] Confirm Release workflow pushes `ghcr.io/shift/waf-rejected-waf:
-      v0.1.0-beta.18` and `:sha-<commit>`; confirm Feature Matrix, Release,
-      CodeQL and Production Deployment outcomes.
+- [x] Verify: fmt, clippy `--lib` default + `distri-kv`, lib tests default
+      (631 passed) + `distri-kv` (651), `--no-default-features` (487),
+      integration (60), real-server e2e (10, server binary reused from
+      `/tmp/opencode/dkv-lease-e2e`), release ignored Coraza reactor tests
+      (7 + engine test), h2 gRPC e2e (14), feature-matrix quick (10 passed,
+      4 skipped), `nix build .#waf-ingress`, SBOM, reactor size (30 MB /
+      32 MiB).
+- [x] Built binary/sidecar/image artifacts + SBOM and image digest; local and
+      downloaded-release `verify-release.sh --deep-image --verify-registry`
+      pass. Local image id `sha256:dad7b74c...`.
+- [x] Public orphan snapshot `31c8089`; main ruleset 26690602 disabled for
+      the force-push and restored to `active`. Follow-up
+      `064859b fix(release): verify gzip-compressed OCI image layers` on
+      public main; tag ruleset 26690638 stayed active.
+- [x] Tag `v0.1.0-beta.18` (annotated) and public pre-release with 16 assets
+      and notes.
+- [x] Release workflow success on `31c8089`; published
+      `ghcr.io/shift/waf-rejected-waf@sha256:13daf1b037f54036b4f7c93c941c588d48877d8ae8f1c960d9b7e74158a6f67b`.
+      Feature Matrix (manual dispatch) success, CodeQL success, Production
+      Deployment success (deploy jobs skipped without staging/production
+      credentials), Release success.
 - [ ] Clean worktrees; leave `main` clean.
 
 ## Release 0.1.0-beta.16 (`release/v0.1.0-beta.16`)
