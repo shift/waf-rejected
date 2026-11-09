@@ -1288,6 +1288,29 @@ Baseline `main` = e05d918: bodyless 0.373 ms, 4 KiB 0.924 ms, 8 KiB
 - [x] Verify: fmt, clippy `--lib --deny warnings` (default and no-default).
 - [x] Docs (`docs/suggestions_from_agents/wrapper-floor.md`) + CHANGELOG.
 
+## Release 0.1.0-beta.18 (`release/v0.1.0-beta.18`)
+
+Base `main` = `31c56af`. Headline: distributed WAF is end-to-end validated.
+
+- [x] Bump `Cargo.toml`/`Cargo.lock` and version references to
+      `0.1.0-beta.18`; include the beta 17 `tonic` 0.12 / `prost` 0.13
+      security update.
+- [x] CHANGELOG `[0.1.0-beta.18] - 2026-11-09` with a fresh Unreleased
+      section, distributed performance numbers and lease/server limits.
+- [ ] Verify: fmt, clippy `--lib` default + `distri-kv`, lib tests default +
+      `distri-kv`, `--no-default-features`, integration, ignored e2e (or
+      document if the server binary is unavailable), release ignored Coraza,
+      h2 gRPC e2e, feature-matrix quick, `nix build .#waf-ingress`, SBOM,
+      reactor size.
+- [ ] Build binary/sidecar/image artifacts + SBOM and image digest; verify
+      with `scripts/verify-release.sh --deep-image`.
+- [ ] Public orphan snapshot; disable ruleset 26690602, force-push, restore.
+- [ ] Tag `v0.1.0-beta.18`; publish public pre-release with assets and notes.
+- [ ] Confirm Release workflow pushes `ghcr.io/shift/waf-rejected-waf:
+      v0.1.0-beta.18` and `:sha-<commit>`; confirm Feature Matrix, Release,
+      CodeQL and Production Deployment outcomes.
+- [ ] Clean worktrees; leave `main` clean.
+
 ## Release 0.1.0-beta.16 (`release/v0.1.0-beta.16`)
 
 - [x] Bump Cargo.toml/Cargo.lock and version references to 0.1.0-beta.16;

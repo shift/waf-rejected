@@ -4,6 +4,49 @@ All notable changes to WAF-Rejected are documented here.
 
 ## [Unreleased]
 
+## [0.1.0-beta.18] - 2026-11-09
+
+### Release summary
+
+Beta 18 makes the distributed WAF end-to-end validated. The non-default
+`distri-kv` client now covers mutual TLS with SPIFFE identity and bearer
+fallback, Ed25519 policy-bundle verification, lease-based shared rate limiting,
+security-event and counter-delta egress, and a `local_only` fallback that keeps
+request decisions local during a cluster outage. The server side
+(`shift/distri-kv@69af979`) provides the Raft-backed `DistriWaf` state, 3-node
+cluster validation and failover, and `AcquireLease`/`ReleaseLease`. A real
+two-instance WAF suite exercises shared budgets, grant/deny, idempotency,
+expiry, release refunds, restart replay, signature accept/reject and fallback.
+The canonical image remains `ghcr.io/shift/waf-rejected-waf`. Defaults are
+unchanged (`enabled = false`, `fallback = "local_only"`); the release binary
+does not enable `distri-kv`.
+
+### Performance
+
+- Distributed control plane is off the request path: p50 stayed at
+  **0.314–0.323 ms** bodyless, **0.445–0.463 ms** at 1 KiB, **0.794–0.807 ms**
+  at 4 KiB and **1.180–1.207 ms** at 8 KiB across no-feature, disabled,
+  enabled-refused and enabled-blackhole scenarios. Throughput was unchanged
+  within noise (7,562–7,683 bodyless req/s; 969–1,008 at 8 KiB), and a silent
+  endpoint never added request latency (slowest sample 10.8 ms). Policy and
+  reputation fresh hits are ~91–93 ns; invalidating all 65,536 entries takes
+  2.6 µs.
+- Lease limits: the controller drains at most `lease_batch_max` (default 64)
+  requests per heartbeat; `lease_queue_capacity` defaults to 4096 and drops the
+  oldest request when full. The request path never performs an RPC and fails
+  closed for expired shared-only budget. distri-kv defaults are 100 tokens per
+  bucket, 10 tokens/s refill, 1024 tokens per request, a 100–60,000 ms TTL
+  clamp and a 600 s idempotency window. Keep `lease_ttl_ms` below the 60 s
+  maximum; lease expiry is the automatic refund path.
+
+### Security
+
+- Updated the optional distributed client to `tonic` 0.12.3 and `prost` 0.13.5,
+  removing the lockfile resolution of `rustls-webpki` 0.102.8
+  (GHSA-82j2-j2ch-gfr8, denial of service on a malformed CRL BIT STRING).
+  Policy bundles are rejected unless their Ed25519 signature, key id, content
+  hash, generation and hash chain are valid.
+
 ### Added
 
 - Real-server shared-budget lease end-to-end coverage (`test/distri-lease-e2e`):

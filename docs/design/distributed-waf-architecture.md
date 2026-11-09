@@ -237,7 +237,7 @@ NodeRecord {
   zone:               String            // "eu-west-1a"
   cluster_id:         String            // distri-kv cluster identity
   endpoints:          NodeEndpoints     // see below
-  version:            String            // WAF semver, e.g. "0.1.0-beta.16"
+  version:            String            // WAF semver, e.g. "0.1.0-beta.18"
   build_commit:       String            // git SHA
   feature_bits:       u64               // compiled features (http3, allow-cache, ...)
   capabilities:       Vec<Capability>   // enum, see below

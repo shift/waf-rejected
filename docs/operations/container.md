@@ -12,7 +12,7 @@ The image is a Debian slim runtime with the `waf-ingress` binary, the bundled
 | Item | Value |
 |---|---|
 | Registry image | `ghcr.io/shift/waf-rejected-waf` |
-| Tag convention | `v<version>`, for example `v0.1.0-beta.16` |
+| Tag convention | `v<version>`, for example `v0.1.0-beta.18` |
 | Additional tag | `sha-<commit>` (same manifest as the release tag) |
 | Tarball convention | `waf-rejected-<version>-image.tar.gz` |
 | Checksum asset | `waf-rejected-<version>-image.tar.gz.sha256` |
@@ -54,7 +54,7 @@ The same image can be built and pushed manually from a machine with registry
 credentials:
 
 ```bash
-VERSION=0.1.0-beta.16
+VERSION=0.1.0-beta.18
 IMAGE=ghcr.io/shift/waf-rejected-waf
 
 # Build the same image as the Release workflow.
@@ -90,13 +90,13 @@ manifest, and `--deep-image` also checks the reactor digest inside the image.
 
 ```bash
 # Verify the asset against the checksum published with the release
-sha256sum --check waf-rejected-0.1.0-beta.16-image.tar.gz.sha256
+sha256sum --check waf-rejected-0.1.0-beta.18-image.tar.gz.sha256
 
 # Verify the tarball was built by this repository's Release workflow
-gh attestation verify waf-rejected-0.1.0-beta.16-image.tar.gz --repo shift/waf-rejected
+gh attestation verify waf-rejected-0.1.0-beta.18-image.tar.gz --repo shift/waf-rejected
 
-docker load -i waf-rejected-0.1.0-beta.16-image.tar.gz
-# Loaded image: ghcr.io/shift/waf-rejected-waf:v0.1.0-beta.16
+docker load -i waf-rejected-0.1.0-beta.18-image.tar.gz
+# Loaded image: ghcr.io/shift/waf-rejected-waf:v0.1.0-beta.18
 ```
 
 The provenance attestation is published for the image tarball, the binary
@@ -108,14 +108,14 @@ Use the asset name shown on the release page if it differs from the convention
 above. Podman uses the same archive:
 
 ```bash
-podman load -i waf-rejected-0.1.0-beta.16-image.tar.gz
+podman load -i waf-rejected-0.1.0-beta.18-image.tar.gz
 ```
 
 Alternatively pull from the registry (see
 [Registry publishing](#registry-publishing)):
 
 ```bash
-docker pull ghcr.io/shift/waf-rejected-waf:v0.1.0-beta.16
+docker pull ghcr.io/shift/waf-rejected-waf:v0.1.0-beta.18
 ```
 
 The release attaches `image-digest.txt`. When the image was published, it
@@ -124,10 +124,10 @@ confirm the pulled or loaded image matches it:
 
 ```bash
 docker image inspect --format '{{index .RepoDigests 0}}' \
-  ghcr.io/shift/waf-rejected-waf:v0.1.0-beta.16
+  ghcr.io/shift/waf-rejected-waf:v0.1.0-beta.18
 
 # Or check the registry reference directly.
-./scripts/verify-release.sh --dir . --version 0.1.0-beta.16 --verify-registry
+./scripts/verify-release.sh --dir . --version 0.1.0-beta.18 --verify-registry
 ```
 
 An image loaded from a local tarball may not carry a `RepoDigests` entry until
@@ -210,9 +210,9 @@ curl -o /dev/null -w '%{http_code}\n' \
 ## Pin by digest
 
 ```bash
-docker pull ghcr.io/shift/waf-rejected-waf:v0.1.0-beta.16
+docker pull ghcr.io/shift/waf-rejected-waf:v0.1.0-beta.18
 docker image inspect --format '{{index .RepoDigests 0}}' \
-  ghcr.io/shift/waf-rejected-waf:v0.1.0-beta.16
+  ghcr.io/shift/waf-rejected-waf:v0.1.0-beta.18
 # ghcr.io/shift/waf-rejected-waf@sha256:...
 ```
 
@@ -259,7 +259,7 @@ Service should expose only `8080`.
 5. Record the new digest in your inventory.
 
 ```bash
-docker pull ghcr.io/shift/waf-rejected-waf:v0.1.0-beta.16
+docker pull ghcr.io/shift/waf-rejected-waf:v0.1.0-beta.18
 docker stop waf-rejected && docker rm waf-rejected
 docker run -d --name waf-rejected ... ghcr.io/shift/waf-rejected-waf@sha256:<new-digest>
 ```
