@@ -416,3 +416,77 @@ cargo audit    # 12 vulnerabilities, 19 warnings
 **Raw numbers.** 1 worker: 4,773 / 5,088 / 3,710 msg/s; 4 workers: 19,782 / 15,631 / 5,083 /
 19,773 / 26,472 msg/s. Probe p99: 4,463 µs (1w), 35,260–36,216 µs (4w). Hardware: i5-8400T, 6C/6T,
 1.7 GHz, Linux 6.18.36, Rust 1.89.0, client and server co-located on loopback.
+
+---
+
+## 9. Update — 2026-11-10: after the performance and backend workstreams
+
+The evaluation above is left as written, because its measurements were correct **for the code that
+existed then**. Two workstreams have since changed the picture. Evidence lives in the QuicCrunch
+repository: `docs/PERFORMANCE_RELEASE.md`, `docs/BACKEND_MESSAGING.md`, `scripts/bench.sh`, merged as
+`98f26b0` (`perf/wait-free`); the messaging prototype is draft PR #2 (`feat/backend-messaging`,
+`7039737`), deliberately **not** merged into `main`.
+
+### 9.1 The original numbers were also partly a logging artefact
+
+One intermediate run reported `p99 = 1,616,904 µs`. That run had `RUST_LOG=debug`, and the transport
+emitted a `debug!` per packet, frame and `written N bytes` write. Two conclusions follow:
+
+- the published 194 µs / 32 µs claims were never reproducible: the shipped benchmark had no latency
+  instrumentation and reported `1 / throughput`;
+- but the early "35 ms p99" measurements were also pessimistic, because the hot path is only quiet
+  when debug logging is disabled.
+
+Fixed in the merged work: per-packet events moved to `trace!` with guarded field construction,
+`release_max_level_info` on the transport crates, and `scripts/bench.sh` forces and prints
+`RUST_LOG=warn` so a stray debug environment cannot silently invalidate a run.
+
+### 9.2 Measured after the transport rewrite
+
+Push-based reads and bounded wait-free sends removed the two command-channel handoffs per send and
+receive. Measured at 1 KiB, 4 streams/connection, `RUST_LOG=warn`:
+
+| Workers | Connections | Pipeline | msg/s | RTT p50 | RTT p99 | Errors / timeouts |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4 | 16 | 1 | **51,350** | 1.09 ms | 3.40 ms | 0 / 0 |
+| 4 | 16 | 64 | 33,000–42,000 | — | 0.46–0.59 ms | 0 / 0 |
+| 6 | 16 | 64 | 39,700 | — | — | 0 / 0 |
+| 1 | 16 | 64 | 21,800 | — | — | 0 / 0 |
+
+Zero errors and zero timeouts across all 36 measured cells. The earlier saturation cliff (88 errors
+and 44 timeouts per 64k samples) was traced to an experimental `SO_ATTACH_REUSEPORT_CBPF` program
+reordering flows plus lost `on_stream_readable` events when no reader was parked; both are fixed, and
+partial writes now return an error instead of silently dropping bytes.
+
+**What is still not met:** a reliable 40k+ msg/s at depth 64 (median is ~35k; only the depth-1 cell
+clears it comfortably), and a p99 below 200 µs is **not achievable** with the current TLS and
+one-runtime-thread-per-worker design — the floor is a p50 of roughly 0.85–1.1 ms with 16 in flight.
+Anyone quoting a sub-200 µs p99 for this code is quoting an artefact.
+
+### 9.3 Security and shape of the code changed too
+
+The backend workstream fixed what §5 criticised: `cargo check/test --workspace` pass, TLS peer
+verification defaults on (insecure mode must be opted into explicitly), CA/SNI and client
+certificate/key support exist, request metadata is actually serialized, the interceptor chain invokes
+auth/RBAC, rate limiting and metrics, and `cargo audit` reports 0 vulnerabilities (13 informational
+warnings). A v1 Cap'n Proto contract (`LeaseAcquire/Release`, `PolicyGet/Watch` with `sinceVersion`,
+`EventIngest`, `Heartbeat`), a server dispatch path, a Rust client and loopback tests exist.
+
+### 9.4 Revised verdict
+
+Still **not adopted** for the DistriWaf control plane, but no longer "reject the code". The honest
+position is:
+
+- **Transport performance is now adequate** for policy/IOC/lease/heartbeat control traffic. gRPC is
+  also adequate, so performance alone does not justify a migration.
+- **The blocker is identity.** tQUIC 1.6 exposes no peer certificate, so SPIFFE-bound mTLS identity —
+  a hard requirement in the distributed WAF design — cannot be derived at the transport layer. The
+  workarounds are patching tQUIC or carrying a signed application-layer identity assertion, both of
+  which add bespoke security code on the critical path.
+- **Remaining work is 10–16 engineer-weeks** (reconnect/pooling, watch resume retention, flow
+  control, exporter endpoints, fuzzing, tail-latency work), for a capability gRPC already provides.
+
+Recommendation: keep the prototype on its branch as an evaluated option, keep distri-kv on tonic, and
+revisit only if peer-certificate access lands upstream (or if a future data-plane transport needs the
+SO_REUSEPORT worker model). Any re-evaluation must reuse `scripts/bench.sh` with `RUST_LOG=warn` and
+the queueing-separated latency instrumentation.
