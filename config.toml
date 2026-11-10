@@ -1,0 +1,428 @@
+# WAF-Rejected default configuration
+# High-performance enterprise web application firewall
+#
+# Every key is shown with the value the compiled defaults use unless noted.
+# The request-inspection backend is the native Rust CRS engine whenever the
+# binary is built with the default `rust-engine` feature. Coraza remains the
+# reference implementation and the explicit switch-back:
+#
+#   [waf.coraza]
+#   backend = "wasm"
+#
+# See docs/user-guide/configuration.md for the full reference.
+
+# ---------------------------------------------------------------------------
+# Top level
+# ---------------------------------------------------------------------------
+
+bind_addr = "0.0.0.0:8080"
+health_bind_addr = "0.0.0.0:8081"
+upstream_uri = "http://127.0.0.1:3000"
+
+# ---------------------------------------------------------------------------
+# Proxy
+# ---------------------------------------------------------------------------
+
+[proxy]
+upstream_url = "http://127.0.0.1:3000"
+bind_addr = "0.0.0.0:8080"
+timeout_seconds = 30
+max_request_size = 10485760
+# Optional PEM CA bundle used to verify HTTPS and TLS WebSocket upstreams.
+# upstream_ca_path = "/etc/waf/certs/upstream-ca.pem"
+# Upstream mutual TLS: set both or neither.
+# upstream_client_cert_path = "/etc/waf/certs/client.crt"
+# upstream_client_key_path = "/etc/waf/certs/client.key"
+# Client routing/override headers are stripped before WAF inspection and
+# upstream forwarding. Names are case-insensitive; a trailing "*" is a prefix
+# match. In "extend" mode these are added to the built-in defaults; in
+# "replace" mode only this list is applied. Set
+# reject_ambiguous_routing = true to return 400 instead of stripping.
+strip_headers = [
+  "x-original-url",
+  "x-rewrite-url",
+  "x-http-method-override",
+  "x-method-override",
+  "x-forwarded-*",
+  "forwarded",
+  "x-host",
+  "x-real-ip",
+]
+strip_headers_mode = "extend"
+reject_ambiguous_routing = false
+
+# Opt-in bounded upstream connection pool. Disabled leaves hyper's built-in
+# pool behaviour unchanged.
+[proxy.pool]
+enabled = false
+max_idle_per_host = 32
+idle_timeout_secs = 90
+# 0 disables out-of-band health probes.
+health_check_interval_secs = 0
+health_check_path = "/healthz"
+
+# Opt-in streaming of large upstream responses. Disabled buffers every response
+# under the configured byte cap before writing to the client.
+[proxy.streaming]
+enabled = false
+response_threshold_bytes = 1048576
+
+# ---------------------------------------------------------------------------
+# Server and listeners
+# ---------------------------------------------------------------------------
+
+[server]
+max_connections = 1000
+# Only trust X-Forwarded-For from these CIDRs. Empty means never trust it.
+trusted_proxies = []
+request_timeout_secs = 30
+keep_alive_timeout_secs = 90
+enable_http2 = true
+enable_http3 = false
+supported_http_versions = ["1.0", "1.1", "2"]
+max_body_size = 10485760
+# HTTP/3 request admission: bounds concurrent request handlers (and their body
+# buffers) before any request body is read. Excess requests wait up to
+# h3_admission_timeout_ms, then receive 503. A per-client cap of 0 is disabled;
+# when set, excess requests from one IP receive 429.
+h3_max_inflight_requests = 256
+h3_max_inflight_per_client = 0
+h3_admission_timeout_ms = 250
+# Streaming gRPC bodies (no content-length) are never buffered or inspected by
+# CRS body rules; these bound the relayed bytes and total duration.
+grpc_max_stream_bytes = 4194304
+grpc_max_stream_seconds = 300
+# Return gRPC-native trailers for blocked gRPC calls (7 PERMISSION_DENIED for
+# 403, 13 INTERNAL for other block statuses).
+grpc_aware_rejections = false
+# "tokio" (portable, default) or "io_uring" (requires the `io-uring` feature;
+# setup failure falls back to tokio with a warning).
+io_backend = "tokio"
+
+[server.websocket]
+# Parser limits enforced before a message is assembled. 0 inherits
+# server.max_body_size. max_frame_bytes must not exceed max_message_bytes.
+max_frame_bytes = 0
+max_message_bytes = 0
+
+[server.tls]
+enabled = false  # Set to true in production or terminate TLS at the load balancer
+cert_path = "/etc/waf-rejected/certs/server.crt"
+key_path = "/etc/waf-rejected/certs/server.key"
+min_version = "1.2"
+max_version = "1.3"
+alpn_protocols = ["h2", "http/1.1"]
+require_client_cert = false
+# client_ca_path = "/etc/waf-rejected/certs/client-ca.pem"
+# Session resumption is opt-in; disabled preserves the previous behaviour.
+session_resumption = false
+session_cache_size = 256
+tls13_tickets = 2
+tcp_nodelay = false
+# 0 leaves the operating-system defaults in place.
+tcp_keepalive_secs = 0
+tcp_keepalive_interval_secs = 0
+tcp_fast_open = false
+
+# Opt-in HTTP/2 flow-control, multiplexing and keep-alive tuning. Disabled uses
+# hyper's defaults and the historical 30s/10s keep-alive policy.
+[server.http2]
+enabled = false
+initial_stream_window_bytes = 1048576
+initial_connection_window_bytes = 16777216
+max_concurrent_streams = 256
+max_pending_accept_reset_streams = 1024
+keep_alive_interval_secs = 30
+keep_alive_timeout_secs = 10
+keep_alive_while_idle = false
+adaptive_window = false
+
+# WebTransport over HTTP/3 is terminating (never proxied upstream). Requires a
+# `webtransport` build, TLS 1.3 and non-empty allowlists; empty denies all.
+[server.webtransport]
+enabled = false
+bind_addr = "0.0.0.0:4434"
+require_origin = true
+allowed_origins = []
+allowed_paths = []
+max_sessions = 1024
+max_sessions_per_ip = 32
+max_bidi_streams = 16
+max_uni_streams = 16
+max_datagram_bytes = 1200
+max_stream_bytes = 1048576
+idle_timeout_secs = 30
+max_session_secs = 300
+inspect_streams = true
+inspect_datagrams = true
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+[logging]
+level = "info"
+json_format = false
+
+# ---------------------------------------------------------------------------
+# WAF core
+# ---------------------------------------------------------------------------
+
+[waf]
+enabled = true
+# "closed" blocks on inspection errors; "open" forwards. Keep "closed".
+fail_mode = "closed"
+upstream_timeout_ms = 30000
+
+[waf.rate_limit]
+per_ip_enabled = true
+per_ip_max_requests = 100
+per_ip_window_secs = 60
+global_enabled = true
+global_max_requests = 10000
+global_window_secs = 60
+# Hard cap on tracked client IPs. At the cap, new IPs are rejected
+# (fail_closed) unless capacity_policy = "evict_oldest".
+max_tracked_ips = 100000
+capacity_policy = "fail_closed"
+
+[waf.security_events]
+enabled = true
+format = "json"
+min_threat_level = "medium"
+enable_cef = true
+cef_output_file = "./logs/security_events.cef"
+cef_device_vendor = "WAF-Rejected"
+cef_device_product = "Security WAF"
+cef_device_version = "1.0.0"
+enable_otel = false
+# otel_service_name = "waf-rejected"
+# otel_service_version = "0.1.0"
+# otel_export_traces = false
+# otel_export_logs = false
+enable_sled = true
+sled_db_path = "./data/waf_security_events.sled"
+sled_max_events = 100000
+sled_compress = false
+
+[waf.content_inspection]
+enabled = true
+inspect_headers = true
+inspect_body = true
+max_body_size = 10485760
+threat_patterns = ["sql_injection", "xss", "command_injection", "path_traversal"]
+
+[waf.geo_blocking]
+enabled = false
+# database_path = "/etc/waf/GeoLite2-City.mmdb"
+# anonymous_database_path = "/etc/waf/GeoIP2-Anonymous-IP.mmdb"
+blocked_countries = []
+blocked_regions = []
+block_tor = false
+block_vpn = false
+block_datacenter = false
+
+# Admission control for expensive (CRS body) inspections. Cheap requests (no
+# body, or a gRPC/GraphQL body withheld from CRS) bypass the queue. Saturation
+# or timeout fails closed with 503 + Retry-After; inspection is never skipped.
+[waf.admission]
+enabled = true
+# 0 = auto: about half the reactor pool, capped at pool_size - 1 (at least 1),
+# reserving reactor workers for cheap traffic.
+heavy_permits = 0
+queue_timeout_ms = 250
+max_queued = 64
+
+# Legacy component-ABI WASM integration (`wasm-waf` feature only). The
+# component ABI is not wired up; enabling this uses the built-in heuristic
+# fallback, not the Coraza module. Use [waf.coraza] instead.
+[waf.wasm]
+enabled = false
+module_path = "rules/coraza.wasm"
+memory_limit = 16777216  # 16 MiB
+timeout_ms = 100
+debug = false
+instance_pool_size = 10
+hot_reload = true
+rules_config = "rules/coraza.conf"
+
+[waf.coraza]
+# Enable request inspection through the selected backend.
+enabled = true
+# Request-inspection backend. "rust" is the default when the binary is built
+# with the default `rust-engine` feature (505/505 CRS rules compiled at
+# start-up). "wasm" selects the Coraza reference implementation; "native"
+# selects the opt-in Go sidecar over a Unix socket.
+# backend = "rust"
+# Fallback after a Rust-engine runtime error: "none" (fail closed, default) or
+# "wasm" (re-evaluate that request with Coraza; requires `wasm-reactor`).
+# fallback = "none"
+# Required when backend = "native".
+# native_socket_path = "/run/waf/coraza.sock"
+# Optional reactor .wasm path; the binary-embedded module is used when unset.
+# module_path = "/usr/share/waf/wasm/coraza_reactor.wasm"
+# Maximum request payload handed to the reactor (wasm contract is 64 KiB).
+# max_payload_bytes = 65536
+# Maximum request-body bytes inspected by CRS. 0 = the whole body (default).
+# max_inspect_bytes = 0
+# Policy above max_inspect_bytes: "inspect-all" (default), "reject" (413) or
+# "forward-uninspected" (documented inspection gap).
+# oversize_action = "inspect-all"
+# memory_limit_bytes = 268435456
+# eval_timeout_ms = 5000
+# pool_size = 0
+# prefilter = "off"  # "off" | "dry-run" | "gated" (gated needs `crs-prefilter`)
+
+# Protocol-aware gRPC inspection (active when waf.coraza.enabled is true).
+# Protobuf bodies are validated at the frame level and withheld from CRS body
+# rules. See docs/grpc-inspection.md.
+[waf.grpc]
+enabled = true
+# Empty = monitor only. Entries are fully-qualified gRPC methods and can be
+# generated from a protobuf FileDescriptorSet.
+method_allowlist = []
+# Generated allowlist artifact (JSON). When set, its methods are merged with
+# method_allowlist, per-method max_message_bytes values win over the global
+# limit, and its unknown_method_action applies unless set explicitly.
+# A configured file that cannot be loaded aborts start-up.
+# allowlist_file = "/etc/waf/grpc/allowlist.json"
+max_message_bytes = 4194304  # 4 MiB
+max_frames = 64
+# "allow" or "block"; unset defaults to block for a non-empty allowlist.
+# unknown_method_action = "block"
+max_string_bytes = 1048576
+max_bytes_len = 1048576
+max_repeated = 1024
+max_depth = 32
+max_decoded_fields = 100000
+reject_unknown_fields = false
+validate_strings = true
+# Content scan of decoded string/bytes fields: "off" (envelope only) or
+# "strings" (default; bounded synthetic payload to the backend).
+content_scan = "strings"
+max_content_scan_bytes = 65536
+
+[waf.graphql]
+# GraphQL-over-HTTP inspection. `crs` (default) keeps the full CRS JSON body
+# scan (no security change). `graphql-only` runs GraphQL checks and withholds
+# the raw body from CRS body rules (header/URI rules still run); it requires a
+# non-empty allowlist and gives up CRS body-rule coverage for these requests.
+# `off` disables GraphQL-specific checks; CRS still scans.
+# See docs/graphql-inspection.md.
+enabled = true
+body_scan = "crs"
+
+# Operation names and/or 64-character SHA-256 query hashes that may execute.
+# Empty = monitor-only (except graphql-only, which requires an entry).
+operation_allowlist = []
+# Persisted-query artifact: JSON list of { "name": "...", "sha256": "..." }.
+# A configured file that cannot be loaded aborts start-up.
+# allowlist_file = "/etc/waf/graphql/allowlist.json"
+# "monitor" or "block"; unset defaults to block for a non-empty allowlist.
+# unknown_operation_action = "block"
+
+max_body_bytes = 8388608       # 8 MiB
+max_query_bytes = 1048576      # 1 MiB
+max_variables_bytes = 1048576  # 1 MiB
+max_variables = 128
+max_depth = 128
+max_aliases = 1024
+max_fields = 8192
+allow_mutations = true
+allow_subscriptions = true
+
+# Opt-in allow-verdict cache (non-default `allow-cache` feature). Memoises only
+# pure-content `Allow` verdicts for a short TTL; blocks and stateful rules are
+# never cached.
+[waf.allow_cache]
+enabled = false
+ttl_secs = 30
+max_entries = 8192
+max_body_bytes = 65536
+# Empty = every route when enabled; prefixes match on a '/' boundary.
+routes = []
+
+# Opt-in compiled bodyless allowlist fast path. Listed routes skip per-request
+# inspection for bodyless, query-free requests only; size, method, rate-limit
+# and geographic gates still run.
+[waf.fast_allow]
+enabled = false
+routes = []
+allow_audit_sample_rate = 0.0
+
+# ---------------------------------------------------------------------------
+# Security modules
+# ---------------------------------------------------------------------------
+
+[security.auth]
+enabled = false
+api_keys = []
+header_name = "X-API-Key"
+require_https = false
+# Optional auth-stage rate limits:
+# [security.auth.rate_limit]
+# requests_per_minute = 60
+# per_ip_enabled = true
+# per_ip_max_requests = 100
+# per_ip_window_secs = 60
+# global_enabled = true
+# global_max_requests = 1000
+# global_window_secs = 60
+
+[security.ai]
+enabled = false
+threat_threshold = 0.8
+timeout_ms = 5000
+
+[security.ai.model]
+# model_path = "/etc/waf/model.onnx"
+anomaly_detection = true
+advanced_classification = false
+
+[security.compliance]
+enabled = false
+
+# Evidence packs, not certifications. See docs/compliance/eu-regulatory-status.md.
+[security.compliance.regulatory]
+gdpr = false
+hipaa = false
+pci_dss = false
+ai_act = false
+nis2 = false
+cra = false
+# data_residency = "eu"
+
+[security.compliance.audit]
+tamper_evident = true
+retention_days = 2555
+integrity_check_hours = 24
+
+[security.compliance.retention]
+security_events_days = 90
+audit_logs_days = 2555
+auto_delete = true
+
+# ---------------------------------------------------------------------------
+# Storage and runtime
+# ---------------------------------------------------------------------------
+
+[storage]
+# "redb" (default), "sled" or "memory".
+backend = "redb"
+path = "./data/waf.redb"
+enable_follower_reads = true
+ttl_cleanup_interval = { secs = 60, nanos = 0 }
+enable_compression = false
+cache_size = 16777216
+# max_memory_entries = 100000
+
+[runtime]
+# Unset values use Tokio defaults (logical CPUs, 512 blocking threads, 10s).
+# worker_threads = 8
+# max_blocking_threads = 512
+# thread_keep_alive_secs = 10
+# CPU pinning requires the non-default `cpu-pinning` build feature; when the
+# feature or platform is unavailable the proxy logs a warning and stays
+# unpinned.
+enable_cpu_pinning = false
+# cpu_pin_cores = [0, 1, 2, 3]

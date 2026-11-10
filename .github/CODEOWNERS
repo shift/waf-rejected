@@ -1,0 +1,11 @@
+# Default owner for the repository. Replace with a team handle if the project
+# moves under an organisation.
+* @shift
+
+# Security-sensitive surfaces require the maintainer's review.
+/SECURITY.md @shift
+/.github/ @shift
+/docs/operations/ @shift
+/docs/compliance/ @shift
+/rules/ @shift
+/src/waf/ @shift

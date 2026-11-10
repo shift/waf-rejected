@@ -1,0 +1,60 @@
+# Development deployment configuration
+bind_addr = "0.0.0.0:8080"
+health_bind_addr = "0.0.0.0:8081"
+upstream_uri = "http://localhost:3000"
+
+[server]
+max_connections = 1000
+trusted_proxies = []
+request_timeout_secs = 30
+keep_alive_timeout_secs = 90
+enable_http2 = true
+enable_http3 = false
+supported_http_versions = ["1.0", "1.1", "2"]
+max_body_size = 10485760
+
+[logging]
+level = "info"
+json_format = true
+
+[waf]
+enabled = true
+
+# Opt-in Coraza body-size policy. Defaults preserve full inspection.
+# [waf.coraza]
+# max_inspect_bytes = 0            # 0 = inspect the whole body (default)
+# oversize_action = "inspect-all"  # "inspect-all" | "forward-uninspected" | "reject"
+# SECURITY: "forward-uninspected" skips CRS body rules after the prefix, so an
+# attacker can place a payload past max_inspect_bytes. Use "reject" for
+# endpoints that should never receive large bodies.
+
+[waf.rate_limit]
+per_ip_enabled = true
+per_ip_max_requests = 100
+per_ip_window_secs = 60
+global_enabled = true
+global_max_requests = 1000
+global_window_secs = 60
+
+[waf.security_events]
+enabled = true
+format = "json"
+min_threat_level = "medium"
+enable_cef = false
+enable_otel = false
+enable_sled = false
+
+[waf.content_inspection]
+enabled = true
+inspect_headers = true
+inspect_body = true
+max_body_size = 1048576
+threat_patterns = ["sql_injection", "xss", "command_injection", "path_traversal"]
+
+[waf.geo_blocking]
+enabled = false
+blocked_countries = []
+blocked_regions = []
+block_tor = false
+block_vpn = false
+block_datacenter = false

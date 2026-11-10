@@ -1,0 +1,90 @@
+# Coraza WASI reactor as the request-inspection backend (explicit switch-back).
+#
+# The Rust engine is the default. Set `backend = "wasm"` to run the full Coraza
+# reference implementation instead: this is the differential oracle and the
+# compatibility escape hatch. It is slower than the Rust engine on bodies
+# (p50 ~4.5 ms bodyless, ~40 ms at 1 KiB, ~170 ms at 4 KiB, ~354 ms at 8 KiB on
+# the reference host) and needs a larger memory budget.
+#
+# Requires a build with the default `wasm-reactor` feature.
+#
+# Run:
+#   WAF_CONFIG_FILE=config/examples/coraza-reference.toml waf-ingress
+
+bind_addr = "0.0.0.0:8080"
+health_bind_addr = "0.0.0.0:8081"
+upstream_uri = "http://127.0.0.1:3000"
+
+[proxy]
+upstream_url = "http://127.0.0.1:3000"
+bind_addr = "0.0.0.0:8080"
+timeout_seconds = 30
+max_request_size = 10485760
+
+[server]
+max_connections = 1000
+request_timeout_secs = 30
+keep_alive_timeout_secs = 90
+enable_http2 = true
+enable_http3 = false
+supported_http_versions = ["1.0", "1.1", "2"]
+max_body_size = 10485760
+
+[logging]
+level = "info"
+json_format = true
+
+[waf]
+enabled = true
+fail_mode = "closed"
+upstream_timeout_ms = 30000
+
+[waf.coraza]
+enabled = true
+backend = "wasm"
+# No fallback after a wasm error: the request fails closed.
+fallback = "none"
+# Omit module_path to use the reactor embedded in the binary.
+# module_path = "/usr/share/waf/wasm/coraza_reactor.wasm"
+# 64 KiB is the wasm payload contract.
+max_payload_bytes = 65536
+# 0 = inspect the whole body (historical default).
+max_inspect_bytes = 0
+oversize_action = "inspect-all"
+memory_limit_bytes = 268435456
+eval_timeout_ms = 5000
+# 0 = one pre-warmed reactor per available core, clamped to 1..=8.
+pool_size = 0
+# `gated` requires a build with the non-default `crs-prefilter` feature.
+prefilter = "off"
+
+[waf.admission]
+# Bound concurrent heavy (CRS body) evaluations. Saturation returns
+# 503 + Retry-After; inspection is never skipped.
+enabled = true
+heavy_permits = 0
+queue_timeout_ms = 250
+max_queued = 64
+
+[waf.rate_limit]
+per_ip_enabled = true
+per_ip_max_requests = 100
+per_ip_window_secs = 60
+global_enabled = true
+global_max_requests = 10000
+global_window_secs = 60
+
+[waf.content_inspection]
+enabled = true
+inspect_headers = true
+inspect_body = true
+max_body_size = 10485760
+threat_patterns = ["sql_injection", "xss", "command_injection", "path_traversal"]
+
+[waf.security_events]
+enabled = true
+format = "json"
+min_threat_level = "medium"
+enable_cef = false
+enable_otel = false
+enable_sled = false

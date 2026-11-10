@@ -1,0 +1,88 @@
+# Default values for waf-rejected Helm chart
+
+# Image configuration
+image:
+  repository: ghcr.io/shift/waf-rejected
+  tag: "v0.1.0-beta.3"
+  pullPolicy: Always
+
+# Service configuration
+service:
+  type: LoadBalancer
+  port: 80
+  httpsPort: 443
+  metricsPort: 8081
+
+# Replica count
+replicaCount: 3
+
+# Resource limits and requests
+resources:
+  requests:
+    memory: "256Mi"
+    cpu: "500m"
+  limits:
+    memory: "1Gi"
+    cpu: "2000m"
+
+# Security configuration
+security:
+  auth:
+    # Enable only after supplying API keys via a Secret.
+    enabled: false
+    requireHttps: true
+  ai:
+    enabled: true
+    threatThreshold: 0.8
+  compliance:
+    enabled: true
+    gdpr: true
+    pciDss: true
+
+# Monitoring configuration
+monitoring:
+  prometheus:
+    enabled: true
+    namespace: monitoring
+  grafana:
+    enabled: true
+    namespace: monitoring
+
+# Logging configuration
+logging:
+  level: "INFO"
+  format: "json"
+  otel:
+    enabled: true
+    serviceName: "waf-rejected"
+
+# Upstream configuration
+upstream:
+  url: "http://backend-service:8080"
+  timeout: 30
+
+# Persistence configuration
+persistence:
+  enabled: true
+  size: "10Gi"
+  storageClass: "standard"
+
+# Node selector
+nodeSelector: {}
+
+# Tolerations
+tolerations: []
+
+# Affinity
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+    - weight: 100
+      podAffinityTerm:
+        labelSelector:
+          matchExpressions:
+          - key: app
+            operator: In
+            values:
+            - waf-rejected
+        topologyKey: kubernetes.io/hostname
