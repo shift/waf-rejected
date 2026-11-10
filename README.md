@@ -1,7 +1,7 @@
 # WAF-Rejected
 
-**Current Beta:** `0.1.0-beta.18` · image
-`ghcr.io/shift/waf-rejected-waf:v0.1.0-beta.18` · tarball attached to the
+**Current Beta:** `0.1.0-beta.19` · image
+`ghcr.io/shift/waf-rejected-waf:v0.1.0-beta.19` · tarball attached to the
 GitHub release
 
 A Rust reverse-proxy web application firewall. Requests are inspected by a
@@ -225,7 +225,7 @@ limits and CI guidance. Fuzzing is not part of `nix build`.
 - Published image: `ghcr.io/shift/waf-rejected-waf:v<version>`, for example:
 
   ```bash
-  docker pull ghcr.io/shift/waf-rejected-waf:v0.1.0-beta.18
+  docker pull ghcr.io/shift/waf-rejected-waf:v0.1.0-beta.19
   docker run -p 8080:8080 -p 8081:8081 \
     ghcr.io/shift/waf-rejected-waf@sha256:<digest>
   ```

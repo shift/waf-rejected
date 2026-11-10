@@ -52,19 +52,23 @@ mod performance_validation {
         );
         assert!(byte_count > 0, "Should find '<' characters");
 
-        // Ensure reasonable performance (should complete quickly)
-        assert!(
-            simd_duration.as_millis() < 100,
-            "SIMD SQL detection should be fast"
-        );
-        assert!(
-            simd_xss_duration.as_millis() < 100,
-            "SIMD XSS detection should be fast"
-        );
-        assert!(
-            simd_count_duration.as_millis() < 100,
-            "SIMD byte counting should be fast"
-        );
+        // Wall-clock budgets are only meaningful in an isolated perf run. Under a
+        // fully parallel unit-test run this assertion measures scheduler contention
+        // rather than SIMD throughput, so it is opt-in via WAF_PERF_ASSERT=1.
+        if std::env::var_os("WAF_PERF_ASSERT").is_some() {
+            assert!(
+                simd_duration.as_millis() < 100,
+                "SIMD SQL detection should be fast: {simd_duration:?}"
+            );
+            assert!(
+                simd_xss_duration.as_millis() < 100,
+                "SIMD XSS detection should be fast: {simd_xss_duration:?}"
+            );
+            assert!(
+                simd_count_duration.as_millis() < 100,
+                "SIMD byte counting should be fast: {simd_count_duration:?}"
+            );
+        }
     }
 
     #[test]

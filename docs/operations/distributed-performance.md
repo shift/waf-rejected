@@ -206,6 +206,31 @@ Exercise this with the controller tests:
   pure and unit-tested. Telemetry drops oldest first and increments
   `waf_distributed_queue_dropped_total`.
 
+## Control-plane measurements (beta 19)
+
+These are server-side `shift/distri-kv` measurements, not WAF request-path
+costs. Three nodes, 0 ms each-way RTT, release host (Intel i5-8400T, 6 logical
+CPUs, shared):
+
+| Measurement | Result |
+| --- | ---: |
+| Policy activation, leader Raft commit | 5.5 ms p50 (2.95 ms low-noise; follower-forwarded 4.6 ms) |
+| Heartbeats | 6,707 ops/s |
+| Lease acquire, 1 client | 3.08 ms p50 |
+| Lease acquire, 8 clients | 8.06 ms p50 (target < 5 ms: **missed**) |
+| Lease acquire, 64 clients | 34.5 ms p50, 510 ms p99 |
+| Leader failover (`kill -9` to serving strict read) | ~0.46 s |
+
+Honest limits for this release:
+
+- Pub/sub is durable per node (topic log, replay, ack markers) but not
+  Raft-replicated cluster-wide until the next distri-kv merge.
+- Key routing uses the consistent-hash ring inside one replicated Raft group;
+  independent per-partition Raft groups ("true Multi-Raft") are not wired.
+- `Discover` partition/leader hints are registry-derived and marked partial.
+- The 8-client lease target is missed at 8.06 ms on the release host; the gate
+  is reported rather than relaxed.
+
 ## Limits and follow-ups
 
 - No real distri-kv cluster was used. A real cluster adds policy/reputation

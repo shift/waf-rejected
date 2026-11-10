@@ -1,6 +1,6 @@
 # Support Matrix
 
-**Release line:** `0.1.0-beta.18`  
+**Release line:** `0.1.0-beta.19`  
 **Default engine:** native Rust CRS engine (`rust-engine`, 505/505 rules)  
 **Reference engine / explicit switch-back:** Coraza 3.3.3 + OWASP CRS 4.14.0 in the WASI reactor (`backend = "wasm"`)  
 **Toolchain:** Rust 1.99.1, wasmtime 49

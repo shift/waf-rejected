@@ -4,6 +4,82 @@ All notable changes to WAF-Rejected are documented here.
 
 ## [Unreleased]
 
+## [0.1.0-beta.19] - 2026-11-10
+
+### Release summary
+
+Beta 19 is the first release where the distributed WAF is **production-shaped**.
+The `shift/distri-kv` control plane is Raft-durable, serves the DistriWaf
+policy, heartbeat and lease contracts, and fails over in well under a second.
+The non-default `distri-kv` WAF client ships mutual TLS/SPIFFE authentication,
+signed policy bundles with chain and generation checks, shared-budget lease
+rate limiting, global-tier reputation, watch-journal replication and
+operator-approved global blocks. The request path remains local: with the
+feature disabled, or with the cluster refused, stalled or unavailable, request
+decisions and latency are unchanged. The release binary does not enable
+`distri-kv` by default (`enabled = false`, `fallback = "local_only"`).
+
+### Distributed control plane (shift/distri-kv)
+
+Measured on a 3-node cluster at 0 ms each-way RTT on the release host
+(Intel i5-8400T, 6 logical CPUs, shared):
+
+- Policy activation through the leader's Raft commit: **5.5 ms p50**
+  (2.95 ms in the low-noise run; follower-forwarded activation 4.6 ms).
+- Heartbeats: **6,707 ops/s**.
+- Lease acquire p50: **3.08 ms** at 1 client, **8.06 ms** at 8 clients,
+  **34.5 ms** at 64 clients. The 8-client p50 misses its < 5 ms target on this
+  host; the gate is reported, not relaxed.
+- Leader failover (`kill -9` to a new leader serving a strict read of a
+  pre-failover write): **~0.46 s**, down from 1.7–2.0 s.
+- Durable Raft log and hard state in sled, group-fsynced appends, periodic
+  snapshots with prefix truncation, and `InstallSnapshot` catch-up for lagging
+  followers.
+- Pub/sub (`Publish`/`Subscribe`/`Acknowledge`) is implemented with a durable
+  per-node topic log, replay and durable ack markers; key mutations and
+  `RELAXED` gets use the consistent-hash routing ring.
+
+### Distributed WAF client
+
+- Mutual TLS client certificates, CA overrides, SPIFFE identity metadata and
+  JWT-SVID bearer fallback; plaintext must be explicitly opted in.
+- Ed25519 policy bundle verification with content hash, key id, generation and
+  hash-chain continuity checks; unsigned or broken bundles are rejected and
+  counted.
+- Shared rate-limit leases acquired asynchronously through a bounded queue,
+  consumed beside local token buckets, and failing closed only for expired
+  shared-only budget.
+- Global-tier reputation and policy generations, watch-journal replication
+  with resume, and global block approval with deterministic exact-match IOCs
+  separated from operator-approved heuristics.
+- Bounded event/counter egress with stable UUIDv5 counter batch ids for
+  idempotent retries. Defaults and metrics are documented in
+  [`docs/operations/distributed.md`](docs/operations/distributed.md).
+
+### Documentation
+
+- Added [`docs/design/quiccrunch-evaluation.md`](docs/design/quiccrunch-evaluation.md):
+  QuicCrunch was evaluated at `4ee1ec4` as a tonic replacement and rejected
+  (workspace does not build, README latency is `1 / throughput`, no mTLS or
+  working auth, 12 known vulnerabilities). Individual ideas are recorded for
+  later reuse; no dependency was added.
+
+### Known limitations
+
+- The 8-client lease p50 target (< 5 ms) is **missed at 8.06 ms** on the
+  release host. The in-process apply path is ~1.9 ms p50; the remainder is the
+  consensus round plus RPC scheduling jitter on a shared host. The 64-client
+  p50 is 34.5 ms with a 510 ms p99 at 0 ms RTT.
+- Pub/sub is **node-local until the next distri-kv merge**: the durable topic
+  log, replay and ack markers are per node, not Raft-replicated cluster-wide.
+- Key routing maps keys to nodes inside one replicated Raft group. Independent
+  per-partition Raft groups (**true Multi-Raft partitions**) are **not wired in
+  this release**; `Discover` partition/leader hints are registry-derived and
+  explicitly marked partial.
+- Distributed policy/reputation fill runs on the controller task, not the
+  request path. Large policy snapshots increase clone cost; keep them small or
+  move to an `Arc`-shared snapshot before enabling large lists.
+
 ## [0.1.0-beta.18] - 2026-11-09
 
 ### Release summary

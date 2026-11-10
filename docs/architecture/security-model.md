@@ -1,6 +1,6 @@
 # Security Architecture and Threat Model
 
-**Status:** Beta (`0.1.0-beta.18` plus Unreleased changes), source-verified on
+**Status:** Beta (`0.1.0-beta.19` plus Unreleased changes), source-verified on
 2026-11-05 against commit `d354ab1` after an external documentation audit. This
 document describes the controls that are actually implemented in the default
 Beta build. **It is not a certification, a CRA conformity assessment or a

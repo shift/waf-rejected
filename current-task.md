@@ -1288,6 +1288,31 @@ Baseline `main` = e05d918: bodyless 0.373 ms, 4 KiB 0.924 ms, 8 KiB
 - [x] Verify: fmt, clippy `--lib --deny warnings` (default and no-default).
 - [x] Docs (`docs/suggestions_from_agents/wrapper-floor.md`) + CHANGELOG.
 
+## Release 0.1.0-beta.19 (`release/v0.1.0-beta.19`)
+
+Base `main` = `535c65b`, with the beta 18 release metadata cherry-picked so the
+release branch carries the `tonic` 0.12 / `prost` 0.13 update and the
+gzip-OCI-layer verifier fix. Headline: distributed WAF is production-shaped.
+
+- [ ] Bump `Cargo.toml`/`Cargo.lock`, README, Helm chart, support matrix and
+      operational docs to `0.1.0-beta.19`.
+- [ ] CHANGELOG `[0.1.0-beta.19] - 2026-11-10` with a fresh Unreleased
+      section, measured distributed numbers, and honest limits (8-client lease
+      target missed, pub/sub node-local until the next merge, Multi-Raft
+      partitions not wired).
+- [ ] Verify: fmt, clippy `--lib` default + `distri-kv`, lib tests default +
+      `distri-kv`, `--no-default-features`, integration, release ignored
+      Coraza, h2 gRPC e2e, feature-matrix quick, `nix build .#waf-ingress`,
+      SBOM, reactor size.
+- [ ] Build binary/sidecar/image artifacts + SBOM and image digest;
+      `verify-release.sh --deep-image --verify-registry`.
+- [ ] Public orphan snapshot; disable/restore main ruleset `26690602`.
+- [ ] Tag `v0.1.0-beta.19` (annotated) and publish the pre-release with assets
+      and notes.
+- [ ] Confirm the Release workflow pushes the canonical image; record CI
+      outcomes.
+- [ ] Clean worktrees; leave `main` clean.
+
 ## Release 0.1.0-beta.18 (`release/v0.1.0-beta.18`)
 
 Base `main` = `31c56af`. Headline: distributed WAF is end-to-end validated.
