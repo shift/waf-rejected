@@ -33,7 +33,7 @@ certs/*.ts.net.*
 *.crt
 
 # Test Results and Outputs
-result*
+/result*
 test_results/
 benchmark_results/
 *.json.bak
@@ -72,7 +72,7 @@ target/llvm-cov-target/
 
 # Nix
 result
-result-*
+/result-*
 
 # Documentation Build
 book/
