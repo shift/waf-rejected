@@ -38,6 +38,7 @@ use super::traits::{
     EventThreatLevel, HeartbeatAck, LeaseSource, NodeInfo, NodeRegistry, PolicySnapshot,
     PolicySource, RateLimitSync, ReputationEntry, ReputationSource, SecurityEventRecord,
 };
+use super::transport::TransportClient;
 
 /// Wire contract version implemented by shift/distri-kv.
 pub const CONTRACT_VERSION: u32 = 1;
@@ -770,6 +771,18 @@ fn counter_batch_id(node_id: &str, epoch: u64, deltas: &[CounterDelta]) -> Strin
     // UUIDv5 over a stable SHA-256 digest makes retries of the same batch
     // idempotent at the server without persisting a mapping.
     uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, &hasher.finalize()).to_string()
+}
+
+#[async_trait]
+impl TransportClient for DistriWafClient {
+    fn transport_name(&self) -> &'static str {
+        "grpc"
+    }
+
+    async fn shutdown(&self) -> Result<(), DistributedError> {
+        self.invalidate_channel().await;
+        Ok(())
+    }
 }
 
 fn read_optional_pem(path: &str, name: &str) -> Result<Option<Vec<u8>>, DistributedError> {

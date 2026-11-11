@@ -6,6 +6,18 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Added
 
+- Selectable distributed transport: `waf.distributed.transport = "grpc"`
+  (default, behaviour unchanged) or `"quiccrunch"`, both behind one
+  `TransportClient` seam so the controller, caches, leases, policy
+  verification and `local_only` fallback are transport-agnostic. Adds
+  `[waf.distributed.quiccrunch]` mTLS settings (no insecure mode), strict
+  validation, and a non-default `quiccrunch-transport` feature. The
+  `quiccrunch-core` dependency is not vendored yet, so the feature is wired
+  but fails closed at construction; enablement/vendoring steps and the tQUIC
+  peer-cert/SPIFFE and Raft blockers are documented in
+  `docs/operations/quiccrunch-transport.md`. Controller tests run the same
+  operations against the mock tonic server and `FakeQuicCrunchTransport`.
+
 - Real-server shared-budget lease end-to-end coverage (`test/distri-lease-e2e`):
   the vendored `waf.distri.v1` `AcquireLease`/`ReleaseLease` messages now match
   shift/distri-kv `69af979` (opaque `bucket_key`, `requested_tokens`, `ttl_ms`,

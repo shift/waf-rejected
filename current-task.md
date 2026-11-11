@@ -1342,6 +1342,6 @@ each, keeping both sides of every conflict.
       in `WebSocketConfig` and its docs; `bridge_websocket` takes both the
       tunnel-bound args and `inspect_responses` (call sites and tests updated).
 - [x] Merge 2 `docs/consistency-pass`: config keys, readiness, docs matrix; matrix keeps every WebSocket, audit-fidelity and readiness row (duplicate size-cap row unified).
-- [ ] Merge 3 `feat/quiccrunch-client`: `waf.distributed.transport` seam.
+- [x] Merge 3 `feat/quiccrunch-client`: `waf.distributed.transport` seam (`grpc` default, `quiccrunch` fails closed without the feature); auto-merged cleanly.
 - [ ] Full gate: fmt, clippy `--lib --deny warnings`, lib tests with and
       without `distri-kv`, `nix build .#waf-ingress`, config validation.

@@ -25,18 +25,25 @@ pub mod controller;
 /// Vendored `waf.distri.v1` prost/tonic bindings. Generated code; do not edit.
 #[allow(clippy::all, missing_docs)]
 pub mod distri_waf;
+#[cfg(test)]
+pub mod fake;
 pub mod grpc;
 pub mod leases;
 pub mod local;
 pub mod metrics;
 pub mod policy_verify;
+#[cfg(feature = "quiccrunch-transport")]
+pub mod quiccrunch;
 pub mod state;
 pub mod traits;
+pub mod transport;
 
 #[cfg(test)]
 mod tests;
 
-pub use crate::config::{DistributedConfig, DistributedFallbackMode};
+pub use crate::config::{
+    DistributedConfig, DistributedFallbackMode, DistributedTransportKind, QuicCrunchConfig,
+};
 
 pub use cache::{CacheLookup, CacheState, VersionedCache};
 pub use controller::{
@@ -55,3 +62,4 @@ pub use traits::{
     EventThreatLevel, HeartbeatAck, LeaseSource, NodeInfo, NodeRegistry, PolicySnapshot,
     PolicySource, RateLimitSync, ReputationEntry, ReputationSource, SecurityEventRecord,
 };
+pub use transport::{build_transport, split_transport, TransportClient, TransportRoles};

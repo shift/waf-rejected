@@ -21,7 +21,9 @@ artifacts and bootstrap/rotation/fallback procedures are in
 | Local-only sources | `src/waf/distributed/local.rs` | Preserve single-process behaviour |
 | Policy/reputation cache | `src/waf/distributed/cache.rs` | TTL + `max_stale`, generation invalidation, explicit `Blocked` |
 | Controller | `src/waf/distributed/controller.rs` | Bounded queues, drop accounting, reconnect/backoff, graceful shutdown |
-| gRPC client | `src/waf/distributed/grpc.rs` | Tonic implementation of all five traits with deadlines |
+| Transport seam | `src/waf/distributed/transport.rs` | `TransportClient` union of the source traits + shutdown; controller sees only the seam |
+| gRPC client | `src/waf/distributed/grpc.rs` | Tonic implementation of all five traits with deadlines (default transport) |
+| QuicCrunch transport | `src/waf/distributed/quiccrunch.rs` | Feature-gated stub; see [quiccrunch-transport.md](quiccrunch-transport.md) |
 | Contract bindings | `src/waf/distributed/distri_waf.rs`, `distri_waf.proto` | Vendored from shift/distri-kv; no build-time `protoc` |
 | State handle | `src/waf/distributed/state.rs` | Connectivity, heartbeat age, generation, multiplier, fallback |
 | Metrics | `src/waf/distributed/metrics.rs`, `src/metrics.rs` | Prometheus families below |
@@ -34,6 +36,9 @@ control-plane call and never blocks on a queue.
 ```toml
 [waf.distributed]
 enabled = true
+# grpc (default, unchanged) or quiccrunch (requires the non-default
+# quiccrunch-transport build feature; not production-ready yet).
+transport = "grpc"
 node_id = "waf-eu-1"
 region = "eu-west-1"
 policy_scope = "default"
@@ -78,6 +83,21 @@ secret and is not written to startup logs; it is not a substitute for TLS on an
 untrusted network. `spiffe_jwt` is used as the bearer token only when
 `auth_token` is empty, so an operator can deploy a short-lived JWT-SVID without
 copying a static token.
+
+### Transport selection
+
+`transport = "grpc"` (default) uses the tonic client described below.
+`transport = "quiccrunch"` selects the optional QuicCrunch transport and is
+only valid in a build with the non-default `quiccrunch-transport` feature;
+selecting it without that feature is a startup configuration error, not a
+silent gRPC fallback. QuicCrunch has separate `[waf.distributed.quiccrunch]`
+mTLS settings and no insecure mode. It is an evaluated but not production-ready
+transport: see [quiccrunch-transport.md](quiccrunch-transport.md) for the
+dependency/vendoring step, the tQUIC peer-certificate/SPIFFE blockers, the Raft
+surface boundary and the rollback switch.
+
+Both transports implement the same client seam, so the controller, caches,
+leases, policy verification and `local_only` fallback behave identically.
 
 ### Authentication and transport security
 

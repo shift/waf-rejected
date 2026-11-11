@@ -1018,6 +1018,48 @@ impl DistributedFallbackMode {
     }
 }
 
+/// Wire transport used by the distributed client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DistributedTransportKind {
+    /// Tonic gRPC over the vendored `waf.distri.v1` contract. Default.
+    #[default]
+    Grpc,
+    /// QuicCrunch transport. Requires the non-default `quiccrunch-transport`
+    /// feature; selecting it without that feature is a configuration error.
+    QuicCrunch,
+}
+
+impl DistributedTransportKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Grpc => "grpc",
+            Self::QuicCrunch => "quiccrunch",
+        }
+    }
+}
+
+/// QuicCrunch-specific connection settings (`[waf.distributed.quiccrunch]`).
+///
+/// These mirror the gRPC mTLS settings but are separate so switching
+/// transports does not silently reuse credentials meant for a different
+/// endpoint. There is no insecure mode: all five fields are required when
+/// `transport = "quiccrunch"` and the distributed client is enabled.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct QuicCrunchConfig {
+    /// QuicCrunch endpoint, for example `quic://dkv-eu.example:7443`.
+    pub endpoint: String,
+    /// Expected server name / SNI used for certificate verification.
+    pub server_name: String,
+    /// PEM CA bundle used to verify the QuicCrunch server certificate.
+    pub ca_cert_path: String,
+    /// PEM client certificate presented to the QuicCrunch server.
+    pub client_cert_path: String,
+    /// PEM private key for `client_cert_path`.
+    pub client_key_path: String,
+}
+
 /// Distributed security fabric client (`[waf.distributed]`).
 ///
 /// Off by default. Enabling this section only has an effect in a build that
@@ -1042,6 +1084,16 @@ pub struct DistributedConfig {
     /// Policy scope requested from the cluster (`GetPolicy`). Empty selects
     /// `default`.
     pub policy_scope: String,
+
+    /// Control-plane transport. `grpc` (default) preserves the tonic client;
+    /// `quiccrunch` selects the optional QuicCrunch transport. Both implement
+    /// the same client seam, so the controller, caches, leases, policy
+    /// verification and `local_only` fallback are transport-agnostic.
+    pub transport: DistributedTransportKind,
+
+    /// QuicCrunch connection and mTLS settings. Only read when
+    /// `transport = "quiccrunch"`.
+    pub quiccrunch: QuicCrunchConfig,
 
     /// Regional bootstrap endpoints (for example
     /// `https://dkv-eu.example:7443`). Empty is valid in `local_only` mode.
@@ -1164,6 +1216,8 @@ impl Default for DistributedConfig {
             node_id: String::new(),
             region: String::new(),
             policy_scope: "default".to_string(),
+            transport: DistributedTransportKind::Grpc,
+            quiccrunch: QuicCrunchConfig::default(),
             endpoints: Vec::new(),
             auth_token: String::new(),
             spiffe_id: String::new(),
@@ -1202,8 +1256,54 @@ impl DistributedConfig {
     /// Validate the distributed block. `enabled = false` performs no checks
     /// beyond the types, so existing configs are unaffected.
     pub fn validate(&self) -> anyhow::Result<()> {
+        // Fail closed even when `enabled = false`: an explicit transport
+        // selection must never be silently downgraded to gRPC. This check is
+        // build-time (feature detection), not derived from the master switch.
+        if self.transport == DistributedTransportKind::QuicCrunch
+            && !cfg!(feature = "quiccrunch-transport")
+        {
+            anyhow::bail!(
+                "waf.distributed.transport = \"quiccrunch\" requires a build with the \
+                 non-default `quiccrunch-transport` feature (cargo build --features \
+                 quiccrunch-transport); rebuild with that feature or set \
+                 waf.distributed.transport = \"grpc\""
+            );
+        }
         if !self.enabled {
             return Ok(());
+        }
+        if self.transport == DistributedTransportKind::QuicCrunch {
+            let qc = &self.quiccrunch;
+            if qc.endpoint.trim().is_empty() {
+                anyhow::bail!(
+                    "waf.distributed.quiccrunch.endpoint must be set when transport = \"quiccrunch\""
+                );
+            }
+            if qc.server_name.trim().is_empty() {
+                anyhow::bail!(
+                    "waf.distributed.quiccrunch.server_name must be set when transport = \"quiccrunch\""
+                );
+            }
+            for (name, value) in [
+                ("ca_cert_path", &qc.ca_cert_path),
+                ("client_cert_path", &qc.client_cert_path),
+                ("client_key_path", &qc.client_key_path),
+            ] {
+                if value.trim().is_empty() {
+                    anyhow::bail!(
+                        "waf.distributed.quiccrunch.{name} must be set when transport = \
+                         \"quiccrunch\"; QuicCrunch has no insecure mode"
+                    );
+                }
+            }
+            if qc.ca_cert_path.len() > 8192
+                || qc.client_cert_path.len() > 8192
+                || qc.client_key_path.len() > 8192
+                || qc.server_name.len() > 255
+                || qc.endpoint.len() > 2048
+            {
+                anyhow::bail!("waf.distributed.quiccrunch settings exceed their maximum lengths");
+            }
         }
         if self.node_id.len() > 128 {
             anyhow::bail!("waf.distributed.node_id must be at most 128 characters");

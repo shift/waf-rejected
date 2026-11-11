@@ -5,9 +5,10 @@
 //! already-applied caches. Queue overflow drops telemetry and increments a
 //! counter; it never blocks or fails a request.
 //!
-//! The controller is transport agnostic. A future distri-kv client implements
-//! [`PolicySource`], [`ReputationSource`], [`RateLimitSync`], [`EventSink`] and
-//! [`NodeRegistry`]; this scaffold ships only the `LocalOnly` set.
+//! The controller is transport agnostic. A transport implements
+//! [`super::transport::TransportClient`] (the union of [`PolicySource`],
+//! [`ReputationSource`], [`RateLimitSync`], [`EventSink`], [`NodeRegistry`] and
+//! [`LeaseSource`]); gRPC and QuicCrunch are interchangeable behind that seam.
 
 use std::collections::VecDeque;
 use std::net::IpAddr;
@@ -30,6 +31,7 @@ use super::traits::{
     PolicySnapshot, PolicySource, RateLimitSync, ReputationEntry, ReputationSource,
     SecurityEventRecord,
 };
+use super::transport::{build_transport, split_transport, TransportClient};
 
 /// What happens when a bounded queue is full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,6 +256,9 @@ pub struct DistributedController {
     event_sink: Arc<dyn EventSink>,
     registry: Arc<dyn NodeRegistry>,
     lease_source: Option<Arc<dyn LeaseSource>>,
+    /// Present only when the controller owns a real transport. Local-only
+    /// controllers have no transport to shut down.
+    transport: Option<Arc<dyn TransportClient>>,
     events: Arc<BoundedQueue<SecurityEventRecord>>,
     counters: Arc<BoundedQueue<CounterDelta>>,
     policy_cache: Arc<VersionedCache<String, PolicySnapshot>>,
@@ -292,7 +297,11 @@ impl DistributedController {
         config: &DistributedConfig,
         state: Arc<DistributedState>,
     ) -> Result<Self, DistributedError> {
-        if config.endpoints.is_empty() {
+        // QuicCrunch carries its own endpoint, so the generic gRPC endpoint
+        // list being empty does not mean "local only" for that transport.
+        if config.endpoints.is_empty()
+            && config.transport != crate::config::DistributedTransportKind::QuicCrunch
+        {
             return Ok(Self::with_sources(
                 config,
                 state,
@@ -303,18 +312,20 @@ impl DistributedController {
                 Arc::new(LocalNodeRegistry),
             ));
         }
-        let client = Arc::new(super::grpc::DistriWafClient::new(config)?);
-        let lease_source: Arc<dyn LeaseSource> = Arc::clone(&client) as Arc<dyn LeaseSource>;
-        Ok(Self::with_sources(
+        let transport = build_transport(config)?;
+        let roles = split_transport(Arc::clone(&transport));
+        let mut controller = Self::with_sources(
             config,
             state,
-            Arc::clone(&client) as Arc<dyn PolicySource>,
-            Arc::clone(&client) as Arc<dyn ReputationSource>,
-            Arc::clone(&client) as Arc<dyn RateLimitSync>,
-            Arc::clone(&client) as Arc<dyn EventSink>,
-            Arc::clone(&client) as Arc<dyn NodeRegistry>,
+            roles.policy,
+            roles.reputation,
+            roles.rate_limit_sync,
+            roles.event_sink,
+            roles.registry,
         )
-        .with_lease_source(lease_source))
+        .with_lease_source(roles.lease);
+        controller.transport = Some(transport);
+        Ok(controller)
     }
 
     /// Attach an asynchronous lease source. Off by default so local-only and
@@ -351,6 +362,7 @@ impl DistributedController {
             event_sink,
             registry,
             lease_source: None,
+            transport: None,
             events: Arc::new(BoundedQueue::new(
                 config.event_queue_capacity,
                 DropPolicy::DropOldest,
@@ -474,6 +486,15 @@ impl DistributedController {
         self.flush_telemetry().await;
         self.events.close();
         self.counters.close();
+        if let Some(transport) = &self.transport {
+            if let Err(error) = transport.shutdown().await {
+                tracing::debug!(
+                    %error,
+                    transport = transport.transport_name(),
+                    "distributed transport shutdown failed"
+                );
+            }
+        }
         tracing::debug!("distributed controller stopped");
     }
 
