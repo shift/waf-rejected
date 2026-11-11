@@ -110,13 +110,13 @@ jobs:
           test -s "waf-rejected-${VERSION}-image.tar.gz"
           ls -l "waf-rejected-${VERSION}-image.tar.gz"
       - name: Upload image artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: image
           path: waf-rejected-*-image.tar.gz
           if-no-files-found: error
       - name: Upload image digest
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: image-digest
           path: image-digest.txt
@@ -141,7 +141,7 @@ jobs:
           test -s "waf-rejected-${VERSION}.cdx.json.sha256"
           ls -l "waf-rejected-${VERSION}.cdx.json"*
       - name: Upload SBOM artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sbom
           path: |

@@ -160,7 +160,7 @@ jobs:
         run: ./scripts/run-crs-corpus.sh --engine both --json target/crs-corpus.json
       - name: Upload corpus report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: crs-corpus-report
           path: target/crs-corpus.json
@@ -184,7 +184,7 @@ jobs:
         run: ./scripts/check-engine-guarantees.sh
       - name: Upload guarantee reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: engine-guarantees-report
           path: target/engine-guarantees/
