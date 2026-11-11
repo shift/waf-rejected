@@ -126,13 +126,13 @@ hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
 
 # WebSocket support
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", features = ["sink"] }
 
 # Tower middleware stack
-tower = { version = "0.4", features = ["full"] }
-tower-http = { version = "0.5", features = ["trace", "cors", "add-extension"] }
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "add-extension"] }
 
 # TLS support
 rustls = { version = "0.23", features = ["ring"] }
@@ -164,12 +164,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Configuration and serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-config = "0.14"
-toml = "0.8"
+config = "0.15"
+toml = "1.2"
 
 # Error handling
 anyhow = "1.0"
-thiserror = "1.0"
+thiserror = "2.0"
 
 # HTTP utilities
 http = "1.0"
@@ -179,7 +179,7 @@ bytes = "1.0"
 # Async utilities
 futures = "0.3"
 pin-project = "1.0"
-parking_lot = "0.12"
+parking_lot = "0.13"
 
 # Time handling
 chrono = { version = "0.4", features = ["serde"] }
@@ -189,12 +189,12 @@ chrono = { version = "0.4", features = ["serde"] }
 # WebAssembly runtime for the experimental reactor ABI. Only pulled in by the
 # non-default `wasm-reactor` feature. `p1` provides the WASI preview1 imports
 # used by the Go/Coraza reactor; `wat` keeps the in-tree WAT spike loadable.
-wasmtime = { version = "49.0", optional = true, default-features = false, features = ["std", "runtime", "cranelift", "wat", "parallel-compilation", "async", "component-model"] }
-wasmtime-wasi = { version = "49.0", optional = true, default-features = false, features = ["p1"] }
+wasmtime = { version = "50.0", optional = true, default-features = false, features = ["std", "runtime", "cranelift", "wat", "parallel-compilation", "async", "component-model"] }
+wasmtime-wasi = { version = "50.0", optional = true, default-features = false, features = ["p1"] }
 
 # Bounded request-body decompression (gzip/deflate via flate2, brotli via brotli)
 flate2 = "1.1"
-brotli = "7.0"
+brotli = "9.1"
 
 # Streaming body processing
 async-stream = "0.3"
@@ -223,22 +223,22 @@ xxhash-rust = { version = "0.8", features = ["xxh3"], optional = true }
 regex-automata = { version = "0.4", optional = true }
 once_cell = "1.19"
 uuid = { version = "1.6", features = ["v4", "v5", "serde"] }
-notify = "6.1"
+notify = "8.2"
 urlencoding = "2.1"
 async-trait = "0.1"
 
 # gRPC client for the distri-kv DistriWaf contract (`distri-kv` feature only).
 tonic = { version = "0.12", optional = true, features = ["tls", "tls-webpki-roots"] }
-prost = { version = "0.13", optional = true }
+prost = { version = "0.14", optional = true }
 # Ed25519 verification for signed policy bundles (`distri-kv` only).
 ring = { version = "0.17", optional = true }
 
 # Development-only dependencies
 
 # WebSocket handshake dependencies
-sha1 = "0.10"
-sha2 = "0.10"
-base64 = "0.22"
+sha1 = "0.11"
+sha2 = "0.11"
+base64 = "0.23"
 hex = "0.4"
 # Constant-time comparison for API-key digests.
 subtle = "2"
@@ -253,20 +253,20 @@ opentelemetry = { version = "0.33", optional = true, default-features = false, f
 sled = { version = "0.34", optional = true }
 
 # High-performance embedded database (Phase 2)
-redb = { version = "3.0", optional = true }
+redb = { version = "4.5", optional = true }
 
 # CLI utilities
 clap = { version = "4.0", features = ["derive"] }
 
 # Random number generation for testing
-rand = "0.8"
+rand = "0.10"
 
 # System information
 num_cpus = "1.0"
 
 # Optional global allocators for performance benchmarking. Non-default.
 mimalloc = { version = "0.1", optional = true }
-tikv-jemallocator = { version = "0.6", optional = true }
+tikv-jemallocator = { version = "0.7", optional = true }
 
 # Optional CPU affinity/pinning for proxy worker threads. Non-default.
 core_affinity = { version = "0.8", optional = true }
@@ -274,8 +274,8 @@ core_affinity = { version = "0.8", optional = true }
 # Memory mapping for optimized WASM loading
 
 # Security modules dependencies
-ipnetwork = "0.20"
-maxminddb = "0.27"
+ipnetwork = "0.21"
+maxminddb = "0.32"
 
 # Threat intelligence integration
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
@@ -283,12 +283,12 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 [dev-dependencies]
 # Testing framework
 proptest = "1"
-testcontainers = "0.15"
+testcontainers = "0.28"
 tokio-test = "0.4"
 tokio-stream = { version = "0.1", features = ["net"] }
 wiremock = "0.6"
 tempfile = "3.0"
-criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+criterion = { version = "0.8", features = ["html_reports", "async_tokio"] }
 # Self-signed certificate generation for TLS WebSocket upstream tests
 rcgen = "0.14"
 # WebTransport client used by the feature-gated integration tests. The
