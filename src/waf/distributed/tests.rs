@@ -16,11 +16,16 @@ use super::local::{
 };
 use super::state::{DistributedState, UnavailableDecision};
 use super::traits::{
-    DistributedError, EventSink, HeartbeatAck, NodeInfo, NodeRegistry, PolicySnapshot,
-    PolicySource, RateLimitSync, ReputationSource, SecurityEventRecord,
+    CounterDelta, DistributedError, EventSink, HeartbeatAck, NodeInfo, NodeRegistry,
+    PolicySnapshot, PolicySource, RateLimitSync, ReputationSource, SecurityEventRecord,
 };
-use crate::config::{DistributedConfig, DistributedFallbackMode};
+use crate::config::{
+    DistributedConfig, DistributedFallbackMode, DistributedTransportKind, QuicCrunchConfig,
+};
 use crate::waf::{Decision, RequestContext, WafEngine};
+
+use super::fake::FakeQuicCrunchTransport;
+use super::transport::{split_transport, TransportClient};
 
 fn enabled_config() -> DistributedConfig {
     DistributedConfig {
@@ -1112,4 +1117,278 @@ fn lease_request_queue_is_bounded_and_accounts_drops() {
     let drained = requests.drain_batch(10);
     assert_eq!(drained.len(), 2);
     assert_eq!(drained[0].shard, 1, "oldest request was evicted");
+}
+
+// ---------------------------------------------------------------------------
+// Transport seam (gRPC and QuicCrunch)
+// ---------------------------------------------------------------------------
+
+async fn exercise_transport(transport: &dyn TransportClient, expected_generation: u64) {
+    let node = NodeInfo {
+        node_id: "node-a".to_string(),
+        region: "eu-west-1".to_string(),
+        version: "test".to_string(),
+        epoch: 3,
+    };
+
+    let ack = transport.register(&node).await.unwrap();
+    assert!(ack.connected, "{} register", transport.transport_name());
+    let ack = transport.heartbeat(&node).await.unwrap();
+    assert!(ack.connected, "{} heartbeat", transport.transport_name());
+
+    let policy = transport.current_policy().await.unwrap();
+    assert_eq!(
+        policy.generation,
+        expected_generation,
+        "{} policy generation",
+        transport.transport_name()
+    );
+
+    let reputation = transport
+        .lookup("203.0.113.7".parse().unwrap())
+        .await
+        .unwrap()
+        .expect("reputation entry");
+    assert!((reputation.score - 0.93).abs() < f32::EPSILON);
+
+    transport
+        .export(&[sample_event()])
+        .await
+        .unwrap_or_else(|error| panic!("{} event ingest: {error}", transport.transport_name()));
+    transport
+        .flush(&[CounterDelta {
+            policy_id: "per_ip".to_string(),
+            window_start_unix: 1,
+            shard: 0,
+            key_hash: [1; 16],
+            consumed: 2,
+            rejected: 1,
+            clock_offset_ms: 0,
+        }])
+        .await
+        .unwrap_or_else(|error| panic!("{} counter flush: {error}", transport.transport_name()));
+    transport.shutdown().await.unwrap();
+}
+
+#[test]
+fn same_transport_seam_round_trips_against_grpc_and_fake_quiccrunch() {
+    use tonic::transport::Server;
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(DistriWafServer::new(MockWaf::default()))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+
+        let config = DistributedConfig {
+            enabled: true,
+            node_id: "node-a".to_string(),
+            region: "eu-west-1".to_string(),
+            policy_scope: "waf".to_string(),
+            endpoints: vec![format!("http://{address}")],
+            allow_insecure_transport: true,
+            require_policy_signature: false,
+            ..DistributedConfig::default()
+        };
+        let grpc = DistriWafClient::new(&config).unwrap();
+        exercise_transport(&grpc, 7).await;
+
+        let fake = FakeQuicCrunchTransport::new(7);
+        exercise_transport(&fake, 7).await;
+        assert_eq!(fake.registrations(), 1);
+        assert_eq!(fake.heartbeats(), 1);
+        assert_eq!(fake.events(), 1);
+        assert_eq!(fake.counters(), 1);
+
+        server.abort();
+    });
+}
+
+#[tokio::test]
+async fn fake_quiccrunch_transport_drives_the_controller_unchanged() {
+    let mut config = enabled_config();
+    config.transport = DistributedTransportKind::QuicCrunch;
+    config.quiccrunch = QuicCrunchConfig {
+        endpoint: "quic://dkv-eu.example:7443".to_string(),
+        server_name: "dkv-eu.example".to_string(),
+        ca_cert_path: "/tmp/ca.pem".to_string(),
+        client_cert_path: "/tmp/client.pem".to_string(),
+        client_key_path: "/tmp/client.key".to_string(),
+    };
+
+    let fake = Arc::new(FakeQuicCrunchTransport::new(5));
+    let roles = split_transport(fake.clone() as Arc<dyn TransportClient>);
+    let state = Arc::new(DistributedState::from_config(&config));
+    let controller = DistributedController::with_sources(
+        &config,
+        Arc::clone(&state),
+        roles.policy,
+        roles.reputation,
+        roles.rate_limit_sync,
+        roles.event_sink,
+        roles.registry,
+    )
+    .with_lease_source(roles.lease);
+
+    let handle = controller.handle();
+    assert_eq!(handle.enqueue_event(sample_event()), PushOutcome::Enqueued);
+    assert_eq!(
+        handle.enqueue_counter(CounterDelta {
+            policy_id: "per_ip".to_string(),
+            window_start_unix: 1,
+            shard: 0,
+            key_hash: [2; 16],
+            consumed: 1,
+            rejected: 0,
+            clock_offset_ms: 0,
+        }),
+        PushOutcome::Enqueued
+    );
+    let handle = controller.spawn();
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(state.policy_generation(), 5);
+    assert!(state.connected());
+    assert_eq!(fake.events(), 1, "event ingest uses the transport seam");
+    assert_eq!(fake.counters(), 1, "counter flush uses the transport seam");
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn fake_quiccrunch_reconnects_and_keeps_local_only_fallback() {
+    let mut config = enabled_config();
+    config.transport = DistributedTransportKind::QuicCrunch;
+    config.heartbeat_interval_secs = 1;
+    let fake = Arc::new(FakeQuicCrunchTransport::new(1));
+    fake.set_fail_heartbeat(true);
+    let roles = split_transport(fake.clone() as Arc<dyn TransportClient>);
+    let state = Arc::new(DistributedState::from_config(&config));
+    let controller = DistributedController::with_sources(
+        &config,
+        Arc::clone(&state),
+        roles.policy,
+        roles.reputation,
+        roles.rate_limit_sync,
+        roles.event_sink,
+        roles.registry,
+    );
+    let handle = controller.spawn();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!state.connected());
+    assert!(state.metrics().reconnects() >= 1);
+    assert_eq!(state.metrics().fallback_activations(), 1);
+    // local_only must never convert an outage into a block/allow override.
+    assert!(!state.should_block_without_cluster());
+    assert!(!state.allows_without_cluster());
+
+    fake.set_fail_heartbeat(false);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !state.connected() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(state.connected(), "transport did not reconnect");
+    assert!(fake.heartbeats() >= 2);
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn transport_deadline_expiry_is_retryable_unavailable() {
+    let fake = FakeQuicCrunchTransport::new(1);
+    fake.set_heartbeat_delay(Duration::from_millis(250));
+    let error = super::grpc::with_deadline(
+        Duration::from_millis(20),
+        fake.heartbeat(&NodeInfo {
+            node_id: "node-a".to_string(),
+            region: "eu-west-1".to_string(),
+            version: "test".to_string(),
+            epoch: 1,
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind, super::traits::DistributedErrorKind::Unavailable);
+    assert!(error.is_retryable());
+}
+
+#[test]
+fn distributed_transport_defaults_to_grpc_and_unknown_values_are_rejected() {
+    assert_eq!(
+        DistributedConfig::default().transport,
+        DistributedTransportKind::Grpc
+    );
+
+    let error = toml::from_str::<DistributedConfig>("transport = \"carrier-pigeon\"")
+        .expect_err("unknown transports must not parse");
+    assert!(error.to_string().contains("transport"), "{error}");
+}
+
+#[cfg(not(feature = "quiccrunch-transport"))]
+#[test]
+fn quiccrunch_without_the_build_feature_fails_closed() {
+    let config = DistributedConfig {
+        enabled: false,
+        transport: DistributedTransportKind::QuicCrunch,
+        ..DistributedConfig::default()
+    };
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("quiccrunch-transport"), "{error}");
+    assert!(error.contains("--features"), "{error}");
+
+    let config = DistributedConfig {
+        enabled: true,
+        node_id: "node-a".to_string(),
+        region: "eu-west-1".to_string(),
+        transport: DistributedTransportKind::QuicCrunch,
+        ..DistributedConfig::default()
+    };
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("quiccrunch-transport"), "{error}");
+
+    let error = match super::transport::build_transport(&config) {
+        Ok(_) => panic!("quiccrunch must not build without its feature"),
+        Err(error) => error,
+    };
+    assert!(error.message.contains("quiccrunch-transport"), "{error}");
+}
+
+fn quiccrunch_config() -> DistributedConfig {
+    DistributedConfig {
+        enabled: true,
+        node_id: "node-a".to_string(),
+        region: "eu-west-1".to_string(),
+        transport: DistributedTransportKind::QuicCrunch,
+        quiccrunch: QuicCrunchConfig {
+            endpoint: "quic://dkv-eu.example:7443".to_string(),
+            server_name: "dkv-eu.example".to_string(),
+            ca_cert_path: "/tmp/ca.pem".to_string(),
+            client_cert_path: "/tmp/client.pem".to_string(),
+            client_key_path: "/tmp/client.key".to_string(),
+        },
+        ..DistributedConfig::default()
+    }
+}
+
+#[cfg(feature = "quiccrunch-transport")]
+#[test]
+fn quiccrunch_requires_complete_mtls_material() {
+    assert!(quiccrunch_config().validate().is_ok());
+
+    let mut config = quiccrunch_config();
+    config.quiccrunch.client_key_path.clear();
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("client_key_path"), "{error}");
+
+    let mut config = quiccrunch_config();
+    config.quiccrunch.ca_cert_path.clear();
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("ca_cert_path"), "{error}");
 }

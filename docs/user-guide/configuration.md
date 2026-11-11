@@ -570,6 +570,7 @@ when no endpoint is configured. See
 ```toml
 [waf.distributed]
 enabled = false                  # master switch
+transport = "grpc"               # grpc (default) | quiccrunch (feature-gated)
 node_id = ""                     # required when endpoints are set
 region = "eu-west-1"             # required when endpoints are set
 policy_scope = "default"         # GetPolicy scope
@@ -585,7 +586,22 @@ counter_queue_capacity = 4096
 reconnect_initial_backoff_ms = 100
 reconnect_max_backoff_ms = 30000
 shadow = true                    # observe/log derived actions, never enforce
+
+# Only read when transport = "quiccrunch". Requires a build with the
+# non-default `quiccrunch-transport` feature; all fields are required and
+# there is no insecure mode.
+[waf.distributed.quiccrunch]
+endpoint = ""                    # e.g. "quic://dkv-eu.example:7443"
+server_name = ""                 # certificate verification name / SNI
+ca_cert_path = ""                # PEM CA bundle
+client_cert_path = ""            # PEM client certificate
+client_key_path = ""             # PEM client private key
 ```
+
+`transport = "quiccrunch"` without the build feature fails at config load with
+an actionable error; it never silently falls back to gRPC. See
+[quiccrunch-transport](../operations/quiccrunch-transport.md). Both transports
+share the same controller, caches, leases and `local_only` fallback.
 
 `fail_open` and `fail_closed` are rejected without at least one endpoint.
 Endpoints must be absolute `http(s)` URLs; `node_id` and `region` must be

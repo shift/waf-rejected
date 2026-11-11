@@ -360,6 +360,11 @@ rust-engine = ["dep:aho-corasick", "native-detect"]
 # minimal tonic client in `src/waf/distributed/grpc.rs`; the default remains
 # `local_only`. See docs/operations/distributed.md.
 distri-kv = ["dep:tonic", "dep:prost", "dep:ring"]
+# Selectable QuicCrunch transport for the distributed client. Non-default and
+# implies `distri-kv`. The `quiccrunch-core` dependency is not vendored yet, so
+# this feature currently compiles the seam but fails closed at construction;
+# see docs/operations/quiccrunch-transport.md for the dependency/vendor step.
+quiccrunch-transport = ["distri-kv"]
 # Compile-in hot-loop instrumentation for the native Rust engine. Non-default
 # and absent from production builds; exposes `RustEngine::evaluate_profiled`.
 # See docs/suggestions_from_agents/engine-hotloop.md.
