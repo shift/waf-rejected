@@ -675,11 +675,33 @@ and fail closed at capacity.
 
 ### 5.10 Error-path and observability issues
 
-- `create_blocked_response` puts the block reason, including up to 100
-  characters of matched payload, into the `x-waf-reason` response header. A
-  match containing a control character can make header construction fail; the
-  current code unwraps the response builder, which can panic the connection
-  task.
+- **Fixed: blocked-response builder abort.** `create_blocked_response` used to
+  put the block reason, including up to 100 characters of matched payload,
+  into the `x-waf-reason` response header and then `unwrap()` the response
+  builder. A decoded `%0A`, `%0D`, NUL, DEL or other control byte made header
+  construction fail. In release builds `panic = "abort"` turned that into a
+  **process-wide abort**, so a remote request could kill the WAF. The fix lives
+  in `src/proxy/service.rs`: `sanitize_reason` renders reason text as visible
+  ASCII, `rule_id_for_reason` maps it to a fixed vocabulary, and
+  `finish_response` falls back to a minimal static `403`/`500` if a builder
+  still rejects its inputs. The WebSocket response helpers in
+  `src/proxy/websocket.rs` and the gRPC rejection path use the same policy, and
+  the AI analysis request builder no longer unwraps. Regression coverage:
+  `blocked_response_sanitises_hostile_reasons_without_echoing_payload`,
+  `rate_limit_response_sanitises_hostile_reason_without_echoing_it`,
+  `grpc_blocked_response_sanitises_hostile_reason_without_echoing_it`,
+  `sanitiser_output_always_parses_as_header_value`,
+  `sanitiser_is_total_for_arbitrary_strings`, and the end-to-end
+  `pipeline_blocks_encoded_newline_payload_without_panicking_or_echoing_it`.
+- **No payload echo.** Block, rate-limit and gRPC rejection responses no longer
+  echo the matched payload, decoded payload, rule name or free-form reason.
+  Clients receive a generic body with the status and a fixed `x-waf-rule-id`
+  category (`sql-injection`, `xss`, `command-injection`, `path-traversal`,
+  `rate-limit`, `protocol-violation`, and similar), plus `x-waf-decision`.
+  `x-waf-reason` is removed. The full reason, including a truncated matched
+  excerpt, remains in the security event log and metrics only. This removes the
+  evasion oracle and the crash input at the same time; framing rejections
+  already used the same generic-response pattern.
 - `x-waf-supported-protocols` advertises HTTP/3 even in builds without the
   `http3` feature.
 - Security events hard-code `http_version` to `"1.1"`, set `response_status` to
