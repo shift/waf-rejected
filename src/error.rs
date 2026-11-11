@@ -14,8 +14,16 @@ pub enum WafError {
     NetworkError(String),
     /// Database error
     DatabaseError(String),
-    /// Authentication error
+    /// Authentication error (HTTPS requirement and other generic failures)
     AuthError(String),
+    /// The presented API key is missing.
+    AuthMissingKey,
+    /// The presented API key was not recognised.
+    AuthInvalidKey,
+    /// The presented API key matched but has expired.
+    AuthExpiredKey,
+    /// The authentication failure budget (temporary lockout) was exhausted.
+    AuthFailureLimited(String),
     /// Validation error
     ValidationError(String),
     /// Internal error
@@ -39,6 +47,12 @@ impl fmt::Display for WafError {
             WafError::NetworkError(msg) => write!(f, "Network error: {}", msg),
             WafError::DatabaseError(msg) => write!(f, "Database error: {}", msg),
             WafError::AuthError(msg) => write!(f, "Authentication error: {}", msg),
+            WafError::AuthMissingKey => write!(f, "Authentication error: missing API key"),
+            WafError::AuthInvalidKey => write!(f, "Authentication error: invalid API key"),
+            WafError::AuthExpiredKey => write!(f, "Authentication error: expired API key"),
+            WafError::AuthFailureLimited(msg) => {
+                write!(f, "Authentication failure lockout: {}", msg)
+            }
             WafError::ValidationError(msg) => write!(f, "Validation error: {}", msg),
             WafError::InternalError(msg) => write!(f, "Internal error: {}", msg),
             WafError::Upstream(msg) => write!(f, "Upstream error: {}", msg),

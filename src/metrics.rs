@@ -25,6 +25,10 @@ pub struct Metrics {
     blocked_total: AtomicU64,
     auth_failures_total: AtomicU64,
     auth_rate_limited_total: AtomicU64,
+    auth_missing_key_total: AtomicU64,
+    auth_invalid_key_total: AtomicU64,
+    auth_expired_key_total: AtomicU64,
+    auth_failure_limited_total: AtomicU64,
     rate_limited_total: AtomicU64,
     upstream_errors_total: AtomicU64,
     upstream_requests_total: AtomicU64,
@@ -120,6 +124,10 @@ impl Metrics {
             blocked_total: AtomicU64::new(0),
             auth_failures_total: AtomicU64::new(0),
             auth_rate_limited_total: AtomicU64::new(0),
+            auth_missing_key_total: AtomicU64::new(0),
+            auth_invalid_key_total: AtomicU64::new(0),
+            auth_expired_key_total: AtomicU64::new(0),
+            auth_failure_limited_total: AtomicU64::new(0),
             rate_limited_total: AtomicU64::new(0),
             upstream_errors_total: AtomicU64::new(0),
             upstream_requests_total: AtomicU64::new(0),
@@ -229,6 +237,23 @@ impl Metrics {
 
     pub fn record_auth_rate_limited(&self) {
         self.auth_rate_limited_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_auth_missing_key(&self) {
+        self.auth_missing_key_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_auth_invalid_key(&self) {
+        self.auth_invalid_key_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_auth_expired_key(&self) {
+        self.auth_expired_key_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_auth_failure_limited(&self) {
+        self.auth_failure_limited_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_rate_limited(&self) {
@@ -623,6 +648,18 @@ impl Metrics {
              # HELP waf_auth_failures_total Requests rejected by API-key authentication.\n\
              # TYPE waf_auth_failures_total counter\n\
              waf_auth_failures_total {}\n\
+             # HELP waf_auth_missing_key_total Authentication rejections with no API key presented.\n\
+             # TYPE waf_auth_missing_key_total counter\n\
+             waf_auth_missing_key_total {}\n\
+             # HELP waf_auth_invalid_key_total Authentication rejections for an unrecognised API key.\n\
+             # TYPE waf_auth_invalid_key_total counter\n\
+             waf_auth_invalid_key_total {}\n\
+             # HELP waf_auth_expired_key_total Authentication rejections for an expired API key.\n\
+             # TYPE waf_auth_expired_key_total counter\n\
+             waf_auth_expired_key_total {}\n\
+             # HELP waf_auth_failure_limited_total Authentication rejections by the pre-validation failure budget.\n\
+             # TYPE waf_auth_failure_limited_total counter\n\
+             waf_auth_failure_limited_total {}\n\
              # HELP waf_auth_rate_limited_total Authenticated requests rejected by the auth rate limiter.\n\
              # TYPE waf_auth_rate_limited_total counter\n\
              waf_auth_rate_limited_total {}\n\
@@ -663,6 +700,10 @@ impl Metrics {
             self.allowed_total.load(Ordering::Relaxed),
             self.blocked_total.load(Ordering::Relaxed),
             self.auth_failures_total.load(Ordering::Relaxed),
+            self.auth_missing_key_total.load(Ordering::Relaxed),
+            self.auth_invalid_key_total.load(Ordering::Relaxed),
+            self.auth_expired_key_total.load(Ordering::Relaxed),
+            self.auth_failure_limited_total.load(Ordering::Relaxed),
             self.auth_rate_limited_total.load(Ordering::Relaxed),
             self.rate_limited_total.load(Ordering::Relaxed),
             self.upstream_errors_total.load(Ordering::Relaxed),
