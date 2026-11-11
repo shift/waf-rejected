@@ -141,6 +141,41 @@ async fn pipeline_allows_clean_requests() {
 }
 
 #[tokio::test]
+async fn pipeline_blocks_encoded_newline_payload_without_panicking_or_echoing_it() {
+    let upstream = spawn_upstream().await;
+    let proxy = spawn_proxy(upstream).await;
+    let client = reqwest::Client::new();
+
+    // `%0A` decodes to a newline inside the matched `UNION\nSELECT` payload.
+    // The block reason therefore contains a control character; the response
+    // must still be a clean 403 and must not echo the match.
+    let response = client
+        .get(format!(
+            "{}/hello?q=1%20UNION%0ASELECT%20*%20FROM%20users",
+            proxy
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.headers().get("x-waf-decision").unwrap(), "block");
+    assert_eq!(
+        response.headers().get("x-waf-rule-id").unwrap(),
+        "sql-injection"
+    );
+    assert!(response.headers().get("x-waf-reason").is_none());
+    let body = response.text().await.unwrap();
+    assert!(!body.contains("UNION"), "payload echoed in body: {body}");
+    assert!(!body.contains("SELECT"), "payload echoed in body: {body}");
+
+    // The hostile request must not have aborted the process: the same proxy
+    // still serves a clean request afterwards.
+    let follow_up = client.get(format!("{}/hello", proxy)).send().await.unwrap();
+    assert_eq!(follow_up.status(), StatusCode::OK);
+    assert_eq!(follow_up.text().await.unwrap(), "upstream-ok");
+}
+
+#[tokio::test]
 async fn pipeline_strips_routing_headers_so_upstream_executes_the_inspected_path() {
     let upstream = spawn_upstream().await;
     let proxy = spawn_proxy(upstream).await;

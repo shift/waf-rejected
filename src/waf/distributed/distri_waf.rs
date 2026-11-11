@@ -1591,7 +1591,7 @@ pub mod distri_waf_server {
                         .header("grpc-status", "12")
                         .header("content-type", "application/grpc")
                         .body(empty_body())
-                        .unwrap())
+                        .unwrap_or_else(|_| http::Response::new(empty_body())))
                 }),
             }
         }

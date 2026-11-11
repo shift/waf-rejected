@@ -456,40 +456,80 @@ impl WebSocketHandler {
         }
     }
 
-    /// Create blocked response
+    /// Create blocked response.
+    ///
+    /// The client receives a generic body and the fixed rule-id category; the
+    /// matched payload stays in the security event log.
     fn create_blocked_response(&self, status: u16, reason: &str) -> Response<Full<Bytes>> {
         let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN);
+        let rule_id = crate::proxy::service::rule_id_for_reason(reason);
+        let body = format!(
+            "WebSocket blocked by WAF\nstatus: {}\nrule: {}\n",
+            status_code.as_u16(),
+            rule_id
+        );
 
-        Response::builder()
-            .status(status_code)
-            .header("content-type", "text/plain")
-            .body(Full::new(Bytes::from(format!(
-                "WebSocket blocked: {}",
-                reason
-            ))))
-            .unwrap()
+        finish_websocket_response(
+            Response::builder()
+                .status(status_code)
+                .header("content-type", "text/plain")
+                .header("x-waf-decision", "block")
+                .header("x-waf-rule-id", rule_id),
+            Full::new(Bytes::from(body)),
+            StatusCode::FORBIDDEN,
+        )
     }
 
-    /// Create rate limit response
-    fn create_rate_limit_response(&self, reason: &str) -> Response<Full<Bytes>> {
-        Response::builder()
-            .status(StatusCode::TOO_MANY_REQUESTS)
-            .header("content-type", "text/plain")
-            .header("retry-after", "60")
-            .body(Full::new(Bytes::from(format!(
-                "WebSocket rate limited: {}",
-                reason
-            ))))
-            .unwrap()
+    /// Create rate limit response. The reason is audit data, not client text.
+    fn create_rate_limit_response(&self, _reason: &str) -> Response<Full<Bytes>> {
+        finish_websocket_response(
+            Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header("content-type", "text/plain")
+                .header("x-waf-decision", "rate-limit")
+                .header("x-waf-rule-id", "rate-limit")
+                .header("retry-after", "60"),
+            Full::new(Bytes::from_static(
+                b"WebSocket rate limited by WAF\nstatus: 429\nrule: rate-limit\n",
+            )),
+            StatusCode::TOO_MANY_REQUESTS,
+        )
     }
 
     /// Create error response
     fn create_error_response(&self, status: StatusCode, message: &str) -> Response<Full<Bytes>> {
-        Response::builder()
-            .status(status)
-            .header("content-type", "text/plain")
-            .body(Full::new(Bytes::from(message.to_string())))
-            .unwrap()
+        finish_websocket_response(
+            Response::builder()
+                .status(status)
+                .header("content-type", "text/plain"),
+            Full::new(Bytes::from(message.to_string())),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+    }
+}
+
+/// Finish a WebSocket response builder without panicking.
+fn finish_websocket_response(
+    builder: hyper::http::response::Builder,
+    body: Full<Bytes>,
+    fallback_status: StatusCode,
+) -> Response<Full<Bytes>> {
+    match builder.body(body) {
+        Ok(response) => response,
+        Err(error) => {
+            error!(
+                "Failed to build WebSocket WAF response, returning static fallback: {}",
+                error
+            );
+            let mut response =
+                Response::new(Full::new(Bytes::from_static(b"WebSocket blocked by WAF\n")));
+            *response.status_mut() = fallback_status;
+            response.headers_mut().insert(
+                hyper::header::CONTENT_TYPE,
+                hyper::header::HeaderValue::from_static("text/plain"),
+            );
+            response
+        }
     }
 }
 

@@ -83,7 +83,9 @@ impl AiThreatDetector {
         }
 
         let body_bytes = ctx.body.as_ref().map(|b| b.as_ref()).unwrap_or(&[]);
-        let req = req_builder.body(body_bytes.to_vec()).unwrap();
+        let req = req_builder
+            .body(body_bytes.to_vec())
+            .map_err(|e| WafError::internal(format!("failed to build AI analysis request: {e}")))?;
 
         // Perform AI analysis with timeout
         let analysis_result = tokio::time::timeout(

@@ -3510,16 +3510,25 @@ impl WafProxyService {
         }
     }
 
-    /// Create blocked response with protocol information
+    /// Create blocked response with protocol information.
+    ///
+    /// The client only receives a generic body, the status and a fixed
+    /// rule-id vocabulary. The full reason (including any matched excerpt) is
+    /// retained by the security event log; it is never echoed to the client.
     pub(crate) fn create_blocked_response(status_code: u16, reason: &str) -> Response<ProxyBody> {
         let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::FORBIDDEN);
-        let body = format!("Request blocked by WAF: {}", reason);
+        let rule_id = rule_id_for_reason(reason);
+        let body = format!(
+            "Request blocked by WAF\nstatus: {}\nrule: {}\n",
+            status.as_u16(),
+            rule_id
+        );
 
         let mut builder = Response::builder()
             .status(status)
             .header("content-type", "text/plain")
             .header("x-waf-decision", "block")
-            .header("x-waf-reason", reason)
+            .header("x-waf-rule-id", rule_id)
             .header(
                 "x-waf-version",
                 concat!("waf-rejected/", env!("CARGO_PKG_VERSION")),
@@ -3532,7 +3541,7 @@ impl WafProxyService {
         if status == StatusCode::SERVICE_UNAVAILABLE {
             builder = builder.header("retry-after", "1");
         }
-        builder.body(ProxyBody::full(body)).unwrap()
+        finish_response(builder, ProxyBody::full(body), StatusCode::FORBIDDEN)
     }
 
     /// Create a gRPC-native rejection response.
@@ -3546,20 +3555,22 @@ impl WafProxyService {
         reason: &str,
     ) -> Response<ProxyBody> {
         let grpc_status = if status_code == 403 { "7" } else { "13" };
+        let rule_id = rule_id_for_reason(reason);
         let mut trailers = HeaderMap::new();
         trailers.insert("grpc-status", HeaderValue::from_static(grpc_status));
         trailers.insert(
             "grpc-message",
-            HeaderValue::from_str(reason)
-                .unwrap_or_else(|_| HeaderValue::from_static("blocked by WAF")),
+            header_value_from_reason(&format!(
+                "blocked by WAF (status: {status_code}, rule: {rule_id})"
+            )),
         );
 
-        Response::builder()
+        let builder = Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "application/grpc")
             .header("trailer", "grpc-status, grpc-message")
             .header("x-waf-decision", "block")
-            .header("x-waf-reason", reason)
+            .header("x-waf-rule-id", rule_id)
             .header(
                 "x-waf-version",
                 concat!("waf-rejected/", env!("CARGO_PKG_VERSION")),
@@ -3567,20 +3578,26 @@ impl WafProxyService {
             .header(
                 "x-waf-supported-protocols",
                 "HTTP/1.0,HTTP/1.1,HTTP/2,HTTP/3",
-            )
-            .body(ProxyBody::buffered(Bytes::new(), Some(trailers)))
-            .unwrap()
+            );
+        finish_response(
+            builder,
+            ProxyBody::buffered(Bytes::new(), Some(trailers)),
+            StatusCode::FORBIDDEN,
+        )
     }
 
-    /// Create rate limit response with protocol information
-    pub(crate) fn create_rate_limit_response(reason: &str) -> Response<ProxyBody> {
-        let body = format!("Rate limited: {}", reason);
+    /// Create rate limit response with protocol information.
+    ///
+    /// Rate-limit reasons are not echoed: they can include the offending key
+    /// or request detail, which is audit data rather than a client message.
+    pub(crate) fn create_rate_limit_response(_reason: &str) -> Response<ProxyBody> {
+        let body = "Rate limited by WAF\nstatus: 429\nrule: rate-limit\n";
 
-        Response::builder()
+        let builder = Response::builder()
             .status(StatusCode::TOO_MANY_REQUESTS)
             .header("content-type", "text/plain")
             .header("x-waf-decision", "rate-limit")
-            .header("x-waf-reason", reason)
+            .header("x-waf-rule-id", "rate-limit")
             .header(
                 "x-waf-version",
                 concat!("waf-rejected/", env!("CARGO_PKG_VERSION")),
@@ -3589,14 +3606,17 @@ impl WafProxyService {
                 "x-waf-supported-protocols",
                 "HTTP/1.0,HTTP/1.1,HTTP/2,HTTP/3",
             )
-            .header("retry-after", "60") // Suggest retry after 60 seconds
-            .body(ProxyBody::full(body))
-            .unwrap()
+            .header("retry-after", "60"); // Suggest retry after 60 seconds
+        finish_response(
+            builder,
+            ProxyBody::full(body),
+            StatusCode::TOO_MANY_REQUESTS,
+        )
     }
 
     /// Create generic error response with protocol information
     pub(crate) fn create_error_response(status: StatusCode, message: &str) -> Response<ProxyBody> {
-        Response::builder()
+        let builder = Response::builder()
             .status(status)
             .header("content-type", "text/plain")
             .header(
@@ -3606,10 +3626,149 @@ impl WafProxyService {
             .header(
                 "x-waf-supported-protocols",
                 "HTTP/1.0,HTTP/1.1,HTTP/2,HTTP/3",
-            )
-            .body(ProxyBody::full(message.to_string()))
-            .unwrap()
+            );
+        finish_response(
+            builder,
+            ProxyBody::full(message.to_string()),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
     }
+}
+
+/// Maximum byte length of a sanitised reason. The value is intentionally
+/// small: it bounds response work and prevents an attacker from padding a
+/// header or log field.
+const MAX_SANITISED_REASON_BYTES: usize = 160;
+
+/// Render attacker-influenced text so it is safe in an HTTP header value and
+/// in a `text/plain` body.
+///
+/// Visible ASCII (0x20..=0x7E) is preserved. Tabs and every other character,
+/// including CR, LF, NUL, DEL and non-ASCII UTF-8, become spaces. Whitespace
+/// runs collapse to one space, the result is trimmed, and it is truncated to
+/// [`MAX_SANITISED_REASON_BYTES`]. The output is ASCII-only and therefore
+/// always accepted by `HeaderValue::from_str`.
+pub(crate) fn sanitize_reason(reason: &str) -> String {
+    let mut out = String::with_capacity(reason.len().min(MAX_SANITISED_REASON_BYTES));
+    let mut pending_space = false;
+
+    for ch in reason.chars() {
+        if out.len() >= MAX_SANITISED_REASON_BYTES {
+            break;
+        }
+        let safe = match ch {
+            '\t' => ' ',
+            '\u{20}'..='\u{7e}' => ch,
+            _ => ' ',
+        };
+        if safe == ' ' {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        if pending_space && out.len() < MAX_SANITISED_REASON_BYTES {
+            out.push(' ');
+        }
+        pending_space = false;
+        if out.len() >= MAX_SANITISED_REASON_BYTES {
+            break;
+        }
+        out.push(safe);
+    }
+
+    out.trim_end().to_string()
+}
+
+/// Header-safe rendering of attacker-influenced text.
+///
+/// [`sanitize_reason`] is already guaranteed to be valid; the fallback keeps
+/// the function total even if that invariant is ever broken.
+pub(crate) fn header_value_from_reason(reason: &str) -> HeaderValue {
+    HeaderValue::from_str(&sanitize_reason(reason))
+        .unwrap_or_else(|_| HeaderValue::from_static("blocked by WAF"))
+}
+
+/// Map a block reason to the fixed rule-id vocabulary exposed to clients.
+///
+/// The actual reason (rule name and matched excerpt) stays in the security
+/// event log. Clients only need a stable category that cannot carry payload.
+pub(crate) fn rule_id_for_reason(reason: &str) -> &'static str {
+    let lower = reason.to_ascii_lowercase();
+    let has = |needle: &str| lower.contains(needle);
+
+    if has("rate limit") || has("rate-limit") || has("too many") {
+        "rate-limit"
+    } else if has("sql injection") || has("sql_injection") || has("sqli") {
+        "sql-injection"
+    } else if has("xss") || has("cross-site scripting") || has("cross site scripting") {
+        "xss"
+    } else if has("command injection") || has("command_injection") {
+        "command-injection"
+    } else if has("path traversal") || has("path_traversal") || has("traversal") {
+        "path-traversal"
+    } else if has("remote file inclusion") || has("local file inclusion") || has("file inclusion") {
+        "file-inclusion"
+    } else if has("xxe") || has("xml external entity") {
+        "xxe"
+    } else if has("ssrf") || has("server-side request forgery") {
+        "ssrf"
+    } else if has("graphql") {
+        "graphql"
+    } else if has("grpc") {
+        "grpc"
+    } else if has("wasm") {
+        "wasm-rule"
+    } else if has("ai detected") || has("ai threat") {
+        "ai-threat"
+    } else if has("geographic") || has("geo blocking") {
+        "geographic-block"
+    } else if has("admission") {
+        "admission-control"
+    } else if has("protocol")
+        || has("framing")
+        || has("smuggl")
+        || has("handshake")
+        || has("malformed")
+        || has("ambiguous")
+    {
+        "protocol-violation"
+    } else {
+        "policy-violation"
+    }
+}
+
+/// Finish a response builder without panicking.
+///
+/// A builder error means a dynamic header was rejected. The request must still
+/// receive a valid response, so fall back to a minimal static response that
+/// carries no dynamic headers instead of aborting the process.
+fn finish_response(
+    builder: hyper::http::response::Builder,
+    body: ProxyBody,
+    fallback_status: StatusCode,
+) -> Response<ProxyBody> {
+    match builder.body(body) {
+        Ok(response) => response,
+        Err(error) => {
+            error!(
+                "Failed to build WAF response, returning static fallback: {}",
+                error
+            );
+            minimal_response(fallback_status)
+        }
+    }
+}
+
+/// Minimal response used when a response builder rejects its inputs.
+fn minimal_response(status: StatusCode) -> Response<ProxyBody> {
+    let mut response = Response::new(ProxyBody::full(Bytes::from_static(
+        b"Request blocked by WAF\n",
+    )));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        hyper::header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain"),
+    );
+    response
 }
 
 /// Parse the upstream WebSocket handshake response head without panicking.
@@ -4776,5 +4935,160 @@ mod tests {
             None,
         );
         assert!(is_grpc_request(&request));
+    }
+
+    async fn collect_body(response: Response<ProxyBody>) -> String {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn hostile_reasons() -> Vec<String> {
+        vec![
+            "Content inspection: SQL Injection - UNION SELECT detected in body: ' UNION\nSELECT SECRET_PAYLOAD".to_string(),
+            "Content inspection: SQL Injection - UNION SELECT detected in body: ' UNION\r\nSELECT SECRET_PAYLOAD".to_string(),
+            "Content inspection: XSS detected in body: <script>\0SECRET_PAYLOAD</script>".to_string(),
+            "Content inspection: XSS detected in body: <script>\u{7f}SECRET_PAYLOAD</script>".to_string(),
+            "Content inspection: XSS detected in body: <script>héllo→SECRET_PAYLOAD</script>".to_string(),
+            format!(
+                "Content inspection: SQL Injection - UNION SELECT detected in body: {}SECRET_PAYLOAD",
+                "A".repeat(4096)
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn blocked_response_sanitises_hostile_reasons_without_echoing_payload() {
+        for reason in hostile_reasons() {
+            let response = WafProxyService::create_blocked_response(403, &reason);
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(response.headers().get("x-waf-decision").unwrap(), "block");
+            let rule_id = response
+                .headers()
+                .get("x-waf-rule-id")
+                .expect("rule id header")
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert!(
+                HeaderValue::from_str(&rule_id).is_ok(),
+                "rule id must be a valid header value"
+            );
+            assert!(response.headers().get("x-waf-reason").is_none());
+            let body = collect_body(response).await;
+            assert!(
+                !body.contains("SECRET_PAYLOAD"),
+                "client body must not echo the matched payload: {body}"
+            );
+            assert!(body.contains(&rule_id));
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_response_uses_fixed_rule_id_vocabulary() {
+        let response = WafProxyService::create_blocked_response(
+            403,
+            "Content inspection: SQL Injection - UNION SELECT detected in query: 1 UNION SELECT SECRET",
+        );
+        assert_eq!(
+            response.headers().get("x-waf-rule-id").unwrap(),
+            "sql-injection"
+        );
+        let body = collect_body(response).await;
+        assert!(body.contains("rule: sql-injection"));
+        assert!(!body.contains("SECRET"));
+        assert!(!body.contains("UNION SELECT"));
+    }
+
+    #[tokio::test]
+    async fn rate_limit_response_sanitises_hostile_reason_without_echoing_it() {
+        for reason in hostile_reasons() {
+            let response = WafProxyService::create_rate_limit_response(&reason);
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(
+                response.headers().get("x-waf-decision").unwrap(),
+                "rate-limit"
+            );
+            assert_eq!(
+                response.headers().get("x-waf-rule-id").unwrap(),
+                "rate-limit"
+            );
+            assert!(response.headers().get("x-waf-reason").is_none());
+            let body = collect_body(response).await;
+            assert!(!body.contains("SECRET_PAYLOAD"));
+        }
+    }
+
+    #[tokio::test]
+    async fn grpc_blocked_response_sanitises_hostile_reason_without_echoing_it() {
+        for reason in hostile_reasons() {
+            let (parts, body) =
+                WafProxyService::create_grpc_blocked_response(403, &reason).into_parts();
+            assert_eq!(parts.status, StatusCode::OK);
+            assert!(parts.headers.get("x-waf-reason").is_none());
+            let rule_id = parts.headers.get("x-waf-rule-id").expect("rule id header");
+            assert!(HeaderValue::from_str(rule_id.to_str().unwrap()).is_ok());
+
+            let mut body = std::pin::pin!(body);
+            let mut trailers = None;
+            let mut data = Vec::new();
+            while let Some(frame) = body.frame().await {
+                let frame = frame.unwrap();
+                match frame.into_data() {
+                    Ok(bytes) => data.extend_from_slice(&bytes),
+                    Err(frame) => {
+                        if let Ok(block) = frame.into_trailers() {
+                            trailers = Some(block);
+                        }
+                    }
+                }
+            }
+            assert!(data.is_empty(), "gRPC rejection body must be empty");
+            let trailers = trailers.expect("gRPC trailers must carry the status");
+            assert_eq!(trailers.get("grpc-status").unwrap(), "7");
+            let message = trailers
+                .get("grpc-message")
+                .expect("grpc-message must be present");
+            assert!(HeaderValue::from_str(message.to_str().unwrap()).is_ok());
+            assert!(!message.to_str().unwrap().contains("SECRET_PAYLOAD"));
+        }
+    }
+
+    #[test]
+    fn sanitiser_output_always_parses_as_header_value() {
+        let long = "A".repeat(4096);
+        let cases = [
+            "\n",
+            "\r\n",
+            "\0",
+            "\u{7f}",
+            "héllo→world",
+            long.as_str(),
+            "\t\tmultiple\t\t\ttabs",
+            "  leading and trailing  ",
+        ];
+        for reason in cases {
+            let sanitized = sanitize_reason(reason);
+            assert!(
+                HeaderValue::from_str(&sanitized).is_ok(),
+                "sanitiser produced an invalid header value for {reason:?}: {sanitized:?}"
+            );
+            assert!(sanitized.len() <= MAX_SANITISED_REASON_BYTES);
+            assert!(
+                sanitized
+                    .chars()
+                    .all(|c| c == '\t' || (' '..='~').contains(&c)),
+                "sanitiser leaked a non-visible character: {sanitized:?}"
+            );
+            assert!(!sanitized.contains('\n') && !sanitized.contains('\r'));
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn sanitiser_is_total_for_arbitrary_strings(reason in any::<String>()) {
+            let sanitized = sanitize_reason(&reason);
+            prop_assert!(HeaderValue::from_str(&sanitized).is_ok());
+            prop_assert!(sanitized.len() <= MAX_SANITISED_REASON_BYTES);
+        }
     }
 }
