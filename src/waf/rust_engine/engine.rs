@@ -1265,7 +1265,7 @@ impl RustEngine {
 
                 if let Some(gate) = rule.gate {
                     if let Some(mask) =
-                        self.gate_mask(candidate, worker_scratch, &mut worker_budget)?
+                        self.gate_mask(candidate, worker_scratch, &mut worker_budget, eval_shared)?
                     {
                         let gates = self
                             .program

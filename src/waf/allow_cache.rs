@@ -1113,7 +1113,7 @@ mod tests {
         let body_a = ctx("POST", "/api", Some(b"a"));
         let body_b = ctx("POST", "/api", Some(b"b"));
         let mut http2 = ctx("GET", "/api", None);
-        http2.http_version = "2".to_string();
+        http2.http_version = "2".into();
 
         // `body_a` and `body_b` deliberately share a fingerprint (the body
         // lives in the second lookup level), so injectivity is asserted on the

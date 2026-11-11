@@ -122,48 +122,48 @@
           };
         });
 
-        # Enterprise test binaries
+        # Enterprise test binaries (quarantined behind `enterprise-proto`).
         enterprise-performance-test = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
           pname = "enterprise-performance-test";
-          cargoBuildCommand = "cargo build --release --bin enterprise_performance_test";
-          cargoCheckCommand = "cargo check --release --bin enterprise_performance_test";
+          cargoBuildCommand = "cargo build --release --bin enterprise_performance_test --features enterprise-proto";
+          cargoCheckCommand = "cargo check --release --bin enterprise_performance_test --features enterprise-proto";
         });
 
         enterprise-security-test = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
           pname = "enterprise-security-test";
-          cargoBuildCommand = "cargo build --release --bin enterprise_security_test";
-          cargoCheckCommand = "cargo check --release --bin enterprise_security_test";
+          cargoBuildCommand = "cargo build --release --bin enterprise_security_test --features enterprise-proto";
+          cargoCheckCommand = "cargo check --release --bin enterprise_security_test --features enterprise-proto";
         });
 
         enterprise-compliance-test = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
           pname = "enterprise-compliance-test";
-          cargoBuildCommand = "cargo build --release --bin enterprise_compliance_test";
-          cargoCheckCommand = "cargo check --release --bin enterprise_compliance_test";
+          cargoBuildCommand = "cargo build --release --bin enterprise_compliance_test --features enterprise-proto";
+          cargoCheckCommand = "cargo check --release --bin enterprise_compliance_test --features enterprise-proto";
         });
 
         enterprise-availability-test = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
           pname = "enterprise-availability-test";
-          cargoBuildCommand = "cargo build --release --bin enterprise_availability_test";
-          cargoCheckCommand = "cargo check --release --bin enterprise_availability_test";
+          cargoBuildCommand = "cargo build --release --bin enterprise_availability_test --features enterprise-proto";
+          cargoCheckCommand = "cargo check --release --bin enterprise_availability_test --features enterprise-proto";
         });
 
         enterprise-modsecurity-test = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
           pname = "enterprise-modsecurity-test";
-          cargoBuildCommand = "cargo build --release --bin enterprise_modsecurity_test";
-          cargoCheckCommand = "cargo check --release --bin enterprise_modsecurity_test";
+          cargoBuildCommand = "cargo build --release --bin enterprise_modsecurity_test --features enterprise-proto";
+          cargoCheckCommand = "cargo check --release --bin enterprise_modsecurity_test --features enterprise-proto";
         });
 
         # Test and utility binaries
         progressive-load-test = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
           pname = "progressive-load-test";
-          cargoBuildCommand = "cargo build --release --bin progressive_load_test";
-          cargoCheckCommand = "cargo check --release --bin progressive_load_test";
+          cargoBuildCommand = "cargo build --release --bin progressive_load_test --features experimental";
+          cargoCheckCommand = "cargo check --release --bin progressive_load_test --features experimental";
         });
 
         echo-backend = craneLib.buildPackage (commonArgs // {
@@ -176,8 +176,8 @@
         simple-multi-protocol-test = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
           pname = "simple-multi-protocol-test";
-          cargoBuildCommand = "cargo build --release --bin simple_multi_protocol_test";
-          cargoCheckCommand = "cargo check --release --bin simple_multi_protocol_test";
+          cargoBuildCommand = "cargo build --release --bin simple_multi_protocol_test --features experimental";
+          cargoCheckCommand = "cargo check --release --bin simple_multi_protocol_test --features experimental";
         });
 
         # Export system binaries  
@@ -195,12 +195,15 @@
           cargoCheckCommand = "cargo check --release --bin create_sample_db --features export-sled";
         });
 
-        # All binaries package - builds everything at once
+        # All binaries package - builds every declared target whose required
+        # features are enabled. The quarantined surfaces must be requested
+        # explicitly (see docs/operations/module-scope.md); the hyperscan
+        # harness keeps needing its own system-libhs feature.
         all-binaries = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
           pname = "waf-all-binaries";
-          cargoBuildCommand = "cargo build --release --all-targets";
-          cargoCheckCommand = "cargo check --release --all-targets";
+          cargoBuildCommand = "cargo build --release --all-targets --features experimental,compliance,enterprise-proto,coraza-native,distri-kv";
+          cargoCheckCommand = "cargo check --release --all-targets --features experimental,compliance,enterprise-proto,coraza-native,distri-kv";
         });
 
         # Native Go Coraza sidecar (experimental, non-default backend). It

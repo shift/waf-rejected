@@ -20,6 +20,24 @@ ci-local:
 ci-feature-matrix *ARGS:
     ./scripts/ci-feature-matrix.sh {{ARGS}}
 
+# Build the default review boundary (proxy + inspection core + support tools).
+build-core:
+    cargo build --bins
+
+# Build the quarantined experimental surface (AI heuristics, prototypes,
+# ad-hoc test servers). Not part of the security boundary; see
+# docs/operations/module-scope.md.
+build-experimental:
+    cargo build --bins --features experimental
+
+# Build the quarantined enterprise/compliance evidence tooling.
+build-enterprise:
+    cargo build --bins --features compliance,enterprise-proto
+
+# Run the library tests for the default boundary.
+test-core:
+    cargo test --lib
+
 benchmark:
     cargo bench
 

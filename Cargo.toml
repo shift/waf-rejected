@@ -25,14 +25,17 @@ required-features = ["export-sled"]
 [[bin]]
 name = "storage_adapter_test"
 path = "src/bin/storage_adapter_test.rs"
+required-features = ["experimental"]
 
 [[bin]]
 name = "io_performance_test"
 path = "src/bin/io_performance_test.rs"
+required-features = ["experimental"]
 
 [[bin]]
-name = "network_io_performance_test" 
+name = "network_io_performance_test"
 path = "src/bin/network_io_performance_test.rs"
+required-features = ["experimental"]
 
 [[bin]]
 name = "grpc-allowlist"
@@ -277,10 +280,17 @@ core_affinity = { version = "0.8", optional = true }
 ipnetwork = "0.20"
 maxminddb = "0.27"
 
-# Threat intelligence integration
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+# Threat intelligence integration. Only the quarantined AI/heuristic modules and
+# the experimental test harnesses use it, so it is behind `experimental` and
+# absent from the default dependency tree.
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false, optional = true }
 
 [dev-dependencies]
+# Integration tests and benchmark examples drive the proxy over HTTP. This is a
+# dev-dependency only: the shipped lib/bins get `reqwest` solely through the
+# quarantined `experimental` feature, so the default normal dependency tree
+# stays small.
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 # Testing framework
 proptest = "1"
 testcontainers = "0.15"
@@ -296,6 +306,11 @@ rcgen = "0.14"
 wtransport = { version = "0.7.2", default-features = false, features = ["ring", "quinn", "dangerous-configuration"] }
 
 [features]
+# The default build is the review boundary: the ingress proxy plus the
+# inspection core (native CRS engine, Coraza WASI reactor, config, health,
+# security events, distributed client seam). Everything else is quarantined
+# behind `experimental`, `compliance` or `enterprise-proto`. See
+# docs/operations/module-scope.md.
 default = ["export-system", "websocket", "wasm-reactor", "rust-engine"]
 integration-tests = []
 # Legacy component-ABI integration. Intentionally empty and NOT supported:
@@ -398,10 +413,37 @@ export-sled = ["sled"]
 export-redb = ["redb"]
 # Reserved; io_uring backend is a stub in Beta.
 io-uring = []
-# AI/ML threat detection features (heuristic implementation, no heavy ML deps)
-ai-threat-detection = []
-# Compliance features
+# AI/ML threat detection features (heuristic implementation, no heavy ML deps).
+# Enables the quarantined AI surface (the `experimental` feature) and wires the
+# `AiThreatDetector` stage into `WafEngine`. Non-default: it is outside the
+# beta security boundary and receives no release testing unless enabled.
+ai-threat-detection = ["experimental"]
+# Compliance features (audit trail, retention, regulatory evidence).
 compliance = ["sled"]
+
+# EXPERIMENTAL SURFACE (quarantined, non-default).
+#
+# Compiles the legacy AI/ML heuristic modules, the research prototypes
+# (engine kernel, fast path, allow cache, CRS prefilter, io_uring), the
+# ModSecurity scaffolding and the ad-hoc test servers / demos. Selecting it
+# does not change the default request path: prototypes remain opt-in through
+# their own configuration keys, and the AI stage still needs
+# `ai-threat-detection`. See docs/operations/module-scope.md.
+experimental = [
+    "dep:reqwest",
+    "engine-kernel",
+    "fastpath",
+    "allow-cache",
+    "crs-prefilter",
+    "io-uring",
+    "parallel-args",
+]
+
+# ENTERPRISE / COMPLIANCE PROTOTYPE SURFACE (quarantined, non-default).
+#
+# Builds the enterprise acceptance test binaries. They are measurement and
+# evidence tooling, not part of the shipped security boundary.
+enterprise-proto = ["compliance"]
 
 # Security modules performance benchmarks
 [[bench]]
@@ -491,22 +533,27 @@ debug = true
 [[bin]]
 name = "enterprise_performance_test"
 path = "src/bin/enterprise_performance_test.rs"
+required-features = ["enterprise-proto"]
 
 [[bin]]
 name = "enterprise_security_test"
 path = "src/bin/enterprise_security_test.rs"
+required-features = ["enterprise-proto"]
 
 [[bin]]
 name = "enterprise_compliance_test"
 path = "src/bin/enterprise_compliance_test.rs"
+required-features = ["enterprise-proto"]
 
 [[bin]]
-name = "enterprise_availability_test"  
+name = "enterprise_availability_test"
 path = "src/bin/enterprise_availability_test.rs"
+required-features = ["enterprise-proto"]
 
 [[bin]]
 name = "enterprise_modsecurity_test"
 path = "src/bin/enterprise_modsecurity_test.rs"
+required-features = ["enterprise-proto"]
 
 [[bin]]
 name = "bodyless-bench"
@@ -515,6 +562,7 @@ path = "src/bin/bodyless_bench.rs"
 [[bin]]
 name = "progressive_load_test"
 path = "src/bin/progressive_load_test.rs"
+required-features = ["experimental"]
 
 [[bin]]
 name = "echo_backend"
@@ -527,26 +575,32 @@ path = "src/bin/end_to_end_test.rs"
 [[bin]]
 name = "advanced_test_backend"
 path = "src/bin/advanced_test_backend.rs"
+required-features = ["experimental"]
 
 [[bin]]
 name = "comprehensive_waf_test"
 path = "src/bin/comprehensive_waf_test.rs"
+required-features = ["experimental"]
 
 [[bin]]
 name = "simple_multi_protocol_test"
 path = "src/bin/simple_multi_protocol_test.rs"
+required-features = ["experimental"]
 
 [[bin]]
 name = "phase4_comprehensive_test"
 path = "src/bin/phase4_comprehensive_test.rs"
+required-features = ["experimental"]
 
 [[bin]]
 name = "phase4_standalone_test"
 path = "src/bin/phase4_standalone_test.rs"
+required-features = ["experimental"]
 
 [[bin]]
 name = "benchmark_core"
 path = "src/bin/benchmark_core.rs"
+required-features = ["experimental"]
 
 # Offline CRS literal-extraction tool. Emits rules/crs/prefilter.json and the
 # human-readable summary. Requires the non-default `crs-prefilter` feature.
@@ -589,3 +643,67 @@ required-features = ["wasm-reactor", "rust-engine", "engine-kernel"]
 name = "transform-bench"
 path = "src/bin/transform_bench.rs"
 required-features = ["crs-prefilter"]
+
+# Previously auto-discovered `src/bin` targets. They are declared explicitly so
+# the quarantine is visible in `cargo metadata`: without `required-features`
+# Cargo built every one of them in the default `cargo build --bins`.
+[[bin]]
+name = "benchmark_simple"
+path = "src/bin/benchmark_simple.rs"
+required-features = ["experimental"]
+
+[[bin]]
+name = "bulk_deletion_performance_test"
+path = "src/bin/bulk_deletion_performance_test.rs"
+required-features = ["experimental"]
+
+[[bin]]
+name = "comprehensive_ttl_validation_test"
+path = "src/bin/comprehensive_ttl_validation_test.rs"
+required-features = ["experimental"]
+
+[[bin]]
+name = "comprehensive_waf_test_clean"
+path = "src/bin/comprehensive_waf_test_clean.rs"
+required-features = ["experimental"]
+
+[[bin]]
+name = "comprehensive_waf_test_fixed"
+path = "src/bin/comprehensive_waf_test_fixed.rs"
+required-features = ["experimental"]
+
+[[bin]]
+name = "enhanced_ttl_performance_test"
+path = "src/bin/enhanced_ttl_performance_test.rs"
+required-features = ["experimental"]
+
+[[bin]]
+name = "multi_protocol_waf_test"
+path = "src/bin/multi_protocol_waf_test.rs"
+required-features = ["experimental"]
+
+[[bin]]
+name = "owasp_comprehensive_test"
+path = "src/bin/owasp_comprehensive_test.rs"
+required-features = ["experimental"]
+
+[[bin]]
+name = "owasp_crs_compliance_test"
+path = "src/bin/owasp_crs_compliance_test.rs"
+required-features = ["experimental"]
+
+[[bin]]
+name = "simple_proxy_test"
+path = "src/bin/simple_proxy_test.rs"
+required-features = ["experimental"]
+
+[[bin]]
+name = "smoke_test"
+path = "src/bin/smoke_test.rs"
+required-features = ["experimental"]
+
+# Compatibility alias for deployments that invoke `waf_proxy` directly. It is
+# a thin wrapper over `server::run()`, so it belongs to the core boundary.
+[[bin]]
+name = "waf_proxy"
+path = "src/bin/waf_proxy.rs"
