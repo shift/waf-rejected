@@ -44,7 +44,14 @@ pub struct SecurityEvent {
     pub request_size: Option<u64>,
     pub response_status: Option<u16>,
     pub response_size: Option<u64>,
+    /// Total time from request receipt to the audit record being written.
     pub processing_time_ms: Option<u64>,
+    /// WAF inspection time, measured from request receipt to the decision.
+    #[serde(default)]
+    pub inspection_duration_ms: Option<u64>,
+    /// Upstream round-trip time, when a response was forwarded from an origin.
+    #[serde(default)]
+    pub upstream_duration_ms: Option<u64>,
 
     /// Geographic and network context
     pub country_code: Option<String>,
@@ -54,6 +61,42 @@ pub struct SecurityEvent {
 
     /// Custom fields for extensibility
     pub custom_fields: HashMap<String, String>,
+}
+
+/// Final response and timing details for an audit event.
+///
+/// The WAF decision is made before the upstream response exists, so the
+/// proxy defers the audit record until the final status is known and fills
+/// these fields in. `Default` preserves the decision-only event shape for
+/// callers that audit at evaluation time.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EventDetails {
+    /// Final HTTP status sent to the client (block, error or upstream).
+    pub response_status: Option<u16>,
+    /// Size of the response body when known.
+    pub response_size: Option<u64>,
+    /// Time spent in WAF inspection.
+    pub inspection_duration_ms: Option<u64>,
+    /// Time spent waiting for the upstream response.
+    pub upstream_duration_ms: Option<u64>,
+    /// Total request lifetime when a later stage measured it.
+    pub total_duration_ms: Option<u64>,
+}
+
+impl EventDetails {
+    /// Status implied by a decision. Allowed requests have no known upstream
+    /// status at inspection time, so they stay `None` rather than a made-up
+    /// `200`.
+    pub fn from_decision(decision: &Decision) -> Self {
+        Self {
+            response_status: match decision {
+                Decision::Block { status, .. } => Some(*status),
+                Decision::RateLimit { .. } => Some(429),
+                Decision::Allow => None,
+            },
+            ..Self::default()
+        }
+    }
 }
 
 /// WAF decision enumeration
@@ -219,6 +262,27 @@ impl SecurityEventLogger {
         decision: &Decision,
         triggered_rules: Vec<String>,
     ) {
+        self.log_event_with_details(
+            ctx,
+            decision,
+            triggered_rules,
+            EventDetails::from_decision(decision),
+        )
+        .await;
+    }
+
+    /// Audit an evaluation with the final response status and timings.
+    ///
+    /// The proxy uses this for deferred audit after the upstream response (or
+    /// a block/error response) is known, so the record reflects the status the
+    /// client actually received.
+    pub async fn log_event_with_details(
+        &self,
+        ctx: &RequestContext,
+        decision: &Decision,
+        triggered_rules: Vec<String>,
+        details: EventDetails,
+    ) {
         if !self.config.enabled {
             return;
         }
@@ -231,8 +295,13 @@ impl SecurityEventLogger {
             return;
         }
 
-        let event =
-            self.create_security_event_with_level(ctx, decision, triggered_rules, threat_level);
+        let event = self.create_security_event_with_level(
+            ctx,
+            decision,
+            triggered_rules,
+            threat_level,
+            details,
+        );
 
         // Export through dispatcher (handles CEF, OTel, etc.)
         if let Err(e) = self.dispatcher.export_event(&event).await {
@@ -250,7 +319,13 @@ impl SecurityEventLogger {
         decision: &Decision,
         triggered_rules: Vec<String>,
         threat_level: ThreatLevel,
+        details: EventDetails,
     ) -> SecurityEvent {
+        let now_ms = ctx.timestamp.elapsed().as_millis() as u64;
+        let response_status = details
+            .response_status
+            .or_else(|| EventDetails::from_decision(decision).response_status);
+
         SecurityEvent {
             id: uuid::Uuid::new_v4(),
             timestamp: Utc::now(),
@@ -264,7 +339,7 @@ impl SecurityEventLogger {
             // HTTP request details
             method: ctx.method.to_string(),
             path: ctx.uri.to_string(),
-            http_version: "1.1".to_string(), // TODO: Extract actual HTTP version
+            http_version: ctx.http_version.to_string(),
             user_agent: ctx
                 .headers
                 .get("user-agent")
@@ -278,13 +353,11 @@ impl SecurityEventLogger {
 
             // Request/response metrics
             request_size: ctx.body_size.map(|size| size as u64),
-            response_status: match decision {
-                Decision::Block { status, .. } => Some(*status),
-                Decision::Allow => Some(200), // Assume success for allowed requests
-                Decision::RateLimit { .. } => Some(429),
-            },
-            response_size: None,      // TODO: Track response size
-            processing_time_ms: None, // TODO: Track processing time
+            response_status,
+            response_size: details.response_size,
+            processing_time_ms: Some(details.total_duration_ms.unwrap_or(now_ms)),
+            inspection_duration_ms: Some(details.inspection_duration_ms.unwrap_or(now_ms)),
+            upstream_duration_ms: details.upstream_duration_ms,
 
             // Geographic and network context (TODO: Implement GeoIP lookup)
             country_code: None,
@@ -433,6 +506,41 @@ impl SecurityEventLogger {
         self.dispatcher.health_check().await
     }
 
+    /// Whether allowed requests produce audit records under the configured
+    /// minimum threat level. The proxy uses this to avoid cloning the request
+    /// context on the hot allow path when the event would be filtered anyway.
+    pub fn logs_allowed_requests(&self) -> bool {
+        self.config.enabled && self.threat_level_logged(ThreatLevel::Low)
+    }
+
+    /// Per-exporter health, used by readiness. Includes the event store
+    /// (`Sled`) when it is configured.
+    pub async fn exporter_health(&self) -> Vec<(String, bool)> {
+        self.dispatcher.health_check_all().await
+    }
+
+    /// Exporters selected by configuration, whether or not the build feature
+    /// is available. Readiness treats a configured-but-missing exporter as a
+    /// down dependency rather than silently ignoring it.
+    pub fn configured_exporters(&self) -> Vec<&'static str> {
+        let mut exporters = Vec::new();
+        if self.config.enable_cef {
+            exporters.push("CEF");
+        }
+        if self.config.enable_otel {
+            exporters.push("OpenTelemetry");
+        }
+        if self.config.enable_sled {
+            exporters.push("Sled");
+        }
+        exporters
+    }
+
+    /// Whether the persistent event store is configured for this process.
+    pub fn event_store_configured(&self) -> bool {
+        self.config.enable_sled
+    }
+
     /// Flush all exporters
     pub async fn flush(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.dispatcher.flush().await
@@ -538,6 +646,90 @@ mod tests {
 
         // Should not panic
         logger.log_event(&ctx, &decision, vec![]).await;
+    }
+
+    #[test]
+    fn audit_event_records_protocol_version_and_block_status() {
+        let logger = SecurityEventLogger::new(SecurityEventsConfig {
+            min_threat_level: "low".to_string(),
+            ..Default::default()
+        });
+        let h2 = RequestContext::with_http_version(
+            IpAddr::from_str("192.168.1.100").unwrap(),
+            Method::GET,
+            Uri::from_str("/api/h2").unwrap(),
+            HeaderMap::new(),
+            Some(0),
+            "2",
+        );
+        let h11 = RequestContext::with_http_version(
+            IpAddr::from_str("192.168.1.100").unwrap(),
+            Method::GET,
+            Uri::from_str("/api/h11").unwrap(),
+            HeaderMap::new(),
+            Some(0),
+            "1.1",
+        );
+        let block = Decision::Block {
+            status: 403,
+            reason: "test".to_string(),
+        };
+
+        let event_h2 = logger.create_security_event_with_level(
+            &h2,
+            &block,
+            vec!["rule".to_string()],
+            ThreatLevel::Medium,
+            EventDetails::default(),
+        );
+        let event_h11 = logger.create_security_event_with_level(
+            &h11,
+            &block,
+            vec!["rule".to_string()],
+            ThreatLevel::Medium,
+            EventDetails::default(),
+        );
+
+        assert_eq!(event_h2.http_version, "2");
+        assert_eq!(event_h11.http_version, "1.1");
+        assert_eq!(event_h2.response_status, Some(403));
+        assert_eq!(event_h11.response_status, Some(403));
+        assert!(event_h2.inspection_duration_ms.is_some());
+        assert_eq!(event_h2.upstream_duration_ms, None);
+    }
+
+    #[test]
+    fn audit_event_records_upstream_502_and_timings() {
+        let logger = SecurityEventLogger::new(SecurityEventsConfig {
+            min_threat_level: "low".to_string(),
+            ..Default::default()
+        });
+        let ctx = RequestContext::with_http_version(
+            IpAddr::from_str("192.168.1.100").unwrap(),
+            Method::GET,
+            Uri::from_str("/api/upstream").unwrap(),
+            HeaderMap::new(),
+            Some(0),
+            "1.1",
+        );
+        let event = logger.create_security_event_with_level(
+            &ctx,
+            &Decision::Allow,
+            vec![],
+            ThreatLevel::Low,
+            EventDetails {
+                response_status: Some(502),
+                inspection_duration_ms: Some(3),
+                upstream_duration_ms: Some(17),
+                total_duration_ms: Some(20),
+                ..EventDetails::default()
+            },
+        );
+
+        assert_eq!(event.response_status, Some(502));
+        assert_eq!(event.inspection_duration_ms, Some(3));
+        assert_eq!(event.upstream_duration_ms, Some(17));
+        assert_eq!(event.processing_time_ms, Some(20));
     }
 
     #[test]
@@ -727,6 +919,8 @@ mod tests {
             response_status: Some(200),
             response_size: None,
             processing_time_ms: None,
+            inspection_duration_ms: None,
+            upstream_duration_ms: None,
             country_code: None,
             region: None,
             city: None,

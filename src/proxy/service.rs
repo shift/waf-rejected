@@ -4,6 +4,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::combinators::BoxBody;
@@ -37,9 +38,10 @@ use tower::Service;
 use tracing::{debug, error, info, warn};
 
 use crate::config::{
-    Config, GrpcStreamingPolicy, HeaderStripMode, ProxyConfig, DEFAULT_STRIP_HEADERS,
+    Config, CorazaBackend, GrpcStreamingPolicy, HeaderStripMode, ProxyConfig, DEFAULT_STRIP_HEADERS,
 };
 use crate::error::WafError;
+use crate::health::{DependencyHealth, ReadinessProbe, ReadinessSnapshot};
 use crate::metrics::Metrics;
 use crate::proxy::buffer_pool::{BodyReadError, BufferPool};
 use crate::proxy::decompression::{
@@ -55,6 +57,7 @@ use crate::proxy::grpc_body::{
 use crate::proxy::telemetry::{RequestRejection, RequestTelemetry};
 use crate::proxy::websocket::{WebSocketHandler, WebSocketTunnelLimiter};
 use crate::waf::auth::{ApiKeyValidator, InMemoryKeyStore};
+use crate::waf::security_events::EventDetails;
 use crate::waf::tls_config::TlsManager;
 use crate::waf::{Decision, RequestContext, ResponseContext, ResponseInspectionOptions, WafEngine};
 
@@ -1048,6 +1051,76 @@ async fn run_upstream_health_checks(
     }
 }
 
+/// Readiness adapter over the live engine and event exporters.
+pub(crate) struct ProxyReadinessProbe {
+    engine: Arc<WafEngine>,
+    backend: String,
+}
+
+#[async_trait]
+impl ReadinessProbe for ProxyReadinessProbe {
+    async fn snapshot(&self) -> ReadinessSnapshot {
+        let engine_health = self.engine.event_exporter_health().await;
+        let configured = self.engine.configured_exporters();
+        let mut dependencies = Vec::new();
+
+        // The persistent event store is a required dependency when enabled.
+        if self.engine.event_store_configured() {
+            let healthy = engine_health
+                .iter()
+                .any(|(name, healthy)| name == "Sled" && *healthy);
+            dependencies.push(DependencyHealth {
+                name: "Sled".to_string(),
+                status: if healthy { "healthy" } else { "down" }.to_string(),
+                required: true,
+                detail: Some(if healthy {
+                    "event store open".to_string()
+                } else {
+                    "event store unavailable or not compiled in".to_string()
+                }),
+            });
+        }
+
+        for name in configured {
+            if name == "Sled" {
+                continue;
+            }
+            let healthy = engine_health
+                .iter()
+                .any(|(exporter, healthy)| exporter == name && *healthy);
+            // Tracing export is best-effort; CEF/Sled are audit paths and are
+            // required when configured.
+            let required = name != "OpenTelemetry";
+            dependencies.push(DependencyHealth {
+                name: name.to_string(),
+                status: if healthy { "healthy" } else { "down" }.to_string(),
+                required,
+                detail: if healthy {
+                    None
+                } else {
+                    Some(format!("{name} exporter health check failed"))
+                },
+            });
+        }
+
+        ReadinessSnapshot {
+            backend: self.backend.clone(),
+            engine_ready: self.engine.is_ready(),
+            engine_detail: self
+                .engine
+                .waf_init_error()
+                .map(str::to_string)
+                .or_else(|| {
+                    Some(format!(
+                        "{backend} inspection engine initialised",
+                        backend = self.backend
+                    ))
+                }),
+            dependencies,
+        }
+    }
+}
+
 impl WafProxyService {
     /// Create a new WAF proxy service with optimized connection pooling
     pub fn new(config: Config) -> Result<Self, WafError> {
@@ -1251,6 +1324,24 @@ impl WafProxyService {
     /// Shared runtime metrics, also served by the health service.
     pub fn metrics(&self) -> Arc<Metrics> {
         Arc::clone(&self.metrics)
+    }
+
+    /// Readiness adapter over the live engine and configured exporters.
+    pub fn readiness_probe(&self) -> Arc<dyn ReadinessProbe> {
+        let backend = if !self.config.waf.enabled {
+            "disabled".to_string()
+        } else {
+            match self.config.waf.coraza.backend {
+                CorazaBackend::Rust => "rust",
+                CorazaBackend::Wasm => "wasm",
+                CorazaBackend::Native => "native",
+            }
+            .to_string()
+        };
+        Arc::new(ProxyReadinessProbe {
+            engine: Arc::clone(&self.waf_engine),
+            backend,
+        })
     }
 
     /// The engine's distributed fabric handle, when compiled and enabled.
@@ -2123,19 +2214,32 @@ impl WafProxyService {
         )
         .with_body(Some(body_bytes.clone()));
 
-        let decision = state.waf_engine.evaluate_shared(&request_context).await;
+        let audit_outcome = state
+            .waf_engine
+            .evaluate_shared_deferred(&request_context)
+            .await;
+        let inspection_ms = start_time.elapsed().as_millis() as u64;
 
-        parts.method = request_context.method;
-        parts.uri = request_context.uri;
-        parts.headers = request_context.headers;
-
-        match decision {
+        match audit_outcome.decision.clone() {
             Decision::Allow => {
                 debug!(
                     "WAF allowed request from {}, forwarding with HTTP/{}",
                     client_ip, http_version
                 );
                 state.metrics.record_allowed();
+
+                // Allowed events are filtered at the default `medium` level;
+                // only clone the context when the record would actually be
+                // written, after the final upstream status is known.
+                let audit_context = state
+                    .waf_engine
+                    .logs_allowed_requests()
+                    .then(|| request_context.clone());
+
+                parts.method = request_context.method;
+                parts.uri = request_context.uri;
+                parts.headers = request_context.headers;
+
                 let response_ctx = state.config.waf.response_inspection.enabled.then(|| {
                     RequestContext::with_http_version(
                         client_ip,
@@ -2153,7 +2257,7 @@ impl WafProxyService {
                             request,
                             config: &state.config.waf.response_inspection,
                         });
-                Self::forward_to_upstream_with_protocol(
+                let response = Self::forward_to_upstream_with_protocol(
                     parts,
                     ProxyBody::buffered(body_bytes, request_trailers),
                     state.upstream_client,
@@ -2175,7 +2279,27 @@ impl WafProxyService {
                     &state.strip_policy,
                     response_inspection,
                 )
-                .await
+                .await?;
+
+                if let Some(context) = audit_context {
+                    let total_ms = start_time.elapsed().as_millis() as u64;
+                    state
+                        .waf_engine
+                        .audit_outcome(
+                            &context,
+                            &audit_outcome,
+                            EventDetails {
+                                response_status: Some(response.status().as_u16()),
+                                inspection_duration_ms: Some(inspection_ms),
+                                upstream_duration_ms: Some(total_ms.saturating_sub(inspection_ms)),
+                                total_duration_ms: Some(total_ms),
+                                ..EventDetails::default()
+                            },
+                        )
+                        .await;
+                }
+
+                Ok(response)
             }
             Decision::Block { status, reason } => {
                 warn!(
@@ -2184,18 +2308,49 @@ impl WafProxyService {
                 );
                 telemetry.reject(RequestRejection::WafBlocked);
                 state.metrics.record_blocked();
-                if classification.is_grpc && state.config.server.grpc_aware_rejections {
-                    Ok(Self::create_grpc_blocked_response(status, &reason))
-                } else {
-                    Ok(Self::create_blocked_response(status, &reason))
-                }
+                let response =
+                    if classification.is_grpc && state.config.server.grpc_aware_rejections {
+                        Self::create_grpc_blocked_response(status, &reason)
+                    } else {
+                        Self::create_blocked_response(status, &reason)
+                    };
+                let total_ms = start_time.elapsed().as_millis() as u64;
+                state
+                    .waf_engine
+                    .audit_outcome(
+                        &request_context,
+                        &audit_outcome,
+                        EventDetails {
+                            response_status: Some(response.status().as_u16()),
+                            inspection_duration_ms: Some(inspection_ms),
+                            total_duration_ms: Some(total_ms),
+                            ..EventDetails::default()
+                        },
+                    )
+                    .await;
+                Ok(response)
             }
             Decision::RateLimit { reason } => {
                 warn!("WAF rate limited request from {}: {}", client_ip, reason);
                 telemetry.reject(RequestRejection::WafRateLimited);
                 state.metrics.record_rate_limited();
                 state.metrics.record_blocked();
-                Ok(Self::create_rate_limit_response(&reason))
+                let response = Self::create_rate_limit_response(&reason);
+                let total_ms = start_time.elapsed().as_millis() as u64;
+                state
+                    .waf_engine
+                    .audit_outcome(
+                        &request_context,
+                        &audit_outcome,
+                        EventDetails {
+                            response_status: Some(response.status().as_u16()),
+                            inspection_duration_ms: Some(inspection_ms),
+                            total_duration_ms: Some(total_ms),
+                            ..EventDetails::default()
+                        },
+                    )
+                    .await;
+                Ok(response)
             }
         }
     }

@@ -361,14 +361,14 @@ WAF-Rejected outputs structured JSON logs for easy aggregation:
 ### Application Health
 
 ```bash
-# Liveness probe
-curl -f http://localhost:8081/health
+# Process liveness probe
+curl -f http://localhost:8081/health/live
 
-# Readiness probe
+# Dependency-aware readiness probe (503 + machine-readable reason when down)
 curl -f http://localhost:8081/health/ready
 
-# Metrics endpoint
-curl -f http://localhost:8080/metrics
+# Metrics endpoint (same health listener)
+curl -f http://localhost:8081/metrics
 ```
 
 ### System Health

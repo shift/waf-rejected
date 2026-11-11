@@ -4,7 +4,7 @@
 `waf.coraza.backend = "wasm"`; nothing in this profile is enabled by a plain
 `config.toml`.
 
-This profile runs the same Coraza 3.3.3 / OWASP CRS 4.14.0 engine as the WASI
+This profile runs the same Coraza 3.8.1 / OWASP CRS 4.14.0 engine as the WASI
 reactor, but as a native Go sidecar over a Unix domain socket. It removes the
 Go-to-wasm execution penalty from CRS body scanning (the dominant cost) and is
 about 6× faster on body inspection than the wasm reactor (proxy p50 at 8 KiB:

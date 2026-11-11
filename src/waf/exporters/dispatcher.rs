@@ -464,6 +464,8 @@ mod tests {
             response_status: Some(200),
             response_size: None,
             processing_time_ms: None,
+            inspection_duration_ms: None,
+            upstream_duration_ms: None,
             country_code: None,
             region: None,
             city: None,

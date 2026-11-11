@@ -10,7 +10,7 @@ the old `src/wasm/` host. It is not the current inspection path.
 
 - The default build compiles the **native Rust CRS engine** (`rust-engine`) and
   selects `waf.coraza.backend = "rust"`.
-- The **Coraza 3.3.3 WASI reactor** (`wasm-reactor`, wasmtime 49) is compiled by
+- The **Coraza 3.8.1 WASI reactor** (`wasm-reactor`, wasmtime 49) is compiled by
   default and is the reference implementation, the differential oracle and the
   explicit `waf.coraza.backend = "wasm"` switch-back.
 - The legacy `wasm-waf` component-ABI stage is **not** compiled by default and

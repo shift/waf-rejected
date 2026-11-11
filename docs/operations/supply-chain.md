@@ -168,7 +168,7 @@ it to the `.cdx.json` asset name used by the release and verification tooling.
 shipped Coraza WASI reactor as an explicit CycloneDX `file` component,
 including:
 
-- `name: coraza_reactor.wasm` and version `coraza-3.3.3`;
+- `name: coraza_reactor.wasm` and version `coraza-3.8.1`;
 - the SHA-256 digest of `wasm/coraza_reactor/coraza_reactor.wasm`;
 - an `Apache-2.0` licence entry covering Coraza and the referenced OWASP CRS
   material;

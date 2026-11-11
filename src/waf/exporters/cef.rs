@@ -314,6 +314,8 @@ mod tests {
             response_status: Some(403),
             response_size: Some(512),
             processing_time_ms: Some(15),
+            inspection_duration_ms: None,
+            upstream_duration_ms: None,
             country_code: Some("US".to_string()),
             region: Some("California".to_string()),
             city: Some("San Francisco".to_string()),

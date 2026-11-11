@@ -80,9 +80,12 @@ curl -fsS http://127.0.0.1:8081/health/ready
 curl -fsS http://127.0.0.1:8081/metrics | head
 ```
 
-`/health` is liveness, `/health/ready` is readiness and `/metrics` is
-Prometheus text. Bind the health listener to a private interface or protect it
-with network policy; it is not meant for untrusted clients.
+`/health` is aggregate component status, `/health/ready` is dependency-aware
+readiness (it returns `503` with a machine-readable `reason` when the engine,
+event store or a required exporter is down), `/health/live` is process
+liveness and `/metrics` is Prometheus text. Bind the health listener to a
+private interface or protect it with network policy; it is not meant for
+untrusted clients.
 
 ## 6. Verify a benign request and a block
 

@@ -1,7 +1,7 @@
 # Security Architecture and Threat Model
 
 **Status:** Beta (`0.1.0-beta.16` plus Unreleased changes), source-verified on
-2026-11-05 against commit `d354ab1` after an external documentation audit. This
+2026-11-11 against commit `563541b` after a documentation consistency pass. This
 document describes the controls that are actually implemented in the default
 Beta build. **It is not a certification, a CRA conformity assessment or a
 substitute for an operator's own risk analysis.** The control-status matrix in
@@ -63,7 +63,7 @@ an independent penetration test passed.
 | Streaming request-body cap and read timeout | Tested | `src/proxy/buffer_pool.rs` — `read_incoming_body`; `src/proxy/service.rs`; `src/proxy/http3.rs` | `tests/integration/pipeline_tests.rs` (`pipeline_rejects_oversized_body`) | beta.1 |
 | Bounded request decompression (`gzip`, `deflate`, `br`) | Tested | `src/proxy/decompression.rs` — `decompress_request_body`, `strip_encoding_headers` | `src/proxy/decompression.rs` unit tests; `tests/integration/pipeline_tests.rs` (six decompression cases) | beta.10 |
 | Native Rust CRS engine as default backend (505 rules) | Tested; parity **Verified** against the Coraza oracle for the pinned corpus | `src/waf/rust_engine/`; `src/waf/mod.rs` — `add_coraza_rule`, backend selection | `tests/corpus/crs/corpus.json` differential corpus; `tests/integration/native_coraza_tests.rs`; engine unit tests | beta.13 |
-| Coraza 3.3.3 WASI reactor as reference and `fallback = "wasm"` | Tested | `src/waf/wasm_reactor.rs`; `src/waf/mod.rs` — backend/fallback selection | `tests/integration/native_coraza_tests.rs`; `tests/corpus/crs/` differential runs | reactor beta.11; default switch-back beta.13 |
+| Coraza 3.8.1 WASI reactor as reference and `fallback = "wasm"` | Tested | `src/waf/wasm_reactor.rs`; `src/waf/mod.rs` — backend/fallback selection | `tests/integration/native_coraza_tests.rs`; `tests/corpus/crs/` differential runs | reactor beta.11; default switch-back beta.13 |
 | Native Coraza sidecar (opt-in `backend = "native"`) | Tested (feature-gated) | `src/waf/native_coraza.rs`; `native/coraza-sidecar/` | `tests/integration/native_coraza_tests.rs` | beta.12 |
 | Traditional content inspection (URI/query/header/body regex, one percent-decode pass) | Tested | `src/waf/content_inspection.rs` — `ContentInspectionRule::evaluate`, `check_with_decoding` | `src/waf/content_inspection.rs` unit tests; fuzz target `fuzz/fuzz_targets/content_inspection.rs` | beta.1 |
 | Dangerous-method blocking (`TRACE`, `CONNECT`) | Tested | `src/waf/rules.rs` — `MethodRule::evaluate` | `src/waf/rules.rs` unit tests; `tests/integration/pipeline_tests.rs` | beta.1 |
@@ -75,6 +75,8 @@ an independent penetration test passed.
 | gRPC streaming policy (`reject` default, explicit `transport-only`) with per-message inspection and whole-stream bounds | Tested | `src/proxy/service.rs` — `handle_grpc_stream`, `GrpcStreamGuard`; `src/waf/grpc.rs` — `GrpcStreamFrameInspector`; `src/config.rs` — `grpc_streaming_policy` | `tests/integration/grpc_h2_e2e.rs` (`streaming_messages_are_content_inspected`, `streaming_policy_reject_returns_grpc_status`, streaming limit cases) | Unreleased |
 | GraphQL-over-HTTP inspection (`crs`, `graphql-only`, `off`) | Tested | `src/waf/graphql.rs`; `src/waf/mod.rs` — `graphql_precheck` | `tests/integration/waf_features_tests.rs`; `src/waf/graphql.rs` unit tests | beta.12 |
 | WebSocket upgrade validation and per-message WAF inspection | Tested | `src/proxy/service.rs` — `bridge_websocket`, `websocket_message_blocked`; `src/proxy/websocket.rs` | `tests/integration/websocket_tests.rs`; `src/proxy/websocket.rs` unit tests | beta.5 |
+| Audit-trail fidelity (real HTTP version, final response status, timings) | Tested | `src/waf/security_events.rs` — `EventDetails`, `log_event_with_details`; `src/proxy/service.rs` — deferred `evaluate_shared_deferred`/`audit_outcome` | `src/waf/security_events.rs` unit tests (`audit_event_records_protocol_version_and_block_status`, `audit_event_records_upstream_502_and_timings`) | Unreleased |
+| Dependency-aware readiness (`/health/ready` 503 + reason) | Tested | `src/health.rs` — `ReadinessProbe`, `ReadinessReport`; `src/proxy/service.rs` — `ProxyReadinessProbe` | `src/health.rs` unit tests (healthy/degraded/down/disabled) | Unreleased |
 | WebSocket per-message size cap | Tested | `src/proxy/service.rs` — `websocket_message_blocked` (uses `server.max_body_size`) | `tests/integration/websocket_tests.rs`; `src/proxy/service.rs` unit tests | beta.6 |
 | HTTP/3 (QUIC) ingress reusing the same pipeline | Tested | `src/proxy/http3.rs` — `serve`, `handle_request`, `read_body` | `src/proxy/http3.rs` integration tests (feature-gated) | beta.7 |
 | WebTransport terminating endpoint (Origin/path/auth/limits/inspection) | Tested (feature-gated) | `src/proxy/webtransport.rs` — `serve`, session handlers | `tests/integration/webtransport_tests.rs`; `src/proxy/webtransport.rs` unit tests | beta.9 |
@@ -344,7 +346,7 @@ compiles `wasm-reactor`, `rust-engine` and `export-system`. In order:
    `RateLimiter`, `GlobalRateLimiter` and `GeoBlockingRule`. The first `Block`
    or `RateLimit` wins.
 
-`waf.coraza.backend` selects `rust` (compiled default), `wasm` (Coraza 3.3.3
+`waf.coraza.backend` selects `rust` (compiled default), `wasm` (Coraza 3.8.1
 WASI reference) or `native` (opt-in sidecar). With `backend = "rust"`,
 `waf.coraza.fallback = "wasm"` re-evaluates a request with Coraza after a
 Rust-engine runtime error; the default `fallback = "none"` fails closed. The
@@ -525,10 +527,10 @@ address.
 
 **Residual:** the control is only as good as the CIDR list. A broad entry such
 as `0.0.0.0/0` makes every peer trusted and every header spoofable. The
-WebSocket handshake does not strip `X-Forwarded-For`, `X-Real-IP` or
-`X-Forwarded-Proto`, so the WebSocket origin sees client-supplied values while
-the HTTP origin does not. `X-Forwarded-Proto` sent to HTTP origins reflects the
-listener, not a trusted edge.
+WebSocket handshake strips client-supplied `X-Forwarded-For`, `X-Real-IP` and
+`X-Forwarded-Proto` and writes the resolved client address, so the WebSocket
+origin sees the same authoritative values as the HTTP origin. `X-Forwarded-Proto`
+sent to HTTP origins reflects the listener, not a trusted edge.
 
 ### 5.2 Encoded payloads
 
@@ -721,18 +723,18 @@ and fail closed at capacity.
   already used the same generic-response pattern.
 - `x-waf-supported-protocols` advertises HTTP/3 even in builds without the
   `http3` feature.
-- Security events hard-code `http_version` to `"1.1"`, set `response_status` to
-  `200` for allowed requests without observing the origin, and leave
-  `response_size`, `processing_time_ms`, `client_port` and all geo fields
-  unset. `waf.security_events.enabled` is now checked before event
-  construction, but the built-in exporter filters still apply.
+- Security events record the negotiated `http_version` and the final
+  `response_status` (block, error or upstream) plus inspection/upstream/total
+  timing; `response_size`, `client_port` and geo fields remain unset.
+  `waf.security_events.enabled` is now checked before event construction, and
+  the built-in exporter filters still apply.
 
 ## 6. Explicit non-goals and residual risks
 
 The following are **not implemented** in Beta and must not be assumed:
 
 - **Coraza/ModSecurity as the default *or* as the only engine.** The default
-  build compiles the native Rust CRS engine and the Coraza 3.3.3 WASI reactor.
+  build compiles the native Rust CRS engine and the Coraza 3.8.1 WASI reactor.
   The Rust engine is the default inspection backend; Coraza is the reference
   implementation, the differential oracle, and the explicit
   `waf.coraza.backend = "wasm"` switch-back. The bundled `rules/coraza.wasm` is
@@ -749,10 +751,13 @@ The following are **not implemented** in Beta and must not be assumed:
   upstreams are supported, but there is no certificate pinning, no per-upstream
   SNI routing and no TLS inspection/termination of upstream traffic. Upstream
   mTLS and a private CA bundle are implemented; neither is enabled by default.
-- **Response inspection and DLP.** Response bodies and headers are not
-  inspected. No data-loss prevention, PII detection, malware scanning,
+- **Response inspection and DLP.** Response inspection is opt-in
+  (`waf.response_inspection.enabled = true`) and implemented only by the native
+  Rust engine; it evaluates response headers and, when `inspect_body` is set,
+  the first `max_body_bytes` of buffered bodies. Streamed and gRPC bodies are
+  skipped. It is not a DLP engine: there is no PII detection, malware scanning,
   file-upload inspection, response body filtering or content-disposition
-  policy. Engine phases 3–5 are plumbed but the proxy does not call them.
+  policy.
 - **Bot management and challenge.** `WafDecision::Challenge` exists in the event
   model but the request path never produces a challenge; there is no CAPTCHA,
   proof-of-work or JS challenge.
@@ -807,8 +812,10 @@ The model holds only if the operator satisfies these assumptions:
     with HTTP/3, a non-empty Origin and path allowlist, and an explicit
     decision that the terminating/echo behaviour is acceptable. There is no
     upstream application bridge.
-12. The origin does not rely on the WAF to inspect response bodies; response
-    inspection is not proxy-wired.
+12. If the origin relies on WAF response inspection, it is explicitly enabled
+    (`waf.response_inspection.enabled = true`) on the native Rust backend, and
+    the origin still keeps its own response DLP/malware controls because
+    streamed and gRPC bodies are not inspected.
 13. Request decompression is accounted for in capacity planning: a small
     compressed body can expand up to `server.max_body_size` before inspection.
 
@@ -837,8 +844,9 @@ The model holds only if the operator satisfies these assumptions:
 - [ ] If WebTransport is enabled, restrict `allowed_origins`/`allowed_paths`,
       set session/stream/datagram caps, and document that it terminates and
       echoes rather than proxying upstream.
-- [ ] Do not assume response inspection: it is not proxy-wired. Add origin-side
-      controls for response DLP, malware scanning and cookie policy.
+- [ ] Do not assume response inspection: it is opt-in and native-Rust-engine
+      only, and streamed/gRPC bodies are not inspected. If enabled, add
+      origin-side controls for response DLP, malware scanning and cookie policy.
 - [ ] Enable JSON security events and ship them to the SIEM; set
       `min_threat_level` deliberately (default `medium` suppresses allowed
       requests).
@@ -860,13 +868,13 @@ The model holds only if the operator satisfies these assumptions:
 
 | Source | What it contains | Where it goes | Limitations |
 |---|---|---|---|
-| Security events (`SecurityEventLogger::log_event`) | UUID, UTC timestamp, resolved client IP, method, path, user agent, decision, threat level, triggered rule names, request size, referer, inbound `X-Forwarded-For`, block reason | tracing JSON on stdout, then optional CEF/Sled/OTel | No response body/size, no processing time, no client port, `http_version` hard-coded `1.1`, geo fields empty; allowed events filtered at default `medium` |
+| Security events (`SecurityEventLogger::log_event`) | UUID, UTC timestamp, resolved client IP, method, path, negotiated HTTP version, user agent, decision, threat level, triggered rule names, request size, final response status, inspection/upstream/total timing, referer, inbound `X-Forwarded-For`, block reason | tracing JSON on stdout, then optional CEF/Sled/OTel | No response body/size, no client port, geo fields empty; allowed events filtered at default `medium` |
 | Application logs (`tracing`) | Startup configuration summary, block reasons with rule names, auth failures, upstream errors, TLS handshake failures | stdout/stderr, collected by the platform | No request correlation ID; log level controls detail; payload fragments can appear in block reasons |
 | CEF exporter (`CefExporter`) | CEF v1 lines with decision, severity and event fields | `waf.security_events.cef_output_file` | Optional, append-only; rotation is the operator's responsibility; export failure is logged but not retried durably |
 | Sled exporter (`SledExporter`) | Serialised `SecurityEvent` records | `waf.security_events.sled_db_path` (default `./waf_security_events.sled`) | Optional; local; `sled_max_events` bounds retention; no encryption at rest by the application |
 | OpenTelemetry exporter | Traces/logs for events | OTLP endpoint configured by the operator | Feature-gated; not a durable audit store |
 | Prometheus metrics (`Metrics::render_prometheus`) | `waf_requests_total`, `waf_allowed_total`, `waf_blocked_total`, `waf_upstream_errors_total`, `waf_uptime_seconds` | `/metrics` on the health listener | Aggregate counters only; no per-rule, per-country or latency labels |
-| Health endpoints (`HealthService::handle_health_request`) | Static component status, version, uptime | `/health`, `/ready`, `/live` | Component status is hard-coded healthy; not a dependency check |
+| Health endpoints (`HealthService::handle_health_request`) | Dependency status (inspection engine/backend, event store, configured exporters), version, uptime | `/health`, `/health/ready`, `/health/live`, `/metrics` | Readiness returns `503` with a machine-readable `reason` when a required dependency is down; `/health/live` stays a process check; `health.dependency_checks = false` makes readiness a liveness alias |
 
 For an incident, preserve: the stdout log window, the CEF file or Sled database
 snapshot, the Prometheus range query, the deployed config (redacted), the

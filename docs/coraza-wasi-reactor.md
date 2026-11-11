@@ -28,7 +28,7 @@ documented switch) or build with `--no-default-features`.
 Measured cost when selected: about **4.5 s** to compile the ~20 MiB module once
 at start-up, about **1.1 s** to warm the reactor pool before readiness, and
 end-to-end proxy p50 **4.47 / 40.13 / 169.56 / 354.09 ms** for bodyless / 1 / 4
-/ 8 KiB bodies on the reference host (versus 0.414 / 0.642 / 1.091 / 1.614 ms
+/ 8 KiB bodies on the reference host (versus 0.315 / 0.454 / 0.810 / 1.234 ms
 for the default Rust engine).
 
 ## Packaging and stable path
