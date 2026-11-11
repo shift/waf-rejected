@@ -160,7 +160,11 @@ pub async fn run_with_config(config: Config) -> Result<(), Box<dyn Error>> {
         None
     };
 
-    let health_service = HealthService::with_metrics(proxy_service.metrics());
+    let health_service = HealthService::with_readiness(
+        proxy_service.metrics(),
+        proxy_service.readiness_probe(),
+        config.health.dependency_checks,
+    );
 
     let health_addr = config.health_bind_addr;
     tokio::spawn(async move {

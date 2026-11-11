@@ -410,8 +410,10 @@ host/clock difference (bodyless is unchanged and the attack/allow ratio moved
 Re-running the full 2,112-case corpus at `aca35db` reproduces the §4 counts
 exactly: wasm and native 2,016/2,112 (5 false negatives, 91 false positives,
 2,112/2,112 agreement); Rust 2,016/2,112 with 3 false negatives and the same
-91 false positives, agreeing with Coraza on 2,110/2,112. Detection and parity
-are unchanged.
+91 false positives, agreeing with Coraza on 2,110/2,112 (the two former oracle
+differences). A fresh `rust-engine-parity --engine both` run on 2026-11-11 at
+`563541b` now agrees on 2,112/2,112: the two differences are resolved. Detection
+and parity are otherwise unchanged.
 
 ## 4. CRS detection corpus
 

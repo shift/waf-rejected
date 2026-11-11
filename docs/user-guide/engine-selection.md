@@ -39,19 +39,20 @@ Measured end-to-end proxy p50 on the reference 6-core host:
 
 | Body | Rust engine | Coraza wasm |
 | --- | ---: | ---: |
-| bodyless | 0.414 ms | 4.47 ms |
-| 1 KiB | 0.642 ms | 40.13 ms |
-| 4 KiB | 1.091 ms | 169.56 ms |
-| 8 KiB | 1.614 ms | 354.09 ms |
+| bodyless | 0.315 ms | 4.47 ms |
+| 1 KiB | 0.454 ms | 40.13 ms |
+| 4 KiB | 0.810 ms | 169.56 ms |
+| 8 KiB | 1.234 ms | 354.09 ms |
 
 These are capacity floors on a shared host, not guarantees. Sub-millisecond
 figures apply to bodyless requests, allow-cache hits (0.56–0.96 µs), fast-allow
 (0.38 µs) and the engine request path. The engine's own request path is
 ~566–591 µs at 4 KiB and ~992 µs at 8 KiB; the proxy adds forwarding and I/O.
-Response inspection is plumbed in the engine but **not proxy-wired** yet.
+Response inspection is opt-in (`waf.response_inspection.enabled = true`) and
+wired for the native Rust engine.
 
-Corpus parity with Coraza is 2,110/2,112 cases; the two differences are
-documented and match the corpus labels. All 505 shipped rules execute.
+Corpus parity with Coraza is 2,112/2,112 cases; the former two oracle
+differences are resolved. All 505 shipped rules execute.
 
 ## Reference / switch-back: Coraza WASI reactor
 

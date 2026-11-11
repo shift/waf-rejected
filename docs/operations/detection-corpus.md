@@ -217,6 +217,10 @@ same commit. No detection rules or defaults were changed.
 | native | 2,016 / 2,112 | 1,695 / 1,700 (99.7%) | 5 | 91 | 0 |
 | parity | — | — | — | — | 2,112 / 2,112 agree |
 
+A fresh `rust-engine-parity --engine both` run on 2026-11-11 at `563541b`
+reports 2,112/2,112 Rust-vs-Coraza agreement (505/505 rules compiled, 0
+unsupported constructs); the two former oracle differences are resolved.
+
 ### Per-tag detection
 
 | Tag | Cases | Positives | Detected | Detection | FN | FP |

@@ -82,6 +82,28 @@ All notable changes to WAF-Rejected are documented here.
   from `image-digest.txt` (or `--image-digest`) when network access and a
   container CLI are available.
 
+### Changed
+
+- Security-event audit records now carry the negotiated HTTP version
+  (`1.0`/`1.1`/`2`/`3`), the final response status (blocks, errors and upstream
+  responses) and inspection/upstream/total timings. Blocks previously recorded
+  their status but allowed requests claimed `200` before the origin replied;
+  both are now deferred until the final response is known. New fields are
+  additive and optional, so older consumers remain compatible.
+- `/health/ready` now probes real dependencies: the inspection engine and
+  selected backend, the persistent event store when enabled, and configured
+  exporters. It returns `503` with a machine-readable `reason`
+  (`engine_not_ready`, `event_store_unavailable:*`, `exporter_unavailable:*`)
+  when a required dependency is down and `degraded` for an optional exporter.
+  `/health/live` remains a process check, and `health.dependency_checks = false`
+  restores the simple liveness alias.
+- Corrected stale documentation: the Coraza WASI reactor is 3.8.1 (not 3.3.3),
+  response inspection is opt-in and proxy-wired for the native Rust engine (not
+  "plumbed but not wired"), current end-to-end p50 figures match beta 16, and
+  the WebSocket handshake does strip and rewrite forwarding headers. A fresh
+  `rust-engine-parity --engine both` run at `563541b` agrees 2,112/2,112 with
+  the Coraza oracle, so the older 2,110/2,112 design-doc figure was retired.
+
 ### Documentation
 
 - Documented the canonical `ghcr.io/shift/waf-rejected-waf` image name and why

@@ -137,6 +137,6 @@ for this change; their combined regex time is ~75 µs of the remaining ~283 µs.
   includes an adversarial test that another rule's literal hit cannot allow a
   gate, a test that a conditional cannot bridge a literal, and a test that a
   literal present in only one alternation branch is not emitted.
-- `rust-engine-parity --engine both`: 2110/2112 corpus decisions agree with
+- `rust-engine-parity --engine both`: 2112/2112 corpus decisions agree with
   Coraza (unchanged), with no native-only false negatives.
 - `engine-kernel-corpus`: 0 false negatives on its covered subset.

@@ -293,19 +293,19 @@ Key points:
   `waf.coraza.backend = "rust"`. Start-up compiles the pinned OWASP CRS 4.14
   bundle (505/505 rules) into the engine IR once in ~210 ms and the process
   reaches readiness in ~276 ms with ~30 MiB RSS. The engine matches the Coraza
-  oracle on 2,110/2,112 corpus cases (the two differences are documented and
-  match the corpus labels), executes all 505/505 rules, and fails closed on any
-  load or runtime error. End-to-end proxy p50 is 0.414 / 0.642 / 1.091 /
-  1.614 ms for bodyless / 1 / 4 / 8 KiB, versus Coraza 4.47 / 40.13 / 169.56 /
-  354.09 ms. Those sub-millisecond figures are path claims (bodyless,
+  oracle on all 2,112/2,112 corpus cases, executes all 505/505 rules, and fails
+  closed on any load or runtime error. End-to-end proxy p50 is 0.315 / 0.454 /
+  0.810 / 1.234 ms for bodyless / 1 / 4 / 8 KiB, versus Coraza 4.47 / 40.13 /
+  169.56 / 354.09 ms. Those sub-millisecond figures are path claims (bodyless,
   allow-cache, prefilter/fast-allow and the engine request path); the engine's
   own request path is ~566–591 µs at 4 KiB and ~992 µs at 8 KiB. Coraza remains
   the **reference implementation** and can be selected with
   `waf.coraza.backend = "wasm"`; `waf.coraza.fallback = "wasm"` opts into
   re-evaluating a request with Coraza after a Rust-engine runtime error.
-  Response inspection is plumbed in the engine but not proxy-wired yet, and
+  Response inspection is opt-in (`waf.response_inspection.enabled = true`) and
+  wired into the response path for the native Rust engine; see
+  [`docs/operations/support-matrix.md`](docs/operations/support-matrix.md).
   io_uring/Hyperscan remain opt-in. See
-  [`docs/suggestions_from_agents/rust-engine.md`](docs/suggestions_from_agents/rust-engine.md).
 - **Body inspection is bounded by policy, not silently truncated.** The wasm
   payload contract is 64 KiB. `waf.coraza.max_inspect_bytes = 0` (default)
   inspects the whole body up to `max_payload_bytes` and fails closed above it;

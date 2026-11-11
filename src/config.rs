@@ -16,6 +16,9 @@ pub struct Config {
     /// Address to bind the health/metrics service to
     pub health_bind_addr: SocketAddr,
 
+    /// Health/readiness probe configuration
+    pub health: HealthConfig,
+
     /// Upstream URI to proxy requests to
     pub upstream_uri: String,
 
@@ -37,6 +40,29 @@ pub struct Config {
     pub security: SecurityConfig,
     /// Runtime / scheduling configuration (Tokio tuning and CPU pinning).
     pub runtime: RuntimeConfig,
+}
+
+/// Health and readiness probe configuration.
+///
+/// Liveness (`/health/live`) is always a process check. Readiness
+/// (`/health/ready`) checks the configured dependencies by default: the
+/// inspection engine (backend compiled and initialised), the event store when
+/// enabled, and every configured exporter. Set `dependency_checks = false` to
+/// keep readiness as a simple liveness alias for environments that probe only
+/// the process.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HealthConfig {
+    /// Probe engine, event store and exporters on `/health/ready`.
+    pub dependency_checks: bool,
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            dependency_checks: true,
+        }
+    }
 }
 
 /// Tokio runtime and CPU-affinity tuning. All fields are optional and default
@@ -2480,6 +2506,7 @@ impl Default for Config {
         Self {
             bind_addr: "0.0.0.0:8080".parse().unwrap(),
             health_bind_addr: "0.0.0.0:8081".parse().unwrap(),
+            health: HealthConfig::default(),
             upstream_uri: "http://127.0.0.1:3000".to_string(),
             proxy: ProxyConfig::default(),
             server: ServerConfig::default(),

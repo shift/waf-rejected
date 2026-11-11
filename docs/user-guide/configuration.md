@@ -54,7 +54,7 @@ migrations:
 | `[security] max_request_size` | `[server] max_body_size` |
 | `[security] rate_limit_requests` | `[waf.rate_limit] per_ip_max_requests` |
 | `[logging] format` | `[logging] json_format` |
-| `[health]`, `[metrics]` | use `health_bind_addr`; health/metrics are always served there |
+| `[health]`, `[metrics]` | use `health_bind_addr`; health/metrics are always served there. `[health] dependency_checks` is the only health option |
 | `[export]` | `[waf.security_events]` exporter keys |
 | top-level `[rate_limit]` | `[waf.rate_limit]` |
 
@@ -70,8 +70,19 @@ health_bind_addr = "0.0.0.0:8081"
 upstream_uri = "http://127.0.0.1:3000"
 ```
 
-`bind_addr` is the proxy listener; `health_bind_addr` serves `/health`,
-`/health/ready` and `/metrics`. Keep the health listener private.
+`bind_addr` is the proxy listener; `health_bind_addr` serves `/health`
+(aggregate component status), `/health/ready` (readiness), `/health/live`
+(process liveness) and `/metrics`. Keep the health listener private.
+
+Readiness checks real dependencies by default and returns `503` with a
+machine-readable `reason` when one is down. Set the option below only if the
+process itself is all the orchestrator should probe:
+
+```toml
+[health]
+# false = /health/ready is a liveness alias (no engine/store/exporter probes)
+dependency_checks = true
+```
 
 ## `[proxy]`
 
@@ -766,8 +777,9 @@ without the feature or host support logs a warning and continues unpinned.
 
 Sub-millisecond numbers apply to bodyless requests, cache/prefilter fast paths
 and the Rust engine request path. End-to-end proxy p50 at 4 KiB and 8 KiB is
-about 1.1 ms and 1.6 ms on the reference host. Response inspection is not
-proxy-wired yet, and Hyperscan/io_uring/allow-cache/fast-allow are opt-in. See
+about 1.1 ms and 1.6 ms on the reference host. Response inspection is opt-in
+(`waf.response_inspection.enabled = true`) and wired for the native Rust
+engine, and Hyperscan/io_uring/allow-cache/fast-allow are opt-in. See
 the [support matrix](../operations/support-matrix.md) before making capacity
 claims.
 

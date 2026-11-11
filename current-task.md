@@ -1341,7 +1341,7 @@ each, keeping both sides of every conflict.
       *and* `max_concurrent_tunnels`/`idle_timeout_secs`/`max_lifetime_secs`
       in `WebSocketConfig` and its docs; `bridge_websocket` takes both the
       tunnel-bound args and `inspect_responses` (call sites and tests updated).
-- [ ] Merge 2 `docs/consistency-pass`: config keys, readiness, docs matrix.
+- [x] Merge 2 `docs/consistency-pass`: config keys, readiness, docs matrix; matrix keeps every WebSocket, audit-fidelity and readiness row (duplicate size-cap row unified).
 - [ ] Merge 3 `feat/quiccrunch-client`: `waf.distributed.transport` seam.
 - [ ] Full gate: fmt, clippy `--lib --deny warnings`, lib tests with and
       without `distri-kv`, `nix build .#waf-ingress`, config validation.

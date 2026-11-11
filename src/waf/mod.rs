@@ -399,6 +399,14 @@ struct CoreOutcome {
     triggered_rules: Vec<String>,
 }
 
+/// Public audit outcome for callers that defer event emission until the final
+/// response status is known.
+#[derive(Debug, Clone)]
+pub struct AuditOutcome {
+    pub decision: Decision,
+    pub triggered_rules: Vec<String>,
+}
+
 impl CoreOutcome {
     fn new(decision: Decision, triggered_rules: Vec<String>) -> Self {
         Self {
@@ -896,6 +904,49 @@ impl WafEngine {
     ))]
     pub fn waf_init_error(&self) -> Option<&str> {
         self.waf_init_error.as_deref()
+    }
+
+    /// Whether the configured inspection engine initialised successfully and
+    /// is ready to evaluate traffic. This is the engine half of readiness.
+    pub fn is_ready(&self) -> bool {
+        #[cfg(any(
+            feature = "wasm-reactor",
+            feature = "coraza-native",
+            feature = "rust-engine"
+        ))]
+        {
+            self.waf_init_error.is_none() && !self.wasm_init_failed
+        }
+        #[cfg(not(any(
+            feature = "wasm-reactor",
+            feature = "coraza-native",
+            feature = "rust-engine"
+        )))]
+        {
+            !self.wasm_init_failed
+        }
+    }
+
+    /// Whether allowed requests produce audit records under the configured
+    /// minimum threat level.
+    pub fn logs_allowed_requests(&self) -> bool {
+        self.event_logger.logs_allowed_requests()
+    }
+
+    /// Health of the configured event exporters, including the persistent
+    /// event store (`Sled`) when enabled.
+    pub async fn event_exporter_health(&self) -> Vec<(String, bool)> {
+        self.event_logger.exporter_health().await
+    }
+
+    /// Exporters selected by configuration.
+    pub fn configured_exporters(&self) -> Vec<&'static str> {
+        self.event_logger.configured_exporters()
+    }
+
+    /// Whether a persistent event store is configured.
+    pub fn event_store_configured(&self) -> bool {
+        self.event_logger.event_store_configured()
     }
 
     fn initialize_geoip(config: &Config) -> Arc<GeoIpService> {
@@ -1470,7 +1521,8 @@ impl WafEngine {
         &self,
         request: &RequestContext,
         rejection: admission::AdmissionRejection,
-    ) -> Decision {
+        audit: bool,
+    ) -> CoreOutcome {
         let decision = Decision::Block {
             status: 503,
             reason: format!(
@@ -1482,10 +1534,12 @@ impl WafEngine {
             reason = %rejection,
             "heavy inspection rejected by admission control"
         );
-        self.event_logger
-            .log_event(request, &decision, vec!["admission-control".to_string()])
-            .await;
-        decision
+        self.finish_outcome(
+            request,
+            CoreOutcome::new(decision, vec!["admission-control".to_string()]),
+            audit,
+        )
+        .await
     }
 
     /// Acquire admission for one evaluation.
@@ -1493,10 +1547,14 @@ impl WafEngine {
     /// The wait happens on the async runtime, before any blocking stage, so a
     /// queued request never occupies an evaluation thread. Rejections are
     /// mapped to the fail-closed `503` decision here.
-    async fn admit(&self, request: &RequestContext) -> Result<AdmissionGuard, Decision> {
+    async fn admit(
+        &self,
+        request: &RequestContext,
+        audit: bool,
+    ) -> Result<AdmissionGuard, CoreOutcome> {
         match self.admission.admit(self.inspection_cost(request)).await {
             Ok(guard) => Ok(guard),
-            Err(rejection) => Err(self.admission_rejected(request, rejection).await),
+            Err(rejection) => Err(self.admission_rejected(request, rejection, audit).await),
         }
     }
 
@@ -1505,10 +1563,43 @@ impl WafEngine {
     /// Exactly one event is emitted per evaluation, matching the inline path
     /// this replaced: blocks, rate limits and allows all produce one event.
     async fn finish(&self, request: &RequestContext, outcome: CoreOutcome) -> Decision {
+        self.finish_outcome(request, outcome, true).await.decision
+    }
+
+    /// Finish an evaluation, optionally deferring the audit record.
+    ///
+    /// Deferred callers emit exactly one event later, with the real response
+    /// status, via [`Self::audit_outcome`].
+    async fn finish_outcome(
+        &self,
+        request: &RequestContext,
+        outcome: CoreOutcome,
+        audit: bool,
+    ) -> CoreOutcome {
+        if audit {
+            self.event_logger
+                .log_event(request, &outcome.decision, outcome.triggered_rules.clone())
+                .await;
+        }
+        outcome
+    }
+
+    /// Emit the audit record for a deferred evaluation with final response
+    /// details (status, sizes and timings).
+    pub async fn audit_outcome(
+        &self,
+        request: &RequestContext,
+        outcome: &AuditOutcome,
+        details: crate::waf::security_events::EventDetails,
+    ) {
         self.event_logger
-            .log_event(request, &outcome.decision, outcome.triggered_rules)
+            .log_event_with_details(
+                request,
+                &outcome.decision,
+                outcome.triggered_rules.clone(),
+                details,
+            )
             .await;
-        outcome.decision
     }
 
     /// Complete a fast-allow lookup. Allows skip audit construction unless the
@@ -1518,18 +1609,23 @@ impl WafEngine {
         &self,
         request: &RequestContext,
         outcome: fast_allow::FastAllowOutcome,
-    ) -> Decision {
+        audit: bool,
+    ) -> CoreOutcome {
         match outcome.decision {
             Decision::Allow => {
-                if self.fast_allow.should_sample_allow() {
+                if audit && self.fast_allow.should_sample_allow() {
                     self.finish(request, CoreOutcome::new(Decision::Allow, Vec::new()))
                         .await;
                 }
-                Decision::Allow
+                CoreOutcome::new(Decision::Allow, outcome.triggered_rules)
             }
             decision => {
-                self.finish(request, CoreOutcome::new(decision, outcome.triggered_rules))
-                    .await
+                self.finish_outcome(
+                    request,
+                    CoreOutcome::new(decision, outcome.triggered_rules),
+                    audit,
+                )
+                .await
             }
         }
     }
@@ -1734,12 +1830,15 @@ impl WafEngine {
             request.body_size,
             request.body.as_ref().is_none_or(|body| body.is_empty()),
         ) {
-            return self.complete_fast_allow(request, outcome).await;
+            return self
+                .complete_fast_allow(request, outcome, true)
+                .await
+                .decision;
         }
 
-        let guard = match self.admit(request).await {
+        let guard = match self.admit(request, true).await {
             Ok(guard) => guard,
-            Err(decision) => return decision,
+            Err(outcome) => return outcome.decision,
         };
 
         // Protocol pre-checks always run, including on an allow-cache hit.
@@ -1786,16 +1885,19 @@ impl WafEngine {
             request.body_size,
             request.body.as_ref().is_none_or(|body| body.is_empty()),
         ) {
-            return self.complete_fast_allow(request, outcome).await;
+            return self
+                .complete_fast_allow(request, outcome, true)
+                .await
+                .decision;
         }
 
         // Admission control covers the protocol pre-checks as well as the rule
         // chain: a gRPC field-content scan runs a Coraza evaluation before the
         // main evaluation. Classification uses the original request, because
         // the pre-checks strip the body that made the scan expensive.
-        let guard = match self.admit(request).await {
+        let guard = match self.admit(request, true).await {
             Ok(guard) => guard,
-            Err(decision) => return decision,
+            Err(outcome) => return outcome.decision,
         };
 
         #[cfg(not(any(feature = "wasm-waf", feature = "ai-threat-detection")))]
@@ -1829,18 +1931,43 @@ impl WafEngine {
     /// when the inspection actually finishes rather than when the caller stops
     /// waiting.
     pub async fn evaluate_shared(self: &Arc<Self>, request: &RequestContext) -> Decision {
+        self.evaluate_shared_outcome(request, true).await.decision
+    }
+
+    /// Evaluate and return the decision plus triggered rules *without*
+    /// emitting the audit record. The caller must later call
+    /// [`Self::audit_outcome`] exactly once, after the final response status
+    /// is known, so the audit trail records the status the client received.
+    pub async fn evaluate_shared_deferred(
+        self: &Arc<Self>,
+        request: &RequestContext,
+    ) -> AuditOutcome {
+        let outcome = self.evaluate_shared_outcome(request, false).await;
+        AuditOutcome {
+            decision: outcome.decision,
+            triggered_rules: outcome.triggered_rules,
+        }
+    }
+
+    async fn evaluate_shared_outcome(
+        self: &Arc<Self>,
+        request: &RequestContext,
+        audit: bool,
+    ) -> CoreOutcome {
         // The WASM and AI stages are async and would need a nested `block_on`
         // inside the blocking task, so those builds keep the inline path
         // instead of nesting runtimes.
         #[cfg(any(feature = "wasm-waf", feature = "ai-threat-detection"))]
         {
-            return self.evaluate(request).await;
+            let _ = audit;
+            let decision = self.evaluate(request).await;
+            return CoreOutcome::new(decision, Vec::new());
         }
 
         #[cfg(not(any(feature = "wasm-waf", feature = "ai-threat-detection")))]
         {
             if !self.enabled {
-                return Decision::Allow;
+                return CoreOutcome::new(Decision::Allow, Vec::new());
             }
 
             if let Some(outcome) = self.fast_allow(
@@ -1851,13 +1978,13 @@ impl WafEngine {
                 request.body_size,
                 request.body.as_ref().is_none_or(|body| body.is_empty()),
             ) {
-                return self.complete_fast_allow(request, outcome).await;
+                return self.complete_fast_allow(request, outcome, audit).await;
             }
 
             let cost = self.inspection_cost(request);
             let guard = match self.admission.admit(cost).await {
                 Ok(guard) => guard,
-                Err(rejection) => return self.admission_rejected(request, rejection).await,
+                Err(rejection) => return self.admission_rejected(request, rejection, audit).await,
             };
 
             // Cheap evaluations are a header/URI rule pass plus a short reactor
@@ -1881,7 +2008,7 @@ impl WafEngine {
             if cost == admission::InspectionCost::Cheap || inline_body {
                 let outcome = self.evaluate_core(request);
                 drop(guard);
-                return self.finish(request, outcome).await;
+                return self.finish_outcome(request, outcome, audit).await;
             }
 
             let engine = Arc::clone(self);
@@ -1895,7 +2022,7 @@ impl WafEngine {
             .await;
 
             match joined {
-                Ok(outcome) => self.finish(request, outcome).await,
+                Ok(outcome) => self.finish_outcome(request, outcome, audit).await,
                 Err(error) => {
                     // A panicking rule used to take down the request task. The
                     // offloaded path can only observe it as a `JoinError`; keep
@@ -1909,9 +2036,10 @@ impl WafEngine {
                     } else {
                         Decision::Allow
                     };
-                    self.finish(
+                    self.finish_outcome(
                         request,
                         CoreOutcome::new(decision, vec!["evaluation-task-failed".to_string()]),
+                        audit,
                     )
                     .await
                 }

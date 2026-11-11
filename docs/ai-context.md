@@ -26,7 +26,7 @@ WAF-Rejected is a high-performance, enterprise-grade Web Application Firewall (W
 
 ### Current Development Status
 - **Release line**: `0.1.0-beta.16` plus Unreleased changes.
-- **Default engine**: native Rust CRS engine (`rust-engine`); Coraza 3.3.3 WASI
+- **Default engine**: native Rust CRS engine (`rust-engine`); Coraza 3.8.1 WASI
   reactor is the reference and explicit `backend = "wasm"` switch-back.
 - **Security status**: see the control matrix in
   `docs/architecture/security-model.md`; it is not a certification.
@@ -38,7 +38,7 @@ WAF-Rejected is a high-performance, enterprise-grade Web Application Firewall (W
 - **Proxy Service** (`src/proxy/`): Multi-protocol reverse proxy
 - **Security Modules**: Content inspection, rate limiting, geo-blocking
 - **Event System**: CEF/OTEL/Sled exporters for security events
-- **WASM Integration**: Coraza 3.3.3 WASI reactor (reference/fallback); the legacy `rules/coraza.wasm` is not a Coraza engine
+- **WASM Integration**: Coraza 3.8.1 WASI reactor (reference/fallback); the legacy `rules/coraza.wasm` is not a Coraza engine
 
 ### Key Patterns
 - **Async-First**: Tokio runtime for concurrency
