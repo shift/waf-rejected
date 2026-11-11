@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -16,9 +17,72 @@ use tracing::{error, info, warn};
 #[cfg(feature = "websocket")]
 use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
 
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
 use crate::config::Config;
 use crate::error::WafError;
+use crate::metrics::Metrics;
 use crate::waf::{Decision, RequestContext, WafEngine};
+
+/// Bounded WebSocket tunnel admission shared by every upgrade handler.
+///
+/// The permit is acquired during the handshake, before the upstream
+/// connection is opened, and is held by the tunnel task. This makes the
+/// configured `server.websocket.max_concurrent_tunnels` cap effective against
+/// both handshake floods and established tunnels.
+#[derive(Clone)]
+pub struct WebSocketTunnelLimiter {
+    permits: Arc<Semaphore>,
+    active: Arc<AtomicUsize>,
+    limit: usize,
+    metrics: Arc<Metrics>,
+}
+
+/// RAII guard for one admitted WebSocket tunnel.
+pub struct WebSocketTunnelGuard {
+    _permit: OwnedSemaphorePermit,
+    active: Arc<AtomicUsize>,
+    metrics: Arc<Metrics>,
+}
+
+impl Drop for WebSocketTunnelGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::Relaxed);
+        self.metrics.websocket_tunnel_finished();
+    }
+}
+
+impl WebSocketTunnelLimiter {
+    pub fn new(limit: usize, metrics: Arc<Metrics>) -> Self {
+        let limit = limit.max(1);
+        Self {
+            permits: Arc::new(Semaphore::new(limit)),
+            active: Arc::new(AtomicUsize::new(0)),
+            limit,
+            metrics,
+        }
+    }
+
+    /// Try to admit one tunnel without waiting. Returns `None` at the cap.
+    pub fn try_acquire(&self) -> Option<WebSocketTunnelGuard> {
+        let permit = Arc::clone(&self.permits).try_acquire_owned().ok()?;
+        self.active.fetch_add(1, Ordering::Relaxed);
+        self.metrics.websocket_tunnel_started();
+        Some(WebSocketTunnelGuard {
+            _permit: permit,
+            active: Arc::clone(&self.active),
+            metrics: Arc::clone(&self.metrics),
+        })
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    pub fn active(&self) -> usize {
+        self.active.load(Ordering::Relaxed)
+    }
+}
 
 /// WebSocket Protocol Upgrade Handler
 ///
@@ -609,6 +673,23 @@ mod tests {
                 Decision::Allow
             }
         }
+    }
+
+    #[test]
+    fn tunnel_cap_rejects_a_second_tunnel_and_releases_on_drop() {
+        let limiter = WebSocketTunnelLimiter::new(1, Arc::new(Metrics::new()));
+        let first = limiter.try_acquire().expect("first tunnel admitted");
+        assert_eq!(limiter.active(), 1);
+        assert!(
+            limiter.try_acquire().is_none(),
+            "a second tunnel must be rejected at a cap of one"
+        );
+        drop(first);
+        assert_eq!(limiter.active(), 0);
+        assert!(
+            limiter.try_acquire().is_some(),
+            "the permit must be released when the tunnel closes"
+        );
     }
 
     #[cfg(feature = "websocket")]

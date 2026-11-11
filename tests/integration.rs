@@ -50,6 +50,9 @@ mod pipeline_tests;
 #[path = "integration/proxy_tests_fixed.rs"]
 mod proxy_tests;
 
+#[path = "integration/resource_limits_tests.rs"]
+mod resource_limits_tests;
+
 #[path = "integration/waf_features_tests.rs"]
 mod waf_features_tests;
 

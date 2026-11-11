@@ -24,6 +24,7 @@ use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::error::CapacityError;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -52,7 +53,7 @@ use crate::proxy::grpc_body::{
     probe_grpc_body, GrpcBodyMode, GrpcProbeError, GrpcStreamError, GrpcStreamGuard, PrefixedBody,
 };
 use crate::proxy::telemetry::{RequestRejection, RequestTelemetry};
-use crate::proxy::websocket::WebSocketHandler;
+use crate::proxy::websocket::{WebSocketHandler, WebSocketTunnelLimiter};
 use crate::waf::auth::{ApiKeyValidator, InMemoryKeyStore};
 use crate::waf::tls_config::TlsManager;
 use crate::waf::{Decision, RequestContext, ResponseContext, ResponseInspectionOptions, WafEngine};
@@ -70,6 +71,7 @@ pub struct WafProxyService {
     config: Arc<Config>,
     buffer_pool: Arc<BufferPool>,
     websocket_handler: WebSocketHandler,
+    websocket_limiter: WebSocketTunnelLimiter,
     tls_manager: Option<Arc<TlsManager>>,
     auth_validator: Option<Arc<ApiKeyValidator>>,
     trusted_proxies: Vec<IpNetwork>,
@@ -618,6 +620,54 @@ fn is_webtransport_upgrade(headers: &hyper::HeaderMap) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case("webtransport"))
 }
 
+/// Why a request head exceeded the configured header bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeaderLimitViolation {
+    Count { count: usize, limit: usize },
+    Bytes { bytes: usize, limit: usize },
+}
+
+impl HeaderLimitViolation {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Count { .. } => "header_count",
+            Self::Bytes { .. } => "header_bytes",
+        }
+    }
+}
+
+/// Enforce `server.max_header_count` and `server.max_header_bytes` before any
+/// body handling. hyper's parser limits are configured above these values so
+/// this check produces the generic `431` response instead of a connection
+/// reset. Only aggregate counts are logged; header values never are.
+pub(crate) fn enforce_header_bounds(
+    headers: &HeaderMap,
+    config: &crate::config::ServerConfig,
+) -> Result<(), HeaderLimitViolation> {
+    let count = headers.len();
+    if count > config.max_header_count {
+        return Err(HeaderLimitViolation::Count {
+            count,
+            limit: config.max_header_count,
+        });
+    }
+
+    let mut bytes = 0usize;
+    for (name, value) in headers {
+        bytes = bytes
+            .saturating_add(name.as_str().len())
+            .saturating_add(value.as_bytes().len())
+            .saturating_add(4);
+        if bytes > config.max_header_bytes {
+            return Err(HeaderLimitViolation::Bytes {
+                bytes,
+                limit: config.max_header_bytes,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Maximum number of bytes accepted across every value of one forwarding
 /// header family. Larger chains are discarded rather than silently truncated.
 pub(crate) const MAX_FORWARDED_HEADER_BYTES: usize = 8 * 1024;
@@ -792,7 +842,47 @@ pub(crate) struct ProxyState {
     pub(crate) auth_validator: Option<Arc<ApiKeyValidator>>,
     pub(crate) trusted_proxies: Arc<Vec<IpNetwork>>,
     pub(crate) strip_policy: Arc<HeaderStripPolicy>,
+    pub(crate) websocket_limiter: WebSocketTunnelLimiter,
     pub(crate) metrics: Arc<Metrics>,
+}
+
+/// RAII slot for one admitted ingress connection. Holding it keeps the
+/// configured `server.max_connections` permit and the active gauge accurate
+/// even if the connection task panics.
+struct ConnectionSlot {
+    _permit: OwnedSemaphorePermit,
+    metrics: Arc<Metrics>,
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.metrics.connection_finished();
+    }
+}
+
+/// Write a minimal `503` with `Retry-After` for a plaintext connection that
+/// exceeded `server.max_connections`, then close. TLS connections cannot be
+/// answered before the handshake, so they are closed promptly instead.
+async fn reject_connection_over_limit(mut stream: TcpStream) {
+    use tokio::io::AsyncWriteExt;
+
+    const BODY: &str = "Service Unavailable\n";
+    let response = format!(
+        "HTTP/1.1 503 Service Unavailable\r\n\
+         Retry-After: 1\r\n\
+         Content-Type: text/plain\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n{}",
+        BODY.len(),
+        BODY
+    );
+    let _ = tokio::time::timeout(
+        Duration::from_secs(1),
+        stream.write_all(response.as_bytes()),
+    )
+    .await;
+    let _ = tokio::time::timeout(Duration::from_secs(1), stream.shutdown()).await;
 }
 
 /// Build the rustls client configuration used for HTTPS upstreams.
@@ -1079,6 +1169,10 @@ impl WafProxyService {
         // Initialize protocol handlers
         let websocket_handler =
             WebSocketHandler::new(Arc::clone(&waf_engine), Arc::clone(&config_arc));
+        let websocket_limiter = WebSocketTunnelLimiter::new(
+            config_arc.server.websocket.max_concurrent_tunnels,
+            Arc::clone(&metrics),
+        );
 
         let tls_manager = if config_arc.server.tls.enabled {
             let manager = TlsManager::new(config_arc.server.tls.clone())?;
@@ -1146,6 +1240,7 @@ impl WafProxyService {
             config: config_arc,
             buffer_pool,
             websocket_handler,
+            websocket_limiter,
             tls_manager,
             auth_validator,
             trusted_proxies,
@@ -1218,6 +1313,7 @@ impl WafProxyService {
             auth_validator: self.auth_validator.clone(),
             trusted_proxies: Arc::new(self.trusted_proxies.clone()),
             strip_policy: Arc::new(HeaderStripPolicy::from_config(&self.config.proxy)),
+            websocket_limiter: self.websocket_limiter.clone(),
             metrics: Arc::clone(&self.metrics),
         };
 
@@ -1309,6 +1405,15 @@ impl WafProxyService {
             debug!("WebTransport requested but this binary was built without the `webtransport` feature");
         }
 
+        // `server.max_connections` is enforced per listener. The process runs
+        // one TCP listener, so this is effectively a process-wide TCP cap.
+        let max_connections = self.config.server.max_connections.max(1);
+        let connection_slots = Arc::new(Semaphore::new(max_connections));
+        info!(
+            "Ingress connection limit: {} concurrent TCP connections",
+            max_connections
+        );
+
         loop {
             let (tcp_stream, remote_addr) = match listener.accept().await {
                 Ok(connection) => connection,
@@ -1322,11 +1427,39 @@ impl WafProxyService {
                 }
             };
 
+            let permit = match Arc::clone(&connection_slots).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    // The connection was accepted (so it is not left in the
+                    // backlog) but never admitted or counted as active.
+                    self.metrics.record_connection_rejected();
+                    warn!(
+                        "Rejected connection from {}: server.max_connections ({}) reached",
+                        remote_addr, max_connections
+                    );
+                    if self.tls_manager.is_none() {
+                        tokio::spawn(reject_connection_over_limit(tcp_stream));
+                    } else {
+                        // A TLS peer cannot receive a meaningful HTTP response
+                        // before the handshake; close promptly instead.
+                        drop(tcp_stream);
+                    }
+                    continue;
+                }
+            };
+
+            self.metrics.connection_started();
+            let slot = ConnectionSlot {
+                _permit: permit,
+                metrics: Arc::clone(&self.metrics),
+            };
+
             let tls_manager = self.tls_manager.clone();
             let state = state.clone();
             let peer_ip = remote_addr.ip();
 
             tokio::task::spawn(async move {
+                let _slot = slot;
                 if let Some(tls_mgr) = tls_manager {
                     match tls_mgr.accept(tcp_stream).await {
                         Ok(tls_stream) => {
@@ -1374,6 +1507,13 @@ impl WafProxyService {
         // when TLS ALPN negotiated h2.
         let enable_http2 = negotiated_h2 && state.config.server.enable_http2;
         let http2_tuning = state.config.server.http2.clone();
+        let max_header_bytes = state.config.server.max_header_bytes;
+        let max_header_count = state.config.server.max_header_count;
+        // Bounds idle keep-alive: hyper starts this timer while waiting for
+        // the next request head, so an idle client is closed rather than held
+        // forever. It also bounds a slow request head.
+        let keep_alive_timeout =
+            Duration::from_secs(state.config.server.keep_alive_timeout_secs.max(1));
         let service =
             service_fn(move |req| Self::handle_request(req, state.clone(), peer_ip, is_https));
 
@@ -1381,6 +1521,13 @@ impl WafProxyService {
             let tuning = &http2_tuning;
             let mut builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
             builder.timer(TokioTimer::new());
+            // Backstop above the explicit header-byte check so the pipeline
+            // returns a generic 431 rather than an HPACK-level reset.
+            let header_backstop = max_header_bytes
+                .saturating_mul(2)
+                .max(16 * 1024)
+                .min(u32::MAX as usize) as u32;
+            builder.max_header_list_size(header_backstop);
             if tuning.enabled {
                 builder
                     .adaptive_window(tuning.adaptive_window)
@@ -1397,7 +1544,7 @@ impl WafProxyService {
             } else {
                 builder
                     .keep_alive_interval(Some(Duration::from_secs(30)))
-                    .keep_alive_timeout(Duration::from_secs(10));
+                    .keep_alive_timeout(keep_alive_timeout);
             }
             builder
                 .serve_connection(io, service)
@@ -1405,7 +1552,16 @@ impl WafProxyService {
                 .map_err(|e| WafError::NetworkError(format!("HTTP/2 connection error: {}", e)))
         } else {
             let mut builder = hyper::server::conn::http1::Builder::new();
-            builder.keep_alive(true).pipeline_flush(true);
+            builder
+                .keep_alive(true)
+                .pipeline_flush(true)
+                .timer(TokioTimer::new())
+                .header_read_timeout(Some(keep_alive_timeout))
+                // hyper backstops, deliberately looser than the explicit
+                // pipeline checks so those return the generic 431.
+                .max_headers(max_header_count.saturating_mul(2).max(100))
+                .max_header_size(max_header_bytes.saturating_mul(2).max(8192))
+                .max_buf_size(max_header_bytes.saturating_add(8192).max(8192));
             builder
                 .serve_connection(io, service)
                 .with_upgrades()
@@ -1423,6 +1579,22 @@ impl WafProxyService {
     ) -> Result<Response<ProxyBody>, Infallible> {
         let start_time = Instant::now();
         let telemetry = RequestTelemetry::begin(Arc::clone(&state.metrics));
+
+        // Header bounds are the primary control; hyper's parser limits are a
+        // backstop configured above these values. Details stay server-side.
+        if let Err(violation) = enforce_header_bounds(req.headers(), &state.config.server) {
+            warn!(
+                "Rejected request head: {} limit exceeded ({:?})",
+                violation.as_str(),
+                violation
+            );
+            telemetry.reject(RequestRejection::HeaderLimit);
+            state.metrics.record_blocked();
+            return Ok(Self::create_error_response(
+                StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+                "Request Header Fields Too Large",
+            ));
+        }
 
         // Detect HTTP protocol version
         let http_version = Self::detect_http_version(&req);
@@ -1585,7 +1757,29 @@ impl WafProxyService {
                 }
             }
 
-            return Ok(Self::proxy_websocket(req, &state, client_ip).await);
+            let tunnel_guard = match state.websocket_limiter.try_acquire() {
+                Some(guard) => guard,
+                None => {
+                    warn!(
+                        "Rejected WebSocket upgrade from {}: server.websocket.max_concurrent_tunnels ({}) reached",
+                        client_ip,
+                        state.websocket_limiter.limit()
+                    );
+                    telemetry.reject(RequestRejection::WebSocketTunnelLimit);
+                    state.metrics.record_websocket_tunnel_rejected();
+                    state.metrics.record_blocked();
+                    let mut response = Self::create_error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "WebSocket tunnel limit reached",
+                    );
+                    response
+                        .headers_mut()
+                        .insert("retry-after", HeaderValue::from_static("1"));
+                    return Ok(response);
+                }
+            };
+
+            return Ok(Self::proxy_websocket(req, &state, client_ip, tunnel_guard).await);
         }
         #[cfg(feature = "webtransport")]
         if is_webtransport_upgrade(req.headers()) {
@@ -1645,6 +1839,7 @@ impl WafProxyService {
                             &state.metrics,
                             client_ip,
                             is_https,
+                            Duration::from_secs(state.config.proxy.timeout_seconds.max(1)),
                             state.config.server.max_body_size,
                             state
                                 .config
@@ -1711,7 +1906,7 @@ impl WafProxyService {
             .get(hyper::header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<usize>().ok());
-        let max_body_size = state.config.server.max_body_size;
+        let max_body_size = state.config.effective_max_request_body();
         let mut body = Some(body);
         let mut pre_read: Option<(Bytes, Option<HeaderMap>)> = None;
 
@@ -1969,6 +2164,7 @@ impl WafProxyService {
                     &state.metrics,
                     client_ip,
                     is_https,
+                    Duration::from_secs(state.config.proxy.timeout_seconds.max(1)),
                     state.config.server.max_body_size,
                     state
                         .config
@@ -2010,6 +2206,7 @@ impl WafProxyService {
         mut req: Request<Incoming>,
         state: &ProxyState,
         client_ip: IpAddr,
+        tunnel_guard: crate::proxy::websocket::WebSocketTunnelGuard,
     ) -> Response<ProxyBody> {
         if state.config.waf.response_inspection.enabled {
             // WebSocket frames are not an HTTP response body; response
@@ -2322,7 +2519,12 @@ impl WafProxyService {
             .websocket
             .resolved_max_message_bytes(state.config.server.max_body_size);
         let codec_config = websocket_codec_config(&state.config.server);
+        let idle_timeout = (state.config.server.websocket.idle_timeout_secs > 0)
+            .then(|| Duration::from_secs(state.config.server.websocket.idle_timeout_secs));
+        let max_lifetime =
+            Duration::from_secs(state.config.server.websocket.max_lifetime_secs.max(1));
         tokio::spawn(async move {
+            let _tunnel_guard = tunnel_guard;
             let upgraded = match on_upgrade.await {
                 Ok(upgraded) => upgraded,
                 Err(e) => {
@@ -2346,6 +2548,9 @@ impl WafProxyService {
                 waf_engine,
                 base_context,
                 max_message_bytes,
+                idle_timeout,
+                max_lifetime,
+                metrics,
             )
             .await;
         });
@@ -2361,19 +2566,65 @@ impl WafProxyService {
 
     /// Bridge two WebSocket streams, evaluating client data frames through the
     /// WAF before forwarding them upstream.
+    #[allow(clippy::too_many_arguments)]
     async fn bridge_websocket<C, U>(
         mut client: WebSocketStream<C>,
         mut upstream: WebSocketStream<U>,
         waf_engine: Arc<WafEngine>,
         base_context: RequestContext,
         max_message_bytes: usize,
+        idle_timeout: Option<Duration>,
+        max_lifetime: Duration,
+        metrics: Arc<Metrics>,
     ) where
         C: AsyncRead + AsyncWrite + Unpin,
         U: AsyncRead + AsyncWrite + Unpin,
     {
+        let lifetime_deadline = tokio::time::Instant::now() + max_lifetime;
+        let mut last_activity = tokio::time::Instant::now();
+
         loop {
+            let idle_deadline = idle_timeout.map(|idle| last_activity + idle);
+            let idle = async {
+                match idle_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+
             tokio::select! {
+                _ = tokio::time::sleep_until(lifetime_deadline) => {
+                    warn!(
+                        "Closing WebSocket tunnel for {} at the {}s lifetime cap",
+                        base_context.client_ip,
+                        max_lifetime.as_secs()
+                    );
+                    metrics.record_websocket_tunnel_lifetime_closed();
+                    let close = CloseFrame {
+                        code: CloseCode::Policy,
+                        reason: "WebSocket tunnel lifetime exceeded".into(),
+                    };
+                    let _ = client.send(Message::Close(Some(close.clone()))).await;
+                    let _ = upstream.send(Message::Close(Some(close))).await;
+                    break;
+                }
+                _ = idle => {
+                    warn!(
+                        "Closing idle WebSocket tunnel for {} after {}s",
+                        base_context.client_ip,
+                        idle_timeout.map(|d| d.as_secs()).unwrap_or_default()
+                    );
+                    metrics.record_websocket_tunnel_idle_closed();
+                    let close = CloseFrame {
+                        code: CloseCode::Away,
+                        reason: "WebSocket tunnel idle timeout".into(),
+                    };
+                    let _ = client.send(Message::Close(Some(close.clone()))).await;
+                    let _ = upstream.send(Message::Close(Some(close))).await;
+                    break;
+                }
                 incoming = client.next() => {
+                    last_activity = tokio::time::Instant::now();
                     match incoming {
                         Some(Ok(message)) => {
                             if Self::websocket_message_blocked(
@@ -2420,6 +2671,7 @@ impl WafProxyService {
                     }
                 }
                 incoming = upstream.next() => {
+                    last_activity = tokio::time::Instant::now();
                     match incoming {
                         Some(Ok(message)) => {
                             if client.send(message).await.is_err() {
@@ -2947,6 +3199,7 @@ impl WafProxyService {
         metrics: &Metrics,
         client_ip: IpAddr,
         is_https: bool,
+        upstream_timeout: Duration,
         max_response_bytes: usize,
         stream_response_threshold: Option<usize>,
         strip_policy: &HeaderStripPolicy,
@@ -2966,9 +3219,8 @@ impl WafProxyService {
         };
 
         metrics.record_upstream_request();
-        match tokio::time::timeout(Duration::from_secs(30), upstream_client.request(proxy_req))
-            .await
-        {
+        let upstream_deadline = Instant::now() + upstream_timeout;
+        match tokio::time::timeout(upstream_timeout, upstream_client.request(proxy_req)).await {
             Ok(Ok(response)) => {
                 let processing_time = start_time.elapsed();
                 debug!("Request processed in {:?}", processing_time);
@@ -3049,7 +3301,7 @@ impl WafProxyService {
                         return match response_builder.body(ProxyBody::guarded(
                             body,
                             max_response_bytes,
-                            Duration::from_secs(30),
+                            upstream_timeout,
                         )) {
                             Ok(response) => Ok(response),
                             Err(e) => {
@@ -3067,31 +3319,36 @@ impl WafProxyService {
                 let mut trailers = None;
                 let mut body = std::pin::pin!(body);
                 loop {
-                    let frame = match tokio::time::timeout(
-                        Duration::from_secs(30),
-                        BodyExt::frame(&mut body),
-                    )
-                    .await
-                    {
-                        Ok(Some(Ok(frame))) => frame,
-                        Ok(Some(Err(e))) => {
-                            metrics.record_upstream_error();
-                            error!("Failed to collect upstream response body: {}", e);
-                            return Ok(Self::create_error_response(
-                                StatusCode::BAD_GATEWAY,
-                                "Failed to read upstream response",
-                            ));
-                        }
-                        Ok(None) => break,
-                        Err(_) => {
-                            metrics.record_upstream_error();
-                            error!("Upstream response collection timed out");
-                            return Ok(Self::create_error_response(
-                                StatusCode::GATEWAY_TIMEOUT,
-                                "Upstream response timeout",
-                            ));
-                        }
-                    };
+                    let remaining = upstream_deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        metrics.record_upstream_error();
+                        error!("Upstream response collection exceeded the configured timeout");
+                        return Ok(Self::create_error_response(
+                            StatusCode::GATEWAY_TIMEOUT,
+                            "Upstream response timeout",
+                        ));
+                    }
+                    let frame =
+                        match tokio::time::timeout(remaining, BodyExt::frame(&mut body)).await {
+                            Ok(Some(Ok(frame))) => frame,
+                            Ok(Some(Err(e))) => {
+                                metrics.record_upstream_error();
+                                error!("Failed to collect upstream response body: {}", e);
+                                return Ok(Self::create_error_response(
+                                    StatusCode::BAD_GATEWAY,
+                                    "Failed to read upstream response",
+                                ));
+                            }
+                            Ok(None) => break,
+                            Err(_) => {
+                                metrics.record_upstream_error();
+                                error!("Upstream response collection timed out");
+                                return Ok(Self::create_error_response(
+                                    StatusCode::GATEWAY_TIMEOUT,
+                                    "Upstream response timeout",
+                                ));
+                            }
+                        };
 
                     match frame.into_data() {
                         Ok(data) => {
@@ -3829,6 +4086,99 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("content-type", content_type.parse().unwrap());
         classify_request(&headers)
+    }
+
+    #[test]
+    fn header_count_and_byte_bounds_are_enforced() {
+        let mut config = crate::config::ServerConfig::default();
+        config.max_header_count = 2;
+        config.max_header_bytes = 64;
+
+        let mut headers = HeaderMap::new();
+        headers.insert("a", "1".parse().unwrap());
+        assert!(enforce_header_bounds(&headers, &config).is_ok());
+
+        headers.insert("b", "2".parse().unwrap());
+        headers.insert("c", "3".parse().unwrap());
+        assert!(matches!(
+            enforce_header_bounds(&headers, &config),
+            Err(HeaderLimitViolation::Count { .. })
+        ));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-big", "A".repeat(128).parse().unwrap());
+        assert!(matches!(
+            enforce_header_bounds(&headers, &config),
+            Err(HeaderLimitViolation::Bytes { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn websocket_bridge_closes_an_idle_tunnel() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let (client_io, _client_peer) = tokio::io::duplex(1024);
+        let (upstream_io, _upstream_peer) = tokio::io::duplex(1024);
+        let client = WebSocketStream::from_raw_socket(client_io, Role::Server, None).await;
+        let upstream = WebSocketStream::from_raw_socket(upstream_io, Role::Client, None).await;
+        let context = RequestContext::new(
+            "127.0.0.1".parse().unwrap(),
+            hyper::Method::GET,
+            "/ws".parse().unwrap(),
+            HeaderMap::new(),
+            None,
+        );
+
+        let started = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            WafProxyService::bridge_websocket(
+                client,
+                upstream,
+                Arc::new(WafEngine::new()),
+                context,
+                1024,
+                Some(Duration::from_millis(100)),
+                Duration::from_secs(30),
+                Arc::new(Metrics::new()),
+            ),
+        )
+        .await
+        .expect("idle tunnel must close instead of hanging");
+        assert!(started.elapsed() >= Duration::from_millis(80));
+    }
+
+    #[tokio::test]
+    async fn websocket_bridge_enforces_the_absolute_lifetime() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let (client_io, _client_peer) = tokio::io::duplex(1024);
+        let (upstream_io, _upstream_peer) = tokio::io::duplex(1024);
+        let client = WebSocketStream::from_raw_socket(client_io, Role::Server, None).await;
+        let upstream = WebSocketStream::from_raw_socket(upstream_io, Role::Client, None).await;
+        let context = RequestContext::new(
+            "127.0.0.1".parse().unwrap(),
+            hyper::Method::GET,
+            "/ws".parse().unwrap(),
+            HeaderMap::new(),
+            None,
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            WafProxyService::bridge_websocket(
+                client,
+                upstream,
+                Arc::new(WafEngine::new()),
+                context,
+                1024,
+                None,
+                Duration::from_millis(100),
+                Arc::new(Metrics::new()),
+            ),
+        )
+        .await
+        .expect("lifetime cap must close the tunnel");
     }
 
     #[test]
@@ -4907,6 +5257,7 @@ mod tests {
             &metrics,
             "127.0.0.1".parse().unwrap(),
             false,
+            Duration::from_secs(30),
             1024 * 1024,
             None,
             &HeaderStripPolicy::from_config(&ProxyConfig::default()),
@@ -4921,6 +5272,60 @@ mod tests {
         // The inspection prefix is capped at `max_body_bytes` (4 in the test
         // config); the full body is still relayed.
         assert_eq!(*evaluator.seen_body_len.lock().unwrap(), Some(4));
+    }
+
+    #[tokio::test]
+    async fn configured_upstream_timeout_aborts_the_exchange() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Accept but never answer, so only the configured timeout can end
+            // the exchange.
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+
+        let tls = build_upstream_tls_config(None, None, None).unwrap();
+        let connector = HttpsConnectorBuilder::new()
+            .with_tls_config(tls)
+            .https_or_http()
+            .enable_http1()
+            .enable_http2()
+            .wrap_connector(HttpConnector::new());
+        let connector = UpstreamConnector {
+            inner: connector,
+            metrics: Arc::new(Metrics::new()),
+        };
+        let client = Client::builder(TokioExecutor::new()).build(connector);
+
+        let request = Request::builder().method("GET").uri("/").body(()).unwrap();
+        let (parts, _) = request.into_parts();
+        let started = Instant::now();
+        let response = WafProxyService::forward_to_upstream_with_protocol(
+            parts,
+            ProxyBody::buffered(Bytes::new(), None),
+            client,
+            format!("http://{upstream_addr}").parse().unwrap(),
+            Instant::now(),
+            "1.1",
+            &Arc::new(WafEngine::new()),
+            &Metrics::new(),
+            "127.0.0.1".parse().unwrap(),
+            false,
+            Duration::from_millis(200),
+            1024 * 1024,
+            None,
+            &HeaderStripPolicy::from_config(&ProxyConfig::default()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a 200ms upstream timeout must not wait for the hard-coded 30s"
+        );
     }
 
     #[test]
