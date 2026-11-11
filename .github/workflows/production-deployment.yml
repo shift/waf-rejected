@@ -58,7 +58,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Install Nix
-      uses: cachix/install-nix-action@v25
+      uses: cachix/install-nix-action@v30
     # Cachix is an optional accelerator, not a requirement. GitHub does not
     # expose `secrets` to a step/job `if`, so `preflight` publishes whether
     # CACHIX_AUTH_TOKEN exists. Without it the build runs against the public
