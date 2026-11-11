@@ -33,6 +33,55 @@ use crate::waf::{Decision, RequestContext};
 
 type H3Stream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
 
+/// Bounded QUIC connection admission for the HTTP/3 listener.
+#[derive(Clone)]
+pub(crate) struct H3ConnectionLimiter {
+    permits: Arc<tokio::sync::Semaphore>,
+    limit: usize,
+    metrics: Arc<crate::metrics::Metrics>,
+}
+
+pub(crate) struct H3ConnectionGuard {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    metrics: Arc<crate::metrics::Metrics>,
+}
+
+impl Drop for H3ConnectionGuard {
+    fn drop(&mut self) {
+        self.metrics.h3_connection_finished();
+    }
+}
+
+impl H3ConnectionLimiter {
+    pub(crate) fn new(limit: usize, metrics: Arc<crate::metrics::Metrics>) -> Self {
+        let limit = limit.max(1);
+        Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(limit)),
+            limit,
+            metrics,
+        }
+    }
+
+    pub(crate) fn try_acquire(&self) -> Option<H3ConnectionGuard> {
+        let permit = Arc::clone(&self.permits).try_acquire_owned().ok()?;
+        self.metrics.h3_connection_started();
+        Some(H3ConnectionGuard {
+            _permit: permit,
+            metrics: Arc::clone(&self.metrics),
+        })
+    }
+
+    pub(crate) fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+/// Stateless retry decision: only challenge a peer that has not already
+/// validated its address, and only when the operator has not disabled it.
+pub(crate) fn should_stateless_retry(enabled: bool, address_validated: bool) -> bool {
+    enabled && !address_validated
+}
+
 /// Bind the UDP listener and serve HTTP/3 connections.
 ///
 /// Returns `Ok(())` without binding when QUIC/TLS cannot be configured, so a
@@ -53,7 +102,22 @@ pub(crate) async fn serve(
     let crypto = QuicServerConfig::try_from(rustls_config).map_err(|e| {
         WafError::Configuration(format!("Failed to build QUIC TLS configuration: {}", e))
     })?;
-    let server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+
+    let mut transport = quinn::TransportConfig::default();
+    transport
+        .max_concurrent_bidi_streams(
+            quinn::VarInt::from_u64(state.config.server.h3_max_concurrent_bidi_streams.max(1))
+                .unwrap_or(quinn::VarInt::MAX),
+        )
+        .max_concurrent_uni_streams(quinn::VarInt::from_u64(16).unwrap_or(quinn::VarInt::MAX))
+        .max_idle_timeout(Some(
+            quinn::IdleTimeout::try_from(Duration::from_secs(
+                state.config.server.h3_idle_timeout_secs.max(1),
+            ))
+            .map_err(|e| WafError::Configuration(format!("Invalid h3_idle_timeout_secs: {}", e)))?,
+        ));
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+    server_config.transport_config(Arc::new(transport));
 
     let endpoint = quinn::Endpoint::server(server_config, bind_addr).map_err(|e| {
         WafError::internal(format!(
@@ -74,10 +138,49 @@ pub(crate) async fn serve(
         state.metrics.clone(),
     );
 
+    let connections = H3ConnectionLimiter::new(
+        state.config.server.h3_max_connections,
+        Arc::clone(&state.metrics),
+    );
+    info!(
+        "HTTP/3 connection limit: {} concurrent QUIC connections, {} bidi streams each, stateless retry: {}",
+        state.config.server.h3_max_connections,
+        state.config.server.h3_max_concurrent_bidi_streams,
+        state.config.server.h3_stateless_retry
+    );
+
     while let Some(incoming) = endpoint.accept().await {
+        // Address validation comes first: an unvalidated peer is challenged
+        // with a stateless retry token before any connection state exists.
+        if should_stateless_retry(
+            state.config.server.h3_stateless_retry,
+            incoming.remote_address_validated(),
+        ) {
+            state.metrics.record_h3_stateless_retry();
+            if let Err(e) = incoming.retry() {
+                debug!("HTTP/3 stateless retry failed: {}", e);
+            }
+            continue;
+        }
+
+        let guard = match connections.try_acquire() {
+            Some(guard) => guard,
+            None => {
+                state.metrics.record_h3_connection_rejected();
+                warn!(
+                    "Refused HTTP/3 connection from {}: server.h3_max_connections ({}) reached",
+                    incoming.remote_address(),
+                    connections.limit()
+                );
+                incoming.refuse();
+                continue;
+            }
+        };
+
         let state = state.clone();
         let admission = admission.clone();
         tokio::spawn(async move {
+            let _guard = guard;
             match incoming.await {
                 Ok(connection) => {
                     let peer_ip = connection.remote_address().ip();
@@ -207,6 +310,27 @@ async fn handle_request(
     // HTTP/2, so the outbound request must not claim HTTP/3.
     parts.version = http::Version::HTTP_11;
 
+    if let Err(violation) =
+        crate::proxy::service::enforce_header_bounds(&parts.headers, &state.config.server)
+    {
+        warn!(
+            "Rejected HTTP/3 request head from {}: {} limit exceeded ({:?})",
+            peer_ip,
+            violation.as_str(),
+            violation
+        );
+        telemetry.reject(RequestRejection::HeaderLimit);
+        state.metrics.record_blocked();
+        return send_response(
+            &mut stream,
+            WafProxyService::create_error_response(
+                StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+                "Request Header Fields Too Large",
+            ),
+        )
+        .await;
+    }
+
     let http_version = "3".to_string();
     if !WafProxyService::is_http_version_supported(&http_version, &state.config) {
         warn!("Unsupported HTTP version 3 request from {}", peer_ip);
@@ -325,7 +449,7 @@ async fn handle_request(
         }
     }
 
-    let max_body_size = state.config.server.max_body_size;
+    let max_body_size = state.config.effective_max_request_body();
     let (body_bytes, request_trailers) = match tokio::time::timeout(
         Duration::from_secs(state.config.server.request_timeout_secs.max(1)),
         read_body(&mut stream, max_body_size),
@@ -503,6 +627,7 @@ async fn handle_request(
                 &state.metrics,
                 client_ip,
                 true,
+                Duration::from_secs(state.config.proxy.timeout_seconds.max(1)),
                 max_body_size,
                 state
                     .config
@@ -1119,6 +1244,85 @@ F4s3IuSi44rR0CGaogZ+O/I=
         let (status, body) = send_h3_request(&endpoint, proxy_addr, request, None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(&body[..], b"upstream-ok");
+    }
+
+    #[test]
+    fn connection_limiter_rejects_over_the_cap_and_releases() {
+        let limiter = H3ConnectionLimiter::new(1, Arc::new(crate::metrics::Metrics::new()));
+        let first = limiter.try_acquire().expect("first connection admitted");
+        assert!(limiter.try_acquire().is_none(), "cap of one must refuse");
+        drop(first);
+        assert!(limiter.try_acquire().is_some(), "permit released on close");
+    }
+
+    #[test]
+    fn stateless_retry_only_challenges_unvalidated_peers() {
+        assert!(should_stateless_retry(true, false));
+        assert!(!should_stateless_retry(true, true));
+        assert!(!should_stateless_retry(false, false));
+    }
+
+    #[tokio::test]
+    async fn h3_connection_cap_refuses_a_second_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let (proxy_addr, endpoint) = start_h3_proxy(dir.path(), |config| {
+            config.server.h3_max_connections = 1;
+        })
+        .await;
+
+        let first = connect_h3(&endpoint, proxy_addr).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let second = endpoint.connect(proxy_addr, "localhost");
+        let admitted = match second {
+            Ok(connecting) => tokio::time::timeout(Duration::from_secs(1), connecting)
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .is_some(),
+            Err(_) => false,
+        };
+        assert!(
+            !admitted,
+            "a second QUIC connection must be refused at h3_max_connections = 1"
+        );
+        drop(first);
+    }
+
+    #[tokio::test]
+    async fn h3_bidi_stream_cap_blocks_a_second_concurrent_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let (proxy_addr, endpoint) = start_h3_proxy(dir.path(), |config| {
+            config.server.h3_max_concurrent_bidi_streams = 1;
+        })
+        .await;
+
+        let connection = connect_h3(&endpoint, proxy_addr).await;
+        let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(connection))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+
+        let first = Request::get(format!("https://localhost:{}/first", proxy_addr.port()))
+            .body(())
+            .unwrap();
+        let _first_stream = send_request.send_request(first).await.unwrap();
+
+        let second = Request::get(format!("https://localhost:{}/second", proxy_addr.port()))
+            .body(())
+            .unwrap();
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(500),
+            send_request.send_request(second),
+        )
+        .await;
+        match outcome {
+            Err(_) => {}     // waited for stream credit: capped
+            Ok(Err(_)) => {} // rejected by the transport: capped
+            Ok(Ok(_)) => panic!("a second bidi stream was admitted at a cap of one"),
+        }
     }
 
     #[tokio::test]

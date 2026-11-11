@@ -26,6 +26,15 @@ pub struct Metrics {
     auth_failures_total: AtomicU64,
     auth_rate_limited_total: AtomicU64,
     rate_limited_total: AtomicU64,
+    connections_active: AtomicU64,
+    connections_rejected_total: AtomicU64,
+    websocket_tunnels_active: AtomicU64,
+    websocket_tunnels_rejected_total: AtomicU64,
+    websocket_tunnels_closed_idle_total: AtomicU64,
+    websocket_tunnels_closed_lifetime_total: AtomicU64,
+    h3_connections_active: AtomicU64,
+    h3_connections_rejected_total: AtomicU64,
+    h3_stateless_retries_total: AtomicU64,
     upstream_errors_total: AtomicU64,
     upstream_requests_total: AtomicU64,
     upstream_connections_total: AtomicU64,
@@ -121,6 +130,15 @@ impl Metrics {
             auth_failures_total: AtomicU64::new(0),
             auth_rate_limited_total: AtomicU64::new(0),
             rate_limited_total: AtomicU64::new(0),
+            connections_active: AtomicU64::new(0),
+            connections_rejected_total: AtomicU64::new(0),
+            websocket_tunnels_active: AtomicU64::new(0),
+            websocket_tunnels_rejected_total: AtomicU64::new(0),
+            websocket_tunnels_closed_idle_total: AtomicU64::new(0),
+            websocket_tunnels_closed_lifetime_total: AtomicU64::new(0),
+            h3_connections_active: AtomicU64::new(0),
+            h3_connections_rejected_total: AtomicU64::new(0),
+            h3_stateless_retries_total: AtomicU64::new(0),
             upstream_errors_total: AtomicU64::new(0),
             upstream_requests_total: AtomicU64::new(0),
             upstream_connections_total: AtomicU64::new(0),
@@ -237,6 +255,62 @@ impl Metrics {
 
     pub fn record_upstream_error(&self) {
         self.upstream_errors_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn connection_started(&self) {
+        self.connections_active.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn connection_finished(&self) {
+        self.connections_active.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn record_connection_rejected(&self) {
+        self.connections_rejected_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn websocket_tunnel_started(&self) {
+        self.websocket_tunnels_active
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn websocket_tunnel_finished(&self) {
+        self.websocket_tunnels_active
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn record_websocket_tunnel_rejected(&self) {
+        self.websocket_tunnels_rejected_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_websocket_tunnel_idle_closed(&self) {
+        self.websocket_tunnels_closed_idle_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_websocket_tunnel_lifetime_closed(&self) {
+        self.websocket_tunnels_closed_lifetime_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn h3_connection_started(&self) {
+        self.h3_connections_active.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn h3_connection_finished(&self) {
+        self.h3_connections_active.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn record_h3_connection_rejected(&self) {
+        self.h3_connections_rejected_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_h3_stateless_retry(&self) {
+        self.h3_stateless_retries_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Count one request handed to the upstream client. Together with
@@ -644,6 +718,31 @@ impl Metrics {
              # HELP waf_upstream_health_check_failures_total Failed upstream health probes.\n\
              # TYPE waf_upstream_health_check_failures_total counter\n\
              waf_upstream_health_check_failures_total {}\n\
+             # HELP waf_connections_active Ingress TCP connections currently admitted.\n\
+             # TYPE waf_connections_active gauge\n\
+             waf_connections_active {}\n\
+             # HELP waf_connections_rejected_total Ingress connections rejected by server.max_connections.\n\
+             # TYPE waf_connections_rejected_total counter\n\
+             waf_connections_rejected_total {}\n\
+             # HELP waf_websocket_tunnels_active Established WebSocket tunnels.\n\
+             # TYPE waf_websocket_tunnels_active gauge\n\
+             waf_websocket_tunnels_active {}\n\
+             # HELP waf_websocket_tunnels_rejected_total WebSocket upgrades rejected by the concurrency cap.\n\
+             # TYPE waf_websocket_tunnels_rejected_total counter\n\
+             waf_websocket_tunnels_rejected_total {}\n\
+             # HELP waf_websocket_tunnels_closed_total WebSocket tunnels closed by a configured bound.\n\
+             # TYPE waf_websocket_tunnels_closed_total counter\n\
+             waf_websocket_tunnels_closed_total{{reason=\"idle\"}} {}\n\
+             waf_websocket_tunnels_closed_total{{reason=\"max_lifetime\"}} {}\n\
+             # HELP waf_h3_connections_active QUIC/HTTP3 connections currently admitted.\n\
+             # TYPE waf_h3_connections_active gauge\n\
+             waf_h3_connections_active {}\n\
+             # HELP waf_h3_connections_rejected_total QUIC/HTTP3 connections refused by the connection cap.\n\
+             # TYPE waf_h3_connections_rejected_total counter\n\
+             waf_h3_connections_rejected_total {}\n\
+             # HELP waf_h3_stateless_retries_total QUIC/HTTP3 connections challenged with stateless retry.\n\
+             # TYPE waf_h3_stateless_retries_total counter\n\
+             waf_h3_stateless_retries_total {}\n\
              # HELP waf_webtransport_sessions_total WebTransport sessions accepted.\n\
              # TYPE waf_webtransport_sessions_total counter\n\
              waf_webtransport_sessions_total {}\n\
@@ -671,6 +770,16 @@ impl Metrics {
             self.upstream_health_checks_total.load(Ordering::Relaxed),
             self.upstream_health_check_failures_total
                 .load(Ordering::Relaxed),
+            self.connections_active.load(Ordering::Relaxed),
+            self.connections_rejected_total.load(Ordering::Relaxed),
+            self.websocket_tunnels_active.load(Ordering::Relaxed),
+            self.websocket_tunnels_rejected_total.load(Ordering::Relaxed),
+            self.websocket_tunnels_closed_idle_total.load(Ordering::Relaxed),
+            self.websocket_tunnels_closed_lifetime_total
+                .load(Ordering::Relaxed),
+            self.h3_connections_active.load(Ordering::Relaxed),
+            self.h3_connections_rejected_total.load(Ordering::Relaxed),
+            self.h3_stateless_retries_total.load(Ordering::Relaxed),
             self.webtransport_sessions_total.load(Ordering::Relaxed),
             self.webtransport_allowed_total.load(Ordering::Relaxed),
             self.webtransport_blocked_total.load(Ordering::Relaxed),

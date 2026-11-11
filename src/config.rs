@@ -361,6 +361,20 @@ pub struct WebSocketConfig {
     /// Maximum size of a reassembled WebSocket message in bytes
     /// (`0` = inherit `server.max_body_size`).
     pub max_message_bytes: usize,
+
+    /// Maximum number of concurrent WebSocket tunnels.
+    ///
+    /// The permit is taken during the upgrade handshake, before the upstream
+    /// connection is opened, and held until the tunnel closes. Excess upgrades
+    /// receive `503` with `Retry-After`.
+    pub max_concurrent_tunnels: usize,
+
+    /// Close an established tunnel after this many seconds without traffic in
+    /// either direction. `0` disables the idle timeout.
+    pub idle_timeout_secs: u64,
+
+    /// Absolute maximum tunnel lifetime in seconds, regardless of activity.
+    pub max_lifetime_secs: u64,
 }
 
 impl WebSocketConfig {
@@ -388,6 +402,9 @@ impl Default for WebSocketConfig {
         Self {
             max_frame_bytes: 0,
             max_message_bytes: 0,
+            max_concurrent_tunnels: 1024,
+            idle_timeout_secs: 300,
+            max_lifetime_secs: 3600,
         }
     }
 }
@@ -439,6 +456,38 @@ pub struct ServerConfig {
 
     /// Maximum request body size in bytes
     pub max_body_size: usize,
+
+    /// Maximum number of header fields accepted in one request head.
+    ///
+    /// Enforced in the request pipeline before any body handling, returning
+    /// `431` when exceeded. hyper's own parser limit remains a backstop and is
+    /// configured above this value so the explicit check is authoritative.
+    pub max_header_count: usize,
+
+    /// Maximum combined size of the header names and values in one request
+    /// head, in bytes. Enforced before body handling, returning `431`.
+    pub max_header_bytes: usize,
+
+    /// Maximum number of concurrent QUIC/HTTP3 connections.
+    ///
+    /// Applied per UDP listener at accept time. Connections over the limit are
+    /// refused before QUIC connection state is created.
+    pub h3_max_connections: usize,
+
+    /// Maximum concurrent bidirectional streams per HTTP/3 connection.
+    ///
+    /// Advertised in the QUIC transport parameters, so a peer cannot open more
+    /// streams than this and excess stream attempts fail closed at the
+    /// transport layer.
+    pub h3_max_concurrent_bidi_streams: u64,
+
+    /// Require stateless address validation (QUIC `retry`) before accepting a
+    /// new HTTP/3 connection. Enabled by default so an unauthenticated peer
+    /// cannot cheaply allocate connection state.
+    pub h3_stateless_retry: bool,
+
+    /// Close an idle QUIC connection after this many seconds.
+    pub h3_idle_timeout_secs: u64,
 
     /// Maximum number of concurrent HTTP/3 request handlers.
     ///
@@ -2511,6 +2560,12 @@ impl Default for ServerConfig {
                 "3".to_string(),
             ],
             max_body_size: 10 * 1024 * 1024, // 10MB
+            max_header_count: 128,
+            max_header_bytes: 64 * 1024,
+            h3_max_connections: 1024,
+            h3_max_concurrent_bidi_streams: 100,
+            h3_stateless_retry: true,
+            h3_idle_timeout_secs: 30,
             h3_max_inflight_requests: 256,
             h3_max_inflight_per_client: 0,
             h3_admission_timeout_ms: 250,
@@ -2875,6 +2930,41 @@ impl Config {
         if self.server.max_body_size == 0 {
             anyhow::bail!("server.max_body_size must be greater than zero");
         }
+        if self.server.max_connections == 0 {
+            anyhow::bail!("server.max_connections must be greater than zero");
+        }
+        if self.server.max_header_count == 0 {
+            anyhow::bail!("server.max_header_count must be greater than zero");
+        }
+        if self.server.max_header_bytes == 0 {
+            anyhow::bail!("server.max_header_bytes must be greater than zero");
+        }
+        if self.server.h3_max_connections == 0 {
+            anyhow::bail!("server.h3_max_connections must be greater than zero");
+        }
+        if self.server.h3_max_concurrent_bidi_streams == 0 {
+            anyhow::bail!("server.h3_max_concurrent_bidi_streams must be greater than zero");
+        }
+        if self.server.h3_idle_timeout_secs == 0 {
+            anyhow::bail!("server.h3_idle_timeout_secs must be greater than zero");
+        }
+        if self.server.websocket.max_concurrent_tunnels == 0 {
+            anyhow::bail!("server.websocket.max_concurrent_tunnels must be greater than zero");
+        }
+        if self.server.websocket.max_lifetime_secs == 0 {
+            anyhow::bail!("server.websocket.max_lifetime_secs must be greater than zero");
+        }
+        if self.server.websocket.idle_timeout_secs > self.server.websocket.max_lifetime_secs {
+            anyhow::bail!(
+                "server.websocket.idle_timeout_secs ({}) must not exceed \
+                 server.websocket.max_lifetime_secs ({})",
+                self.server.websocket.idle_timeout_secs,
+                self.server.websocket.max_lifetime_secs
+            );
+        }
+        if self.proxy.max_request_size == 0 {
+            anyhow::bail!("proxy.max_request_size must be greater than zero");
+        }
         if self.server.h3_max_inflight_requests == 0 {
             anyhow::bail!("server.h3_max_inflight_requests must be greater than zero");
         }
@@ -3162,6 +3252,15 @@ impl Config {
         Ok(())
     }
 
+    /// Effective cap for a request body.
+    ///
+    /// `proxy.max_request_size` is a transport cap that can only tighten
+    /// `server.max_body_size`; it never widens it. This keeps existing configs
+    /// safe when the proxy value is larger than the server value.
+    pub fn effective_max_request_body(&self) -> usize {
+        self.proxy.max_request_size.min(self.server.max_body_size)
+    }
+
     /// Get the upstream URI as a hyper::Uri
     #[cfg_attr(not(test), allow(dead_code))] // Used in tests and future API compatibility
     pub fn upstream_uri(&self) -> anyhow::Result<http::Uri> {
@@ -3182,6 +3281,66 @@ mod tests {
         assert_eq!(config.upstream_uri, "http://127.0.0.1:3000");
         assert_eq!(config.server.max_connections, 10000);
         assert_eq!(config.logging.level, "info");
+    }
+
+    #[test]
+    fn resource_limit_defaults_are_safe_and_valid() {
+        let config = Config::default();
+        assert_eq!(config.server.max_connections, 10000);
+        assert!(config.server.max_header_count > 0);
+        assert!(config.server.max_header_bytes > 0);
+        assert!(config.server.h3_max_connections > 0);
+        assert!(config.server.h3_max_concurrent_bidi_streams > 0);
+        assert!(config.server.h3_stateless_retry);
+        assert!(config.server.websocket.max_concurrent_tunnels > 0);
+        assert!(config.server.websocket.idle_timeout_secs > 0);
+        assert!(config.server.websocket.max_lifetime_secs > 0);
+        config.validate().expect("defaults must validate");
+    }
+
+    #[test]
+    fn proxy_max_request_size_can_only_tighten_the_body_cap() {
+        let mut config = Config::default();
+        config.server.max_body_size = 1024;
+        config.proxy.max_request_size = 256;
+        assert_eq!(config.effective_max_request_body(), 256);
+
+        config.proxy.max_request_size = 4096;
+        assert_eq!(config.effective_max_request_body(), 1024);
+    }
+
+    #[test]
+    fn new_resource_limits_parse_and_are_validated() {
+        let parsed: Config = toml::from_str(
+            "[server]\n\
+             max_connections = 7\n\
+             max_header_count = 9\n\
+             max_header_bytes = 4096\n\
+             h3_max_connections = 3\n\
+             h3_max_concurrent_bidi_streams = 4\n\
+             h3_stateless_retry = false\n\
+             h3_idle_timeout_secs = 12\n\
+             [server.websocket]\n\
+             max_concurrent_tunnels = 2\n\
+             idle_timeout_secs = 30\n\
+             max_lifetime_secs = 60\n",
+        )
+        .expect("resource limit keys parse");
+        assert_eq!(parsed.server.max_connections, 7);
+        assert_eq!(parsed.server.max_header_count, 9);
+        assert_eq!(parsed.server.h3_max_concurrent_bidi_streams, 4);
+        assert!(!parsed.server.h3_stateless_retry);
+        assert_eq!(parsed.server.websocket.max_concurrent_tunnels, 2);
+        parsed.validate().expect("parsed limits validate");
+
+        let bad = toml::from_str::<Config>("[server]\nmax_connections = 0\n").unwrap();
+        assert!(bad.validate().is_err());
+
+        let bad_ws = toml::from_str::<Config>(
+            "[server.websocket]\nidle_timeout_secs = 120\nmax_lifetime_secs = 60\n",
+        )
+        .unwrap();
+        assert!(bad_ws.validate().is_err());
     }
 
     #[test]

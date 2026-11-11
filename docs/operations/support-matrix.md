@@ -61,11 +61,11 @@ This table is the operator-facing summary.
 | Per-IP rate limiting | Supported | `max_tracked_ips = 100000`, `capacity_policy = "fail_closed"` | 64 shards, incremental cleanup, hard cap. `evict_oldest` is available but weaker. |
 | Global rate limiting | Supported | Configurable | One process-wide bucket; not shared across replicas. |
 | Heavy-inspection admission | Supported | `waf.admission.enabled = true`, `queue_timeout_ms = 250`, `max_queued = 64` | Saturation returns `503 + Retry-After`; inspection is never skipped. |
-| WebSocket per-message inspection | Supported | `server.max_body_size` per message | Client text/binary messages are inspected; control frames and upstream-to-client traffic are not. No idle timeout or concurrent-tunnel cap. |
-| HTTP/3 admission | Supported (feature-gated) | `http3` feature + `enable_http3` + `"3"` in `supported_http_versions` + TLS 1.3 | No cap on concurrent QUIC connections/streams; no stateless retry. |
+| WebSocket per-message inspection | Supported | `server.max_body_size` per message | Client text/binary messages are inspected; control frames and upstream-to-client traffic are not. Tunnels are bounded by `server.websocket.max_concurrent_tunnels`, `idle_timeout_secs` and `max_lifetime_secs`. |
+| HTTP/3 admission | Supported (feature-gated) | `http3` feature + `enable_http3` + `"3"` in `supported_http_versions` + TLS 1.3 | Bounded by `server.h3_max_connections`, `h3_max_concurrent_bidi_streams`, `h3_idle_timeout_secs`; stateless retry is on by default (`h3_stateless_retry`). |
 | WebTransport | Supported (feature-gated, terminating) | `webtransport` feature + `server.webtransport` | Origin/path/auth checks, session/stream/datagram caps, local inspection and bounded echo. **No upstream proxying.** |
 | Response inspection | Opt-in (native Rust engine) | `waf.response_inspection.enabled = true` | Headers and buffered bodies (first `max_body_bytes`) are evaluated; blocks return `block_status` with a generic body. Streamed/gRPC bodies are skipped with a metric. Disabled by default; Coraza backends unsupported. |
-| Header-size / header-count / connection caps | Not implemented | hyper defaults | `server.max_connections` is parsed but not enforced. |
+| Header-size / header-count / connection caps | Supported | `server.max_header_count`, `server.max_header_bytes`, `server.max_connections` | Header excess returns `431`; over-limit plaintext connections receive `503 + Retry-After`; hyper parser limits remain a backstop. |
 
 ## Body inspection policy
 
@@ -236,9 +236,11 @@ owns every core**. Leave at least one core for the proxy, TLS and networking.
 - WebTransport is a **terminating** endpoint: it authenticates, inspects and
   echoes sessions locally. Application-specific upstream proxying is **not
   implemented**, and HTTP/1.1 `Upgrade: webtransport` remains `501`.
-- Request framing validation and bounded decompression are on by default, but
-  header-size/header-count limits and `server.max_connections` are not
-  enforced; hyper defaults and the OS/container limits apply.
+- Request framing validation and bounded decompression are on by default.
+  Header-size/header-count and ingress-connection caps are enforced by
+  configuration (`server.max_header_count`, `server.max_header_bytes`,
+  `server.max_connections`); hyper parser limits and the OS/container limits
+  remain backstops.
 - io_uring and Hyperscan/Vectorscan are **opt-in** and fall back to portable
   implementations.
 - gRPC streaming bodies are not sent to CRS; descriptor content scanning is

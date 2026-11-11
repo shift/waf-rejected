@@ -44,8 +44,8 @@ claim must point at code, at a regression test, and at the release that
 introduced it. Rows are deliberately conservative. A blank test cell means "no
 automated test", not "tested elsewhere".
 
-**Coverage summary:** 27 rows — 24 implemented and tested (the Rust engine's
-CRS parity is additionally checked against the Coraza oracle), 3 **not
+**Coverage summary:** 29 rows — 27 implemented and tested (the Rust engine's
+CRS parity is additionally checked against the Coraza oracle), 2 **not
 implemented**. GeoIP is tested only when licensed databases are supplied and is
 therefore unverified in a bare deployment. No other row is marked **Verified**
 on the strength of this audit alone; the external review examined documentation,
@@ -81,7 +81,10 @@ an independent penetration test passed.
 | Upstream response size cap | Tested | `src/proxy/service.rs` — `forward_to_upstream_with_protocol`, `Limited`/`GuardedBody` | `tests/integration/pipeline_tests.rs` (`pipeline_rejects_oversized_upstream_response`) | beta.1 |
 | Response body/header inspection | Opt-in, tested (native Rust engine only) | `src/proxy/service.rs` — `inspect_upstream_response`, `forward_to_upstream_with_protocol`; `src/waf/rust_engine/` response phases; `src/config.rs` — `ResponseInspectionConfig` | `src/waf/rust_engine/engine.rs` response tests; `src/proxy/service.rs` response-inspection tests; `tests/integration/http2_tuning_tests.rs` (h2 buffered + streamed skip) | Unreleased |
 | WebTransport upstream proxying | **Not implemented** | `src/proxy/webtransport.rs` is a terminating/echo endpoint; no upstream connector | `tests/integration/webtransport_tests.rs` verifies echo and rejection only | — |
-| Configurable header-size / header-count / concurrent-connection limits | **Not implemented** (hyper defaults only; `server.max_connections` is not read) | `src/config.rs` defines `max_connections`; no enforcement in `src/proxy/listener.rs` or `service.rs` | None | — |
+| Configurable header-size / header-count limits | Tested | `src/proxy/service.rs` — `enforce_header_bounds`; called from `handle_request` and `src/proxy/http3.rs`; hyper parser limits configured above the explicit bounds as a backstop | `src/proxy/service.rs` unit test (`header_count_and_byte_bounds_are_enforced`); `tests/integration/resource_limits_tests.rs` (`header_count_limit_returns_431`, `header_byte_limit_returns_431`) | Unreleased |
+| Ingress concurrent-connection cap (`503` + `Retry-After`, gauge, rejection counter) | Tested | `src/proxy/service.rs` — `start_with_connection_listener`, `ConnectionSlot`, `reject_connection_over_limit` | `tests/integration/resource_limits_tests.rs` (`connection_limit_rejects_an_extra_connection_with_503`) | Unreleased |
+| WebSocket tunnel concurrency, idle-timeout and lifetime caps | Tested | `src/proxy/websocket.rs` — `WebSocketTunnelLimiter`; `src/proxy/service.rs` — `proxy_websocket`, `bridge_websocket` | `src/proxy/websocket.rs` unit test (`tunnel_cap_rejects_a_second_tunnel_and_releases_on_drop`); `src/proxy/service.rs` bridge tests; `tests/integration/resource_limits_tests.rs` (`websocket_concurrency_cap_rejects_a_second_tunnel`, `websocket_idle_timeout_closes_with_going_away`, `websocket_lifetime_cap_closes_with_policy_violation`) | Unreleased |
+| HTTP/3 QUIC connection/stream caps and stateless retry | Tested (feature-gated) | `src/proxy/http3.rs` — `serve`, `H3ConnectionLimiter`, `should_stateless_retry`, transport configuration | `src/proxy/http3.rs` unit tests (`connection_limiter_rejects_over_the_cap_and_releases`, `stateless_retry_only_challenges_unvalidated_peers`, `h3_connection_cap_refuses_a_second_connection`, `h3_bidi_stream_cap_blocks_a_second_concurrent_request`) | Unreleased |
 
 ## 3. System context and trust boundaries
 
@@ -218,9 +221,11 @@ HTTP/3 is compiled only with the `http3` feature and starts only when
 configuration fails, `http3::serve` returns `Ok(())` without binding, so HTTP/3
 silently degrades to TCP; the TCP listener is unaffected. HTTP/3 0-RTT is not
 explicitly enabled (rustls leaves `max_early_data_size` at 0). Admission is
-therefore build-feature + config + ALPN; there is **no** cap on concurrent QUIC
-connections or request streams, and `serve` does not call `Incoming::retry()`
-for stateless address validation. QUIC anti-amplification limits still apply.
+therefore build-feature + config + ALPN. Concurrent QUIC connections are capped
+by `server.h3_max_connections`, bidirectional streams per connection by
+`server.h3_max_concurrent_bidi_streams`, and `server.h3_stateless_retry`
+(default on) calls `Incoming::retry()` for an unvalidated peer before connection
+state is allocated. QUIC anti-amplification limits still apply.
 
 WebTransport is compiled only with the `webtransport` feature and has its own
 UDP listener (default `0.0.0.0:4434`, which must differ from the HTTP/3 port).
@@ -304,11 +309,15 @@ larger than `server.max_body_size` returns `413`. On success
 gRPC path adds a bounded `grpc-encoding: gzip` decoder in front of field
 inspection, capped by `waf.grpc.max_decompressed_bytes`.
 
-`proxy.max_request_size`, `proxy.timeout_seconds`, `server.max_connections` and
-`server.keep_alive_timeout_secs` are present in configuration but are not wired
-into the runtime; the upstream request and response-collection timeouts are
-hard-coded to 30 seconds. Header count and header-section size remain bounded
-only by hyper defaults.
+`proxy.max_request_size` tightens `server.max_body_size` (it can only lower the
+effective body cap, never raise it). `proxy.timeout_seconds` bounds the whole
+upstream exchange, including response collection. `server.max_connections` is
+enforced at accept time; a plaintext over-limit connection receives `503` with
+`Retry-After`, while a TLS connection is closed promptly before the handshake.
+`server.keep_alive_timeout_secs` bounds idle keep-alive and request-head reads
+through hyper's header-read timer. Header count and header-section size are
+enforced by `enforce_header_bounds` before body handling, with hyper's parser
+limits left deliberately looser as a backstop.
 
 ### 4.5 WAF evaluation and fail mode
 
@@ -449,10 +458,12 @@ After the upgrade, `bridge_websocket` inspects each client `Text` or `Binary`
 message through the full `WafEngine::evaluate` chain, including the rate
 limiters, and closes both sides on a block. Messages larger than
 `server.max_body_size` are blocked before inspection; tungstenite's own default
-frame/message limits also apply. Control frames are passed through,
-upstream-to-client messages are not inspected, and there is no idle or
-total-lifetime timeout on the tunnel and no cap on concurrent tunnels.
-`permessage-deflate` is not configured in the proxy's tungstenite codec, while
+frame/message limits also apply. Control frames are passed through and
+upstream-to-client messages are not inspected. Concurrent tunnels are capped by
+`server.websocket.max_concurrent_tunnels`; established tunnels are closed with
+`1001` after `idle_timeout_secs` without traffic and with `1008` at
+`max_lifetime_secs`. `permessage-deflate` is not configured in the proxy's
+tungstenite codec, while
 client extension headers are forwarded to the origin; an origin may therefore
 accept an extension the proxy cannot decode. Each frame consumes a rate-limit
 token and can produce a security event.
@@ -546,14 +557,15 @@ inspected window, or exhaust memory.
 
 **Current control:** path and query over 8 KiB return `414`; body over 16 MiB in
 the inspection rule returns `413`; the proxy streams and rejects bodies over
-`server.max_body_size` (default 10 MiB) before inspection. Header count and
-header-section size are bounded by hyper defaults, not by configuration.
+`min(server.max_body_size, proxy.max_request_size)` before inspection. Header
+count and header-section size are enforced by `server.max_header_count` and
+`server.max_header_bytes` before body handling, returning a generic `431` with
+details only in server logs. `server.max_connections` caps concurrent ingress
+connections, so concurrent large uploads cannot grow without bound.
 
-**Residual:** there is no operator-tunable header-size, header-count or
-query-parameter-count limit. The whole body is buffered in memory, and
-`server.max_connections` is not enforced, so concurrent large uploads can
-exhaust memory. `ContentInspectionConfig.max_body_size` is not the effective
-limit; `server.max_body_size` is.
+**Residual:** there is no query-parameter-count limit. The whole body is still
+buffered in memory up to the effective cap. `ContentInspectionConfig.max_body_size`
+is not the effective transport limit; the `min` of the two server/proxy keys is.
 
 ### 5.4 WebSocket frames
 
@@ -564,14 +576,17 @@ to exhaust resources.
 **Current control:** text and binary messages are evaluated with the full rule
 chain; messages over `server.max_body_size` are blocked; blocked messages close
 both sides. Fragmented messages are reassembled by tungstenite before
-inspection.
+inspection. `server.websocket.max_concurrent_tunnels` caps concurrent tunnels
+(the permit is taken during the handshake, before the upstream connection is
+opened), `idle_timeout_secs` closes an inactive tunnel with `1001`, and
+`max_lifetime_secs` closes it with `1008`. Both bounds are enforced on the
+established tunnel and emit metrics.
 
 **Residual:** control frames and upstream-to-client traffic are not inspected.
 Compression is not negotiated by the proxy's codec, but client extension
 headers are forwarded, so an origin may accept an extension the proxy cannot
-decode. There is no idle or total-lifetime timeout, no per-connection frame
-budget beyond the rate limiter, and no cap on concurrent tunnels. Each frame
-consumes a rate-limit token and can produce a security event.
+decode. There is no per-connection frame budget beyond the rate limiter. Each
+frame consumes a rate-limit token and can produce a security event.
 
 ### 5.5 HTTP/3
 
@@ -586,12 +601,14 @@ authentication checks and session/stream/datagram limits; it does not open a
 WebSocket-over-HTTP/3 path.
 
 **Residual:** HTTP/3 is feature-gated and silently does not start if QUIC
-configuration fails, which can cause an unintended protocol downgrade. The
-endpoint does not call `Incoming::retry()`, so there is no stateless address
-validation before handshake state is allocated (QUIC anti-amplification limits
-still apply). There is no cap on concurrent QUIC connections or request
-streams. WebSocket-over-HTTP/3 (extended `CONNECT`) remains unimplemented;
-WebTransport payloads are inspected and echoed, never proxied upstream.
+configuration fails, which can cause an unintended protocol downgrade.
+`server.h3_stateless_retry` (default `true`) challenges an unvalidated peer with
+`Incoming::retry()` before connection state is allocated. `h3_max_connections`
+refuses excess QUIC connections, and `h3_max_concurrent_bidi_streams` is
+advertised in the transport parameters so excess stream attempts fail closed at
+the transport layer. `h3_idle_timeout_secs` closes idle connections.
+WebSocket-over-HTTP/3 (extended `CONNECT`) remains unimplemented; WebTransport
+payloads are inspected and echoed, never proxied upstream.
 
 ### 5.6 Decompression and transfer encoding
 

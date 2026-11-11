@@ -112,8 +112,15 @@ reject_ambiguous_routing = false
   upstreams.
 - Upstream mTLS requires **both** client cert and key; setting one is a startup
   error.
-- `max_request_size` and `server.max_body_size` are transport caps. They do not
-  change CRS inspection depth (`waf.coraza.max_inspect_bytes` does).
+- `max_request_size` and `server.max_body_size` are transport caps. The
+  effective request-body cap is `min(proxy.max_request_size,
+  server.max_body_size)`, so the proxy key can tighten the server cap but never
+  widen it. They do not change CRS inspection depth
+  (`waf.coraza.max_inspect_bytes` does).
+- `timeout_seconds` bounds the whole upstream exchange (connect, response
+  headers and response-body collection). A timeout returns `504`.
+- `keep_alive_timeout_secs` is under `[server]` and bounds idle keep-alive and
+  request-head reads; see below.
 
 ### `[proxy.pool]` — opt-in
 
@@ -156,6 +163,12 @@ enable_http2 = true
 enable_http3 = false
 supported_http_versions = ["1.0", "1.1", "2"]
 max_body_size = 10485760
+max_header_count = 128
+max_header_bytes = 65536
+h3_max_connections = 1024
+h3_max_concurrent_bidi_streams = 100
+h3_stateless_retry = true
+h3_idle_timeout_secs = 30
 h3_max_inflight_requests = 256
 h3_max_inflight_per_client = 0
 h3_admission_timeout_ms = 250
@@ -168,6 +181,23 @@ grpc_aware_rejections = false
 io_backend = "tokio"
 ```
 
+- `max_connections` caps concurrent ingress TCP connections for the listener.
+  The process runs one TCP listener, so it is effectively process-wide for
+  TCP. A plaintext connection over the limit receives `503` with
+  `Retry-After`; a TLS connection is closed promptly before the handshake.
+  `waf_connections_active` and `waf_connections_rejected_total` expose the
+  gauge and rejection counter. Must be greater than zero.
+- `max_header_count` and `max_header_bytes` bound the request head before any
+  body is read. Exceeding either returns a generic `431`; the count/byte
+  details are logged server-side only. hyper's parser limits are configured
+  above these values as a backstop, not as the primary control.
+- `keep_alive_timeout_secs` bounds idle keep-alive and request-head reads. A
+  connection that sends no next request within this window is closed.
+- `h3_max_connections`, `h3_max_concurrent_bidi_streams`,
+  `h3_stateless_retry` and `h3_idle_timeout_secs` apply only to HTTP/3.
+  Stateless retry challenges an unvalidated QUIC peer before connection state
+  is allocated; excess connections are refused and excess stream attempts fail
+  closed at the transport layer.
 - `trusted_proxies` is a CIDR list. All forwarding headers are ignored unless
   the immediate peer matches; an invalid CIDR aborts start-up. For a trusted
   peer the forwarding sources are considered in this order:
@@ -213,6 +243,9 @@ io_backend = "tokio"
 [server.websocket]
 max_frame_bytes = 0
 max_message_bytes = 0
+max_concurrent_tunnels = 1024
+idle_timeout_secs = 300
+max_lifetime_secs = 3600
 ```
 
 - The tungstenite parser enforces these limits while reading, so an oversized
@@ -222,6 +255,17 @@ max_message_bytes = 0
 - `0` inherits `server.max_body_size` for both values, preserving the previous
   behaviour. `max_frame_bytes` must not exceed `max_message_bytes`.
 - The assembled message is still re-checked by the WAF as defence in depth.
+- `max_concurrent_tunnels` is checked during the upgrade handshake, before the
+  upstream connection is opened, and the permit is held for the tunnel's
+  lifetime. Excess upgrades receive `503` with `Retry-After`. Must be greater
+  than zero.
+- `idle_timeout_secs` closes a tunnel with `1001` after this long without
+  traffic in either direction; `0` disables the idle close. `max_lifetime_secs`
+  closes it with `1008` regardless of activity. `idle_timeout_secs` must not
+  exceed `max_lifetime_secs`; `max_lifetime_secs` must be greater than zero.
+- Metrics: `waf_websocket_tunnels_active`,
+  `waf_websocket_tunnels_rejected_total` and
+  `waf_websocket_tunnels_closed_total{reason="idle|max_lifetime"}`.
 
 ### `[server.tls]`
 
