@@ -222,6 +222,31 @@ owns every core**. Leave at least one core for the proxy, TLS and networking.
   proposal path lands. Keep `local_only` and verify the control plane
   directly with `grpcurl` until both prerequisites are closed.
 
+## Build scope (quarantined features)
+
+The support matrix above describes the **default build**: the ingress proxy,
+config/health/metrics, the native Rust CRS engine, the Coraza WASI reactor,
+security events and the core-owned distributed client seam. That is the review
+and release boundary.
+
+The following surfaces are quarantined behind non-default features. They are
+retained in the tree but are **outside the security boundary**, are not release
+tested and carry no support commitment unless their feature is explicitly
+enabled:
+
+| Surface | Feature | Examples |
+| --- | --- | --- |
+| Legacy AI/ML heuristics and threat intelligence | `experimental` (the AI detector stage also needs `ai-threat-detection`) | `advanced_ai_waf_integration`, `ai_optimization_engine`, `threat_intelligence` |
+| Research prototypes | `experimental` | engine kernel, fast path, allow cache, CRS prefilter, io_uring |
+| Ad-hoc acceptance/demo harnesses | `experimental` | `comprehensive_waf_test`, `phase4_*`, `progressive_load_test`, `simple_multi_protocol_test` |
+| Compliance evidence module | `compliance` | audit trail, retention, regulatory evidence packs |
+| Enterprise evidence generators | `enterprise-proto` | `enterprise_*_test` binaries |
+| Vectorscan/Hyperscan harness | `hyperscan-eval` | `hyperscan-bench` (requires system `libhs`) |
+
+`cargo build --bins` builds only CORE and SUPPORT targets; the classification,
+borderline decisions and build commands are in
+[`module-scope.md`](module-scope.md).
+
 ## Known limitations
 
 - Sub-millisecond latency is a **path** property: bodyless, allow-cache,

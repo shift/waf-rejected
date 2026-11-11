@@ -1,4 +1,7 @@
 pub mod admission;
+/// Legacy AI/ML heuristic detector. Quarantined behind `ai-threat-detection`
+/// (which implies `experimental`); the default pipeline never constructs it.
+#[cfg(feature = "ai-threat-detection")]
 pub mod ai;
 pub mod auth;
 pub mod content_inspection;
@@ -897,13 +900,26 @@ impl WafEngine {
     /// reactor or the gRPC allowlist artifact) could not be loaded or
     /// initialised. Proxy start-up treats this as fatal so the process never
     /// serves traffic without its WAF engine.
-    #[cfg(any(
-        feature = "wasm-reactor",
-        feature = "coraza-native",
-        feature = "rust-engine"
-    ))]
+    ///
+    /// With no inspection backend compiled in there can be no init error, so
+    /// the accessor still exists for the readiness snapshot.
     pub fn waf_init_error(&self) -> Option<&str> {
-        self.waf_init_error.as_deref()
+        #[cfg(any(
+            feature = "wasm-reactor",
+            feature = "coraza-native",
+            feature = "rust-engine"
+        ))]
+        {
+            self.waf_init_error.as_deref()
+        }
+        #[cfg(not(any(
+            feature = "wasm-reactor",
+            feature = "coraza-native",
+            feature = "rust-engine"
+        )))]
+        {
+            None
+        }
     }
 
     /// Whether the configured inspection engine initialised successfully and

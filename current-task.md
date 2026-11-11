@@ -1345,3 +1345,65 @@ each, keeping both sides of every conflict.
 - [x] Merge 3 `feat/quiccrunch-client`: `waf.distributed.transport` seam (`grpc` default, `quiccrunch` fails closed without the feature); auto-merged cleanly.
 - [ ] Full gate: fmt, clippy `--lib --deny warnings`, lib tests with and
       without `distri-kv`, `nix build .#waf-ingress`, config validation.
+
+# Chore: quarantine experimental surface behind features
+
+**Branch:** `chore/quarantine-experimental` (base `0da131f`).
+**Goal:** shrink the default build/review boundary to proxy + inspection core
+by feature-gating, without deleting code or changing detection, framing or
+fail-closed behaviour.
+
+## Plan
+
+- [x] Inventory every `[[bin]]` and non-core `src/` module; classify as CORE,
+      SUPPORT, EXPERIMENTAL or COMPLIANCE/ENTERPRISE (table in commit body and
+      `docs/operations/module-scope.md`).
+- [x] Add `experimental` / `enterprise-proto` features (keep existing
+      `compliance`); `default` unchanged and excludes quarantined code.
+- [x] `required-features` on every non-core `[[bin]]`.
+- [x] Gate AI/ML, threat-intelligence and ModSecurity modules at the
+      `lib.rs`/`waf/mod.rs` module boundary; gate `waf::ai` behind
+      `ai-threat-detection`.
+- [x] Make `reqwest` optional and tie it to `experimental`; core deps unchanged.
+- [x] Update `scripts/ci-feature-matrix.sh`, `justfile`, workflow matrix and
+      `flake.nix` package commands.
+- [x] Document `docs/operations/module-scope.md`, README, support matrix.
+
+## Notes / borderline
+
+- 12 files in `src/bin/` were auto-discovered but had no `[[bin]]` entry (so
+  they always built). They are now declared explicitly and quarantined behind
+  `experimental`; nothing was deleted.
+- `echo_backend`/`end_to_end_test` are SUPPORT (fixture upstream needed to
+  verify the core); `progressive_load_test` and ad-hoc suites are EXPERIMENTAL.
+- `hyperscan-eval` is deliberately not part of `experimental` because it links
+  system `libhs`.
+
+## Verification
+
+- `cargo fmt -- --check` — pass.
+- `cargo clippy --lib -- --deny warnings` — pass.
+- `cargo test --lib` — 649 tests, 639 passed, 10 ignored.
+- `cargo test --lib --features distri-kv` — 675 tests, 665 passed, 10 ignored.
+- `cargo test --lib --features experimental` — 796 tests, 785 passed, 11 ignored.
+- `cargo test --lib --features compliance` — 655 tests, 645 passed, 10 ignored.
+- `cargo build --bins` — 14 binaries (was 40 of 54 auto-discovered).
+- `cargo build --bins --features experimental,compliance` — 44 binaries.
+- `cargo check --all-targets` (default) and with
+  `experimental,compliance,enterprise-proto` — pass.
+- `nix build .#waf-ingress` — pass.
+- `./scripts/ci-feature-matrix.sh --quick` — PASS (13 passed, 5 quick-skips).
+- `./scripts/validate-configs.sh` — 19 configs + 5 tests pass.
+- Normal dependency count (unique): 431 → 420.
+
+### Pre-existing breakage fixed to make the quarantine buildable
+
+- `waf_init_error()` was gated while `proxy/service.rs` called it
+  unconditionally, so `--no-default-features` never compiled (verified at base
+  `0da131f`).
+- `parallel-args` called `gate_mask` without the `EvalState` argument.
+- `allow_cache` test assigned `String` to a `Cow<'static, str>` field.
+- `io_performance_test` test compared `Bytes` with `[u8; 20]`.
+
+No detection, framing or fail-closed behaviour changed; all four are
+compile-only fixes on code paths that already failed to build.

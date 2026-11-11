@@ -170,15 +170,34 @@ details are logged server-side but never sent to the client.
 
 ## Build and test
 
+The default build is the review boundary: the ingress proxy plus the inspection
+core and support tools. Experimental AI/ML heuristics, research prototypes
+(engine kernel, fast path, allow cache, CRS prefilter, io_uring), compliance
+evidence packs and enterprise acceptance suites are quarantined behind the
+non-default `experimental`, `compliance` and `enterprise-proto` features. They
+remain in the tree but are outside the security boundary and receive no release
+testing unless their feature is enabled. See
+[`docs/operations/module-scope.md`](docs/operations/module-scope.md) for the
+full classification and build recipes.
+
 ```bash
 nix develop -c cargo fmt -- --check
 nix develop -c cargo clippy --lib -- --deny warnings
 nix develop -c cargo test --lib
+nix develop -c cargo test --lib --features distri-kv
 nix develop -c cargo test --test integration
 nix develop -c cargo check --all-targets
+nix develop -c cargo build --bins        # core + support only
 ./scripts/validate-configs.sh
 ./scripts/demo.sh
 nix build .#waf-ingress
+```
+
+Quarantined surfaces are built explicitly:
+
+```bash
+nix develop -c cargo build --bins --features experimental
+nix develop -c cargo build --bins --features experimental,compliance,enterprise-proto
 ```
 
 MaxMind-backed integration tests are skipped unless local databases are

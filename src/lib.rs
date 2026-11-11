@@ -60,19 +60,31 @@ pub mod waf;
 #[cfg(test)]
 pub mod performance_validation;
 
-// Compliance and security modules
+// Compliance and security modules. Gated: the evidence/audit surface is
+// outside the default security boundary (see docs/operations/module-scope.md).
 #[cfg(feature = "compliance")]
 pub mod compliance;
 
-// Legacy AI modules (kept for compatibility)
+// Quarantined experimental surface: legacy AI/ML heuristics, threat
+// intelligence and the ModSecurity scaffolding. Compiled only with the
+// non-default `experimental` feature (or `ai-threat-detection`, which implies
+// it). Nothing here is on the default request path.
+#[cfg(feature = "experimental")]
 pub mod advanced_ai_waf_integration;
+#[cfg(feature = "experimental")]
 pub mod advanced_ml_models;
+#[cfg(feature = "experimental")]
 pub mod ai_optimization_engine;
+#[cfg(feature = "experimental")]
 pub mod ai_threat_detection;
+#[cfg(feature = "experimental")]
 pub mod ai_waf_integration;
+#[cfg(feature = "experimental")]
 pub mod threat_intelligence;
 
-// Advanced modules for future phases
+// Advanced modules for future phases (quarantined with the experimental
+// surface; nothing in the core pipeline references it).
+#[cfg(feature = "experimental")]
 pub mod modsecurity;
 
 // The historical `wasm` module is retained in-tree but is not compiled:
@@ -89,8 +101,11 @@ pub use health::HealthService;
 pub use proxy::{BufferPool, WafProxyService};
 pub use waf::{Decision, RequestContext, WafEngine};
 
-// Legacy re-exports for compatibility
+// Legacy re-exports for compatibility (quarantined `experimental` surface).
+#[cfg(feature = "experimental")]
 pub use advanced_ai_waf_integration::{AdvancedAiWafIntegration, RequestAnalysisData};
+#[cfg(feature = "experimental")]
 pub use ai_optimization_engine::{AiOptimizationEngine, OptimizedThreatAnalysis};
+#[cfg(feature = "experimental")]
 pub use ai_threat_detection::{RequestFeatures, ThreatAnalysis, ThreatDetectionService};
 pub use error::WafResult;

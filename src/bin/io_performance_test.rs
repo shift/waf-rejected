@@ -260,7 +260,7 @@ mod tests {
 
         // Read file
         let read_data = handler.read_file(&test_file).await?;
-        assert_eq!(read_data, test_data);
+        assert_eq!(&read_data[..], &test_data[..]);
 
         // Check stats (should show zero-copy operations)
         let stats = handler.get_stats();

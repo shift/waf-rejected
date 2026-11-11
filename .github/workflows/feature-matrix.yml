@@ -113,6 +113,12 @@ jobs:
             args: "--no-default-features"
           - name: no-default-features,wasm-reactor
             args: "--no-default-features --features wasm-reactor"
+          - name: distri-kv
+            args: "--features distri-kv"
+          - name: experimental
+            args: "--features experimental"
+          - name: compliance
+            args: "--features compliance"
     steps:
       - uses: actions/checkout@v4
       - name: Install Nix
@@ -134,6 +140,8 @@ jobs:
             args: "--all-targets --features http3,webtransport,wasm-reactor"
           - name: all-targets + ai-threat-detection
             args: "--all-targets --features ai-threat-detection"
+          - name: all-targets + experimental,compliance,enterprise-proto
+            args: "--all-targets --features experimental,compliance,enterprise-proto"
           - name: bin graphql-allowlist + wasm-reactor
             args: "--bin graphql-allowlist --features wasm-reactor"
           - name: bin grpc-allowlist + wasm-reactor
