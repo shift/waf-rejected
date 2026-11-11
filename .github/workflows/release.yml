@@ -358,7 +358,7 @@ jobs:
           } > release-body.md
           cat release-body.md
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           prerelease: true
           generate_release_notes: true
