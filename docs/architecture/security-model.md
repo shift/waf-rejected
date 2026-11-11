@@ -59,6 +59,8 @@ an independent penetration test passed.
 | Trusted-proxy client-IP resolution and forwarding-header rewrite | Tested | `src/proxy/service.rs` — `resolve_client_ip`, `build_upstream_request` | `src/proxy/service.rs` unit tests (`test_client_ip_*`, proptest `resolve_client_ip_never_panics_*`) | beta.2 |
 | Client routing/override header stripping (same path/method WAF and origin) | Tested | `src/proxy/service.rs` — `HeaderStripPolicy`, `handle_request`; `src/proxy/http3.rs` | `src/proxy/service.rs` unit tests; `tests/integration/pipeline_tests.rs` (`pipeline_strips_routing_headers_*`, `pipeline_rejects_ambiguous_routing_headers_when_enabled`) | Unreleased (H3) |
 | API-key authentication and HTTPS requirement | Tested | `src/waf/auth.rs` — `ApiKeyValidator::validate_request`, `InMemoryKeyStore::from_raw_keys` | `tests/integration/auth_tests.rs`; `src/waf/auth.rs` unit tests | beta.1 |
+| Pre-validation auth failure budget and temporary lockout | Opt-in, tested | `src/waf/auth.rs` — `AuthRateLimiter::check_failure_budget`, `record_failure`; `ApiKeyValidator::validate_request_for_client` | `src/waf/auth.rs` unit tests (`wrong_keys_exhaust_the_failure_budget_*`, `correct_key_from_a_penalised_source_*`, `failure_budgets_are_isolated_per_source`) | Unreleased |
+| API-key expiry and dual-key rotation | Tested | `src/waf/auth.rs` — `ApiKeyEntry`, `InMemoryKeyStore::from_entries`, `validate_at`; `src/config.rs` — `AuthConfig::validate` | `src/waf/auth.rs` unit test (`expired_key_is_rejected_and_rotation_accepts_old_and_new`) | Unreleased |
 | Ambiguous request-framing rejection (CL/TE smuggling) | Tested | `src/proxy/framing.rs` — `validate_request_framing`; called from `service.rs` and `http3.rs` before body reads | `src/proxy/framing.rs` unit tests; `tests/integration/pipeline_tests.rs` (`pipeline_accepts_chunked_body`, `pipeline_rejects_content_length_mismatch`) | beta.10 |
 | Streaming request-body cap and read timeout | Tested | `src/proxy/buffer_pool.rs` — `read_incoming_body`; `src/proxy/service.rs`; `src/proxy/http3.rs` | `tests/integration/pipeline_tests.rs` (`pipeline_rejects_oversized_body`) | beta.1 |
 | Bounded request decompression (`gzip`, `deflate`, `br`) | Tested | `src/proxy/decompression.rs` — `decompress_request_body`, `strip_encoding_headers` | `src/proxy/decompression.rs` unit tests; `tests/integration/pipeline_tests.rs` (six decompression cases) | beta.10 |
@@ -75,7 +77,10 @@ an independent penetration test passed.
 | gRPC streaming policy (`reject` default, explicit `transport-only`) with per-message inspection and whole-stream bounds | Tested | `src/proxy/service.rs` — `handle_grpc_stream`, `GrpcStreamGuard`; `src/waf/grpc.rs` — `GrpcStreamFrameInspector`; `src/config.rs` — `grpc_streaming_policy` | `tests/integration/grpc_h2_e2e.rs` (`streaming_messages_are_content_inspected`, `streaming_policy_reject_returns_grpc_status`, streaming limit cases) | Unreleased |
 | GraphQL-over-HTTP inspection (`crs`, `graphql-only`, `off`) | Tested | `src/waf/graphql.rs`; `src/waf/mod.rs` — `graphql_precheck` | `tests/integration/waf_features_tests.rs`; `src/waf/graphql.rs` unit tests | beta.12 |
 | WebSocket upgrade validation and per-message WAF inspection | Tested | `src/proxy/service.rs` — `bridge_websocket`, `websocket_message_blocked`; `src/proxy/websocket.rs` | `tests/integration/websocket_tests.rs`; `src/proxy/websocket.rs` unit tests | beta.5 |
-| WebSocket per-message size cap | Tested | `src/proxy/service.rs` — `websocket_message_blocked` (uses `server.max_body_size`) | `tests/integration/websocket_tests.rs`; `src/proxy/service.rs` unit tests | beta.6 |
+| WebSocket extension negotiation stripped when the proxy did not negotiate it | Tested | `src/proxy/service.rs` — `proxy_websocket` request/response header filters | `tests/integration/websocket_tests.rs` (`websocket_extensions_are_stripped_in_both_directions`) | Unreleased |
+| WebSocket control-frame validation (RFC 6455 size/fragmentation/close code) | Tested | `src/proxy/service.rs` — `websocket_control_violation`, `websocket_error_close`, `bridge_websocket` | `src/proxy/service.rs` unit tests; `tests/integration/websocket_tests.rs` (`websocket_fragmented_control_frame_*`, `websocket_oversized_control_payload_*`) | Unreleased |
+| WebSocket upstream-to-client per-message inspection (opt-in) | Opt-in, tested | `src/proxy/service.rs` — `bridge_websocket` with `server.websocket.inspect_responses` | `tests/integration/websocket_tests.rs` (`websocket_upstream_payload_is_blocked_when_response_inspection_is_enabled`) | Unreleased |
+| WebSocket per-message size cap | Tested | `src/proxy/service.rs` — `websocket_message_blocked` (uses `server.websocket.max_frame_bytes` / `max_message_bytes`) | `tests/integration/websocket_tests.rs`; `src/proxy/service.rs` unit tests | beta.6 |
 | HTTP/3 (QUIC) ingress reusing the same pipeline | Tested | `src/proxy/http3.rs` — `serve`, `handle_request`, `read_body` | `src/proxy/http3.rs` integration tests (feature-gated) | beta.7 |
 | WebTransport terminating endpoint (Origin/path/auth/limits/inspection) | Tested (feature-gated) | `src/proxy/webtransport.rs` — `serve`, session handlers | `tests/integration/webtransport_tests.rs`; `src/proxy/webtransport.rs` unit tests | beta.9 |
 | Upstream response size cap | Tested | `src/proxy/service.rs` — `forward_to_upstream_with_protocol`, `Limited`/`GuardedBody` | `tests/integration/pipeline_tests.rs` (`pipeline_rejects_oversized_upstream_response`) | beta.1 |
@@ -276,11 +281,29 @@ not from an inbound header.
   (`global_enabled`, `global_max_requests`, `global_window_secs`). A saturated
   limiter table, or a per-IP limit without a resolved client address, fails
   closed. Rejections increment `waf_auth_rate_limited_total` and return `429`.
+- when `security.auth.failure_limit.enabled` is true, a failure budget is
+  consulted **before** the key digest is compared. It is keyed independently
+  by the trusted-proxy-resolved client IP and by the first 16 hex characters of
+  the presented key's SHA-256 digest. Failed attempts (missing, invalid or
+  expired key) consume the budget. After `max_failures` within `window_secs`
+  the source is locked out for `lockout_secs`, and even a correct key from that
+  source is rejected until the lockout expires. Saturated failure tables fail
+  closed. Rejections increment `waf_auth_failure_limited_total` and return
+  `429`; no presented key material is stored or logged. Distinct counters
+  `waf_auth_missing_key_total`, `waf_auth_invalid_key_total` and
+  `waf_auth_expired_key_total` identify the rejection reason. The budget is
+  opt-in; the default (`enabled = false`) preserves the pre-existing behaviour
+  for existing deployments.
 
-Keys are held in plaintext in configuration and hashed at startup. Failed
-authentication happens before the WAF rule chain, so invalid keys are not rate
-limited by the proxy; only successfully validated keys consume the auth
-limiter.
+Keys are held in plaintext in configuration and hashed at startup. The legacy
+`security.auth.api_keys` list remains valid and maps to non-expiring entries.
+`security.auth.api_key_entries` adds an optional RFC 3339 `expires_at` per key;
+an expired key is rejected with `401` after consuming the failure budget. To
+rotate, list the new key alongside the old key and set `expires_at` on the old
+one; both are accepted until the old expiry. Failed authentication happens
+before the WAF rule chain, so the failure budget, not the success rate limiter,
+meters brute force attempts. When the failure budget is disabled, only
+successfully validated keys consume the success rate limiter.
 
 ### 4.4 Body admission, framing and decompression
 
@@ -457,16 +480,34 @@ requires a `101` response.
 After the upgrade, `bridge_websocket` inspects each client `Text` or `Binary`
 message through the full `WafEngine::evaluate` chain, including the rate
 limiters, and closes both sides on a block. Messages larger than
-`server.max_body_size` are blocked before inspection; tungstenite's own default
-frame/message limits also apply. Control frames are passed through and
-upstream-to-client messages are not inspected. Concurrent tunnels are capped by
-`server.websocket.max_concurrent_tunnels`; established tunnels are closed with
-`1001` after `idle_timeout_secs` without traffic and with `1008` at
-`max_lifetime_secs`. `permessage-deflate` is not configured in the proxy's
-tungstenite codec, while
-client extension headers are forwarded to the origin; an origin may therefore
-accept an extension the proxy cannot decode. Each frame consumes a rate-limit
-token and can produce a security event.
+`server.websocket.max_message_bytes` (default inherits `server.max_body_size`)
+are blocked before inspection; tungstenite's own frame/message limits also
+apply. Control frames are validated against RFC 6455 before forwarding: control
+payloads are capped at 125 bytes, fragmented control frames are rejected by the
+parser, and close codes/reasons must be legal. Protocol violations close both
+sides with `1002` (Protocol); oversized data or control frames that hit the
+parser cap close with `1008` (Policy).
+
+Concurrent tunnels are capped by `server.websocket.max_concurrent_tunnels`;
+established tunnels are closed with `1001` after `idle_timeout_secs` without
+traffic and with `1008` at `max_lifetime_secs`. Both bounds are enforced on the
+established tunnel and emit metrics.
+
+`server.websocket.inspect_responses` (default `false`) enables inspection of
+upstream-to-client `Text`/`Binary` frames with the same bounded
+`max_message_bytes` buffer and rate-limit budget as the request direction. It is
+opt-in because every origin frame then incurs a full WAF evaluation, roughly
+doubling per-frame inspection cost on a busy tunnel and potentially rejecting
+frames that were previously forwarded. Inspection errors and blocks close both
+sides with `1008`; an unverified upstream frame is never forwarded.
+
+The proxy does not negotiate WebSocket extensions: its tungstenite codec has no
+`permessage-deflate` support. `Sec-WebSocket-Extensions` is therefore stripped
+from the client request before it reaches the origin **and** from the origin's
+`101` response before it reaches the client. This prevents an origin from
+accepting compression the proxy cannot decode, which would silently degrade
+inspection. Each inspected frame consumes a rate-limit token and can produce a
+security event.
 
 ### 4.9 HTTP/3 path
 
@@ -574,19 +615,25 @@ frame, a control frame or the server-to-client direction; or hold a tunnel open
 to exhaust resources.
 
 **Current control:** text and binary messages are evaluated with the full rule
-chain; messages over `server.max_body_size` are blocked; blocked messages close
-both sides. Fragmented messages are reassembled by tungstenite before
-inspection. `server.websocket.max_concurrent_tunnels` caps concurrent tunnels
-(the permit is taken during the handshake, before the upstream connection is
-opened), `idle_timeout_secs` closes an inactive tunnel with `1001`, and
-`max_lifetime_secs` closes it with `1008`. Both bounds are enforced on the
-established tunnel and emit metrics.
+chain; messages over `server.websocket.max_message_bytes` are blocked; blocked
+messages close both sides. Fragmented messages are reassembled by tungstenite
+before inspection. Control frames are validated against RFC 6455 (125-byte cap,
+no fragmentation, legal close codes) and protocol violations close with `1002`.
+`Sec-WebSocket-Extensions` is stripped in both handshake directions because the
+proxy does not negotiate compression. Opt-in `server.websocket.inspect_responses`
+applies the same inspection and bounded buffer to upstream-to-client frames.
+`server.websocket.max_concurrent_tunnels` caps concurrent tunnels (the permit is
+taken during the handshake, before the upstream connection is opened),
+`idle_timeout_secs` closes an inactive tunnel with `1001`, and `max_lifetime_secs`
+closes it with `1008`; both bounds are enforced on the established tunnel and
+emit metrics.
 
-**Residual:** control frames and upstream-to-client traffic are not inspected.
-Compression is not negotiated by the proxy's codec, but client extension
-headers are forwarded, so an origin may accept an extension the proxy cannot
-decode. There is no per-connection frame budget beyond the rate limiter. Each
-frame consumes a rate-limit token and can produce a security event.
+**Residual:** when `inspect_responses` is left at its default `false`,
+upstream-to-client data frames are not inspected. Per-message inspection is
+per process; there is no per-connection frame budget beyond the rate limiter.
+Tunnel lifetime and concurrency are bounded by the resource-limit controls.
+Each inspected frame consumes a rate-limit token and can produce a security
+event.
 
 ### 5.5 HTTP/3
 
@@ -681,14 +728,19 @@ startup-loaded hash set. Per-IP state is sharded and hard-capped at
 `capacity_policy = "fail_closed"` rejects new IPs at the cap, so an attacker
 cannot evict legitimate buckets; `evict_oldest` is explicitly less safe.
 Cleanup is incremental (one shard per 100 evaluations), so the map never grows
-without bound.
+without bound. When `security.auth.failure_limit.enabled` is true, failed
+authentication is metered *before* key validation by client IP and by presented
+key digest prefix, with a temporary lockout; failed attempts therefore consume
+budget exactly like successful ones. This is opt-in and disabled by default.
 
 **Residual:** rate limits are per process, not shared across replicas, and are
 keyed on the resolved IP. IPv6 rotation and distributed sources still defeat
-per-IP limits. Failed authentication is not rate limited because auth runs
-before the rule chain. API keys are shared secrets with no rotation API, expiry
-or replay protection. The auth limiter's per-key/per-IP tables are hard-capped
-and fail closed at capacity.
+per-IP limits. With the failure budget disabled, failed authentication is not
+rate limited because auth runs before the rule chain; enable
+`security.auth.failure_limit` for brute-force protection. API keys are shared
+secrets; expiry and dual-key rotation are configuration-driven (no hot-reload
+rotation API), and there is no replay protection. The auth limiter's and
+failure-budget tables are hard-capped and fail closed at capacity.
 
 ### 5.10 Error-path and observability issues
 
@@ -819,7 +871,9 @@ The model holds only if the operator satisfies these assumptions:
 - [ ] Enable API-key authentication and keep `require_https = true` when the
       WAF terminates TLS; set it to `false` only behind a trusted TLS LB.
 - [ ] Generate high-entropy API keys, store them in a secret manager, and rotate
-      them by redeploying (there is no rotation API).
+      with `security.auth.api_key_entries` (old key plus new key, `expires_at`
+      on the retiring key). Enable `security.auth.failure_limit` if the auth
+      endpoint is reachable by untrusted clients.
 - [ ] Restrict `server.trusted_proxies` to exact LB/proxy CIDRs and verify with
       a request that a forged `X-Forwarded-For` is ignored.
 - [ ] Set `server.max_body_size` to the smallest value the application needs;

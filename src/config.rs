@@ -375,6 +375,12 @@ pub struct WebSocketConfig {
 
     /// Absolute maximum tunnel lifetime in seconds, regardless of activity.
     pub max_lifetime_secs: u64,
+
+    /// Inspect upstream-to-client `Text`/`Binary` frames with the same bounded
+    /// buffers and rate-limit budgets as the client-to-upstream direction.
+    /// Defaults to `false`; enabling it roughly doubles per-frame inspection
+    /// cost on a tunnel and can reject previously forwarded origin frames.
+    pub inspect_responses: bool,
 }
 
 impl WebSocketConfig {
@@ -405,6 +411,7 @@ impl Default for WebSocketConfig {
             max_concurrent_tunnels: 1024,
             idle_timeout_secs: 300,
             max_lifetime_secs: 3600,
+            inspect_responses: false,
         }
     }
 }
@@ -3169,9 +3176,15 @@ impl Config {
         self.waf.grpc.validate()?;
         self.waf.graphql.validate()?;
         self.waf.distributed.validate()?;
-        if self.security.auth.enabled && self.security.auth.api_keys.is_empty() {
-            anyhow::bail!("security.auth.enabled is true but security.auth.api_keys is empty");
+        if self.security.auth.enabled
+            && self.security.auth.api_keys.is_empty()
+            && self.security.auth.api_key_entries.is_empty()
+        {
+            anyhow::bail!(
+                "security.auth.enabled is true but security.auth.api_keys and api_key_entries are empty"
+            );
         }
+        self.security.auth.validate()?;
         for cidr in &self.server.trusted_proxies {
             cidr.parse::<ipnetwork::IpNetwork>().map_err(|e| {
                 anyhow::anyhow!("invalid server.trusted_proxies entry '{}': {}", cidr, e)
@@ -3843,6 +3856,8 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
         assert_eq!(config.server.h3_max_inflight_requests, 256);
         assert_eq!(config.server.h3_max_inflight_per_client, 0);
         assert_eq!(config.server.h3_admission_timeout_ms, 250);
+        assert!(!config.server.websocket.inspect_responses);
+        assert!(!config.security.auth.failure_limit.enabled);
         assert_eq!(
             config
                 .server

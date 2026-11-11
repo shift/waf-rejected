@@ -8,10 +8,15 @@ use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
 };
-use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::oneshot;
 use tokio_rustls::rustls;
 use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::TlsAcceptor;
+use tokio_tungstenite::tungstenite::handshake::server::{
+    Request as WsRequest, Response as WsResponse,
+};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
 use tokio_tungstenite::tungstenite::protocol::frame::Frame;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -73,6 +78,27 @@ async fn spawn_proxy_with_ws_limits(
     config.waf.rate_limit.global_enabled = false;
     config.waf.coraza.enabled = false;
 
+    spawn_proxy_for_config(config).await
+}
+
+async fn spawn_proxy_with_ws_response_inspection(
+    upstream: std::net::SocketAddr,
+    inspect_responses: bool,
+) -> String {
+    let mut config = Config {
+        upstream_uri: format!("http://{}", upstream),
+        ..Config::default()
+    };
+    config.server.max_body_size = 4096;
+    config.server.websocket.inspect_responses = inspect_responses;
+    config.waf.rate_limit.per_ip_enabled = false;
+    config.waf.rate_limit.global_enabled = false;
+    config.waf.coraza.enabled = false;
+
+    spawn_proxy_for_config(config).await
+}
+
+async fn spawn_proxy_for_config(config: Config) -> String {
     let service = Arc::new(WafProxyService::new(config).unwrap());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -81,6 +107,62 @@ async fn spawn_proxy_with_ws_limits(
     });
 
     format!("{}", addr)
+}
+
+/// Perform a raw client handshake so tests can send headers (extensions) that
+/// the tungstenite client does not expose. Returns the socket and response head.
+async fn raw_ws_handshake(proxy: &str, extra_headers: &str) -> (TcpStream, String) {
+    let mut stream = TcpStream::connect(proxy).await.unwrap();
+    let request = format!(
+        "GET /ws HTTP/1.1\r\nHost: {proxy}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         {extra_headers}\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut head = Vec::new();
+    let mut chunk = [0u8; 512];
+    loop {
+        let read = stream.read(&mut chunk).await.unwrap();
+        assert!(read > 0, "proxy closed during handshake");
+        head.extend_from_slice(&chunk[..read]);
+        if head.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+        assert!(head.len() < 16 * 1024, "handshake head too large");
+    }
+    (stream, String::from_utf8_lossy(&head).into_owned())
+}
+
+/// Write a masked client frame (required by RFC 6455 for client-to-server).
+async fn send_masked_frame(stream: &mut TcpStream, fin: bool, opcode: u8, payload: &[u8]) {
+    let mut frame = Vec::with_capacity(payload.len() + 14);
+    frame.push(if fin { 0x80 | opcode } else { opcode });
+    if payload.len() < 126 {
+        frame.push(0x80 | payload.len() as u8);
+    } else {
+        frame.push(0x80 | 126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    }
+    let mask = [0x12u8, 0x34, 0x56, 0x78];
+    frame.extend_from_slice(&mask);
+    for (index, byte) in payload.iter().enumerate() {
+        frame.push(byte ^ mask[index % 4]);
+    }
+    stream.write_all(&frame).await.unwrap();
+}
+
+async fn read_close_code(stream: &mut TcpStream) -> Option<u16> {
+    let mut header = [0u8; 2];
+    stream.read_exact(&mut header).await.ok()?;
+    assert_eq!(header[0] & 0x0f, 0x8, "expected a close frame");
+    let length = (header[1] & 0x7f) as usize;
+    if length < 2 {
+        return None;
+    }
+    let mut payload = vec![0u8; length];
+    stream.read_exact(&mut payload).await.ok()?;
+    Some(u16::from_be_bytes([payload[0], payload[1]]))
 }
 
 fn permissive_client_config() -> WebSocketConfig {
@@ -239,6 +321,126 @@ async fn websocket_upgrade_is_blocked_by_waf() {
             .await;
 
     assert!(result.is_err(), "WAF should block the upgrade handshake");
+}
+
+#[tokio::test]
+async fn websocket_extensions_are_stripped_in_both_directions() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_hdr_async(
+            stream,
+            move |req: &WsRequest, mut response: WsResponse| {
+                let saw = req.headers().contains_key("sec-websocket-extensions");
+                let _ = tx.send(saw);
+                // An origin may accept an extension even when the proxy's codec
+                // cannot decode it; the proxy must strip this response header.
+                response.headers_mut().insert(
+                    "sec-websocket-extensions",
+                    "permessage-deflate".parse().unwrap(),
+                );
+                Ok(response)
+            },
+        )
+        .await
+        .unwrap();
+        let _ = ws.next().await;
+    });
+
+    let proxy = spawn_proxy(upstream).await;
+    let (mut stream, head) =
+        raw_ws_handshake(&proxy, "Sec-WebSocket-Extensions: permessage-deflate\r\n").await;
+
+    assert!(
+        !head
+            .to_ascii_lowercase()
+            .contains("sec-websocket-extensions"),
+        "proxy forwarded an unnegotiated extension response: {head}"
+    );
+    let upstream_saw_extension = tokio::time::timeout(std::time::Duration::from_secs(3), rx)
+        .await
+        .expect("upstream handshake callback timeout")
+        .expect("upstream callback dropped");
+    assert!(
+        !upstream_saw_extension,
+        "proxy forwarded an unnegotiated extension request upstream"
+    );
+    let _ = stream.shutdown().await;
+}
+
+#[tokio::test]
+async fn websocket_fragmented_control_frame_is_rejected_with_protocol_close() {
+    let upstream = spawn_ws_upstream().await;
+    let proxy = spawn_proxy(upstream).await;
+    let (mut stream, _) = raw_ws_handshake(&proxy, "").await;
+
+    // FIN=0 on a ping is a protocol violation (RFC 6455 section 5.5).
+    send_masked_frame(&mut stream, false, 0x9, &[]).await;
+
+    let code = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        read_close_code(&mut stream),
+    )
+    .await
+    .expect("proxy must close the tunnel");
+    assert_eq!(code, Some(1002), "fragmented control frame must close 1002");
+}
+
+#[tokio::test]
+async fn websocket_oversized_control_payload_is_rejected_with_protocol_close() {
+    let upstream = spawn_ws_upstream().await;
+    let proxy = spawn_proxy(upstream).await;
+    let (mut stream, _) = raw_ws_handshake(&proxy, "").await;
+
+    send_masked_frame(&mut stream, true, 0x9, &vec![0u8; 126]).await;
+
+    let code = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        read_close_code(&mut stream),
+    )
+    .await
+    .expect("proxy must close the tunnel");
+    assert_eq!(code, Some(1002), "oversized control frame must close 1002");
+}
+
+async fn spawn_ws_upstream_sending(payload: &'static str) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let _ = ws.next().await;
+        let _ = ws.send(Message::Text(payload.into())).await;
+        let _ = ws.next().await;
+    });
+    addr
+}
+
+#[tokio::test]
+async fn websocket_upstream_payload_is_blocked_when_response_inspection_is_enabled() {
+    let upstream = spawn_ws_upstream_sending("id=1 UNION SELECT * FROM users").await;
+    let proxy = spawn_proxy_with_ws_response_inspection(upstream, true).await;
+
+    let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{}/ws", proxy))
+        .await
+        .expect("websocket handshake through proxy");
+    client.send(Message::Text("benign".into())).await.unwrap();
+
+    let next = tokio::time::timeout(std::time::Duration::from_secs(3), client.next())
+        .await
+        .expect("upstream frame should have been inspected");
+    match next {
+        Some(Ok(Message::Close(frame))) => {
+            assert_eq!(
+                frame.map(|frame| frame.code),
+                Some(tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy)
+            );
+        }
+        Some(Err(_)) | None => {}
+        Some(Ok(other)) => panic!("upstream malicious frame was forwarded: {other:?}"),
+    }
 }
 
 /// Generate a self-signed test CA and a server certificate for 127.0.0.1

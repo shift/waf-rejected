@@ -26,7 +26,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsConnector;
-use tokio_tungstenite::tungstenite::error::CapacityError;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{
     CloseFrame, Role, WebSocketConfig as WsCodecConfig,
@@ -54,7 +53,7 @@ use crate::proxy::grpc_body::{
 };
 use crate::proxy::telemetry::{RequestRejection, RequestTelemetry};
 use crate::proxy::websocket::{WebSocketHandler, WebSocketTunnelLimiter};
-use crate::waf::auth::{ApiKeyValidator, InMemoryKeyStore};
+use crate::waf::auth::{ApiKeyEntry, ApiKeyValidator, InMemoryKeyStore};
 use crate::waf::tls_config::TlsManager;
 use crate::waf::{Decision, RequestContext, ResponseContext, ResponseInspectionOptions, WafEngine};
 
@@ -1182,13 +1181,26 @@ impl WafProxyService {
         };
 
         let auth_validator = if config_arc.security.auth.enabled {
-            let store = Arc::new(InMemoryKeyStore::from_raw_keys(
-                &config_arc.security.auth.api_keys,
-            ));
+            let auth = &config_arc.security.auth;
+            let mut entries: Vec<ApiKeyEntry> = auth
+                .api_keys
+                .iter()
+                .map(|key| ApiKeyEntry {
+                    key: key.clone(),
+                    expires_at: None,
+                })
+                .collect();
+            entries.extend(auth.api_key_entries.iter().cloned());
+            let store = Arc::new(InMemoryKeyStore::from_entries(&entries));
             info!(
-                "API key authentication enabled ({} key(s), header '{}')",
-                config_arc.security.auth.api_keys.len(),
-                config_arc.security.auth.header_name
+                "API key authentication enabled ({} key(s), header '{}', failure limit {})",
+                entries.len(),
+                auth.header_name,
+                if auth.failure_limit.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
             );
             Some(Arc::new(ApiKeyValidator::new(
                 store,
@@ -1671,6 +1683,54 @@ impl WafProxyService {
                     state.metrics.record_rate_limited();
                     state.metrics.record_blocked();
                     return Ok(Self::create_rate_limit_response(&e));
+                }
+                Err(WafError::AuthFailureLimited(e)) => {
+                    warn!(
+                        "Authentication failure lockout for request from {}: {}",
+                        client_ip, e
+                    );
+                    telemetry.reject(RequestRejection::WafRateLimited);
+                    state.metrics.record_auth_failure_limited();
+                    state.metrics.record_auth_failure();
+                    state.metrics.record_rate_limited();
+                    state.metrics.record_blocked();
+                    return Ok(Self::create_rate_limit_response(&e));
+                }
+                Err(WafError::AuthExpiredKey) => {
+                    warn!("Authentication rejected expired API key from {}", client_ip);
+                    telemetry.reject(RequestRejection::Authentication);
+                    state.metrics.record_auth_expired_key();
+                    state.metrics.record_auth_failure();
+                    state.metrics.record_blocked();
+                    return Ok(Self::create_error_response(
+                        StatusCode::UNAUTHORIZED,
+                        "Unauthorized",
+                    ));
+                }
+                Err(WafError::AuthMissingKey) => {
+                    warn!(
+                        "Authentication rejected request from {}: missing API key",
+                        client_ip
+                    );
+                    telemetry.reject(RequestRejection::Authentication);
+                    state.metrics.record_auth_missing_key();
+                    state.metrics.record_auth_failure();
+                    state.metrics.record_blocked();
+                    return Ok(Self::create_error_response(
+                        StatusCode::UNAUTHORIZED,
+                        "Unauthorized",
+                    ));
+                }
+                Err(WafError::AuthInvalidKey) => {
+                    warn!("Authentication rejected invalid API key from {}", client_ip);
+                    telemetry.reject(RequestRejection::Authentication);
+                    state.metrics.record_auth_invalid_key();
+                    state.metrics.record_auth_failure();
+                    state.metrics.record_blocked();
+                    return Ok(Self::create_error_response(
+                        StatusCode::UNAUTHORIZED,
+                        "Unauthorized",
+                    ));
                 }
                 Err(e) => {
                     warn!("Authentication rejected request from {}: {}", client_ip, e);
@@ -2274,6 +2334,7 @@ impl WafProxyService {
                     | "te"
                     | "trailer"
                     | "sec-websocket-accept"
+                    | "sec-websocket-extensions"
                     | "x-forwarded-host"
                     | "x-forwarded-for"
                     | "x-real-ip"
@@ -2495,6 +2556,16 @@ impl WafProxyService {
             .status(StatusCode::SWITCHING_PROTOCOLS)
             .version(hyper::Version::HTTP_11);
         for (name, value) in upstream_headers.iter() {
+            // The proxy's tungstenite codec never negotiates extensions (no
+            // permessage-deflate). Forwarding an origin acceptance would make
+            // the client compress frames the proxy cannot decode, silently
+            // disabling inspection. Strip it on the response direction too.
+            if name
+                .as_str()
+                .eq_ignore_ascii_case("sec-websocket-extensions")
+            {
+                continue;
+            }
             builder = builder.header(name.clone(), value.clone());
         }
         builder = builder
@@ -2523,6 +2594,7 @@ impl WafProxyService {
             .then(|| Duration::from_secs(state.config.server.websocket.idle_timeout_secs));
         let max_lifetime =
             Duration::from_secs(state.config.server.websocket.max_lifetime_secs.max(1));
+        let inspect_responses = state.config.server.websocket.inspect_responses;
         tokio::spawn(async move {
             let _tunnel_guard = tunnel_guard;
             let upgraded = match on_upgrade.await {
@@ -2551,6 +2623,7 @@ impl WafProxyService {
                 idle_timeout,
                 max_lifetime,
                 metrics,
+                inspect_responses,
             )
             .await;
         });
@@ -2564,8 +2637,11 @@ impl WafProxyService {
             .unwrap_or_else(|_| Self::create_error_response(StatusCode::BAD_GATEWAY, "Handshake"))
     }
 
-    /// Bridge two WebSocket streams, evaluating client data frames through the
-    /// WAF before forwarding them upstream.
+    /// Bridge two WebSocket streams, evaluating data frames through the WAF
+    /// before forwarding them. Control frames are validated against RFC 6455
+    /// bounds before either side sees them. When `inspect_responses` is set,
+    /// upstream-to-client data frames are inspected with the same bounded
+    /// buffer and rate-limit budget as the request direction.
     #[allow(clippy::too_many_arguments)]
     async fn bridge_websocket<C, U>(
         mut client: WebSocketStream<C>,
@@ -2576,6 +2652,7 @@ impl WafProxyService {
         idle_timeout: Option<Duration>,
         max_lifetime: Duration,
         metrics: Arc<Metrics>,
+        inspect_responses: bool,
     ) where
         C: AsyncRead + AsyncWrite + Unpin,
         U: AsyncRead + AsyncWrite + Unpin,
@@ -2627,6 +2704,32 @@ impl WafProxyService {
                     last_activity = tokio::time::Instant::now();
                     match incoming {
                         Some(Ok(message)) => {
+                            if let Some(close) = Self::websocket_control_violation(&message) {
+                                warn!(
+                                    "WebSocket protocol violation from {}",
+                                    base_context.client_ip
+                                );
+                                let _ = client.send(Message::Close(Some(close.clone()))).await;
+                                let _ = upstream.send(Message::Close(Some(close))).await;
+                                break;
+                            }
+                            match &message {
+                                Message::Ping(data) => {
+                                    if client.send(Message::Pong(data.clone())).await.is_err() {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                Message::Pong(_) => continue,
+                                Message::Close(frame) => {
+                                    let frame = frame.clone();
+                                    let _ = upstream.send(Message::Close(frame.clone())).await;
+                                    let _ = client.send(Message::Close(frame)).await;
+                                    break;
+                                }
+                                Message::Frame(_) => continue,
+                                _ => {}
+                            }
                             if Self::websocket_message_blocked(
                                 &waf_engine,
                                 &base_context,
@@ -2644,22 +2747,15 @@ impl WafProxyService {
                             }
                         }
                         Some(Err(e)) => {
-                            // The parser rejects an oversized frame or a
-                            // fragmented message that exceeds the message cap
-                            // before assembling it. Close both sides with a
-                            // policy violation rather than forwarding.
-                            if matches!(
-                                e,
-                                WsError::Capacity(CapacityError::MessageTooLong { .. })
-                            ) {
+                            // The parser rejects an oversized frame, a
+                            // fragmented/oversized control frame, or a
+                            // message that exceeds the cap before forwarding.
+                            // Close both sides rather than forwarding.
+                            if let Some(close) = Self::websocket_error_close(&e) {
                                 warn!(
-                                    "WebSocket client {} exceeded the configured limit: {}",
+                                    "WebSocket client {} violated the protocol: {}",
                                     base_context.client_ip, e
                                 );
-                                let close = CloseFrame {
-                                    code: CloseCode::Policy,
-                                    reason: "WebSocket message exceeds configured limit".into(),
-                                };
                                 let _ = client.send(Message::Close(Some(close.clone()))).await;
                                 let _ = upstream.send(Message::Close(Some(close))).await;
                             } else {
@@ -2674,18 +2770,113 @@ impl WafProxyService {
                     last_activity = tokio::time::Instant::now();
                     match incoming {
                         Some(Ok(message)) => {
+                            if let Some(close) = Self::websocket_control_violation(&message) {
+                                warn!(
+                                    "WebSocket protocol violation from upstream for {}",
+                                    base_context.client_ip
+                                );
+                                let _ = client.send(Message::Close(Some(close.clone()))).await;
+                                let _ = upstream.send(Message::Close(Some(close))).await;
+                                break;
+                            }
+                            match &message {
+                                Message::Ping(data) => {
+                                    if upstream.send(Message::Pong(data.clone())).await.is_err() {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                Message::Pong(_) => continue,
+                                Message::Close(frame) => {
+                                    let frame = frame.clone();
+                                    let _ = client.send(Message::Close(frame.clone())).await;
+                                    let _ = upstream.send(Message::Close(frame)).await;
+                                    break;
+                                }
+                                Message::Frame(_) => continue,
+                                _ => {}
+                            }
+                            if inspect_responses
+                                && Self::websocket_message_blocked(
+                                    &waf_engine,
+                                    &base_context,
+                                    &message,
+                                    max_message_bytes,
+                                )
+                                .await
+                            {
+                                warn!(
+                                    "WAF blocked upstream WebSocket frame for {}",
+                                    base_context.client_ip
+                                );
+                                let close = CloseFrame {
+                                    code: CloseCode::Policy,
+                                    reason: "WebSocket response blocked by WAF".into(),
+                                };
+                                let _ = client.send(Message::Close(Some(close.clone()))).await;
+                                let _ = upstream.send(Message::Close(Some(close))).await;
+                                break;
+                            }
                             if client.send(message).await.is_err() {
                                 break;
                             }
                         }
                         Some(Err(e)) => {
-                            debug!("WebSocket upstream stream error: {}", e);
+                            // An inspection/parse failure must close the
+                            // tunnel, never forward the unverified message.
+                            if let Some(close) = Self::websocket_error_close(&e) {
+                                warn!(
+                                    "WebSocket upstream stream error for {}: {}",
+                                    base_context.client_ip, e
+                                );
+                                let _ = client.send(Message::Close(Some(close.clone()))).await;
+                                let _ = upstream.send(Message::Close(Some(close))).await;
+                            } else {
+                                debug!("WebSocket upstream stream error: {}", e);
+                            }
                             break;
                         }
                         None => break,
                     }
                 }
             }
+        }
+    }
+
+    /// Validate an assembled control message against RFC 6455. Control frames
+    /// carry at most 125 payload bytes, are never fragmented (the parser
+    /// rejects `FIN=0` before this point), and close codes must be legal.
+    fn websocket_control_violation(message: &Message) -> Option<CloseFrame> {
+        let reason = match message {
+            Message::Ping(payload) | Message::Pong(payload) if payload.len() > 125 => {
+                "control frame payload exceeds 125 bytes"
+            }
+            Message::Close(Some(frame)) if !frame.code.is_allowed() => "invalid close code",
+            Message::Close(Some(frame)) if frame.reason.len() > 123 => {
+                "close reason exceeds 123 bytes"
+            }
+            _ => return None,
+        };
+        Some(CloseFrame {
+            code: CloseCode::Protocol,
+            reason: reason.into(),
+        })
+    }
+
+    /// Map stream errors to the close code sent to both peers.
+    fn websocket_error_close(error: &WsError) -> Option<CloseFrame> {
+        match error {
+            WsError::Protocol(_) => Some(CloseFrame {
+                code: CloseCode::Protocol,
+                reason: "WebSocket protocol violation".into(),
+            }),
+            // Capacity covers oversized frames/messages; the parser rejects
+            // them before assembly.
+            WsError::Capacity(_) => Some(CloseFrame {
+                code: CloseCode::Policy,
+                reason: "WebSocket message exceeds configured limit".into(),
+            }),
+            _ => None,
         }
     }
 
@@ -4141,6 +4332,7 @@ mod tests {
                 Some(Duration::from_millis(100)),
                 Duration::from_secs(30),
                 Arc::new(Metrics::new()),
+                false,
             ),
         )
         .await
@@ -4175,6 +4367,7 @@ mod tests {
                 None,
                 Duration::from_millis(100),
                 Arc::new(Metrics::new()),
+                false,
             ),
         )
         .await
@@ -4945,6 +5138,40 @@ mod tests {
         ] {
             assert!(policy.should_strip(name), "{name} must be stripped");
         }
+    }
+
+    #[test]
+    fn websocket_control_frame_validation_rejects_oversized_and_invalid_close() {
+        let oversized = Message::Ping(vec![0u8; 126].into());
+        let close = WafProxyService::websocket_control_violation(&oversized);
+        assert_eq!(close.map(|frame| frame.code), Some(CloseCode::Protocol));
+
+        let invalid_close = Message::Close(Some(CloseFrame {
+            code: CloseCode::from(1005),
+            reason: "status code must not be sent".into(),
+        }));
+        let close = WafProxyService::websocket_control_violation(&invalid_close);
+        assert_eq!(close.map(|frame| frame.code), Some(CloseCode::Protocol));
+
+        let valid = Message::Ping(vec![0u8; 125].into());
+        assert!(WafProxyService::websocket_control_violation(&valid).is_none());
+    }
+
+    #[test]
+    fn websocket_protocol_errors_map_to_protocol_close() {
+        use tokio_tungstenite::tungstenite::error::ProtocolError;
+
+        let close = WafProxyService::websocket_error_close(&WsError::Protocol(
+            ProtocolError::FragmentedControlFrame,
+        ))
+        .expect("protocol error must close");
+        assert_eq!(close.code, CloseCode::Protocol);
+
+        let close = WafProxyService::websocket_error_close(&WsError::Protocol(
+            ProtocolError::ControlFrameTooBig,
+        ))
+        .expect("protocol error must close");
+        assert_eq!(close.code, CloseCode::Protocol);
     }
 
     #[test]

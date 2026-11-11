@@ -1330,3 +1330,18 @@ Delegated task; worktree only. Base `main` = 39f0020.
   CHANGELOG.
 - Verified: fmt, lib tests with `distri-kv` (651 passed), full ignored e2e
   (10 passed), clippy lib and integration `--deny warnings`, script run.
+
+# Integration: auth/ws + docs consistency + quiccrunch transport
+
+**Goal:** land `fix/auth-and-ws`, `docs/consistency-pass` and
+`feat/quiccrunch-client` on local `main` (base `563541b`), one merge commit
+each, keeping both sides of every conflict.
+
+- [x] Merge 1 `fix/auth-and-ws`: keep `server.websocket.inspect_responses`
+      *and* `max_concurrent_tunnels`/`idle_timeout_secs`/`max_lifetime_secs`
+      in `WebSocketConfig` and its docs; `bridge_websocket` takes both the
+      tunnel-bound args and `inspect_responses` (call sites and tests updated).
+- [ ] Merge 2 `docs/consistency-pass`: config keys, readiness, docs matrix.
+- [ ] Merge 3 `feat/quiccrunch-client`: `waf.distributed.transport` seam.
+- [ ] Full gate: fmt, clippy `--lib --deny warnings`, lib tests with and
+      without `distri-kv`, `nix build .#waf-ingress`, config validation.

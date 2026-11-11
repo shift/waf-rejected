@@ -246,6 +246,7 @@ max_message_bytes = 0
 max_concurrent_tunnels = 1024
 idle_timeout_secs = 300
 max_lifetime_secs = 3600
+inspect_responses = false
 ```
 
 - The tungstenite parser enforces these limits while reading, so an oversized
@@ -266,6 +267,15 @@ max_lifetime_secs = 3600
 - Metrics: `waf_websocket_tunnels_active`,
   `waf_websocket_tunnels_rejected_total` and
   `waf_websocket_tunnels_closed_total{reason="idle|max_lifetime"}`.
+- `inspect_responses` (default `false`) inspects upstream-to-client `Text` and
+  `Binary` frames through the same WAF path and bounded message buffer as the
+  request direction. Enabling it roughly doubles per-frame inspection cost on a
+  busy tunnel and can reject origin frames that were previously forwarded, so
+  it is opt-in. Inspection errors and blocks close both sides with `1008`.
+- `Sec-WebSocket-Extensions` is always stripped on both handshake directions
+  because the proxy's codec does not negotiate extensions. There is no key for
+  this; forwarding it would let an origin compress frames the proxy cannot
+  inspect.
 
 ### `[server.tls]`
 
@@ -650,9 +660,15 @@ instead.
 [security.auth]
 enabled = false
 api_keys = []
+# Optional per-key expiry and dual-key rotation. `api_keys` entries have no
+# expiry; both forms may be combined during rotation.
+# api_key_entries = [
+#   { key = "old-key", expires_at = "2026-12-31T00:00:00Z" },
+#   { key = "new-key" },
+# ]
 header_name = "X-API-Key"
 require_https = false
-# Optional auth-stage limits:
+# Optional auth-stage success limits:
 # [security.auth.rate_limit]
 # requests_per_minute = 60      # per API key
 # per_ip_enabled = true
@@ -661,10 +677,19 @@ require_https = false
 # global_enabled = true
 # global_max_requests = 1000
 # global_window_secs = 60
+# Optional pre-validation failure budget (brute-force lockout). Disabled by
+# default; when enabled, failed keys consume the budget and a correct key from
+# a locked-out source is still rejected until the lockout expires.
+# [security.auth.failure_limit]
+# enabled = true
+# max_failures = 10
+# window_secs = 60
+# lockout_secs = 300
 ```
 
-Enabling auth with an empty `api_keys` list aborts start-up. Prefer injecting
-keys from a secret.
+Enabling auth with no `api_keys` and no `api_key_entries` aborts start-up.
+Prefer injecting keys from a secret. `expires_at` must be RFC 3339; an expired
+key is rejected with `401`. No presented key is logged.
 
 ```toml
 [security.ai]
