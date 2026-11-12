@@ -29,7 +29,6 @@ global_window_secs = 60
 
 [waf.security_events]
 enabled = true
-format = "json"
 min_threat_level = "medium"
 enable_cef = true
 cef_output_file = "./logs/security_events.cef"
@@ -37,14 +36,7 @@ cef_device_vendor = "WAF-Rejected"
 cef_device_product = "Security WAF"
 cef_device_version = "1.0.0"
 enable_otel = false
-# Persistent audit-trail store (redb default; sled is the legacy backend).
-store_backend = "redb"
-store_path = "./data/waf_security_events.redb"
-store_max_events = 100000
-enable_sled = false
-# sled_db_path = "./data/waf_security_events.sled"
-# sled_max_events = 100000
-sled_compress = false
+# The persistent audit store is configured in [storage].
 
 [waf.content_inspection]
 enabled = true
@@ -60,3 +52,12 @@ blocked_regions = []
 block_tor = false
 block_vpn = false
 block_datacenter = false
+
+[storage]
+# Persistent audit-trail store (redb default; sled is the legacy backend).
+enabled = true
+backend = "redb"
+path = "./data/waf_security_events.redb"
+max_events = 100000
+ttl_cleanup_interval = { secs = 60, nanos = 0 }
+cache_size = 16777216

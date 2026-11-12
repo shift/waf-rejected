@@ -371,13 +371,12 @@ pub enum ReadConsistency {
 ### TOML Configuration Example
 ```toml
 [storage]
-backend = "redb"  # "redb", "sled", or "memory"
-path = "/var/lib/waf/storage/waf.redb"
+enabled = true
+backend = "redb"  # "redb" or "sled"
+path = "/var/lib/waf/storage/waf_security_events.redb"
+max_events = 100000
 ttl_cleanup_interval = { secs = 300, nanos = 0 }
-enable_follower_reads = true
-enable_compression = false
 cache_size = 16777216
-# max_memory_entries = 100000   # backend = "memory"
 ```
 
 The Linux io_uring listener is selected with `[server] io_backend = "io_uring"`

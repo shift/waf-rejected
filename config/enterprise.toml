@@ -29,7 +29,6 @@ json_format = true
 [waf]
 enabled = true
 fail_mode = "closed"
-upstream_timeout_ms = 30000
 
 [waf.rate_limit]
 per_ip_enabled = true
@@ -41,7 +40,6 @@ global_window_secs = 60
 
 [waf.security_events]
 enabled = true
-format = "json"
 min_threat_level = "medium"
 enable_cef = true
 cef_output_file = "/var/log/waf/security_events.cef"
@@ -53,14 +51,7 @@ otel_service_name = "waf-security-events"
 otel_service_version = "1.0.0"
 otel_export_traces = true
 otel_export_logs = true
-# Persistent audit-trail store (redb default; sled is the legacy backend).
-store_backend = "redb"
-store_path = "/var/log/waf/security.redb"
-store_max_events = 1000000
-enable_sled = false
-# sled_db_path = "/var/log/waf/security.db"
-# sled_max_events = 1000000
-sled_compress = true
+# The persistent audit store is configured in [storage].
 
 [waf.content_inspection]
 enabled = true
@@ -86,7 +77,15 @@ timeout_ms = 150
 debug = false
 instance_pool_size = 20
 hot_reload = true
-rules_config = "rules/enterprise-modsecurity.conf"
+
+[storage]
+# Persistent audit-trail store (redb default; sled is the legacy backend).
+enabled = true
+backend = "redb"
+path = "/var/log/waf/security.redb"
+max_events = 1000000
+ttl_cleanup_interval = { secs = 60, nanos = 0 }
+cache_size = 16777216
 
 [security.auth]
 # Set to true and provide keys (ideally from a secret) before enabling.
@@ -99,24 +98,3 @@ require_https = true
 enabled = false
 threat_threshold = 0.8
 timeout_ms = 5000
-
-[security.compliance]
-enabled = true
-
-[security.compliance.audit]
-tamper_evident = true
-retention_days = 2555
-integrity_check_hours = 24
-
-[security.compliance.regulatory]
-gdpr = true
-hipaa = false
-pci_dss = true
-ai_act = true
-nis2 = true
-cra = true
-
-[security.compliance.retention]
-security_events_days = 90
-audit_logs_days = 2555
-auto_delete = true

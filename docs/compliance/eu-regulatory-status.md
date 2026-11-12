@@ -113,12 +113,7 @@ that workflow rather than duplicate the reporting lifecycle.
 
 ## Configuration
 
-```toml
-[security.compliance.regulatory]
-gdpr = true
-ai_act = true
-nis2 = true
-cra = true
-```
-
-The `compliance` Cargo feature must be enabled to compile the module.
+There is no `[security.compliance]` TOML surface: the compliance managers are
+a library API constructed from `AuditConfig`, `RegulatoryConfig` and
+`RetentionConfig` in embedding code. The `compliance` Cargo feature must be
+enabled to compile the module.

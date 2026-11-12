@@ -1454,3 +1454,28 @@ fail-closed behaviour.
 
 No detection, framing or fail-closed behaviour changed; all four are
 compile-only fixes on code paths that already failed to build.
+
+# Delegated: eliminate the dead `[storage]` configuration surface (`.worktrees/deadconfig`)
+
+**Branch:** `fix/no-dead-config` (base `309603d`).
+
+## Status
+
+- [x] Audited every serde key with `scripts/audit-config-keys.sh` and the
+      `print_config_key_paths` helper.
+- [x] `[storage]` is now the canonical audit-store selector: `enabled`,
+      `backend`, `path`, `max_events`, `ttl_cleanup_interval`, `cache_size`.
+      `SecurityEventLogger::with_storage` consumes it; legacy
+      `[waf.security_events] store_*` keys remain while `storage.enabled =
+      false` and conflict when both select a store.
+- [x] Removed dead keys: storage `enable_follower_reads`, `enable_compression`,
+      `max_memory_entries`, `memory` backend; `proxy.upstream_url`/`bind_addr`;
+      `waf.upstream_timeout_ms`; `waf.security_events.format`/`sled_compress`;
+      `waf.wasm.rules_config`; `security.ai.model.*`.
+- [x] Wired `logging.level`/`json_format` into `init_tracing`.
+- [x] Added `every_config_key_is_consumed_or_removed` guard and
+      `docs/developer-guide/config-keys.md`.
+- [x] Gates: fmt clean; clippy --lib clean; 676 lib tests pass; 702 lib
+      tests pass with `distri-kv`; validate-configs 19 files ok; `nix build
+      .#waf-ingress` exit 0 (/nix/store/khxhcbxwb1drilqwak11fnrhcqbg8y50-waf-ingress-0.1.0-beta.16).
+- [x] Commit and push `fix/no-dead-config`.

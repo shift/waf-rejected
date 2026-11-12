@@ -147,6 +147,31 @@ fn typo_in_waf_coraza_backend_key_fails() {
 }
 
 #[test]
+fn removed_storage_keys_are_rejected_with_file_and_key() {
+    for (key, value) in [
+        ("enable_follower_reads", "true"),
+        ("enable_compression", "true"),
+        ("max_memory_entries", "1000"),
+    ] {
+        let error = load_contents(&format!("[storage]\n{key} = {value}\n"))
+            .expect_err("removed storage key must be a hard error");
+        let message = format!("{error:#}");
+        assert!(message.contains("config.toml"), "{message}");
+        assert!(message.contains(&format!("storage.{key}")), "{message}");
+        assert!(message.contains("unknown key"), "{message}");
+    }
+}
+
+#[test]
+fn storage_memory_backend_is_rejected() {
+    let error = load_contents("[storage]\nbackend = \"memory\"\n")
+        .expect_err("memory is not a runtime audit-store backend");
+    let message = format!("{error:#}");
+    assert!(message.contains("storage.backend"), "{message}");
+    assert!(message.contains("redb"), "{message}");
+}
+
+#[test]
 fn env_overrides_still_apply() {
     let _guard = ENV_LOCK.lock().expect("config test env lock");
     let directory = tempfile::tempdir().expect("temporary config directory");

@@ -34,7 +34,6 @@ json_format = false
 [waf]
 enabled = true
 fail_mode = "closed"
-upstream_timeout_ms = 30000
 
 [waf.rate_limit]
 per_ip_enabled = true
@@ -46,11 +45,9 @@ global_window_secs = 60
 
 [waf.security_events]
 enabled = true
-format = "json"
 min_threat_level = "medium"
 enable_cef = false
 enable_otel = false
-enable_sled = false
 
 [waf.content_inspection]
 enabled = true

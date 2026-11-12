@@ -87,7 +87,6 @@ json_format = false
 [waf]
 enabled = true
 fail_mode = "closed"
-upstream_timeout_ms = 120000
 
 [waf.rate_limit]
 # Disabled so the matrix measures inspection capacity, not the default
@@ -100,7 +99,6 @@ global_enabled = false
 enabled = false
 enable_cef = false
 enable_otel = false
-enable_sled = false
 
 [waf.content_inspection]
 enabled = true

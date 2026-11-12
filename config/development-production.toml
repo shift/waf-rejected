@@ -38,11 +38,9 @@ global_window_secs = 60
 
 [waf.security_events]
 enabled = true
-format = "json"
 min_threat_level = "medium"
 enable_cef = false
 enable_otel = false
-enable_sled = false
 
 [waf.content_inspection]
 enabled = true

@@ -34,12 +34,17 @@ data:
 
     [waf.security_events]
     enabled = true
-    format = "json"
     min_threat_level = "medium"
     enable_cef = false
     enable_otel = {{ .Values.logging.otel.enabled }}
-    enable_sled = {{ .Values.persistence.enabled }}
-    sled_db_path = "/var/lib/waf/data/waf_security_events.sled"
+
+    [storage]
+    enabled = {{ .Values.persistence.enabled }}
+    backend = "redb"
+    path = "/var/lib/waf/data/waf_security_events.redb"
+    max_events = 1000000
+    ttl_cleanup_interval = { secs = 60, nanos = 0 }
+    cache_size = 16777216
 
     [waf.content_inspection]
     enabled = true

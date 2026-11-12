@@ -424,8 +424,8 @@ region, Tor exit, VPN or datacenter flag.
 
 ### 4.7 Upstream forwarding and response handling
 
-`forward_to_upstream_with_protocol` rewrites the URI to
-`proxy.upstream_url` plus the inbound path and query, preserves the client
+`forward_to_upstream_with_protocol` rewrites the URI to the top-level
+`upstream_uri` plus the inbound path and query, preserves the client
 `Host` for the origin (also copied to a proxy-generated `X-Forwarded-Host`),
 and strips hop-by-hop fields plus every client routing/override header before
 the upstream request is built. The default strip set covers `x-original-url`,
@@ -937,8 +937,8 @@ The model holds only if the operator satisfies these assumptions:
 | Security events (`SecurityEventLogger::log_event`) | UUID, UTC timestamp, resolved client IP, method, path, negotiated HTTP version, user agent, decision, threat level, triggered rule names, request size, final response status, inspection/upstream/total timing, referer, inbound `X-Forwarded-For`, block reason | tracing JSON on stdout, then optional CEF/event store/OTel | No response body/size, no client port, geo fields empty; allowed events filtered at default `medium` |
 | Application logs (`tracing`) | Startup configuration summary, block reasons with rule names, auth failures, upstream errors, TLS handshake failures | stdout/stderr, collected by the platform | No request correlation ID; log level controls detail; payload fragments can appear in block reasons |
 | CEF exporter (`CefExporter`) | CEF v1 lines with decision, severity and event fields | `waf.security_events.cef_output_file` | Optional, append-only; rotation is the operator's responsibility; export failure is logged but not retried durably |
-| Persistent event store (`RedbExporter`, default) | Serialised `SecurityEvent` records, `timestamp_ms ++ uuid` keys | `waf.security_events.store_path` (default `./data/waf_security_events.redb`) | `Durability::Immediate`: an acknowledged event is fsynced before the write returns (one fsync per write transaction). `store_max_events` bounds retention; no encryption at rest by the application. Single-writer file, local to one process |
-| Sled exporter (`SledExporter`, legacy) | Serialised `SecurityEvent` records | `waf.security_events.store_backend = "sled"`, `sled_db_path` (default `./waf_security_events.sled`) | Legacy backend, still selectable. Every write is flushed explicitly (sled's 500 ms batching would otherwise lose acknowledged events on a crash). Migrate to redb with `waf-storage-migrate`; no reverse support without a fresh migration |
+| Persistent event store (`RedbExporter`, default) | Serialised `SecurityEvent` records, `timestamp_ms ++ uuid` keys | `[storage] path` (default `./data/waf_security_events.redb`) | `Durability::Immediate`: an acknowledged event is fsynced before the write returns (one fsync per write transaction). `[storage] max_events` bounds retention; no encryption at rest by the application. Single-writer file, local to one process |
+| Sled exporter (`SledExporter`, legacy) | Serialised `SecurityEvent` records | `[storage] backend = "sled"` + `path`, or legacy `waf.security_events.store_backend = "sled"` / `sled_db_path` | Legacy backend, still selectable. Every write is flushed explicitly (sled's 500 ms batching would otherwise lose acknowledged events on a crash). Migrate to redb with `waf-storage-migrate`; no reverse support without a fresh migration |
 | OpenTelemetry exporter | Traces/logs for events | OTLP endpoint configured by the operator | Feature-gated; not a durable audit store |
 | Prometheus metrics (`Metrics::render_prometheus`) | `waf_requests_total`, `waf_allowed_total`, `waf_blocked_total`, `waf_upstream_errors_total`, `waf_uptime_seconds` | `/metrics` on the health listener | Aggregate counters only; no per-rule, per-country or latency labels |
 | Health endpoints (`HealthService::handle_health_request`) | Dependency status (inspection engine/backend, event store, configured exporters), version, uptime | `/health`, `/health/ready`, `/health/live`, `/metrics` | Readiness returns `503` with a machine-readable `reason` when a required dependency is down; `/health/live` stays a process check; `health.dependency_checks = false` makes readiness a liveness alias |

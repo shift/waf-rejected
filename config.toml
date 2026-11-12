@@ -24,8 +24,6 @@ upstream_uri = "http://127.0.0.1:3000"
 # ---------------------------------------------------------------------------
 
 [proxy]
-upstream_url = "http://127.0.0.1:3000"
-bind_addr = "0.0.0.0:8080"
 timeout_seconds = 30
 max_request_size = 10485760
 # Optional PEM CA bundle used to verify HTTPS and TLS WebSocket upstreams.
@@ -188,7 +186,6 @@ json_format = false
 enabled = true
 # "closed" blocks on inspection errors; "open" forwards. Keep "closed".
 fail_mode = "closed"
-upstream_timeout_ms = 30000
 
 [waf.rate_limit]
 per_ip_enabled = true
@@ -204,7 +201,6 @@ capacity_policy = "fail_closed"
 
 [waf.security_events]
 enabled = true
-format = "json"
 min_threat_level = "medium"
 enable_cef = true
 cef_output_file = "./logs/security_events.cef"
@@ -216,17 +212,7 @@ enable_otel = false
 # otel_service_version = "0.1.0"
 # otel_export_traces = false
 # otel_export_logs = false
-# Persistent audit-trail store. redb is the default backend; `store_backend =
-# "sled"` selects the legacy sled store. See
-# docs/operations/migrating-event-store.md before switching.
-store_backend = "redb"
-store_path = "./data/waf_security_events.redb"
-store_max_events = 100000
-# Legacy sled backend (kept for reference; set store_backend = "sled" to use it).
-enable_sled = false
-# sled_db_path = "./data/waf_security_events.sled"
-# sled_max_events = 100000
-sled_compress = false
+# The persistent audit store is configured in [storage].
 
 [waf.content_inspection]
 enabled = true
@@ -267,7 +253,6 @@ timeout_ms = 100
 debug = false
 instance_pool_size = 10
 hot_reload = true
-rules_config = "rules/coraza.conf"
 
 [waf.coraza]
 # Enable request inspection through the selected backend.
@@ -397,47 +382,21 @@ enabled = false
 threat_threshold = 0.8
 timeout_ms = 5000
 
-[security.ai.model]
-# model_path = "/etc/waf/model.onnx"
-anomaly_detection = true
-advanced_classification = false
-
-[security.compliance]
-enabled = false
-
-# Evidence packs, not certifications. See docs/compliance/eu-regulatory-status.md.
-[security.compliance.regulatory]
-gdpr = false
-hipaa = false
-pci_dss = false
-ai_act = false
-nis2 = false
-cra = false
-# data_residency = "eu"
-
-[security.compliance.audit]
-tamper_evident = true
-retention_days = 2555
-integrity_check_hours = 24
-
-[security.compliance.retention]
-security_events_days = 90
-audit_logs_days = 2555
-auto_delete = true
-
-# ---------------------------------------------------------------------------
-# Storage and runtime
-# ---------------------------------------------------------------------------
-
 [storage]
-# "redb" (default), "sled" or "memory".
+# The persistent audit-trail store. `enabled = false` (the default) preserves
+# the historical no-store behaviour; the legacy [waf.security_events]
+# store_backend/enable_sled keys are still accepted when this section is off.
+enabled = true
+# "redb" (default) or "sled" (legacy). See
+# docs/operations/migrating-event-store.md before switching.
 backend = "redb"
-path = "./data/waf.redb"
-enable_follower_reads = true
+path = "./data/waf_security_events.redb"
+# Retention cap: oldest events are deleted first. Omit to keep every event.
+max_events = 100000
+# Minimum seconds between retention passes. 0 = cleanup after every write.
 ttl_cleanup_interval = { secs = 60, nanos = 0 }
-enable_compression = false
+# redb page cache in bytes; omit for redb's default. Ignored by sled.
 cache_size = 16777216
-# max_memory_entries = 100000
 
 [runtime]
 # Unset values use Tokio defaults (logical CPUs, 512 blocking threads, 10s).

@@ -29,7 +29,6 @@ data:
     [waf]
     enabled = true
     fail_mode = "closed"
-    upstream_timeout_ms = 30000
 
     [waf.rate_limit]
     per_ip_enabled = true
@@ -41,7 +40,6 @@ data:
 
     [waf.security_events]
     enabled = true
-    format = "json"
     min_threat_level = "medium"
     enable_cef = true
     cef_output_file = "/var/log/waf/security_events.cef"
@@ -53,10 +51,14 @@ data:
     otel_service_version = "0.1.0-beta.3"
     otel_export_traces = true
     otel_export_logs = true
-    enable_sled = true
-    sled_db_path = "/var/log/waf/security.db"
-    sled_max_events = 1000000
-    sled_compress = true
+
+    [storage]
+    enabled = true
+    backend = "redb"
+    path = "/var/log/waf/security.redb"
+    max_events = 1000000
+    ttl_cleanup_interval = { secs = 60, nanos = 0 }
+    cache_size = 16777216
 
     [waf.content_inspection]
     enabled = true
@@ -84,12 +86,3 @@ data:
 
     [security.ai]
     enabled = false
-
-    [security.compliance]
-    enabled = true
-
-    [security.compliance.regulatory]
-    gdpr = true
-    ai_act = true
-    nis2 = true
-    cra = true

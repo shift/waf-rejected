@@ -170,11 +170,6 @@ mod tests {
             enabled: true,
             threat_threshold: 0.9,
             timeout_ms: 3000,
-            model: crate::config::AiModelConfig {
-                model_path: Some("/path/to/model".to_string()),
-                anomaly_detection: true,
-                advanced_classification: true,
-            },
         };
 
         let detector = AiThreatDetector::new(config.clone()).unwrap();

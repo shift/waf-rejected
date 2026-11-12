@@ -8,7 +8,6 @@ max_body_size = 1048576
 [waf]
 enabled = true
 fail_mode = "open"
-upstream_timeout_ms = 3000
 
 [waf.content_inspection]
 enabled = true
