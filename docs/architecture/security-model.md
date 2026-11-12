@@ -54,7 +54,7 @@ an independent penetration test passed.
 
 | Control | Status | Code location | Test location | Introduced in |
 |---|---|---|---|---|
-| TLS 1.2/1.3 admission, ALPN `h2`, optional client certs | Tested | `src/waf/tls_config.rs` — `TlsManager::new`, `accept`, `selected_versions` | `src/waf/tls_config.rs` unit tests (`versions_respect_min_and_max`, `alpn_defaults_advertise_h2_then_http1`) | beta.1; hardened in beta.2 |
+| TLS 1.2/1.3 admission, ALPN `h2`, optional client certs | Tested | `src/waf/tls_config.rs` — `TlsManager::new`, `accept`, `selected_versions` | `src/waf/tls_config.rs` unit tests (`versions_respect_min_and_max`, `alpn_defaults_advertise_h2_then_http1`, `handshake_with_trusted_ca_and_h2_alpn_succeeds`, `handshake_from_untrusted_ca_is_rejected`, `handshake_with_hostname_mismatch_is_rejected`, `tls11_client_is_refused`); `tests/integration/grpc_h2_e2e.rs` for a full HTTPS/HTTP2 request | beta.1; hardened in beta.2; TLS stack refreshed in beta.16 |
 | HTTP-version allowlist (`505` for unlisted versions) | Tested | `src/proxy/service.rs` — `detect_http_version`, `is_http_version_supported` | `tests/integration/pipeline_tests.rs` (protocol cases); `src/proxy/service.rs` unit tests | beta.1 |
 | Trusted-proxy client-IP resolution and forwarding-header rewrite | Tested | `src/proxy/service.rs` — `resolve_client_ip`, `build_upstream_request` | `src/proxy/service.rs` unit tests (`test_client_ip_*`, proptest `resolve_client_ip_never_panics_*`) | beta.2 |
 | Client routing/override header stripping (same path/method WAF and origin) | Tested | `src/proxy/service.rs` — `HeaderStripPolicy`, `handle_request`; `src/proxy/http3.rs` | `src/proxy/service.rs` unit tests; `tests/integration/pipeline_tests.rs` (`pipeline_strips_routing_headers_*`, `pipeline_rejects_ambiguous_routing_headers_when_enabled`) | Unreleased (H3) |
@@ -220,6 +220,15 @@ only) and the configured ALPN list. Client certificates are optional; when
 `server.tls.require_client_cert` is true, a client CA must be configured or
 startup fails. HTTP/2 is served only when TLS ALPN negotiated `h2`; cleartext
 HTTP/2 (h2c) is not offered. HTTP/1.1 is the plaintext default.
+
+The TLS stack is `rustls 0.23.46` with the ring provider and
+`rustls-webpki 0.103.16`; the optional distri-kv gRPC client uses
+`tonic 0.12`/`hyper 1` so no pre-fix `rustls 0.22`, `rustls-webpki 0.102` or
+`h2 0.3` remains in `Cargo.lock`. See
+[`docs/operations/supply-chain.md`](../operations/supply-chain.md) for the
+advisory history. The unit tests above perform real handshakes and assert that
+an untrusted CA, a hostname mismatch and a TLS 1.1-only ClientHello are all
+refused.
 
 HTTP/3 is compiled only with the `http3` feature and starts only when
 `server.enable_http3` is true, `"3"` is listed in

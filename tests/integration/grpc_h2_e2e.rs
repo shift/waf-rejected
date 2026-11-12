@@ -1115,12 +1115,12 @@ async fn streaming_policy_reject_returns_grpc_status() {
     assert!(data.is_empty());
     let trailers = trailers.expect("grpc rejection trailers");
     assert_eq!(trailers.get("grpc-status").unwrap(), "7");
-    assert!(trailers
-        .get("grpc-message")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .contains("grpc_streaming_policy"));
+    // Client-visible text is the fixed rule-id vocabulary; the full reason is
+    // retained in the security event log (see create_grpc_blocked_response).
+    assert_eq!(
+        trailers.get("grpc-message").unwrap(),
+        "blocked by WAF (status: 403, rule: grpc)"
+    );
     assert_eq!(
         env.upstream_state.calls.load(Ordering::SeqCst),
         0,
@@ -1185,12 +1185,12 @@ async fn grpc_aware_rejection_is_opt_in_and_maps_status() {
     assert!(data.is_empty());
     let trailers = trailers.expect("grpc-aware rejection trailers");
     assert_eq!(trailers.get("grpc-status").unwrap(), "7");
-    assert!(trailers
-        .get("grpc-message")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .contains("not in waf.grpc.method_allowlist"));
+    // Client-visible text is the fixed rule-id vocabulary; the full reason is
+    // retained in the security event log (see create_grpc_blocked_response).
+    assert_eq!(
+        trailers.get("grpc-message").unwrap(),
+        "blocked by WAF (status: 403, rule: grpc)"
+    );
 }
 
 #[tokio::test]

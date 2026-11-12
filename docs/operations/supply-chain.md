@@ -51,6 +51,52 @@ Current exceptions:
 | --- | --- | --- |
 | `RUSTSEC-2025-0134` | `rustls-pemfile` 2.2.0 | Crate archived with no fixed release. Used only to parse operator-supplied PEM TLS material (`src/waf/tls_config.rs`, `src/proxy/http3.rs`). Follow-up: migrate to `rustls-pki-types` `PemObject`. |
 
+### TLS advisory remediation (November 2026)
+
+`cargo audit` on the `fix/security-advisories` branch found eight vulnerabilities
+in the TLS/HTTP2 path. They were not in the direct `rustls 0.23` dependency:
+`tonic 0.11` (the optional `distri-kv` gRPC client) still resolved
+`h2 0.3.27`, `rustls 0.22.4` and `rustls-webpki 0.102.8` through
+`hyper 0.14`/`tokio-rustls 0.25`. Upgrading the gRPC stack to
+`tonic 0.12.3` / `prost 0.13.5` moved it onto `hyper 1` and the already-pinned
+`rustls 0.23.46` / `rustls-webpki 0.103.16`, removing the vulnerable versions
+from `Cargo.lock` rather than pinning them back. No TLS behaviour changed: the
+server still uses the ring provider, the configured TLS 1.2/1.3 range, the same
+certificate verification defaults and the same ALPN order.
+
+| Crate | Before | After | Advisory | Fixed in |
+| --- | --- | --- | --- | --- |
+| `h2` | 0.3.27 | removed (`h2 0.4.20` via tonic 0.12) | RUSTSEC-2026-0258 | >= 0.4.16 |
+| `rustls` | 0.22.4 | removed (`0.23.46` remains) | RUSTSEC-2026-0346, RUSTSEC-2026-0349 | >= 0.23.46 |
+| `rustls-webpki` | 0.102.8 | removed (`0.103.16` remains) | RUSTSEC-2026-0104, -0098, -0099, -0382, -0049 | >= 0.103.16 |
+| `fxhash` | 0.2.1 | unchanged | RUSTSEC-2025-0057 (unmaintained) | no fixed release |
+| `instant` | 0.1.13 | unchanged | RUSTSEC-2024-0384 (unmaintained) | no fixed release |
+| `rustls-pemfile` | 2.2.0 | unchanged | RUSTSEC-2025-0134 (unmaintained) | no fixed release |
+
+`fxhash` and `instant` are transitive dependencies of the optional legacy
+`sled` backend, not of the request path or the TLS path. They are reported as
+unmaintained warnings only; there is no patched release. Keep them until the
+remaining sled-only deployments are migrated to redb (the default event store),
+then remove `sled` and both warnings disappear. They do not require an
+`advisories.ignore` entry because `unmaintained = "workspace"` only fails on
+direct dependencies.
+
+Current status after this remediation:
+
+```text
+$ nix develop -c cargo audit
+    Scanning Cargo.lock for vulnerabilities (539 crate dependencies)
+    warning: 3 allowed warnings found   # fxhash, instant, rustls-pemfile (all unmaintained)
+    # 0 vulnerabilities
+```
+
+Triage rule for a new advisory: reproduce it with `cargo audit`, identify the
+reverse dependency with `cargo tree -i <crate>`, and upgrade the nearest
+parent that allows the patched release. A vulnerability is never silenced with
+an ignore entry; only unmaintained crates with no fixed release may be accepted,
+with the exposure documented here and a follow-up item. TLS-path advisories are
+release blockers.
+
 ### Dependency remediation (November 2026)
 
 GitHub Dependabot reported 27 alerts (4 high, 23 moderate) against the public
