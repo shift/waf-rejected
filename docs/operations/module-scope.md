@@ -80,6 +80,7 @@ sidecar backend), `http3`, `webtransport`, `parallel-args`, `allow-cache`,
 | `io_performance_test` | `experimental` |
 | `network_io_performance_test` | `experimental` |
 | `progressive_load_test` | `experimental` |
+| `soak-load` | `experimental` |
 | `advanced_test_backend` | `experimental` |
 | `comprehensive_waf_test` | `experimental` |
 | `simple_multi_protocol_test` | `experimental` |

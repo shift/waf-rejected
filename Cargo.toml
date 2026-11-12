@@ -578,6 +578,13 @@ name = "progressive_load_test"
 path = "src/bin/progressive_load_test.rs"
 required-features = ["experimental"]
 
+# Mixed-traffic soak and deterministic fault-injection harness. Driven by
+# scripts/soak.sh; see docs/operations/soak-testing.md.
+[[bin]]
+name = "soak-load"
+path = "src/bin/soak_load.rs"
+required-features = ["experimental"]
+
 [[bin]]
 name = "echo_backend"
 path = "src/bin/echo_backend.rs"
