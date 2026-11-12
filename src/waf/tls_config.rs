@@ -421,4 +421,197 @@ mod tests {
             vec![b"h2".to_vec(), b"http/1.1".to_vec()]
         );
     }
+
+    /// Generate a CA plus a server leaf for `localhost`/`127.0.0.1`.
+    /// Returns `(ca_path, cert_path, key_path)`.
+    fn ca_and_server_cert(
+        dir: &std::path::Path,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        use rcgen::{
+            BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose,
+        };
+
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "waf-tls-ingress-test-ca");
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let mut server_params =
+            CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()]).unwrap();
+        server_params
+            .distinguished_name
+            .push(DnType::CommonName, "localhost");
+        server_params.use_authority_key_identifier_extension = true;
+        server_params
+            .key_usages
+            .push(KeyUsagePurpose::DigitalSignature);
+        server_params
+            .extended_key_usages
+            .push(rcgen::ExtendedKeyUsagePurpose::ServerAuth);
+        let server_key = KeyPair::generate().unwrap();
+        let issuer = Issuer::from_params(&ca_params, &ca_key);
+        let server_cert = server_params.signed_by(&server_key, &issuer).unwrap();
+
+        let ca_path = dir.join("ca.pem");
+        let cert_path = dir.join("server.pem");
+        let key_path = dir.join("server.key");
+        std::fs::write(&ca_path, ca_cert.pem()).unwrap();
+        std::fs::write(&cert_path, server_cert.pem()).unwrap();
+        std::fs::write(&key_path, server_key.serialize_pem()).unwrap();
+        (ca_path, cert_path, key_path)
+    }
+
+    fn manager_with_cert(cert_path: &std::path::Path, key_path: &std::path::Path) -> TlsManager {
+        TlsManager::new(TlsConfig {
+            enabled: true,
+            cert_path: cert_path.to_string_lossy().into_owned(),
+            key_path: key_path.to_string_lossy().into_owned(),
+            ..TlsConfig::default()
+        })
+        .unwrap()
+    }
+
+    fn roots_from(ca_path: &std::path::Path) -> RootCertStore {
+        let ca_file = File::open(ca_path).unwrap();
+        let mut roots = RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut BufReader::new(ca_file)) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        roots
+    }
+
+    fn client_config(roots: RootCertStore) -> Arc<rustls::ClientConfig> {
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&TLS12, &TLS13])
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        Arc::new(config)
+    }
+
+    async fn spawn_accepting_manager(manager: Arc<TlsManager>) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _ = manager.accept(stream).await;
+            }
+        });
+        addr
+    }
+
+    async fn connect(
+        addr: std::net::SocketAddr,
+        roots: RootCertStore,
+        server_name: &str,
+    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, std::io::Error> {
+        let tcp = TcpStream::connect(addr).await?;
+        let connector = tokio_rustls::TlsConnector::from(client_config(roots));
+        connector
+            .connect(
+                rustls::pki_types::ServerName::try_from(server_name.to_string()).unwrap(),
+                tcp,
+            )
+            .await
+            .map_err(std::io::Error::other)
+    }
+
+    #[tokio::test]
+    async fn handshake_with_trusted_ca_and_h2_alpn_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ca_path, cert_path, key_path) = ca_and_server_cert(dir.path());
+        let manager = Arc::new(manager_with_cert(&cert_path, &key_path));
+        let addr = spawn_accepting_manager(manager).await;
+
+        let tls = connect(addr, roots_from(&ca_path), "localhost")
+            .await
+            .expect("trusted CA must complete the handshake");
+        assert_eq!(
+            tls.get_ref().1.alpn_protocol(),
+            Some(b"h2".as_ref()),
+            "ALPN must negotiate h2"
+        );
+    }
+
+    #[tokio::test]
+    async fn handshake_from_untrusted_ca_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, cert_path, key_path) = ca_and_server_cert(dir.path());
+        let other = tempfile::tempdir().unwrap();
+        let (untrusted_ca, _, _) = ca_and_server_cert(other.path());
+        let manager = Arc::new(manager_with_cert(&cert_path, &key_path));
+        let addr = spawn_accepting_manager(manager).await;
+
+        assert!(
+            connect(addr, roots_from(&untrusted_ca), "localhost")
+                .await
+                .is_err(),
+            "a certificate from an untrusted CA must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn handshake_with_hostname_mismatch_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ca_path, cert_path, key_path) = ca_and_server_cert(dir.path());
+        let manager = Arc::new(manager_with_cert(&cert_path, &key_path));
+        let addr = spawn_accepting_manager(manager).await;
+
+        assert!(
+            connect(addr, roots_from(&ca_path), "not-the-server.example")
+                .await
+                .is_err(),
+            "a hostname mismatch must be rejected"
+        );
+    }
+
+    /// A TLS 1.1 ClientHello (legacy version 0x0302, no supported_versions
+    /// extension). rustls has no TLS 1.1 code path, so a 1.1-only client must
+    /// receive an alert or a close, never a ServerHello.
+    fn tls11_client_hello() -> Vec<u8> {
+        let mut body = vec![0x03, 0x02];
+        body.extend_from_slice(&[0x42; 32]);
+        body.push(0); // empty session id
+        body.extend_from_slice(&[0x00, 0x02, 0x00, 0x2f]); // AES128-CBC-SHA
+        body.extend_from_slice(&[0x01, 0x00]); // null compression
+        let mut handshake = vec![0x01];
+        handshake.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        handshake.extend_from_slice(&body);
+        let mut record = vec![0x16, 0x03, 0x01];
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    #[tokio::test]
+    async fn tls11_client_is_refused() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (_, cert_path, key_path) = ca_and_server_cert(dir.path());
+        let manager = Arc::new(manager_with_cert(&cert_path, &key_path));
+        let addr = spawn_accepting_manager(manager).await;
+
+        let mut tcp = TcpStream::connect(addr).await.unwrap();
+        tcp.write_all(&tls11_client_hello()).await.unwrap();
+        let mut response = [0u8; 5];
+        let read = tokio::time::timeout(Duration::from_secs(5), tcp.read(&mut response))
+            .await
+            .expect("server must answer or close a TLS 1.1 ClientHello");
+
+        match read {
+            Ok(0) | Err(_) => {}
+            Ok(n) => {
+                assert_eq!(response[0], 21, "expected a TLS alert, got {response:?}");
+                assert!(n >= 5);
+            }
+        }
+    }
 }
