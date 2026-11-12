@@ -1,0 +1,34 @@
+# distri-kv server image for the distributed WAF regional cell.
+#
+# Build against a distri-kv checkout at the contract commit used by the WAF
+# client (9079588 or later):
+#   docker build -f deploy/distributed/Dockerfile.distri-kv \
+#     -t distri-kv:9079588 /path/to/distri-kv
+#
+# The build context is the distri-kv repository root (it contains the
+# workspace Cargo.toml, the `distri-kv` crate and `ezraft`).
+FROM rust:1.99-bookworm AS builder
+
+WORKDIR /build
+COPY . .
+RUN cargo build --release -p distri-kv --bin distri-kv-server
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 1000 --create-home distri \
+    && mkdir -p /var/lib/distri-kv /etc/distri-kv/certs /etc/distri-kv/secrets \
+    && chown -R 1000:1000 /var/lib/distri-kv
+
+COPY --from=builder /build/target/release/distri-kv-server /usr/local/bin/distri-kv-server
+
+WORKDIR /var/lib/distri-kv
+USER 1000
+EXPOSE 7443 7444 8082 8443 9091
+ENV RUST_LOG=info
+HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=5 \
+    CMD ["curl", "-fsS", "http://127.0.0.1:8082/health"]
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/distri-kv-server"]

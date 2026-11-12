@@ -1,0 +1,150 @@
+# WAF-Rejected high-throughput profile: native Coraza sidecar.
+#
+# This is an opt-in deployment profile. It does NOT change the default backend:
+# a plain `config.toml` selects the native Rust engine
+# (`waf.coraza.backend = "rust"`) in default builds and only switches here
+# because this file sets `backend = "native"` explicitly.
+#
+# Requirements:
+#   * waf-ingress built with `--features wasm-reactor,coraza-native`
+#   * the `coraza-sidecar` process reachable on native_socket_path
+#   * the proxy and sidecar share a uid or gid (socket mode is 0660)
+#
+# See docs/operations/native-performance-profile.md for measured capacity,
+# socket sizing, failure modes and the wasm/native decision guide.
+
+bind_addr = "0.0.0.0:8080"
+health_bind_addr = "0.0.0.0:8081"
+upstream_uri = "http://127.0.0.1:3000"
+
+[proxy]
+timeout_seconds = 30
+max_request_size = 1048576
+
+[server]
+# Bound file descriptors and per-connection memory. The sidecar, not the proxy,
+# is the CPU bottleneck at large bodies; the proxy should stay connection-rich.
+max_connections = 8192
+trusted_proxies = []
+request_timeout_secs = 30
+keep_alive_timeout_secs = 90
+enable_http2 = true
+# Terminate TLS/HTTP-3 at the edge load balancer; plaintext h2/h1 ingress here.
+enable_http3 = false
+supported_http_versions = ["1.0", "1.1", "2"]
+# Hard cap on buffered request bodies. Bodies above max_inspect_bytes are
+# rejected by the Coraza policy below before they consume scan CPU.
+max_body_size = 1048576
+grpc_max_stream_bytes = 4194304
+grpc_max_stream_seconds = 300
+# Return gRPC-native status/trailers for blocked gRPC calls.
+grpc_aware_rejections = true
+
+[logging]
+level = "info"
+json_format = true
+
+[waf]
+enabled = true
+# A sidecar outage must fail closed (503), never silently allow traffic.
+fail_mode = "closed"
+
+[waf.coraza]
+enabled = true
+backend = "native"
+native_socket_path = "/run/waf/coraza.sock"
+# 64 KiB is the reactor/native payload contract. The sidecar `--max-body` must
+# be at least this large plus request line and headers.
+max_payload_bytes = 65536
+# Bound the linear CRS cost instead of buying cores: scan at most 64 KiB and
+# reject anything larger with 413. Use "forward-uninspected" only if the
+# documented inspection gap is acceptable for your threat model.
+max_inspect_bytes = 65536
+oversize_action = "reject"
+# Client deadline, slightly above the sidecar's --timeout observation budget.
+eval_timeout_ms = 5000
+# One pooled connection per concurrent evaluation. 8 is the validation ceiling;
+# lower it to (sidecar cores - 1) on small hosts, or leave 0 for auto (cores
+# clamped to 8). More connections than cores only adds queueing.
+pool_size = 8
+
+[waf.admission]
+# Reserve sidecar capacity for cheap (bodyless / withheld-body) requests.
+# Heavy requests either get a permit or fail closed with 503 + Retry-After.
+enabled = true
+heavy_permits = 4
+queue_timeout_ms = 500
+max_queued = 256
+
+[waf.rate_limit]
+# Starting point for a high-throughput edge. Tune to the real client mix; keep
+# both limits enabled so a single IP cannot monopolise the sidecar.
+per_ip_enabled = true
+per_ip_max_requests = 6000
+per_ip_window_secs = 60
+global_enabled = true
+global_max_requests = 100000
+global_window_secs = 60
+
+[waf.security_events]
+enabled = true
+min_threat_level = "medium"
+enable_cef = false
+enable_otel = false
+# Keep the hot path synchronous and allocation-light. Set [storage] enabled =
+# true only when a durable local audit trail is required.
+
+[waf.content_inspection]
+enabled = true
+inspect_headers = true
+inspect_body = true
+max_body_size = 65536
+threat_patterns = ["sql_injection", "xss", "command_injection", "path_traversal"]
+
+[waf.geo_blocking]
+enabled = false
+blocked_countries = []
+blocked_regions = []
+block_tor = false
+block_vpn = false
+block_datacenter = false
+
+[waf.grpc]
+# Protocol-aware gRPC: protobuf frames are validated structurally and withheld
+# from CRS body rules (URI/header rules still run). Empty allowlist =
+# monitor-only; add generated methods and `unknown_method_action = "block"`
+# for enforcement. `content_scan = "off"` is the fastest envelope-only mode.
+enabled = true
+method_allowlist = []
+max_message_bytes = 4194304
+max_frames = 64
+content_scan = "strings"
+max_content_scan_bytes = 65536
+
+[waf.graphql]
+# `crs` keeps full CRS JSON body inspection. `graphql-only` is cheaper but
+# requires a generated operation allowlist and withholds the raw body from
+# CRS; choose it only when that documented coverage gap is acceptable.
+enabled = true
+body_scan = "crs"
+operation_allowlist = []
+max_body_bytes = 8388608
+max_query_bytes = 1048576
+max_variables_bytes = 1048576
+max_variables = 128
+max_depth = 128
+max_aliases = 1024
+max_fields = 8192
+allow_mutations = true
+allow_subscriptions = true
+
+[security.auth]
+enabled = false
+api_keys = []
+header_name = "X-API-Key"
+require_https = false
+
+[security.ai]
+enabled = false
+threat_threshold = 0.8
+timeout_ms = 5000

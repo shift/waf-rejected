@@ -1,0 +1,32 @@
+bind_addr = "0.0.0.0:8080"
+health_bind_addr = "0.0.0.0:8081"
+upstream_uri = "http://upstream:3000"
+
+[server]
+max_body_size = 10485760
+enable_http2 = true
+enable_http3 = false
+supported_http_versions = ["1.0", "1.1", "2"]
+
+[logging]
+level = "info"
+json_format = true
+
+[waf]
+enabled = true
+fail_mode = "closed"
+
+[waf.coraza]
+enabled = true
+backend = "native"
+native_socket_path = "/run/waf/coraza.sock"
+max_payload_bytes = 65536
+eval_timeout_ms = 5000
+pool_size = 2
+
+[waf.rate_limit]
+per_ip_enabled = false
+global_enabled = false
+
+[security.auth]
+enabled = false

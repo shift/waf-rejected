@@ -1,0 +1,82 @@
+# GraphQL persisted-query allowlist (`graphql-only` body policy).
+#
+# `graphql-only` validates the GraphQL document and operation against the
+# allowlist, then withholds the raw JSON body from CRS body rules. URI and
+# header rules still run. This is an explicit coverage trade-off: CRS body-rule
+# coverage is given up for GraphQL requests, so it requires a non-empty
+# operation allowlist.
+#
+# The referenced artifact is a legacy-style JSON list. Generate the production
+# artifact from your client manifest with:
+#
+#   graphql-allowlist generate --manifest operations.json \
+#       --out /etc/waf/graphql/allowlist.json --unknown-operation-action block
+#
+# Use `body_scan = "crs"` (the default) to keep the full CRS JSON body scan.
+#
+# Run (from the repository root, so the relative allowlist path resolves):
+#   WAF_CONFIG_FILE=config/examples/graphql-persisted.toml waf-ingress
+
+bind_addr = "0.0.0.0:8080"
+health_bind_addr = "0.0.0.0:8081"
+upstream_uri = "http://127.0.0.1:3000"
+
+[proxy]
+timeout_seconds = 30
+max_request_size = 10485760
+
+[server]
+max_connections = 1000
+request_timeout_secs = 30
+keep_alive_timeout_secs = 90
+enable_http2 = true
+enable_http3 = false
+supported_http_versions = ["1.0", "1.1", "2"]
+max_body_size = 10485760
+
+[logging]
+level = "info"
+json_format = true
+
+[waf]
+enabled = true
+fail_mode = "closed"
+
+[waf.coraza]
+backend = "rust"
+fallback = "none"
+max_payload_bytes = 65536
+
+[waf.graphql]
+enabled = true
+body_scan = "graphql-only"
+# Path is resolved from the proxy's working directory at start-up. A missing or
+# invalid file aborts start-up.
+allowlist_file = "config/examples/graphql-persisted-allowlist.json"
+# Inline entries are merged with the artifact. Names or 64-character SHA-256
+# query hashes are accepted.
+operation_allowlist = []
+unknown_operation_action = "block"
+max_body_bytes = 8388608
+max_query_bytes = 1048576
+max_variables_bytes = 1048576
+max_variables = 128
+max_depth = 128
+max_aliases = 1024
+max_fields = 8192
+allow_mutations = false
+allow_subscriptions = false
+
+[waf.rate_limit]
+per_ip_enabled = true
+per_ip_max_requests = 100
+per_ip_window_secs = 60
+global_enabled = true
+global_max_requests = 10000
+global_window_secs = 60
+
+[waf.security_events]
+enabled = true
+min_threat_level = "medium"
+enable_cef = false
+enable_otel = false

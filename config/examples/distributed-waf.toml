@@ -1,0 +1,127 @@
+# Distributed WAF node (regional distri-kv security fabric).
+#
+# Requires a build with the non-default `distri-kv` feature:
+#   nix develop -c cargo build --release --bin waf-ingress --features distri-kv
+#
+# The request path never waits on distri-kv. With `fallback = "local_only"`
+# (the default and the value intentionally pinned here) an unreachable cluster
+# only stops policy/reputation refresh; local rules, rate limits and exporters
+# keep enforcing the last-known-good state.
+#
+# The Service names below match deploy/distributed/compose.yaml and the
+# Kubernetes manifests. Replace them with the regional bootstrap endpoints in
+# production, for example https://dkv-eu.example:7443.
+#
+# SECURITY: the client in this revision does not attach mTLS/bearer metadata.
+# Terminate authentication in a local sidecar or keep the cluster on a trusted
+# control-plane network until client auth lands. See
+# docs/operations/distributed-deployment.md.
+
+bind_addr = "0.0.0.0:8080"
+health_bind_addr = "0.0.0.0:8081"
+upstream_uri = "http://upstream:3000"
+
+[proxy]
+timeout_seconds = 30
+max_request_size = 10485760
+
+[server]
+max_connections = 8192
+request_timeout_secs = 30
+keep_alive_timeout_secs = 90
+enable_http2 = true
+enable_http3 = false
+supported_http_versions = ["1.0", "1.1", "2"]
+max_body_size = 10485760
+grpc_max_stream_bytes = 4194304
+grpc_max_stream_seconds = 300
+grpc_aware_rejections = true
+
+[logging]
+level = "info"
+json_format = true
+
+[waf]
+enabled = true
+# Keep engine failures independent from control-plane fallback.
+fail_mode = "closed"
+
+[waf.coraza]
+backend = "rust"
+fallback = "none"
+max_payload_bytes = 65536
+max_inspect_bytes = 65536
+oversize_action = "reject"
+eval_timeout_ms = 5000
+
+[waf.rate_limit]
+per_ip_enabled = true
+per_ip_max_requests = 6000
+per_ip_window_secs = 60
+global_enabled = true
+global_max_requests = 100000
+global_window_secs = 60
+
+[waf.content_inspection]
+enabled = true
+inspect_headers = true
+inspect_body = true
+max_body_size = 10485760
+threat_patterns = ["sql_injection", "xss", "command_injection", "path_traversal"]
+
+[waf.security_events]
+enabled = true
+min_threat_level = "medium"
+enable_cef = false
+enable_otel = false
+
+[waf.distributed]
+enabled = true
+# Stable, whitespace-free identity. Use the pod/host name in orchestration.
+node_id = "waf-1"
+region = "eu-west-1"
+policy_scope = "default"
+# Regional bootstrap endpoints. All configured endpoints are tried; the
+# controller reconnects with exponential backoff. Use https:// with a CA
+# bundle and client certificate in production.
+endpoints = ["http://dkv-client:7443"]
+# Local demo only: this endpoint is plaintext behind a sidecar. Production
+# configs must use https:// and leave this false.
+allow_insecure_transport = true
+# Policy bundles are Ed25519-signed. Replace this placeholder with the
+# regional cluster's public key (hex or base64, 32 raw bytes); bundles that do
+# not verify are rejected.
+policy_signing_public_key = "0000000000000000000000000000000000000000000000000000000000000000"
+policy_signing_key_id = "placeholder-replace-me"
+# Mutual TLS / SPIFFE identity (production). Paths are unset in this demo.
+# tls_ca_cert_path = "/etc/waf/certs/ca.pem"
+# tls_client_cert_path = "/etc/waf/certs/waf.pem"
+# tls_client_key_path = "/etc/waf/certs/waf-key.pem"
+# spiffe_id = "spiffe://example.org/waf/waf-1"
+# Shared rate-limit leases are off by default; enable only with the real
+# cluster lease RPC available.
+leases_enabled = false
+# Never put consensus on the request path.
+fallback = "local_only"
+policy_cache_ttl_secs = 300
+reputation_cache_ttl_secs = 300
+max_stale_secs = 900
+heartbeat_interval_secs = 10
+request_timeout_ms = 2000
+event_queue_capacity = 8192
+counter_queue_capacity = 4096
+reconnect_initial_backoff_ms = 100
+reconnect_max_backoff_ms = 30000
+# Canary safety: observe and log derived policy/reputation, do not enforce it
+# until registration and metrics are verified. Set false only after the
+# rollout in docs/operations/distributed-deployment.md.
+shadow = true
+
+[storage]
+# redb is the default event store; "sled" is the legacy backend.
+enabled = true
+backend = "redb"
+path = "/var/lib/waf/data/waf_security_events.redb"
+max_events = 100000
+ttl_cleanup_interval = { secs = 60, nanos = 0 }
+cache_size = 16777216

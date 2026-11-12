@@ -1,0 +1,58 @@
+# Minimal WAF-Rejected configuration.
+#
+# This is the smallest configuration that is useful in front of an upstream:
+# the compiled default inspection backend is the native Rust CRS engine
+# (`waf.coraza.backend = "rust"`), so no Coraza/wasm settings are required.
+#
+# Run:
+#   WAF_CONFIG_FILE=config/examples/minimal.toml waf-ingress
+#
+# Everything not listed here uses the compiled defaults. Explicitly pinning
+# `enable_http3 = false` keeps a plain HTTP/1.1 + HTTP/2 listener; enable it
+# only in a build with the `http3` feature.
+
+bind_addr = "0.0.0.0:8080"
+health_bind_addr = "0.0.0.0:8081"
+upstream_uri = "http://127.0.0.1:3000"
+
+[proxy]
+timeout_seconds = 30
+max_request_size = 10485760
+
+[server]
+request_timeout_secs = 30
+keep_alive_timeout_secs = 90
+enable_http2 = true
+enable_http3 = false
+supported_http_versions = ["1.0", "1.1", "2"]
+max_body_size = 10485760
+
+[logging]
+level = "info"
+json_format = true
+
+[waf]
+enabled = true
+# Fail closed: an inspection error blocks instead of forwarding.
+fail_mode = "closed"
+
+[waf.rate_limit]
+per_ip_enabled = true
+per_ip_max_requests = 100
+per_ip_window_secs = 60
+global_enabled = true
+global_max_requests = 10000
+global_window_secs = 60
+
+[waf.content_inspection]
+enabled = true
+inspect_headers = true
+inspect_body = true
+max_body_size = 10485760
+threat_patterns = ["sql_injection", "xss", "command_injection", "path_traversal"]
+
+[waf.security_events]
+enabled = true
+min_threat_level = "medium"
+enable_cef = false
+enable_otel = false
