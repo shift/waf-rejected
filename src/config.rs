@@ -173,8 +173,43 @@ impl Default for StorageConfig {
 }
 
 impl StorageConfig {
-    /// Convert to waf storage configuration
-    pub fn to_waf_storage_config(&self) -> WafStorageConfig {
+    /// Validate the persistent event-store selection.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        match self.backend.as_str() {
+            "redb" | "sled" | "memory" => {}
+            other => anyhow::bail!(
+                "storage.backend must be one of \"redb\" (default), \"sled\" (legacy) or \
+                 \"memory\" (tests only); got {:?}",
+                other
+            ),
+        }
+        if self.backend != "memory" && self.path.trim().is_empty() {
+            anyhow::bail!(
+                "storage.path must not be empty for the {} backend",
+                self.backend
+            );
+        }
+        if self.ttl_cleanup_interval.is_zero() {
+            anyhow::bail!("storage.ttl_cleanup_interval must be greater than zero");
+        }
+        if self.backend == "sled" && !cfg!(feature = "export-sled") {
+            anyhow::bail!(
+                "storage.backend = \"sled\" requires a build with the `export-sled` feature"
+            );
+        }
+        if self.backend == "redb" && !cfg!(feature = "export-redb") {
+            anyhow::bail!(
+                "storage.backend = \"redb\" requires a build with the `export-redb` feature"
+            );
+        }
+        Ok(())
+    }
+
+    /// Convert to waf storage configuration.
+    ///
+    /// Unknown backends are an error: silently falling back would let a typo
+    /// create a store with a different durability profile than intended.
+    pub fn to_waf_storage_config(&self) -> Result<WafStorageConfig, String> {
         let backend = match self.backend.as_str() {
             "sled" => crate::waf::storage::StorageBackend::Sled {
                 path: self.path.clone(),
@@ -187,15 +222,20 @@ impl StorageConfig {
             "memory" => crate::waf::storage::StorageBackend::Memory {
                 max_size: self.max_memory_entries,
             },
-            _ => crate::waf::storage::StorageBackend::default(),
+            other => {
+                return Err(format!(
+                    "unknown storage.backend {:?} (expected \"redb\", \"sled\" or \"memory\")",
+                    other
+                ))
+            }
         };
 
-        WafStorageConfig {
+        Ok(WafStorageConfig {
             backend,
             enable_follower_reads: self.enable_follower_reads,
             ttl_cleanup_interval: self.ttl_cleanup_interval,
             enable_compression: self.enable_compression,
-        }
+        })
     }
 }
 
@@ -1677,11 +1717,102 @@ pub struct SecurityEventsConfig {
     pub otel_export_traces: Option<bool>,
     pub otel_export_logs: Option<bool>,
 
-    /// Sled database persistence configuration
+    /// Persistent event-store backend selection.
+    ///
+    /// `"redb"` (default when a store is configured) or `"sled"` (legacy).
+    /// `None` falls back to `enable_sled`: `true` selects sled, `false` leaves
+    /// the persistent store disabled (the historical default).
+    pub store_backend: Option<String>,
+
+    /// Path for the persistent event store. Defaults to
+    /// `./data/waf_security_events.redb` for redb and to `sled_db_path` (or
+    /// `./waf_security_events.sled`) for the legacy sled backend.
+    pub store_path: Option<String>,
+
+    /// Retention cap: once exceeded, the oldest events are deleted first.
+    pub store_max_events: Option<usize>,
+
+    /// Legacy sled persistence configuration.
+    ///
+    /// `enable_sled = true` selects the legacy sled backend when
+    /// `store_backend` is unset. Existing configs keep working unchanged.
     pub enable_sled: bool,
     pub sled_db_path: Option<String>,
     pub sled_max_events: Option<usize>,
     pub sled_compress: bool,
+}
+
+impl SecurityEventsConfig {
+    /// Resolved persistent store backend, or `None` when no store is enabled.
+    pub fn resolved_store_backend(&self) -> Option<&'static str> {
+        match self.store_backend.as_deref() {
+            Some("redb") => Some("redb"),
+            Some("sled") => Some("sled"),
+            Some(_) => None,
+            None if self.enable_sled => Some("sled"),
+            None => None,
+        }
+    }
+
+    /// Path for the resolved backend.
+    pub fn resolved_store_path(&self) -> String {
+        if let Some(path) = &self.store_path {
+            return path.clone();
+        }
+        match self.resolved_store_backend() {
+            Some("sled") => self
+                .sled_db_path
+                .clone()
+                .unwrap_or_else(|| "./waf_security_events.sled".to_string()),
+            _ => "./data/waf_security_events.redb".to_string(),
+        }
+    }
+
+    /// Retention cap shared by both persistent backends.
+    pub fn resolved_store_max_events(&self) -> Option<usize> {
+        self.store_max_events.or(self.sled_max_events)
+    }
+
+    /// Validate backend selection and build-feature availability.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let backend = match self.store_backend.as_deref() {
+            Some("redb") | Some("sled") | Some("none") | None => self.store_backend.as_deref(),
+            Some(other) => anyhow::bail!(
+                "waf.security_events.store_backend must be \"redb\" (default), \"sled\" \
+                 (legacy) or \"none\"; got {:?}",
+                other
+            ),
+        };
+
+        if self.enable_sled && backend.is_some_and(|backend| backend != "sled") {
+            anyhow::bail!(
+                "waf.security_events.enable_sled = true conflicts with store_backend = {:?}; \
+                 set enable_sled = false when selecting the redb store",
+                backend.unwrap_or_default()
+            );
+        }
+
+        match self.resolved_store_backend() {
+            Some("redb") if !cfg!(feature = "export-redb") => anyhow::bail!(
+                "waf.security_events.store_backend = \"redb\" requires a build with the \
+                 `export-redb` feature"
+            ),
+            Some("sled") if !cfg!(feature = "export-sled") => anyhow::bail!(
+                "waf.security_events.store_backend = \"sled\" requires a build with the \
+                 `export-sled` feature"
+            ),
+            _ => {}
+        }
+
+        if self.resolved_store_backend().is_some() && self.resolved_store_path().trim().is_empty() {
+            anyhow::bail!("waf.security_events.store_path must not be empty");
+        }
+        if self.resolved_store_max_events() == Some(0) {
+            anyhow::bail!("waf.security_events.store_max_events must be greater than zero");
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2807,6 +2938,9 @@ impl Default for SecurityEventsConfig {
             sled_db_path: None,
             sled_max_events: None,
             sled_compress: false,
+            store_backend: None,
+            store_path: None,
+            store_max_events: None,
         }
     }
 }
@@ -3303,6 +3437,7 @@ impl Config {
         self.waf.grpc.validate()?;
         self.waf.graphql.validate()?;
         self.waf.distributed.validate()?;
+        self.waf.security_events.validate()?;
         if self.security.auth.enabled
             && self.security.auth.api_keys.is_empty()
             && self.security.auth.api_key_entries.is_empty()
@@ -3388,6 +3523,7 @@ impl Config {
         }
 
         self.runtime.validate()?;
+        self.storage.validate()?;
 
         Ok(())
     }

@@ -6,6 +6,42 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Added
 
+- redb is the default security-event store. `waf.security_events.store_backend`
+  (default `"redb"`) and `[storage] backend` (default `"redb"`) select it; the
+  legacy sled backend stays selectable and existing configs that set
+  `enable_sled = true` keep working. `RedbExporter` records events with the same
+  `timestamp_ms ++ uuid` key layout as the sled exporter and pins
+  `Durability::Immediate`, so an acknowledged event is fsynced and survives a
+  crash (one fsync per write transaction). Unknown backend values are rejected
+  at startup instead of silently creating a sled store.
+
+- `waf-storage-migrate`: sled → redb (and `--reverse` redb → sled) migration
+  with per-batch progress, a crash-safe checkpoint for idempotent resume,
+  refusal to overwrite a non-empty destination without `--force`, and a
+  verification pass comparing key counts and a SHA-256 digest (or `--sample`
+  full compare). It auto-detects the legacy `security_events` sled tree. See
+  `docs/operations/migrating-event-store.md`.
+
+- One backend-parity suite (`src/waf/storage/parity_tests.rs`) runs every
+  scenario against redb, sled and memory through the `StorageAdapter` trait:
+  insert/get/delete, ordering, prefix/range scans, TTL expiry and cleanup, bulk
+  deletion, concurrent readers/writers, restart durability, size/compaction
+  accounting and error cases. The trait gained `scan_range`, `scan_prefix`,
+  `ttl`, `delete_many` and `backend_name`.
+
+### Fixed
+
+- `RedbStorageAdapter` never compiled (`pub` inside a trait impl, a
+  `TableDefinition<u64, _>` used with byte keys, `.value().to_vec()` on a
+  `u64`) and had no tests in the default build. It now compiles, uses a unique
+  `expiry ++ key` expiration index, cleans stale index entries on overwrite and
+  delete, reports `disk_size` and releases its file lock on drop.
+- The sled adapter/exporter ignored TTLs on read, left stale TTL entries after
+  an overwrite without a TTL, and scanned the TTL tree quadratically. TTLs are
+  now checked on `get`/`exists`/scans, the TTL tree is keyed by data key
+  (schema 2, upgraded in place from the old layout), and cleanup is linear.
+  Memory scans are sorted to match the ordered backends.
+
 - Selectable distributed transport: `waf.distributed.transport = "grpc"`
   (default, behaviour unchanged) or `"quiccrunch"`, both behind one
   `TransportClient` seam so the controller, caches, leases, policy

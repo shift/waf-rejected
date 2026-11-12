@@ -53,9 +53,13 @@ otel_service_name = "waf-security-events"
 otel_service_version = "1.0.0"
 otel_export_traces = true
 otel_export_logs = true
-enable_sled = true
-sled_db_path = "/var/log/waf/security.db"
-sled_max_events = 1000000
+# Persistent audit-trail store (redb default; sled is the legacy backend).
+store_backend = "redb"
+store_path = "/var/log/waf/security.redb"
+store_max_events = 1000000
+enable_sled = false
+# sled_db_path = "/var/log/waf/security.db"
+# sled_max_events = 1000000
 sled_compress = true
 
 [waf.content_inspection]

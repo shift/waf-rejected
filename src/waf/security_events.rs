@@ -12,6 +12,9 @@ use super::exporters::{CefExporter, ExporterDispatcher, SecurityEventExporter};
 #[cfg(feature = "export-otel")]
 use super::exporters::OpenTelemetryExporter;
 
+#[cfg(feature = "export-redb")]
+use super::exporters::RedbExporter;
+
 #[cfg(feature = "export-sled")]
 use super::exporters::SledExporter;
 
@@ -224,26 +227,57 @@ impl SecurityEventLogger {
             dispatcher.add_exporter(otel_exporter);
         }
 
-        // Add Sled database exporter if enabled
-        #[cfg(feature = "export-sled")]
-        if config.enable_sled {
-            let sled_path = config
-                .sled_db_path
-                .as_deref()
-                .unwrap_or("./waf_security_events.sled");
-            match SledExporter::new(
-                sled_path,
-                Some("security_events".to_string()),
-                config.sled_max_events,
-                config.sled_compress,
-            ) {
-                Ok(sled_exporter) => {
-                    dispatcher.add_exporter(sled_exporter);
-                }
-                Err(e) => {
-                    tracing::error!("Failed to initialize Sled exporter: {}", e);
+        // Add the persistent event store. redb is the default when a store is
+        // selected; sled remains available as the legacy backend.
+        match config.resolved_store_backend() {
+            #[cfg(feature = "export-redb")]
+            Some("redb") => {
+                let path = config.resolved_store_path();
+                match RedbExporter::new(&path, config.resolved_store_max_events()) {
+                    Ok(exporter) => {
+                        dispatcher.add_exporter(exporter);
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to initialize redb event store at {}: {}", path, e);
+                    }
                 }
             }
+            #[cfg(feature = "export-sled")]
+            Some("sled") => {
+                let sled_path = config
+                    .store_path
+                    .as_deref()
+                    .or(config.sled_db_path.as_deref())
+                    .unwrap_or("./waf_security_events.sled");
+                match SledExporter::new(
+                    sled_path,
+                    Some("security_events".to_string()),
+                    config.resolved_store_max_events(),
+                    config.sled_compress,
+                ) {
+                    Ok(sled_exporter) => {
+                        dispatcher.add_exporter(sled_exporter);
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to initialize Sled exporter: {}", e);
+                    }
+                }
+            }
+            #[cfg(not(feature = "export-redb"))]
+            Some("redb") => {
+                tracing::error!(
+                    "waf.security_events.store_backend = \"redb\" but this build has no \
+                     `export-redb` feature; no persistent event store is active"
+                );
+            }
+            #[cfg(not(feature = "export-sled"))]
+            Some("sled") => {
+                tracing::error!(
+                    "waf.security_events.store_backend = \"sled\" but this build has no \
+                     `export-sled` feature; no persistent event store is active"
+                );
+            }
+            _ => {}
         }
 
         Self { dispatcher, config }
@@ -530,15 +564,17 @@ impl SecurityEventLogger {
         if self.config.enable_otel {
             exporters.push("OpenTelemetry");
         }
-        if self.config.enable_sled {
-            exporters.push("Sled");
+        match self.config.resolved_store_backend() {
+            Some("redb") => exporters.push("Redb"),
+            Some("sled") => exporters.push("Sled"),
+            _ => {}
         }
         exporters
     }
 
     /// Whether the persistent event store is configured for this process.
     pub fn event_store_configured(&self) -> bool {
-        self.config.enable_sled
+        self.config.resolved_store_backend().is_some()
     }
 
     /// Flush all exporters

@@ -5,7 +5,8 @@
 use super::{ReadConsistency, StorageAdapter, StorageError, StorageResult, StorageStats};
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::ops::Bound;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 use tokio::time::interval;
@@ -47,7 +48,7 @@ impl MemoryStorageAdapter {
 
     /// Start background TTL cleanup task
     async fn start_ttl_cleanup(&self) {
-        let data = self.data.clone();
+        let data = Arc::downgrade(&self.data);
         let expired_count = self.expired_count.clone();
         let cleanup_interval = self.ttl_cleanup_interval;
 
@@ -56,6 +57,10 @@ impl MemoryStorageAdapter {
 
             loop {
                 interval.tick().await;
+
+                let Some(data) = Weak::upgrade(&data) else {
+                    return;
+                };
 
                 let now = SystemTime::now();
                 let mut data_lock = data.write().await;
@@ -256,6 +261,83 @@ impl StorageAdapter for MemoryStorageAdapter {
         // No-op for memory storage
         Ok(())
     }
+
+    async fn scan_range(
+        &self,
+        start: Bound<&[u8]>,
+        end: Bound<&[u8]>,
+        limit: Option<usize>,
+    ) -> StorageResult<Vec<(Vec<u8>, Vec<u8>)>> {
+        let data = self.data.read().await;
+        let now = SystemTime::now();
+
+        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = data
+            .iter()
+            .filter(|(key, entry)| {
+                if let Some(expires_at) = entry.expires_at {
+                    if now >= expires_at {
+                        return false;
+                    }
+                }
+                in_range(key.as_slice(), &start, &end)
+            })
+            .map(|(key, entry)| (key.clone(), entry.value.clone()))
+            .collect();
+
+        // A HashMap has no order; the other backends return lexicographic key
+        // order, so sort to keep the trait contract identical.
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        if let Some(limit) = limit {
+            entries.truncate(limit);
+        }
+
+        Ok(entries)
+    }
+
+    async fn ttl(&self, key: &[u8]) -> StorageResult<Option<Duration>> {
+        let data = self.data.read().await;
+        let Some(entry) = data.get(key) else {
+            return Ok(None);
+        };
+        let Some(expires_at) = entry.expires_at else {
+            return Ok(None);
+        };
+
+        match expires_at.duration_since(SystemTime::now()) {
+            Ok(remaining) if !remaining.is_zero() => Ok(Some(remaining)),
+            _ => Ok(None),
+        }
+    }
+
+    async fn delete_many(&self, keys: &[Vec<u8>]) -> StorageResult<u64> {
+        let mut data = self.data.write().await;
+        let mut removed = 0u64;
+        for key in keys {
+            if data.remove(key).is_some() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "memory"
+    }
+}
+
+fn in_range(key: &[u8], start: &Bound<&[u8]>, end: &Bound<&[u8]>) -> bool {
+    let after_start = match start {
+        Bound::Included(start) => key >= *start,
+        Bound::Excluded(start) => key > *start,
+        Bound::Unbounded => true,
+    };
+    let before_end = match end {
+        Bound::Included(end) => key <= *end,
+        Bound::Excluded(end) => key < *end,
+        Bound::Unbounded => true,
+    };
+    after_start && before_end
 }
 
 #[cfg(test)]

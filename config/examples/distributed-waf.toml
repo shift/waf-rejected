@@ -123,6 +123,7 @@ reconnect_max_backoff_ms = 30000
 shadow = true
 
 [storage]
+# redb is the default event store; "sled" is the legacy backend.
 backend = "redb"
 path = "/var/lib/waf/data/waf.redb"
 enable_follower_reads = true

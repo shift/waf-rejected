@@ -20,7 +20,9 @@ an explicit feature.
 | Feature | Default | Contents | Notes |
 | --- | --- | --- | --- |
 | _(none — default set)_ | yes | `waf-ingress`, proxy, config, health, metrics, WAF core, native Rust CRS engine (`rust-engine`), Coraza WASI reactor (`wasm-reactor`), security events/exporters, WebSocket, distributed client seam (`distri-kv` is a non-default feature but core-owned) | The review boundary. |
-| `export-system` | yes | `sled`-backed event export | Existing default. |
+| `export-system` | yes | sled-backed event export and the legacy sled adapter | Existing default; implies `export-sled`. |
+| `export-redb` | yes | redb-backed event store (default backend) | Default since the redb cut-over. |
+| `export-sled` | yes | sled event exporter and storage adapter (legacy backend) | Kept for existing deployments and the migration source. |
 | `websocket` | yes | WebSocket upgrade/frame inspection | Existing default. |
 | `wasm-reactor` | yes | Coraza/OWASP CRS WASI reactor (reference path) | Existing default. |
 | `rust-engine` | yes | Native Rust CRS engine (default backend) | Existing default. |
@@ -34,7 +36,7 @@ prototype: `hyperscan-eval` (links system `libhs`, kept separate so
 `experimental` does not require `vectorscan`), `coraza-native` (native Go
 sidecar backend), `http3`, `webtransport`, `parallel-args`, `allow-cache`,
 `crs-prefilter`, `fastpath`, `engine-kernel`, `io-uring`, `alloc-*`,
-`cpu-pinning`, `export-otel`, `export-redb`, `export-sled`.
+`cpu-pinning`, `export-otel`.
 
 ## Binary classification
 
@@ -58,6 +60,7 @@ sidecar backend), `http3`, `webtransport`, `parallel-args`, `allow-cache`,
 | `rust-engine-parity` | Differential parity harness for the default engine. Requires `rust-engine` (default). |
 | `waf-events-query` | Event-export inspection tool. Requires `export-sled`. |
 | `create_sample_db` | Event-store fixture builder. Requires `export-sled`. |
+| `waf-storage-migrate` | Verified sled ↔ redb event-store migration (requires `export-sled` and `export-redb`, both default). |
 | `grpc-allowlist` | Generates the gRPC descriptor allowlist used by shipped configs. |
 | `graphql-allowlist` | Generates the GraphQL persisted-query allowlist. Requires `wasm-reactor`. |
 | `coraza_abi_bench` | Coraza reactor ABI benchmark (reference path). Requires `wasm-reactor`. |

@@ -134,7 +134,7 @@ flowchart LR
     subgraph E["Evidence - trust boundary 4"]
         LOG["tracing / JSON stdout"]
         CEF["CEF file"]
-        SLED["Sled database"]
+        STORE["Event store<br/>redb (default), sled (legacy)"]
         OTEL["OpenTelemetry"]
     end
 
@@ -166,7 +166,7 @@ flowchart LR
     WTP -.-> CL
     ENG -.-> LOG
     ENG -.-> CEF
-    ENG -.-> SLED
+    ENG -.-> STORE
     ENG -.-> OTEL
     HM -.-> MON["Operator / Prometheus"]
 ```
@@ -176,7 +176,7 @@ flowchart LR
 | TB1 | Client to ingress | Untrusted | TLS policy, HTTP version allowlist, framing validation, auth, decompression and body limits |
 | TB2 | Trusted proxy to WAF | Only listed CIDRs are trusted for forwarding headers | `resolve_client_ip` ignores all forwarding headers from other peers; for trusted peers it combines every `X-Forwarded-For`, `Forwarded`, `X-Real-IP` and `X-Client-IP` value and walks right-to-left |
 | TB3 | WAF to origin | Origin is trusted to serve its own content; it is not trusted to see forged client identity | Hop-by-hop and forwarding headers are stripped and rewritten |
-| TB4 | WAF to evidence store | Local filesystem/database and SIEM collector are operator-controlled | Optional CEF/Sled/OTel exporters; export failures are logged, not blocking |
+| TB4 | WAF to evidence store | Local filesystem/database and SIEM collector are operator-controlled | Optional CEF/event-store/OTel exporters; export failures are logged, not blocking. The persistent store defaults to redb (`Durability::Immediate`, fsync per acknowledged event); sled is legacy and still selectable |
 | TB5 | WAF to health/metrics | Operator network only | Separate listener; no authentication or TLS in the process |
 
 Assets in scope: client credentials (API keys), request metadata and bodies,
@@ -850,7 +850,7 @@ The model holds only if the operator satisfies these assumptions:
 5. Configuration and API keys are mounted as secrets, not baked into the image
    or committed. The config file is readable only by the service account.
 6. The process runs as a non-root user with a read-only root filesystem except
-   for the Sled/CEF paths, and has CPU/memory limits sized for
+   for the event-store/CEF paths, and has CPU/memory limits sized for
    `max_body_size × expected concurrency`.
 7. MaxMind databases, if used, are licensed, mounted read-only and refreshed on
    a schedule; their absence is treated as a configuration error by monitoring.
@@ -904,8 +904,11 @@ The model holds only if the operator satisfies these assumptions:
 - [ ] Enable JSON security events and ship them to the SIEM; set
       `min_threat_level` deliberately (default `medium` suppresses allowed
       requests).
-- [ ] If persistence is required, enable the Sled exporter with an explicit
-      path, size cap and backup/retention policy.
+- [ ] If persistence is required, keep the default redb event store (or select
+      the legacy sled backend) with an explicit path, `store_max_events` cap and
+      backup/retention policy. Follow
+      [the migration runbook](../operations/migrating-event-store.md) when
+      changing backends.
 - [ ] Bind the health listener to loopback or a private interface; scrape it
       over an authenticated internal network.
 - [ ] Mount GeoIP databases read-only, refresh them, and alert when they are
@@ -922,16 +925,27 @@ The model holds only if the operator satisfies these assumptions:
 
 | Source | What it contains | Where it goes | Limitations |
 |---|---|---|---|
-| Security events (`SecurityEventLogger::log_event`) | UUID, UTC timestamp, resolved client IP, method, path, negotiated HTTP version, user agent, decision, threat level, triggered rule names, request size, final response status, inspection/upstream/total timing, referer, inbound `X-Forwarded-For`, block reason | tracing JSON on stdout, then optional CEF/Sled/OTel | No response body/size, no client port, geo fields empty; allowed events filtered at default `medium` |
+| Security events (`SecurityEventLogger::log_event`) | UUID, UTC timestamp, resolved client IP, method, path, negotiated HTTP version, user agent, decision, threat level, triggered rule names, request size, final response status, inspection/upstream/total timing, referer, inbound `X-Forwarded-For`, block reason | tracing JSON on stdout, then optional CEF/event store/OTel | No response body/size, no client port, geo fields empty; allowed events filtered at default `medium` |
 | Application logs (`tracing`) | Startup configuration summary, block reasons with rule names, auth failures, upstream errors, TLS handshake failures | stdout/stderr, collected by the platform | No request correlation ID; log level controls detail; payload fragments can appear in block reasons |
 | CEF exporter (`CefExporter`) | CEF v1 lines with decision, severity and event fields | `waf.security_events.cef_output_file` | Optional, append-only; rotation is the operator's responsibility; export failure is logged but not retried durably |
-| Sled exporter (`SledExporter`) | Serialised `SecurityEvent` records | `waf.security_events.sled_db_path` (default `./waf_security_events.sled`) | Optional; local; `sled_max_events` bounds retention; no encryption at rest by the application |
+| Persistent event store (`RedbExporter`, default) | Serialised `SecurityEvent` records, `timestamp_ms ++ uuid` keys | `waf.security_events.store_path` (default `./data/waf_security_events.redb`) | `Durability::Immediate`: an acknowledged event is fsynced before the write returns (one fsync per write transaction). `store_max_events` bounds retention; no encryption at rest by the application. Single-writer file, local to one process |
+| Sled exporter (`SledExporter`, legacy) | Serialised `SecurityEvent` records | `waf.security_events.store_backend = "sled"`, `sled_db_path` (default `./waf_security_events.sled`) | Legacy backend, still selectable. Every write is flushed explicitly (sled's 500 ms batching would otherwise lose acknowledged events on a crash). Migrate to redb with `waf-storage-migrate`; no reverse support without a fresh migration |
 | OpenTelemetry exporter | Traces/logs for events | OTLP endpoint configured by the operator | Feature-gated; not a durable audit store |
 | Prometheus metrics (`Metrics::render_prometheus`) | `waf_requests_total`, `waf_allowed_total`, `waf_blocked_total`, `waf_upstream_errors_total`, `waf_uptime_seconds` | `/metrics` on the health listener | Aggregate counters only; no per-rule, per-country or latency labels |
 | Health endpoints (`HealthService::handle_health_request`) | Dependency status (inspection engine/backend, event store, configured exporters), version, uptime | `/health`, `/health/ready`, `/health/live`, `/metrics` | Readiness returns `503` with a machine-readable `reason` when a required dependency is down; `/health/live` stays a process check; `health.dependency_checks = false` makes readiness a liveness alias |
 
-For an incident, preserve: the stdout log window, the CEF file or Sled database
-snapshot, the Prometheus range query, the deployed config (redacted), the
+**Why redb is the default.** redb is a single-file, pure-Rust copy-on-write
+B-tree with ACID transactions, checksummed pages and a per-transaction
+durability level. Maintenance is limited to monitoring file size and taking
+file-level backups. sled is a directory of segments with a background log
+cleaner, less predictable disk growth, and a 500 ms write-batching default that
+has to be overridden to keep acknowledged audit events, so its operational and
+durability story is harder to audit. redb therefore became the default; sled
+stays behind its feature flag and is supported as the legacy backend so existing
+deployments keep working.
+
+For an incident, preserve: the stdout log window, the CEF file or a snapshot of
+the redb (or legacy sled) event store, the Prometheus range query, the deployed config (redacted), the
 container image digest, the SBOM and the release attestation. The WAF does not
 record packet captures, TLS secrets, full request bodies or response bodies;
 do not expect them from this component.
@@ -960,7 +974,7 @@ do not expect them from this component.
 | `src/waf/geoip.rs` | `GeoIpService::from_database`, `lookup`, `GeoBlockingRule::evaluate` | MaxMind lookup and geo/anonymity blocking |
 | `src/waf/tls_config.rs` | `TlsManager::new`, `accept`, `quic_server_config` | TLS versions, ALPN, client certs, QUIC TLS 1.3 |
 | `src/waf/security_events.rs` | `SecurityEventLogger::log_event`, `create_security_event`, `should_log_event` | Event construction and filtering |
-| `src/waf/exporters/*` | `ExporterDispatcher`, `CefExporter`, `SledExporter`, `OpenTelemetryExporter` | Evidence export |
+| `src/waf/exporters/*` | `ExporterDispatcher`, `CefExporter`, `RedbExporter`, `SledExporter` (legacy), `OpenTelemetryExporter` | Evidence export |
 | `src/health.rs` | `HealthService::start`, `handle_health_request` | Health, readiness, liveness and metrics listener |
 | `src/metrics.rs` | `Metrics::render_prometheus` | Prometheus counters |
 | `src/config.rs` | `Config::load`, `Config::validate`, `WafConfig`, `ServerConfig`, `SecurityEventsConfig` | Configuration and startup validation |

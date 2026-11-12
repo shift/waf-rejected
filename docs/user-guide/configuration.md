@@ -417,9 +417,14 @@ enable_otel = false
 # otel_service_name = "waf-rejected"
 # otel_export_traces = false
 # otel_export_logs = false
-enable_sled = true
-sled_db_path = "./data/waf_security_events.sled"
-sled_max_events = 100000
+# Persistent audit-trail store: redb (default) or sled (legacy).
+store_backend = "redb"
+store_path = "./data/waf_security_events.redb"
+store_max_events = 100000
+# Legacy sled backend (opt-in; see the migration runbook).
+enable_sled = false
+# sled_db_path = "./data/waf_security_events.sled"
+# sled_max_events = 100000
 sled_compress = false
 ```
 
@@ -428,6 +433,26 @@ creates spans through the global OpenTelemetry tracer, so the embedding
 application must install a matching `opentelemetry_sdk` 0.33 `TracerProvider`
 before constructing the WAF. The SDK is intentionally not a dependency of
 WAF-Rejected; with the default provider the exporter is a no-op.
+
+### Persistent event store
+
+`store_backend` selects the durable audit-trail store:
+
+| Value | Status | Durability | Notes |
+|---|---|---|---|
+| `redb` | **Default** | fsync on every commit (`Durability::Immediate`); an acknowledged event survives a crash | Single file. `store_path` defaults to `./data/waf_security_events.redb`; `store_max_events` deletes the oldest events first |
+| `sled` | Legacy, still supported | Explicit flush after every write (sled's default 500 ms batching is not crash-safe for acknowledged events) | Directory tree. Kept so existing configs keep working |
+| `none` | Disabled | — | No persistent store; stdout/CEF/OTel still work |
+
+`enable_sled = true` without `store_backend` selects the legacy sled store, so
+pre-existing configurations behave exactly as before. Setting
+`store_backend = "redb"` together with `enable_sled = true` is rejected as
+ambiguous; set `enable_sled = false`.
+
+To move an existing sled store to redb, follow
+[the migration runbook](../operations/migrating-event-store.md). Downgrading to
+sled requires the reverse migration (`waf-storage-migrate --reverse`) or
+restoring a pre-migration backup; the two formats are not interchangeable.
 
 ### `[waf.content_inspection]`
 
@@ -763,7 +788,9 @@ Compliance outputs are evidence packs, not certifications. See
 
 ```toml
 [storage]
-backend = "redb"           # "redb" | "sled" | "memory"
+# redb is the default security-event store. "sled" is the legacy backend;
+# "memory" exists for tests.
+backend = "redb"
 path = "./data/waf.redb"
 enable_follower_reads = true
 ttl_cleanup_interval = { secs = 60, nanos = 0 }
@@ -772,8 +799,12 @@ cache_size = 16777216
 # max_memory_entries = 100000   # backend = "memory"
 ```
 
-The container image uses `/var/lib/waf/data`; mount it read-write for the event
-store.
+redb writes use `Durability::Immediate`, so an acknowledged write is fsynced and
+survives a crash; the cost is one fsync per write transaction. sled is kept for
+existing deployments and flushes explicitly on every write. Unknown backend
+values are rejected at startup instead of falling back to sled. The container
+image uses `/var/lib/waf/data`; mount it read-write for the event store. See
+[migrating the event store](../operations/migrating-event-store.md).
 
 ## `[runtime]`
 

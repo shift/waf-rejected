@@ -22,6 +22,14 @@ name = "create_sample_db"
 path = "src/bin/create_sample_db.rs"
 required-features = ["export-sled"]
 
+# One-way cut-over from the legacy sled event store to the default redb store,
+# with checkpointed resume and a full verification pass. `--reverse` performs
+# the downgrade. See docs/operations/migrating-event-store.md.
+[[bin]]
+name = "waf-storage-migrate"
+path = "src/bin/waf-storage-migrate.rs"
+required-features = ["export-sled", "export-redb"]
+
 [[bin]]
 name = "storage_adapter_test"
 path = "src/bin/storage_adapter_test.rs"
@@ -311,7 +319,13 @@ wtransport = { version = "0.7.2", default-features = false, features = ["ring", 
 # security events, distributed client seam). Everything else is quarantined
 # behind `experimental`, `compliance` or `enterprise-proto`. See
 # docs/operations/module-scope.md.
-default = ["export-system", "websocket", "wasm-reactor", "rust-engine"]
+default = [
+    "export-system",
+    "export-redb",
+    "websocket",
+    "wasm-reactor",
+    "rust-engine",
+]
 integration-tests = []
 # Legacy component-ABI integration. Intentionally empty and NOT supported:
 # the historical `wasm` module is not compiled, so enabling this feature does
@@ -407,10 +421,10 @@ webtransport = ["dep:wtransport"]
 # Security features
 geoip = []
 # Export system features
-export-system = ["sled"]
+export-system = ["export-sled"]
 export-otel = ["opentelemetry"]
-export-sled = ["sled"]
-export-redb = ["redb"]
+export-sled = ["dep:sled"]
+export-redb = ["dep:redb"]
 # Reserved; io_uring backend is a stub in Beta.
 io-uring = []
 # AI/ML threat detection features (heuristic implementation, no heavy ML deps).
@@ -419,7 +433,7 @@ io-uring = []
 # beta security boundary and receives no release testing unless enabled.
 ai-threat-detection = ["experimental"]
 # Compliance features (audit trail, retention, regulatory evidence).
-compliance = ["sled"]
+compliance = ["export-sled"]
 
 # EXPERIMENTAL SURFACE (quarantined, non-default).
 #
