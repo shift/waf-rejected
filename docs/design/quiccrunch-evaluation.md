@@ -490,3 +490,63 @@ Recommendation: keep the prototype on its branch as an evaluated option, keep di
 revisit only if peer-certificate access lands upstream (or if a future data-plane transport needs the
 SO_REUSEPORT worker model). Any re-evaluation must reuse `scripts/bench.sh` with `RUST_LOG=warn` and
 the queueing-separated latency instrumentation.
+
+---
+
+## 10. Update — 2026-11-12: the identity blocker is closed, CI is green
+
+Two of the three objections in §9.4 no longer hold. The transport verdict does.
+
+### 10.1 Peer identity now works end to end
+
+tQUIC 1.6 has `TlsSession::peer_cert_chain()` internally but exposes nothing on `Connection`, and
+nothing in the crate sets `SSL_VERIFY_FAIL_IF_NO_PEER_CERT`. QuicCrunch now carries a **vendored tQUIC
+patch** (`vendor/tquic`, ~60 lines across 3 files, recorded as
+`patches/tquic-1.6.0-peer-identity.patch`) that adds `Connection::peer_cert_chain()`/`peer_cert()`
+and `TlsConfig::set_verify_client_cert()`.
+
+On top of that:
+
+- the adapter server loads client CAs, sets `SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT`,
+  re-checks the chain post-handshake and closes with `0x100`/`0x101` on failure;
+- without a configured client CA the server warns that mTLS is **off** rather than implying it is on;
+- a `spiffe://` URI SAN is extracted from the verified leaf, validated against a configured trust
+  domain, propagated as `x-quiccrunch-peer-spiffe-id` and enforced by `SpiffePolicy` /
+  `SpiffeIdentityInterceptor` on the RBAC path;
+- 8 real-socket tests cover mTLS success, missing client cert, foreign CA, expired cert,
+  out-of-domain SAN, client rejecting a foreign server CA, policy denial and rotation without restart.
+
+The patch is also proposed upstream: **Tencent/tquic#538** (`feat(tls): expose peer certificate chain
+on Connection and support required client auth`), open and mergeable. If it lands, the vendored patch
+is deleted and upgrades stop needing a rebase. Until then, every tQUIC bump must reapply it — that
+maintenance cost is real and is the main remaining structural objection.
+
+Still not proven: no CRL/OCSP revocation, CA/server-cert rotation needs a restart, no SPIFFE bundle
+federation or JWT-SVID, and the async worker path does not expose peer identity.
+
+### 10.2 CI is green, and the repo is clean enough to publish
+
+CI was never actually running: the repo was private and account billing was blocked, so every job
+died in 2 seconds. Now public, with a rewritten pipeline (stable-only gate, `workflow_dispatch` for
+benchmarks and beta, `cargo audit` with a documented policy, `concurrency`, least-privilege
+permissions, release via `softprops/action-gh-release`). Tracked files dropped from 4,846 to 228 —
+4,575 of them were `node_modules` from an agent extension. `cargo audit`: 0 vulnerabilities.
+
+### 10.3 What changed in the assessment
+
+- **Identity: no longer a blocker.** It is solved, with a documented maintenance cost.
+- **Reconnect/pooling, watch resume, backpressure: done.** Bounded retention with
+  `resume-too-old` rather than silent gaps, endpoint-keyed pooling with jittered backoff, bounded
+  per-watch queues with explicit `slow-consumer`/`backpressure` errors.
+- **Raft RPC surface: done.** Versioned `AppendEntries`/`RequestVote`/streaming `InstallSnapshot`
+  with idempotent resume, explicit error codes and leader hints, plus a transport trait seam.
+- **Performance verdict: unchanged.** The same-shape comparison still shows tonic winning bulk
+  throughput 1.5–2.9× at depth 1800; QUIC wins only the single-connection, depth-1 cell (+17 %,
+  p99 184 µs vs 340 µs). The p99 <200 µs target is met only in that shape.
+- **Still missing before a transport swap:** a tonic-vs-QuicCrunch Raft benchmark (the Raft numbers
+  measured so far are dev-profile and host-load affected), schema-evolution tests, codec fuzzing, and
+  a revocation story.
+
+**Verdict now:** a credible alternative transport with the identity problem solved, not yet a
+drop-in replacement. The remaining gate is evidence, not architecture: a release-profile Raft
+comparison and a fuzzed decoder. distri-kv stays on tonic until those exist.
