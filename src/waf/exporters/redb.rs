@@ -15,12 +15,16 @@ use crate::waf::storage::{ReadConsistency, RedbStorageAdapter, StorageAdapter};
 use async_trait::async_trait;
 use std::ops::Bound;
 use std::path::Path;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info};
 
 /// redb-backed security event exporter.
 pub struct RedbExporter {
     store: RedbStorageAdapter,
     max_events: Option<usize>,
+    cleanup_interval: Duration,
+    last_cleanup: Mutex<Instant>,
 }
 
 impl RedbExporter {
@@ -32,13 +36,20 @@ impl RedbExporter {
     pub fn new<P: AsRef<Path>>(
         db_path: P,
         max_events: Option<usize>,
+        cache_size: Option<usize>,
+        cleanup_interval: Duration,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let store = RedbStorageAdapter::open_sync(db_path, None, false)
+        let store = RedbStorageAdapter::open_sync(db_path, cache_size, false)
             .map_err(|e| format!("failed to open redb event store: {e}"))?;
 
         info!("Opened redb database for security events");
 
-        Ok(Self { store, max_events })
+        Ok(Self {
+            store,
+            max_events,
+            cleanup_interval,
+            last_cleanup: Mutex::new(Instant::now()),
+        })
     }
 
     /// Sortable key: timestamp_ms (big-endian) then the event UUID.
@@ -68,10 +79,25 @@ impl RedbExporter {
     }
 
     /// Delete the oldest events when the retention cap is exceeded.
+    ///
+    /// A non-zero cleanup interval throttles the retention pass so a busy
+    /// writer does not pay for a count scan on every event. Zero (the default
+    /// for the legacy configuration path) preserves cleanup-after-every-write.
     async fn cleanup_old_events(&self) -> ExportResult {
         let Some(max_events) = self.max_events else {
             return Ok(());
         };
+
+        if !self.cleanup_interval.is_zero() {
+            let mut last = self
+                .last_cleanup
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if last.elapsed() < self.cleanup_interval {
+                return Ok(());
+            }
+            *last = Instant::now();
+        }
 
         let current = self.store.stats().await?.key_count as usize;
         if current <= max_events {
@@ -284,7 +310,13 @@ mod tests {
     #[tokio::test]
     async fn exports_and_queries_events() {
         let dir = tempfile::tempdir().unwrap();
-        let exporter = RedbExporter::new(dir.path().join("events.redb"), None).unwrap();
+        let exporter = RedbExporter::new(
+            dir.path().join("events.redb"),
+            None,
+            None,
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
 
         let first = test_event(Uuid::new_v4(), 0);
         let second = test_event(Uuid::new_v4(), 10);
@@ -315,7 +347,13 @@ mod tests {
     #[tokio::test]
     async fn enforces_max_events_retention() {
         let dir = tempfile::tempdir().unwrap();
-        let exporter = RedbExporter::new(dir.path().join("events.redb"), Some(2)).unwrap();
+        let exporter = RedbExporter::new(
+            dir.path().join("events.redb"),
+            Some(2),
+            None,
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
 
         for i in 0..5 {
             exporter
@@ -334,11 +372,11 @@ mod tests {
         let event = test_event(Uuid::new_v4(), 0);
 
         {
-            let exporter = RedbExporter::new(&path, None).unwrap();
+            let exporter = RedbExporter::new(&path, None, None, std::time::Duration::ZERO).unwrap();
             exporter.export_event(&event).await.unwrap();
         }
 
-        let reopened = RedbExporter::new(&path, None).unwrap();
+        let reopened = RedbExporter::new(&path, None, None, std::time::Duration::ZERO).unwrap();
         let recent = reopened.get_recent_events(10).await.unwrap();
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].id, event.id);

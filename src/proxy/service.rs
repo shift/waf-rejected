@@ -4673,8 +4673,6 @@ mod tests {
     fn test_proxy_service_creation() {
         let mut config = Config {
             proxy: ProxyConfig {
-                upstream_url: "http://localhost:8080".to_string(),
-                bind_addr: "0.0.0.0:3000".to_string(),
                 timeout_seconds: 30,
                 max_request_size: 10_485_760,
                 upstream_ca_path: None,
@@ -4695,8 +4693,6 @@ mod tests {
     fn test_coraza_init_failure_is_fatal_at_startup() {
         let mut config = Config {
             proxy: ProxyConfig {
-                upstream_url: "http://localhost:8080".to_string(),
-                bind_addr: "0.0.0.0:3000".to_string(),
                 timeout_seconds: 30,
                 max_request_size: 10_485_760,
                 upstream_ca_path: None,
@@ -4725,8 +4721,6 @@ mod tests {
     fn test_grpc_allowlist_init_failure_is_fatal_at_startup() {
         let mut config = Config {
             proxy: ProxyConfig {
-                upstream_url: "http://localhost:8080".to_string(),
-                bind_addr: "0.0.0.0:3000".to_string(),
                 timeout_seconds: 30,
                 max_request_size: 10_485_760,
                 upstream_ca_path: None,

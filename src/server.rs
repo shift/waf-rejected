@@ -64,8 +64,8 @@ pub fn build_runtime(config: &Config) -> std::io::Result<tokio::runtime::Runtime
 /// Synchronous entry point used by the binaries. Loads configuration, builds
 /// the tuned runtime, then drives the async server future.
 pub fn run() -> Result<(), Box<dyn Error>> {
-    init_tracing()?;
     let config = Config::load()?;
+    init_tracing(&config.logging)?;
     crate::affinity::set_reactor_pinning(config.runtime.enable_cpu_pinning);
     let runtime = build_runtime(&config)?;
     runtime.block_on(run_with_config(config))
@@ -217,21 +217,38 @@ async fn shutdown_signal() {
     }
 }
 
-fn init_tracing() -> Result<(), Box<dyn Error>> {
+fn init_tracing(logging: &crate::config::LoggingConfig) -> Result<(), Box<dyn Error>> {
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // An explicit RUST_LOG still wins; otherwise use the validated
+    // `[logging] level` instead of a hard-coded default.
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(logging.level.as_str()));
 
-    tracing_subscriber::registry()
-        .with(
-            fmt::layer()
-                .with_target(true)
-                .with_thread_ids(true)
-                .with_file(true)
-                .with_line_number(true),
-        )
-        .with(env_filter)
-        .try_init()?;
+    if logging.json_format {
+        tracing_subscriber::registry()
+            .with(
+                fmt::layer()
+                    .json()
+                    .with_target(true)
+                    .with_thread_ids(true)
+                    .with_file(true)
+                    .with_line_number(true),
+            )
+            .with(env_filter)
+            .try_init()?;
+    } else {
+        tracing_subscriber::registry()
+            .with(
+                fmt::layer()
+                    .with_target(true)
+                    .with_thread_ids(true)
+                    .with_file(true)
+                    .with_line_number(true),
+            )
+            .with(env_filter)
+            .try_init()?;
+    }
 
     Ok(())
 }

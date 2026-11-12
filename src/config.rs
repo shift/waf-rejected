@@ -146,63 +146,128 @@ impl RuntimeConfig {
     }
 }
 
+/// Persistent audit-trail (security-event) store selection.
+///
+/// This section is the canonical way to enable and configure the on-disk audit
+/// store consumed by [`crate::waf::security_events::SecurityEventLogger`].
+/// `enabled = false` (the default) preserves the historical behaviour: no
+/// persistent store is opened unless the legacy
+/// `[waf.security_events] store_backend` / `enable_sled` keys select one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StorageConfig {
+    /// Open the persistent audit store at start-up.
+    pub enabled: bool,
+
+    /// Audit-store backend: `"redb"` (default) or `"sled"` (legacy).
     pub backend: String,
+
+    /// Audit-store path. redb uses a single file; sled uses a directory.
     pub path: String,
-    pub enable_follower_reads: bool,
+
+    /// Retention cap: once exceeded, the oldest events are deleted first.
+    /// `None` keeps every event.
+    pub max_events: Option<usize>,
+
+    /// Minimum interval between retention-cleanup passes. `0` (the default)
+    /// runs cleanup after every write, which is the historical behaviour.
+    ///
+    /// This is a retention schedule, not a per-event TTL: audit events do not
+    /// expire by age. The name is retained for configuration compatibility.
     pub ttl_cleanup_interval: Duration,
-    pub enable_compression: bool,
+
+    /// redb page cache size in bytes. `None` uses redb's default. Ignored by
+    /// the sled backend.
     pub cache_size: Option<usize>,
-    pub max_memory_entries: Option<usize>,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             backend: "redb".to_string(),
-            path: "./data/waf.redb".to_string(),
-            enable_follower_reads: true,
-            ttl_cleanup_interval: Duration::from_secs(60),
-            enable_compression: false,
-            cache_size: Some(16 * 1024 * 1024), // 16MB default cache
-            max_memory_entries: None,
+            path: "./data/waf_security_events.redb".to_string(),
+            max_events: None,
+            ttl_cleanup_interval: Duration::ZERO,
+            cache_size: None,
         }
     }
 }
 
+/// Resolved audit-store settings consumed by the exporter path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedEventStore {
+    /// `"redb"` or `"sled"`.
+    pub backend: &'static str,
+    pub path: String,
+    pub max_events: Option<usize>,
+    pub cleanup_interval: Duration,
+    pub cache_size: Option<usize>,
+}
+
 impl StorageConfig {
-    /// Validate the persistent event-store selection.
+    /// Validate the persistent audit-store selection.
     pub fn validate(&self) -> anyhow::Result<()> {
         match self.backend.as_str() {
-            "redb" | "sled" | "memory" => {}
+            "redb" | "sled" => {}
             other => anyhow::bail!(
-                "storage.backend must be one of \"redb\" (default), \"sled\" (legacy) or \
-                 \"memory\" (tests only); got {:?}",
+                "storage.backend must be \"redb\" (default) or \"sled\" (legacy); got {:?}",
                 other
             ),
         }
-        if self.backend != "memory" && self.path.trim().is_empty() {
+        if self.path.trim().is_empty() {
             anyhow::bail!(
                 "storage.path must not be empty for the {} backend",
                 self.backend
             );
         }
-        if self.ttl_cleanup_interval.is_zero() {
-            anyhow::bail!("storage.ttl_cleanup_interval must be greater than zero");
+        if self.max_events == Some(0) {
+            anyhow::bail!("storage.max_events must be greater than zero when set");
         }
-        if self.backend == "sled" && !cfg!(feature = "export-sled") {
+        if self.cache_size == Some(0) {
+            anyhow::bail!("storage.cache_size must be greater than zero when set");
+        }
+        if self.enabled && self.backend == "sled" && !cfg!(feature = "export-sled") {
             anyhow::bail!(
                 "storage.backend = \"sled\" requires a build with the `export-sled` feature"
             );
         }
-        if self.backend == "redb" && !cfg!(feature = "export-redb") {
+        if self.enabled && self.backend == "redb" && !cfg!(feature = "export-redb") {
             anyhow::bail!(
                 "storage.backend = \"redb\" requires a build with the `export-redb` feature"
             );
         }
         Ok(())
+    }
+
+    /// Resolve the store the exporter should open.
+    ///
+    /// `[storage]` wins when `enabled = true`. Otherwise the legacy
+    /// `[waf.security_events]` selection is preserved unchanged.
+    pub fn resolve_event_store(&self, events: &SecurityEventsConfig) -> Option<ResolvedEventStore> {
+        if self.enabled {
+            return Some(ResolvedEventStore {
+                backend: match self.backend.as_str() {
+                    "sled" => "sled",
+                    _ => "redb",
+                },
+                path: self.path.clone(),
+                max_events: self.max_events,
+                cleanup_interval: self.ttl_cleanup_interval,
+                cache_size: self.cache_size,
+            });
+        }
+
+        events
+            .resolved_store_backend()
+            .map(|backend| ResolvedEventStore {
+                backend,
+                path: events.resolved_store_path(),
+                max_events: events.resolved_store_max_events(),
+                // Legacy behaviour: cleanup after every write.
+                cleanup_interval: Duration::ZERO,
+                cache_size: None,
+            })
     }
 
     /// Convert to waf storage configuration.
@@ -219,12 +284,9 @@ impl StorageConfig {
                 path: self.path.clone(),
                 cache_size: self.cache_size,
             },
-            "memory" => crate::waf::storage::StorageBackend::Memory {
-                max_size: self.max_memory_entries,
-            },
             other => {
                 return Err(format!(
-                    "unknown storage.backend {:?} (expected \"redb\", \"sled\" or \"memory\")",
+                    "unknown storage.backend {:?} (expected \"redb\" or \"sled\")",
                     other
                 ))
             }
@@ -232,9 +294,8 @@ impl StorageConfig {
 
         Ok(WafStorageConfig {
             backend,
-            enable_follower_reads: self.enable_follower_reads,
             ttl_cleanup_interval: self.ttl_cleanup_interval,
-            enable_compression: self.enable_compression,
+            enable_compression: false,
         })
     }
 }
@@ -242,12 +303,6 @@ impl StorageConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProxyConfig {
-    /// Upstream server URL
-    pub upstream_url: String,
-
-    /// Proxy bind address
-    pub bind_addr: String,
-
     /// Request timeout in seconds
     pub timeout_seconds: u64,
 
@@ -930,6 +985,20 @@ pub struct LoggingConfig {
     pub json_format: bool,
 }
 
+impl LoggingConfig {
+    /// Validate the log level used to build the tracing filter.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        match self.level.as_str() {
+            "trace" | "debug" | "info" | "warn" | "error" => Ok(()),
+            other => anyhow::bail!(
+                "logging.level must be one of \"trace\", \"debug\", \"info\", \"warn\" or \
+                 \"error\"; got {:?}",
+                other
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WafConfig {
@@ -938,9 +1007,6 @@ pub struct WafConfig {
 
     /// Fail mode: "closed" (block on errors) or "open" (allow on errors)
     pub fail_mode: String,
-
-    /// Connection timeout for upstream in milliseconds
-    pub upstream_timeout_ms: u64,
 
     /// Rate limiting configuration
     pub rate_limit: RateLimitConfig,
@@ -1693,9 +1759,6 @@ pub struct SecurityEventsConfig {
     /// Enable security event logging
     pub enabled: bool,
 
-    /// Log format (json, cef, plain)
-    pub format: String,
-
     /// Minimum threat level to log (Low, Medium, High, Critical)
     pub min_threat_level: String,
 
@@ -1739,7 +1802,6 @@ pub struct SecurityEventsConfig {
     pub enable_sled: bool,
     pub sled_db_path: Option<String>,
     pub sled_max_events: Option<usize>,
-    pub sled_compress: bool,
 }
 
 impl SecurityEventsConfig {
@@ -1952,9 +2014,6 @@ pub struct WasmConfig {
 
     /// Enable hot reloading of WASM modules
     pub hot_reload: bool,
-
-    /// Rules configuration file
-    pub rules_config: String,
 }
 
 /// Real Coraza WASI reactor configuration.
@@ -2546,22 +2605,6 @@ pub struct AiConfig {
 
     /// Processing timeout in milliseconds
     pub timeout_ms: u64,
-
-    /// Model configuration
-    pub model: AiModelConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct AiModelConfig {
-    /// Path to ML model file
-    pub model_path: Option<String>,
-
-    /// Enable anomaly detection
-    pub anomaly_detection: bool,
-
-    /// Enable advanced classification
-    pub advanced_classification: bool,
 }
 
 impl Default for AiConfig {
@@ -2570,11 +2613,6 @@ impl Default for AiConfig {
             enabled: false,
             threat_threshold: 0.8,
             timeout_ms: 5000,
-            model: AiModelConfig {
-                model_path: None,
-                anomaly_detection: true,
-                advanced_classification: false,
-            },
         }
     }
 }
@@ -2649,16 +2687,6 @@ pub struct RetentionConfig {
     pub auto_delete: bool,
 }
 
-impl Default for AiModelConfig {
-    fn default() -> Self {
-        Self {
-            model_path: None,
-            anomaly_detection: true,
-            advanced_classification: false,
-        }
-    }
-}
-
 impl Default for AuditConfig {
     fn default() -> Self {
         Self {
@@ -2727,9 +2755,6 @@ pub struct SecurityConfig {
     pub auth: crate::waf::auth::AuthConfig,
     /// AI threat detection configuration
     pub ai: AiConfig,
-
-    /// Enterprise compliance configuration
-    pub compliance: ComplianceConfig,
 }
 
 impl Default for Config {
@@ -2753,8 +2778,6 @@ impl Default for Config {
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
-            upstream_url: "http://127.0.0.1:3000".to_string(),
-            bind_addr: "0.0.0.0:8080".to_string(),
             timeout_seconds: 30,
             max_request_size: 10 * 1024 * 1024, // 10MB
             upstream_ca_path: None,
@@ -2885,7 +2908,6 @@ impl Default for WafConfig {
         Self {
             enabled: true,
             fail_mode: "closed".to_string(), // Default to fail-closed (secure)
-            upstream_timeout_ms: 5000,       // 5 second timeout
             rate_limit: RateLimitConfig::default(),
             security_events: SecurityEventsConfig::default(),
             content_inspection: ContentInspectionConfig::default(),
@@ -2922,7 +2944,6 @@ impl Default for SecurityEventsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            format: "json".to_string(),
             min_threat_level: "medium".to_string(),
             enable_cef: false,
             cef_output_file: None,
@@ -2937,7 +2958,6 @@ impl Default for SecurityEventsConfig {
             enable_sled: false,
             sled_db_path: None,
             sled_max_events: None,
-            sled_compress: false,
             store_backend: None,
             store_path: None,
             store_max_events: None,
@@ -2982,7 +3002,6 @@ impl Default for SecurityConfig {
         Self {
             auth: crate::waf::auth::AuthConfig::default(),
             ai: AiConfig::default(),
-            compliance: ComplianceConfig::default(),
         }
     }
 }
@@ -2999,7 +3018,6 @@ impl Default for WasmConfig {
             debug: false,
             instance_pool_size: 10,
             hot_reload: true,
-            rules_config: "rules/coraza.conf".to_string(),
         }
     }
 }
@@ -3522,8 +3540,23 @@ impl Config {
             }
         }
 
+        self.logging.validate()?;
         self.runtime.validate()?;
         self.storage.validate()?;
+        if self.storage.enabled
+            && (self.waf.security_events.store_backend.is_some()
+                || self.waf.security_events.enable_sled
+                || self.waf.security_events.store_path.is_some()
+                || self.waf.security_events.store_max_events.is_some()
+                || self.waf.security_events.sled_db_path.is_some()
+                || self.waf.security_events.sled_max_events.is_some())
+        {
+            anyhow::bail!(
+                "storage.enabled = true conflicts with the legacy \
+                 waf.security_events store_backend/enable_sled/store_path/store_max_events/\
+                 sled_db_path/sled_max_events keys; configure the audit store only in [storage]"
+            );
+        }
 
         Ok(())
     }
@@ -4584,6 +4617,394 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
 
         config.waf.distributed.fallback = DistributedFallbackMode::LocalOnly;
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn storage_section_resolves_the_audit_store() {
+        let mut config = Config::default();
+        assert!(!config.storage.enabled);
+        assert!(config
+            .storage
+            .resolve_event_store(&config.waf.security_events)
+            .is_none());
+
+        config.storage.enabled = true;
+        config.storage.backend = "redb".to_string();
+        config.storage.path = "/tmp/audit.redb".to_string();
+        config.storage.max_events = Some(42);
+        config.storage.cache_size = Some(4096);
+        config.storage.ttl_cleanup_interval = Duration::from_secs(30);
+        let store = config
+            .storage
+            .resolve_event_store(&config.waf.security_events)
+            .expect("enabled storage resolves a store");
+        assert_eq!(store.backend, "redb");
+        assert_eq!(store.path, "/tmp/audit.redb");
+        assert_eq!(store.max_events, Some(42));
+        assert_eq!(store.cache_size, Some(4096));
+        assert_eq!(store.cleanup_interval, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn storage_enabled_rejects_legacy_store_selection() {
+        let mut config = Config::default();
+        config.storage.enabled = true;
+        config.waf.security_events.store_backend = Some("redb".to_string());
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("storage.enabled"), "{error}");
+        assert!(error.contains("legacy"), "{error}");
+    }
+
+    #[test]
+    fn legacy_store_selection_still_resolves_without_storage() {
+        let mut config = Config::default();
+        config.waf.security_events.store_backend = Some("sled".to_string());
+        config.waf.security_events.store_path = Some("/tmp/legacy.sled".to_string());
+        config.waf.security_events.store_max_events = Some(7);
+        let store = config
+            .storage
+            .resolve_event_store(&config.waf.security_events)
+            .expect("legacy selection resolves");
+        assert_eq!(store.backend, "sled");
+        assert_eq!(store.path, "/tmp/legacy.sled");
+        assert_eq!(store.max_events, Some(7));
+        assert_eq!(store.cleanup_interval, Duration::ZERO);
+    }
+
+    /// Every key in the serde schema, as a dotted TOML path.
+    ///
+    /// `Option::None` is serialized as JSON `null`, so optional keys are
+    /// included (a TOML serializer would omit them). `Duration` is the only
+    /// struct serialized as `{ secs, nanos }`; collapse it to the TOML key.
+    fn declared_config_keys() -> std::collections::BTreeSet<String> {
+        fn walk(prefix: &str, value: &serde_json::Value, out: &mut Vec<String>) {
+            if let Some(object) = value.as_object() {
+                if object.len() == 2 && object.contains_key("secs") && object.contains_key("nanos")
+                {
+                    out.push(prefix.to_string());
+                    return;
+                }
+                for (key, child) in object {
+                    let path = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    walk(&path, child, out);
+                }
+            } else if let Some(array) = value.as_array() {
+                if let Some(first) = array.first() {
+                    if first.is_object() {
+                        walk(&format!("{prefix}[]"), first, out);
+                    }
+                }
+            } else {
+                out.push(prefix.to_string());
+            }
+        }
+        let value = serde_json::to_value(Config::default()).expect("Config serializes to JSON");
+        let mut keys = Vec::new();
+        walk("", &value, &mut keys);
+        keys.into_iter().collect()
+    }
+
+    /// Config keys that the runtime actually consumes.
+    ///
+    /// A key is consumed when it is read by `main`/`server`/`proxy`/`waf`, or
+    /// by a `config.rs` accessor that those modules call. A key that is only
+    /// accepted by serde is dead: wire it or remove it. Keep this list in sync
+    /// with `declared_config_keys()`; see `docs/developer-guide/config-keys.md`.
+    const CONSUMED_KEYS: &[&str] = &[
+        "bind_addr",
+        "health.dependency_checks",
+        "health_bind_addr",
+        "logging.json_format",
+        "logging.level",
+        "proxy.max_request_size",
+        "proxy.pool.enabled",
+        "proxy.pool.health_check_interval_secs",
+        "proxy.pool.health_check_path",
+        "proxy.pool.idle_timeout_secs",
+        "proxy.pool.max_idle_per_host",
+        "proxy.reject_ambiguous_routing",
+        "proxy.streaming.enabled",
+        "proxy.streaming.response_threshold_bytes",
+        "proxy.strip_headers_mode",
+        "proxy.timeout_seconds",
+        "proxy.upstream_ca_path",
+        "proxy.upstream_client_cert_path",
+        "proxy.upstream_client_key_path",
+        "runtime.cpu_pin_cores",
+        "runtime.enable_cpu_pinning",
+        "runtime.max_blocking_threads",
+        "runtime.thread_keep_alive_secs",
+        "runtime.worker_threads",
+        "security.ai.enabled",
+        "security.ai.threat_threshold",
+        "security.ai.timeout_ms",
+        "security.auth.enabled",
+        "security.auth.failure_limit.enabled",
+        "security.auth.failure_limit.lockout_secs",
+        "security.auth.failure_limit.max_failures",
+        "security.auth.failure_limit.window_secs",
+        "security.auth.header_name",
+        "security.auth.rate_limit",
+        "security.auth.require_https",
+        "server.enable_http2",
+        "server.enable_http3",
+        "server.grpc_aware_rejections",
+        "server.grpc_max_decompressed_bytes",
+        "server.grpc_max_stream_bytes",
+        "server.grpc_max_stream_messages",
+        "server.grpc_max_stream_seconds",
+        "server.grpc_streaming_policy",
+        "server.h3_admission_timeout_ms",
+        "server.h3_idle_timeout_secs",
+        "server.h3_max_concurrent_bidi_streams",
+        "server.h3_max_connections",
+        "server.h3_max_inflight_per_client",
+        "server.h3_max_inflight_requests",
+        "server.h3_stateless_retry",
+        "server.http2.adaptive_window",
+        "server.http2.enabled",
+        "server.http2.initial_connection_window_bytes",
+        "server.http2.initial_stream_window_bytes",
+        "server.http2.keep_alive_interval_secs",
+        "server.http2.keep_alive_timeout_secs",
+        "server.http2.keep_alive_while_idle",
+        "server.http2.max_concurrent_streams",
+        "server.http2.max_pending_accept_reset_streams",
+        "server.io_backend",
+        "server.keep_alive_timeout_secs",
+        "server.max_body_size",
+        "server.max_connections",
+        "server.max_header_bytes",
+        "server.max_header_count",
+        "server.request_timeout_secs",
+        "server.tls.cert_path",
+        "server.tls.client_ca_path",
+        "server.tls.enabled",
+        "server.tls.key_path",
+        "server.tls.max_version",
+        "server.tls.min_version",
+        "server.tls.require_client_cert",
+        "server.tls.session_cache_size",
+        "server.tls.session_resumption",
+        "server.tls.tcp_fast_open",
+        "server.tls.tcp_keepalive_interval_secs",
+        "server.tls.tcp_keepalive_secs",
+        "server.tls.tcp_nodelay",
+        "server.tls.tls13_tickets",
+        "server.websocket.idle_timeout_secs",
+        "server.websocket.inspect_responses",
+        "server.websocket.max_concurrent_tunnels",
+        "server.websocket.max_frame_bytes",
+        "server.websocket.max_lifetime_secs",
+        "server.websocket.max_message_bytes",
+        "server.webtransport.bind_addr",
+        "server.webtransport.enabled",
+        "server.webtransport.idle_timeout_secs",
+        "server.webtransport.inspect_datagrams",
+        "server.webtransport.inspect_streams",
+        "server.webtransport.max_bidi_streams",
+        "server.webtransport.max_datagram_bytes",
+        "server.webtransport.max_session_secs",
+        "server.webtransport.max_sessions",
+        "server.webtransport.max_sessions_per_ip",
+        "server.webtransport.max_stream_bytes",
+        "server.webtransport.max_uni_streams",
+        "server.webtransport.require_origin",
+        "storage.backend",
+        "storage.cache_size",
+        "storage.enabled",
+        "storage.max_events",
+        "storage.path",
+        "storage.ttl_cleanup_interval",
+        "upstream_uri",
+        "waf.admission.enabled",
+        "waf.admission.heavy_permits",
+        "waf.admission.max_queued",
+        "waf.admission.queue_timeout_ms",
+        "waf.allow_cache.enabled",
+        "waf.allow_cache.max_body_bytes",
+        "waf.allow_cache.max_entries",
+        "waf.allow_cache.ttl_secs",
+        "waf.content_inspection.enabled",
+        "waf.content_inspection.inspect_body",
+        "waf.content_inspection.inspect_headers",
+        "waf.content_inspection.max_body_size",
+        "waf.coraza.backend",
+        "waf.coraza.enabled",
+        "waf.coraza.eval_timeout_ms",
+        "waf.coraza.fallback",
+        "waf.coraza.max_inspect_bytes",
+        "waf.coraza.max_payload_bytes",
+        "waf.coraza.memory_limit_bytes",
+        "waf.coraza.module_path",
+        "waf.coraza.native_socket_path",
+        "waf.coraza.oversize_action",
+        "waf.coraza.pool_size",
+        "waf.coraza.prefilter",
+        "waf.distributed.advertise_endpoint",
+        "waf.distributed.allow_insecure_transport",
+        "waf.distributed.auth_token",
+        "waf.distributed.counter_queue_capacity",
+        "waf.distributed.enabled",
+        "waf.distributed.event_queue_capacity",
+        "waf.distributed.fallback",
+        "waf.distributed.heartbeat_interval_secs",
+        "waf.distributed.lease_batch_max",
+        "waf.distributed.lease_queue_capacity",
+        "waf.distributed.lease_ttl_ms",
+        "waf.distributed.leases_enabled",
+        "waf.distributed.max_stale_secs",
+        "waf.distributed.node_id",
+        "waf.distributed.policy_cache_ttl_secs",
+        "waf.distributed.policy_initial_hash",
+        "waf.distributed.policy_scope",
+        "waf.distributed.policy_signing_key_id",
+        "waf.distributed.policy_signing_public_key",
+        "waf.distributed.quiccrunch.ca_cert_path",
+        "waf.distributed.quiccrunch.client_cert_path",
+        "waf.distributed.quiccrunch.client_key_path",
+        "waf.distributed.quiccrunch.endpoint",
+        "waf.distributed.quiccrunch.server_name",
+        "waf.distributed.reconnect_initial_backoff_ms",
+        "waf.distributed.reconnect_max_backoff_ms",
+        "waf.distributed.region",
+        "waf.distributed.reputation_cache_ttl_secs",
+        "waf.distributed.request_timeout_ms",
+        "waf.distributed.require_policy_signature",
+        "waf.distributed.shadow",
+        "waf.distributed.spiffe_id",
+        "waf.distributed.spiffe_jwt",
+        "waf.distributed.spiffe_metadata_key",
+        "waf.distributed.tls_ca_cert_path",
+        "waf.distributed.tls_client_cert_path",
+        "waf.distributed.tls_client_key_path",
+        "waf.distributed.tls_server_name",
+        "waf.distributed.transport",
+        "waf.enabled",
+        "waf.fail_mode",
+        "waf.fast_allow.allow_audit_sample_rate",
+        "waf.fast_allow.enabled",
+        "waf.geo_blocking.anonymous_database_path",
+        "waf.geo_blocking.block_datacenter",
+        "waf.geo_blocking.block_tor",
+        "waf.geo_blocking.block_vpn",
+        "waf.geo_blocking.database_path",
+        "waf.geo_blocking.enabled",
+        "waf.graphql.allow_mutations",
+        "waf.graphql.allow_subscriptions",
+        "waf.graphql.allowlist_file",
+        "waf.graphql.body_scan",
+        "waf.graphql.enabled",
+        "waf.graphql.max_aliases",
+        "waf.graphql.max_body_bytes",
+        "waf.graphql.max_depth",
+        "waf.graphql.max_fields",
+        "waf.graphql.max_query_bytes",
+        "waf.graphql.max_variables",
+        "waf.graphql.max_variables_bytes",
+        "waf.graphql.unknown_operation_action",
+        "waf.grpc.allowlist_file",
+        "waf.grpc.content_scan",
+        "waf.grpc.enabled",
+        "waf.grpc.max_bytes_len",
+        "waf.grpc.max_content_scan_bytes",
+        "waf.grpc.max_decoded_fields",
+        "waf.grpc.max_decompressed_bytes",
+        "waf.grpc.max_depth",
+        "waf.grpc.max_frames",
+        "waf.grpc.max_message_bytes",
+        "waf.grpc.max_repeated",
+        "waf.grpc.max_string_bytes",
+        "waf.grpc.reject_unknown_fields",
+        "waf.grpc.unknown_method_action",
+        "waf.grpc.validate_strings",
+        "waf.rate_limit.capacity_policy",
+        "waf.rate_limit.global_enabled",
+        "waf.rate_limit.global_max_requests",
+        "waf.rate_limit.global_window_secs",
+        "waf.rate_limit.max_tracked_ips",
+        "waf.rate_limit.per_ip_enabled",
+        "waf.rate_limit.per_ip_max_requests",
+        "waf.rate_limit.per_ip_window_secs",
+        "waf.response_inspection.block_status",
+        "waf.response_inspection.enabled",
+        "waf.response_inspection.inspect_body",
+        "waf.response_inspection.max_body_bytes",
+        "waf.security_events.cef_device_product",
+        "waf.security_events.cef_device_vendor",
+        "waf.security_events.cef_device_version",
+        "waf.security_events.cef_output_file",
+        "waf.security_events.enable_cef",
+        "waf.security_events.enable_otel",
+        "waf.security_events.enable_sled",
+        "waf.security_events.enabled",
+        "waf.security_events.min_threat_level",
+        "waf.security_events.otel_export_logs",
+        "waf.security_events.otel_export_traces",
+        "waf.security_events.otel_service_name",
+        "waf.security_events.otel_service_version",
+        "waf.security_events.sled_db_path",
+        "waf.security_events.sled_max_events",
+        "waf.security_events.store_backend",
+        "waf.security_events.store_max_events",
+        "waf.security_events.store_path",
+        "waf.wasm.debug",
+        "waf.wasm.enabled",
+        "waf.wasm.hot_reload",
+        "waf.wasm.instance_pool_size",
+        "waf.wasm.memory_limit",
+        "waf.wasm.module_path",
+        "waf.wasm.timeout_ms",
+    ];
+
+    #[test]
+    fn every_config_key_is_consumed_or_removed() {
+        let declared = declared_config_keys();
+        let consumed: std::collections::BTreeSet<&str> = CONSUMED_KEYS.iter().copied().collect();
+
+        let unwired: Vec<_> = declared
+            .iter()
+            .filter(|key| !consumed.contains(key.as_str()))
+            .collect();
+        assert!(
+            unwired.is_empty(),
+            "config key(s) are declared in the serde schema but missing from CONSUMED_KEYS:\n  {}\n\
+             Wire each key to runtime behaviour or remove it from the schema, then add it to \
+             CONSUMED_KEYS in src/config.rs. See docs/developer-guide/config-keys.md.",
+            unwired
+                .iter()
+                .map(|key| key.as_str())
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        );
+
+        let stale: Vec<_> = CONSUMED_KEYS
+            .iter()
+            .filter(|key| !declared.contains(**key))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "CONSUMED_KEYS lists key(s) that no longer exist in the schema:\n  {}\n\
+             Remove them from CONSUMED_KEYS.",
+            stale
+                .iter()
+                .map(|key| **key)
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        );
+    }
+
+    /// Audit helper used by `scripts/audit-config-keys.sh`.
+    #[test]
+    #[ignore = "audit helper; run scripts/audit-config-keys.sh"]
+    fn print_config_key_paths() {
+        for key in declared_config_keys() {
+            println!("KEY {key}");
+        }
     }
 
     #[test]

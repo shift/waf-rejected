@@ -16,8 +16,6 @@ health_bind_addr = "0.0.0.0:8081"
 upstream_uri = "http://127.0.0.1:3000"
 
 [proxy]
-upstream_url = "http://127.0.0.1:3000"
-bind_addr = "0.0.0.0:8080"
 timeout_seconds = 30
 max_request_size = 10485760
 # upstream_ca_path = "/etc/waf/certs/upstream-ca.pem"
@@ -100,7 +98,6 @@ json_format = true
 [waf]
 enabled = true
 fail_mode = "closed"
-upstream_timeout_ms = 30000
 
 [waf.rate_limit]
 per_ip_enabled = true
@@ -112,7 +109,6 @@ global_window_secs = 60
 
 [waf.security_events]
 enabled = true
-format = "json"
 min_threat_level = "medium"
 enable_cef = true
 cef_output_file = "/var/lib/waf/logs/security_events.cef"
@@ -120,14 +116,7 @@ cef_device_vendor = "WAF-Rejected"
 cef_device_product = "WAF-Rejected"
 cef_device_version = "0.1.0-beta.13"
 enable_otel = false
-# Persistent audit-trail store (redb default; sled is the legacy backend).
-store_backend = "redb"
-store_path = "/var/lib/waf/data/waf_security_events.redb"
-store_max_events = 100000
-enable_sled = false
-# sled_db_path = "/var/lib/waf/data/waf_security_events.sled"
-# sled_max_events = 100000
-sled_compress = false
+# The persistent audit store is configured in [storage].
 
 [waf.content_inspection]
 enabled = true
@@ -233,33 +222,14 @@ enabled = false
 threat_threshold = 0.8
 timeout_ms = 5000
 
-[security.compliance]
-enabled = false
-
-[security.compliance.regulatory]
-gdpr = false
-hipaa = false
-pci_dss = false
-ai_act = false
-nis2 = false
-cra = false
-
-[security.compliance.audit]
-tamper_evident = true
-retention_days = 2555
-integrity_check_hours = 24
-
-[security.compliance.retention]
-security_events_days = 90
-audit_logs_days = 2555
-auto_delete = true
-
 [storage]
+# Persistent audit-trail store. redb is the default; sled is the legacy backend.
+enabled = true
 backend = "redb"
-path = "/var/lib/waf/data/waf.redb"
-enable_follower_reads = true
+path = "/var/lib/waf/data/waf_security_events.redb"
+max_events = 100000
+# Minimum seconds between retention passes. 0 = cleanup after every write.
 ttl_cleanup_interval = { secs = 60, nanos = 0 }
-enable_compression = false
 cache_size = 16777216
 
 [runtime]

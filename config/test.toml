@@ -11,8 +11,6 @@ health_bind_addr = "0.0.0.0:8081"
 upstream_uri = "http://httpbin.org"
 
 [proxy]
-upstream_url = "http://httpbin.org"
-bind_addr = "0.0.0.0:8080"
 timeout_seconds = 10
 max_request_size = 1048576
 
@@ -36,10 +34,8 @@ blocked_countries = []
 
 [waf.security_events]
 enabled = true
-format = "json"
 enable_cef = false
 enable_otel = false
-enable_sled = false
 
 [logging]
 level = "info"

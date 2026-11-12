@@ -69,19 +69,21 @@ This table is the operator-facing summary.
 
 ## Event-store matrix
 
-The persistent audit-trail store is selected by
-`waf.security_events.store_backend` (and, for the general KV layer, by
-`[storage] backend`). Both are defaulted to redb.
+The persistent audit-trail store is selected and configured in `[storage]`:
+`enabled = true` opens it, and `backend = "redb"` (default) or `"sled"`
+(legacy) selects the format. `[waf.security_events]` keeps the legacy
+`store_backend`/`enable_sled` keys for pre-existing files; they are used only
+while `[storage] enabled = false` and are rejected when both select a store.
 
 | Backend | Status | Default path | Durability | Migration |
 |---|---|---|---|---|
-| redb (`store_backend = "redb"`, `[storage] backend = "redb"`) | **Default** | `./data/waf_security_events.redb`, `./data/waf.redb` | `Durability::Immediate`: fsync per acknowledged write transaction | Source of a sled → redb cut-over; reverse migration supported by `waf-storage-migrate --reverse` |
-| sled (legacy) | Supported, legacy | `./waf_security_events.sled` (exporter), `[storage] path` (adapter) | Explicit flush after every write (sled's 500 ms batching is not crash-safe) | Migrate with `waf-storage-migrate`; do not point an old binary at a redb file |
-| memory | Tests only | — | None (lost on restart) | Not applicable |
+| redb (`[storage] backend = "redb"`) | **Default** | `./data/waf_security_events.redb` | `Durability::Immediate`: fsync per acknowledged write transaction | Source of a sled → redb cut-over; reverse migration supported by `waf-storage-migrate --reverse` |
+| sled (legacy) | Supported, legacy | Configured `[storage] path` (a directory); the legacy exporter default is `./waf_security_events.sled` | Explicit flush after every write (sled's 500 ms batching is not crash-safe) | Migrate with `waf-storage-migrate`; do not point an old binary at a redb file |
+| memory | Not a runtime audit store | — | — | Tests use `StorageAdapter` directly |
 
-Unknown `store_backend`/`[storage] backend` values are rejected at startup. A
-fresh deployment never creates a sled directory unless sled is named explicitly.
-See [migrating the event store](migrating-event-store.md).
+Unknown backend values are rejected at startup. A fresh deployment never
+creates a sled directory unless sled is named explicitly. See
+[migrating the event store](migrating-event-store.md).
 
 ## Body inspection policy
 

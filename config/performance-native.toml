@@ -18,8 +18,6 @@ health_bind_addr = "0.0.0.0:8081"
 upstream_uri = "http://127.0.0.1:3000"
 
 [proxy]
-upstream_url = "http://127.0.0.1:3000"
-bind_addr = "0.0.0.0:8080"
 timeout_seconds = 30
 max_request_size = 1048576
 
@@ -50,7 +48,6 @@ json_format = true
 enabled = true
 # A sidecar outage must fail closed (503), never silently allow traffic.
 fail_mode = "closed"
-upstream_timeout_ms = 30000
 
 [waf.coraza]
 enabled = true
@@ -91,13 +88,11 @@ global_window_secs = 60
 
 [waf.security_events]
 enabled = true
-format = "json"
 min_threat_level = "medium"
 enable_cef = false
 enable_otel = false
-# Keep the hot path synchronous and allocation-light. Enable sled only when a
-# durable local audit trail is required.
-enable_sled = false
+# Keep the hot path synchronous and allocation-light. Set [storage] enabled =
+# true only when a durable local audit trail is required.
 
 [waf.content_inspection]
 enabled = true
@@ -153,9 +148,3 @@ require_https = false
 enabled = false
 threat_threshold = 0.8
 timeout_ms = 5000
-
-[security.compliance]
-enabled = false
-
-# Metrics: Prometheus text is always served from health_bind_addr at /metrics;
-# liveness is /health/live and readiness is /health/ready.

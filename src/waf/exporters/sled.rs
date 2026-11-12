@@ -9,7 +9,8 @@ use async_trait::async_trait;
 use serde_json;
 use sled::{Db, IVec};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::task;
 use tracing::{debug, error, info, warn};
 
@@ -18,7 +19,8 @@ pub struct SledExporter {
     db: Arc<Db>,
     tree_name: String,
     max_events: Option<usize>,
-    compress_events: bool,
+    cleanup_interval: Duration,
+    last_cleanup: Mutex<Instant>,
 }
 
 impl SledExporter {
@@ -27,7 +29,7 @@ impl SledExporter {
         db_path: P,
         tree_name: Option<String>,
         max_events: Option<usize>,
-        compress_events: bool,
+        cleanup_interval: Duration,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let db = sled::open(db_path)?;
         let tree_name = tree_name.unwrap_or_else(|| "security_events".to_string());
@@ -41,7 +43,8 @@ impl SledExporter {
             db: Arc::new(db),
             tree_name,
             max_events,
-            compress_events,
+            cleanup_interval,
+            last_cleanup: Mutex::new(Instant::now()),
         })
     }
 
@@ -59,7 +62,8 @@ impl SledExporter {
             db: Arc::new(db),
             tree_name,
             max_events: None,
-            compress_events: false,
+            cleanup_interval: Duration::ZERO,
+            last_cleanup: Mutex::new(Instant::now()),
         })
     }
 
@@ -85,13 +89,7 @@ impl SledExporter {
         event: &SecurityEvent,
     ) -> Result<IVec, Box<dyn std::error::Error + Send + Sync>> {
         let json = serde_json::to_vec(event)?;
-
-        if self.compress_events {
-            // Simple compression using flate2 could be added here
-            Ok(IVec::from(json))
-        } else {
-            Ok(IVec::from(json))
-        }
+        Ok(IVec::from(json))
     }
 
     /// Deserialize event from storage
@@ -103,9 +101,23 @@ impl SledExporter {
         Ok(event)
     }
 
-    /// Clean up old events if max_events is set
+    /// Clean up old events if max_events is set.
+    ///
+    /// A non-zero cleanup interval throttles the retention pass; zero runs it
+    /// after every write (the legacy behaviour).
     async fn cleanup_old_events(&self) -> ExportResult {
         if let Some(max_events) = self.max_events {
+            if !self.cleanup_interval.is_zero() {
+                let mut last = self
+                    .last_cleanup
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if last.elapsed() < self.cleanup_interval {
+                    return Ok(());
+                }
+                *last = Instant::now();
+            }
+
             let db = Arc::clone(&self.db);
             let tree_name = self.tree_name.clone();
 
@@ -512,7 +524,8 @@ mod tests {
             db: Arc::new(sled::Config::new().temporary(true).open().unwrap()),
             tree_name: "test_events".to_string(),
             max_events: Some(2), // Only keep 2 events
-            compress_events: false,
+            cleanup_interval: Duration::ZERO,
+            last_cleanup: Mutex::new(Instant::now()),
         };
 
         // Add 3 events

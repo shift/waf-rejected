@@ -41,7 +41,6 @@ data:
     [waf]
     enabled = true
     fail_mode = "closed"
-    upstream_timeout_ms = 30000
 
     [waf.coraza]
     backend = "rust"
@@ -68,11 +67,9 @@ data:
 
     [waf.security_events]
     enabled = true
-    format = "json"
     min_threat_level = "medium"
     enable_cef = false
     enable_otel = false
-    enable_sled = false
 
     [waf.distributed]
     enabled = true
@@ -93,11 +90,11 @@ data:
     shadow = true
 
     [storage]
+    enabled = true
     backend = "redb"
-    path = "/var/lib/waf/data/waf.redb"
-    enable_follower_reads = true
+    path = "/var/lib/waf/data/waf_security_events.redb"
+    max_events = 100000
     ttl_cleanup_interval = { secs = 60, nanos = 0 }
-    enable_compression = false
     cache_size = 16777216
 ---
 apiVersion: apps/v1

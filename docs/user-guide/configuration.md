@@ -49,7 +49,7 @@ migrations:
 | --- | --- |
 | `[server] host` / `port` | top-level `bind_addr` |
 | `[server] workers` | `[runtime] worker_threads` |
-| `[proxy] upstream` | top-level `upstream_uri` (and `[proxy] upstream_url`) |
+| `[proxy] upstream` / `upstream_url` | top-level `upstream_uri` |
 | `[proxy] retry_attempts` | no equivalent; remove (retries are not configurable) |
 | `[security] max_request_size` | `[server] max_body_size` |
 | `[security] rate_limit_requests` | `[waf.rate_limit] per_ip_max_requests` |
@@ -57,6 +57,14 @@ migrations:
 | `[health]`, `[metrics]` | use `health_bind_addr`; health/metrics are always served there. `[health] dependency_checks` is the only health option |
 | `[export]` | `[waf.security_events]` exporter keys |
 | top-level `[rate_limit]` | `[waf.rate_limit]` |
+| `[proxy] upstream_url` / `bind_addr` | top-level `upstream_uri` / `bind_addr` |
+| `[waf] upstream_timeout_ms` | `[proxy] timeout_seconds` |
+| `[waf.security_events] format` / `sled_compress` | remove (no runtime switch) |
+| `[waf.security_events] store_*` / `enable_sled` | `[storage]` (legacy keys still accepted while `[storage] enabled = false`) |
+| `[storage] enable_follower_reads` / `enable_compression` / `max_memory_entries` | remove (no runtime behaviour) |
+| `[security.ai.model]` | remove (model selection was not wired) |
+| `[security.compliance]` | remove (library-only API; no proxy runtime wiring) |
+| `[waf.wasm] rules_config` | remove (the WASM engine has no rules-file input) |
 
 The legacy `[waf.wasm]` section is still parsed on every build so shipped
 configs remain loadable; it only has an effect in `wasm-waf` builds. Prefer
@@ -88,8 +96,6 @@ dependency_checks = true
 
 ```toml
 [proxy]
-upstream_url = "http://127.0.0.1:3000"
-bind_addr = "0.0.0.0:8080"
 timeout_seconds = 30
 max_request_size = 10485760
 # upstream_ca_path = "/etc/waf/certs/upstream-ca.pem"
@@ -101,6 +107,10 @@ strip_headers = ["x-original-url", "x-rewrite-url", "x-http-method-override",
 strip_headers_mode = "extend"   # "extend" (default) or "replace"
 reject_ambiguous_routing = false
 ```
+
+The listener address and upstream URI are top-level keys (`bind_addr`,
+`upstream_uri`); the old `[proxy] bind_addr` / `upstream_url` duplicates are
+rejected so there is one source of truth.
 
 - `strip_headers` removes client-controlled routing and method/path override
   headers before the WAF evaluates the request and before it is forwarded.
@@ -358,13 +368,15 @@ level = "info"      # trace, debug, info, warn, error
 json_format = true
 ```
 
+`level` and `json_format` configure the process tracing subscriber. An explicit
+`RUST_LOG` environment filter still wins over `level`.
+
 ## `[waf]`
 
 ```toml
 [waf]
 enabled = true
 fail_mode = "closed"       # "open" forwards on inspection failure
-upstream_timeout_ms = 30000
 ```
 
 Keep `fail_mode = "closed"`. It controls the WAF layer's response to inspection
@@ -406,7 +418,6 @@ the IP, so unrelated clients do not serialize. Cleanup is incremental
 ```toml
 [waf.security_events]
 enabled = true
-format = "json"
 min_threat_level = "medium"
 enable_cef = true
 cef_output_file = "./logs/security_events.cef"
@@ -417,16 +428,10 @@ enable_otel = false
 # otel_service_name = "waf-rejected"
 # otel_export_traces = false
 # otel_export_logs = false
-# Persistent audit-trail store: redb (default) or sled (legacy).
-store_backend = "redb"
-store_path = "./data/waf_security_events.redb"
-store_max_events = 100000
-# Legacy sled backend (opt-in; see the migration runbook).
-enable_sled = false
-# sled_db_path = "./data/waf_security_events.sled"
-# sled_max_events = 100000
-sled_compress = false
 ```
+
+This section controls event filtering and the stdout/CEF/OpenTelemetry
+exporters. The persistent audit store is configured in [`[storage]`](#storage).
 
 `enable_otel` requires a build with `--features export-otel`. The exporter
 creates spans through the global OpenTelemetry tracer, so the embedding
@@ -434,20 +439,14 @@ application must install a matching `opentelemetry_sdk` 0.33 `TracerProvider`
 before constructing the WAF. The SDK is intentionally not a dependency of
 WAF-Rejected; with the default provider the exporter is a no-op.
 
-### Persistent event store
+### Legacy store keys
 
-`store_backend` selects the durable audit-trail store:
-
-| Value | Status | Durability | Notes |
-|---|---|---|---|
-| `redb` | **Default** | fsync on every commit (`Durability::Immediate`); an acknowledged event survives a crash | Single file. `store_path` defaults to `./data/waf_security_events.redb`; `store_max_events` deletes the oldest events first |
-| `sled` | Legacy, still supported | Explicit flush after every write (sled's default 500 ms batching is not crash-safe for acknowledged events) | Directory tree. Kept so existing configs keep working |
-| `none` | Disabled | — | No persistent store; stdout/CEF/OTel still work |
-
-`enable_sled = true` without `store_backend` selects the legacy sled store, so
-pre-existing configurations behave exactly as before. Setting
-`store_backend = "redb"` together with `enable_sled = true` is rejected as
-ambiguous; set `enable_sled = false`.
+`[waf.security_events]` still accepts the pre-`[storage]` keys
+(`store_backend`, `store_path`, `store_max_events`, `enable_sled`,
+`sled_db_path`, `sled_max_events`) so existing files keep loading. They are
+used only while `[storage] enabled = false`. Setting `[storage] enabled = true`
+together with any of those keys is rejected as ambiguous; configure the store
+in one place.
 
 To move an existing sled store to redb, follow
 [the migration runbook](../operations/migrating-event-store.md). Downgrading to
@@ -748,63 +747,50 @@ key is rejected with `401`. No presented key is logged.
 enabled = false
 threat_threshold = 0.8
 timeout_ms = 5000
-
-[security.ai.model]
-# model_path = "/etc/waf/model.onnx"
-anomaly_detection = true
-advanced_classification = false
 ```
 
 The AI/threat-intelligence modules are experimental and not on the request path
 by default.
 
-```toml
-[security.compliance]
-enabled = false
-
-[security.compliance.regulatory]
-gdpr = false
-hipaa = false
-pci_dss = false
-ai_act = false
-nis2 = false
-cra = false
-
-[security.compliance.audit]
-tamper_evident = true
-retention_days = 2555
-integrity_check_hours = 24
-
-[security.compliance.retention]
-security_events_days = 90
-audit_logs_days = 2555
-auto_delete = true
-```
-
-Compliance outputs are evidence packs, not certifications. See
+`[security.compliance]` was parsed but never connected to the proxy. The
+compliance managers remain a feature-gated library API (`compliance` /
+`enterprise-proto` builds) constructed with `AuditConfig`, `RegulatoryConfig`
+and `RetentionConfig` directly; there are no TOML keys for them. Compliance
+outputs are evidence packs, not certifications. See
 [`eu-regulatory-status.md`](../compliance/eu-regulatory-status.md).
 
 ## `[storage]`
 
+The single place that selects and configures the persistent audit-trail store.
+
 ```toml
 [storage]
-# redb is the default security-event store. "sled" is the legacy backend;
-# "memory" exists for tests.
-backend = "redb"
-path = "./data/waf.redb"
-enable_follower_reads = true
-ttl_cleanup_interval = { secs = 60, nanos = 0 }
-enable_compression = false
-cache_size = 16777216
-# max_memory_entries = 100000   # backend = "memory"
+# false (default) = no persistent store. Legacy [waf.security_events] store
+# keys still work while this is false.
+enabled = true
+backend = "redb"                       # "redb" (default) or "sled" (legacy)
+path = "./data/waf_security_events.redb"
+max_events = 100000                    # omit to keep every event
+ttl_cleanup_interval = { secs = 60, nanos = 0 }  # 0 = cleanup every write
+cache_size = 16777216                  # redb page cache; omit for default
 ```
 
-redb writes use `Durability::Immediate`, so an acknowledged write is fsynced and
-survives a crash; the cost is one fsync per write transaction. sled is kept for
-existing deployments and flushes explicitly on every write. Unknown backend
-values are rejected at startup instead of falling back to sled. The container
-image uses `/var/lib/waf/data`; mount it read-write for the event store. See
-[migrating the event store](../operations/migrating-event-store.md).
+| Key | Behaviour |
+|---|---|
+| `enabled` | Opens the store at start-up. The default (`false`) preserves the historical no-store behaviour. |
+| `backend` | `redb` writes with `Durability::Immediate` (one fsync per committed transaction). `sled` is the legacy directory store and flushes after every write. Unknown values are rejected at startup. |
+| `path` | Single redb file or sled directory. The container image uses `/var/lib/waf/data`; mount it read-write. |
+| `max_events` | Retention cap; the oldest events are deleted first. |
+| `ttl_cleanup_interval` | Minimum time between retention passes. `0` (the default) runs the pass after every write. Audit events do not expire by age, so this is a cleanup schedule, not a per-event TTL. |
+| `cache_size` | redb page cache in bytes. Ignored by sled. |
+
+The `[storage]` section used to declare `enable_follower_reads`,
+`enable_compression` and `max_memory_entries`. Those keys never had a runtime
+effect in this deployment (there are no follower reads, the event exporters do
+not compress, and the runtime has no memory-backed audit store), so they are
+rejected now. Unknown or removed keys are hard errors naming the file and key.
+
+See [migrating the event store](../operations/migrating-event-store.md).
 
 ## `[runtime]`
 

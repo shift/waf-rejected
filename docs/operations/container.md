@@ -159,7 +159,7 @@ Notes:
 - The bundled `config.docker.toml` has **authentication disabled**. Enable
   `security.auth` with keys injected from a secret before exposing the proxy.
 - Mount the config read-only. The container needs write access only to
-  `/var/lib/waf` for the Sled event store and CEF log file.
+  `/var/lib/waf` for the redb/sled event store and CEF log file.
 - Do not publish `8081` to untrusted networks. It exposes health and Prometheus
   metrics, not just liveness.
 - `SIGTERM` triggers graceful shutdown, so use `docker stop` rather than
@@ -273,7 +273,7 @@ docker stop waf-rejected && docker rm waf-rejected
 docker run -d --name waf-rejected ... ghcr.io/shift/waf-rejected-waf@sha256:<previous-digest>
 ```
 
-- The Sled event store is forward compatible within a supported line. If a
+- The redb/sled event store is forward compatible within a supported line. If a
   release notes a store format change, keep a copy of `/var/lib/waf/data` before
   upgrading so that rollback can restore it.
 - Rollback is supported while the previous release is inside its support

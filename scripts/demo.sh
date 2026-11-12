@@ -177,14 +177,12 @@ max_body_size = 1048576
 
 [waf.security_events]
 enabled = true
-format = "json"
 min_threat_level = "medium"
 enable_cef = false
 enable_otel = false
-enable_sled = false
 
 [storage]
-backend = "memory"
+enabled = false
 EOF
 
 if [[ "$UPSTREAM_IMPL" == "perl" ]]; then

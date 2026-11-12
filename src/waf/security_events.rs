@@ -1,4 +1,4 @@
-use crate::config::SecurityEventsConfig;
+use crate::config::{ResolvedEventStore, SecurityEventsConfig, StorageConfig};
 use crate::waf::{Decision, RequestContext};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -197,11 +197,22 @@ impl From<&Decision> for SecurityEventDecision {
 pub struct SecurityEventLogger {
     dispatcher: ExporterDispatcher,
     config: SecurityEventsConfig,
+    store: Option<ResolvedEventStore>,
 }
 
 impl SecurityEventLogger {
-    /// Create a new security event logger with configuration
+    /// Create a security event logger using the legacy `[waf.security_events]`
+    /// store selection.
     pub fn new(config: SecurityEventsConfig) -> Self {
+        Self::with_storage(config, StorageConfig::default())
+    }
+
+    /// Create a security event logger with an explicit `[storage]` selection.
+    ///
+    /// `[storage] enabled = true` is authoritative; otherwise the legacy
+    /// `[waf.security_events]` keys are used unchanged.
+    pub fn with_storage(config: SecurityEventsConfig, storage: StorageConfig) -> Self {
+        let store = storage.resolve_event_store(&config);
         let mut dispatcher = ExporterDispatcher::new(false); // Don't fail fast for resilience
 
         // Add CEF exporter if enabled
@@ -229,58 +240,71 @@ impl SecurityEventLogger {
 
         // Add the persistent event store. redb is the default when a store is
         // selected; sled remains available as the legacy backend.
-        match config.resolved_store_backend() {
-            #[cfg(feature = "export-redb")]
-            Some("redb") => {
-                let path = config.resolved_store_path();
-                match RedbExporter::new(&path, config.resolved_store_max_events()) {
-                    Ok(exporter) => {
-                        dispatcher.add_exporter(exporter);
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to initialize redb event store at {}: {}", path, e);
-                    }
-                }
-            }
-            #[cfg(feature = "export-sled")]
-            Some("sled") => {
-                let sled_path = config
-                    .store_path
-                    .as_deref()
-                    .or(config.sled_db_path.as_deref())
-                    .unwrap_or("./waf_security_events.sled");
-                match SledExporter::new(
-                    sled_path,
-                    Some("security_events".to_string()),
-                    config.resolved_store_max_events(),
-                    config.sled_compress,
-                ) {
-                    Ok(sled_exporter) => {
-                        dispatcher.add_exporter(sled_exporter);
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to initialize Sled exporter: {}", e);
+        if let Some(store) = store.as_ref() {
+            match store.backend {
+                #[cfg(feature = "export-redb")]
+                "redb" => {
+                    match RedbExporter::new(
+                        &store.path,
+                        store.max_events,
+                        store.cache_size,
+                        store.cleanup_interval,
+                    ) {
+                        Ok(exporter) => {
+                            dispatcher.add_exporter(exporter);
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to initialize redb event store at {}: {}",
+                                store.path,
+                                e
+                            );
+                        }
                     }
                 }
+                #[cfg(feature = "export-sled")]
+                "sled" => {
+                    match SledExporter::new(
+                        &store.path,
+                        Some("security_events".to_string()),
+                        store.max_events,
+                        store.cleanup_interval,
+                    ) {
+                        Ok(sled_exporter) => {
+                            dispatcher.add_exporter(sled_exporter);
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to initialize Sled exporter at {}: {}",
+                                store.path,
+                                e
+                            );
+                        }
+                    }
+                }
+                #[cfg(not(feature = "export-redb"))]
+                "redb" => {
+                    tracing::error!(
+                        "event store backend \"redb\" is configured but this build has no \
+                         `export-redb` feature; no persistent event store is active"
+                    );
+                }
+                #[cfg(not(feature = "export-sled"))]
+                "sled" => {
+                    tracing::error!(
+                        "event store backend \"sled\" is configured but this build has no \
+                         `export-sled` feature; no persistent event store is active"
+                    );
+                }
+                _ => {}
             }
-            #[cfg(not(feature = "export-redb"))]
-            Some("redb") => {
-                tracing::error!(
-                    "waf.security_events.store_backend = \"redb\" but this build has no \
-                     `export-redb` feature; no persistent event store is active"
-                );
-            }
-            #[cfg(not(feature = "export-sled"))]
-            Some("sled") => {
-                tracing::error!(
-                    "waf.security_events.store_backend = \"sled\" but this build has no \
-                     `export-sled` feature; no persistent event store is active"
-                );
-            }
-            _ => {}
         }
 
-        Self { dispatcher, config }
+        Self {
+            dispatcher,
+            config,
+            store,
+        }
     }
 
     /// Create a default logger with basic tracing output
@@ -564,17 +588,18 @@ impl SecurityEventLogger {
         if self.config.enable_otel {
             exporters.push("OpenTelemetry");
         }
-        match self.config.resolved_store_backend() {
-            Some("redb") => exporters.push("Redb"),
-            Some("sled") => exporters.push("Sled"),
-            _ => {}
+        if let Some(store) = &self.store {
+            exporters.push(match store.backend {
+                "sled" => "Sled",
+                _ => "Redb",
+            });
         }
         exporters
     }
 
     /// Whether the persistent event store is configured for this process.
     pub fn event_store_configured(&self) -> bool {
-        self.config.resolved_store_backend().is_some()
+        self.store.is_some()
     }
 
     /// Flush all exporters
@@ -672,6 +697,28 @@ mod tests {
             headers,
             Some(1024),
         )
+    }
+
+    #[cfg(feature = "export-redb")]
+    #[test]
+    fn storage_section_opens_the_configured_redb_store() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let storage = StorageConfig {
+            enabled: true,
+            backend: "redb".to_string(),
+            path: directory.path().join("audit.redb").display().to_string(),
+            max_events: Some(10),
+            ttl_cleanup_interval: std::time::Duration::ZERO,
+            cache_size: None,
+        };
+        let logger = SecurityEventLogger::with_storage(SecurityEventsConfig::default(), storage);
+
+        assert!(logger.event_store_configured());
+        assert!(
+            logger.active_exporters().iter().any(|name| *name == "Redb"),
+            "configured store must be attached to the exporter dispatcher: {:?}",
+            logger.active_exporters()
+        );
     }
 
     #[tokio::test]

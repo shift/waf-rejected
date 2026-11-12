@@ -25,8 +25,6 @@ health_bind_addr = "0.0.0.0:8081"
 upstream_uri = "http://127.0.0.1:3000"
 
 [proxy]
-upstream_url = "http://127.0.0.1:3000"
-bind_addr = "0.0.0.0:8080"
 timeout_seconds = 30
 max_request_size = 10485760
 [proxy.pool]
@@ -84,7 +82,6 @@ json_format = true
 [waf]
 enabled = true
 fail_mode = "closed"
-upstream_timeout_ms = 30000
 
 [waf.coraza]
 backend = "rust"
@@ -134,13 +131,11 @@ threat_patterns = ["sql_injection", "xss", "command_injection", "path_traversal"
 
 [waf.security_events]
 enabled = true
-format = "json"
 min_threat_level = "medium"
 enable_cef = false
 enable_otel = false
-# Keep the hot path allocation-light; enable sled only when a durable local
-# audit trail is required.
-enable_sled = false
+# Keep the hot path allocation-light; set [storage] enabled = true only when a
+# durable local audit trail is required.
 
 [runtime]
 # Leave worker_threads unset to use Tokio's default (logical CPUs).
@@ -153,9 +148,9 @@ enable_cpu_pinning = false
 
 [storage]
 # redb is the default event store; "sled" is the legacy backend.
+enabled = true
 backend = "redb"
-path = "./data/waf.redb"
-enable_follower_reads = true
+path = "./data/waf_security_events.redb"
+max_events = 100000
 ttl_cleanup_interval = { secs = 60, nanos = 0 }
-enable_compression = false
 cache_size = 16777216

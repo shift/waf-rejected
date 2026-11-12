@@ -15,9 +15,9 @@ There are two on-disk layouts:
 
 | Layout | Written by | Path | Shape |
 |---|---|---|---|
-| redb (default) | `RedbExporter` / `[storage] backend = "redb"` | `store_path`, default `./data/waf_security_events.redb` | one file, tables `data`, `ttl_metadata`, `expiration_index` |
-| sled adapter (legacy `[storage]`) | `SledStorageAdapter` | `[storage] path` | sled directory, trees `data`, `ttl`, `meta` |
-| sled exporter (legacy events) | `SledExporter` (`enable_sled = true`) | `sled_db_path`, default `./waf_security_events.sled` | sled directory, tree `security_events` |
+| redb (default) | `RedbExporter` / `[storage] enabled = true` + `backend = "redb"` | `[storage] path`, default `./data/waf_security_events.redb` | one file, tables `data`, `ttl_metadata`, `expiration_index` |
+| sled adapter (legacy) | `SledStorageAdapter` | `[storage] path` | sled directory, trees `data`, `ttl`, `meta` |
+| sled exporter (legacy events) | `SledExporter` (`[storage] backend = "sled"`, or legacy `enable_sled = true`) | `[storage] path`, or legacy `sled_db_path` / default `./waf_security_events.sled` | sled directory, tree `security_events` |
 
 `waf-storage-migrate` auto-detects the legacy exporter tree. If the source sled
 directory contains a non-adapter tree (normally `security_events`), that tree is
@@ -126,16 +126,16 @@ Exit codes:
 Edit the WAF configuration:
 
 ```toml
-[waf.security_events]
-store_backend = "redb"
-store_path = "/var/lib/waf/data/waf_security_events.redb"
-store_max_events = 100000
-enable_sled = false          # must be false when store_backend = "redb"
-
 [storage]
+enabled = true
 backend = "redb"
-path = "/var/lib/waf/data/waf.redb"
+path = "/var/lib/waf/data/waf_security_events.redb"
+max_events = 100000
 ```
+
+Remove any legacy `[waf.security_events] store_backend` / `store_path` /
+`store_max_events` / `enable_sled` / `sled_db_path` / `sled_max_events` keys:
+`storage.enabled = true` and those keys together are rejected as ambiguous.
 
 Restart the WAF. Readiness reports the store as a dependency; a failed open
 fails the readiness check (the request path is not blocked by an export
@@ -154,8 +154,8 @@ waf-storage-migrate --reverse \
   --to-tree security_events
 ```
 
-Then set `store_backend = "sled"` (or `enable_sled = true`), restore the legacy
-path, and restart. Alternatively restore the pre-migration sled backup: that is
+Then set `[storage] backend = "sled"` and `path` to the legacy sled directory,
+and restart. Alternatively restore the pre-migration sled backup: that is
 the fastest rollback and loses only events written to redb after the cut-over.
 
 Keep the sled backup until the redb store has been accepted (at least one

@@ -228,8 +228,6 @@ impl Default for StorageBackend {
 pub struct StorageConfig {
     /// Storage backend type
     pub backend: StorageBackend,
-    /// Enable follower reads for better performance
-    pub enable_follower_reads: bool,
     /// TTL cleanup interval
     pub ttl_cleanup_interval: Duration,
     /// Enable compression for stored values
@@ -240,7 +238,6 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             backend: StorageBackend::default(),
-            enable_follower_reads: false,
             ttl_cleanup_interval: Duration::from_secs(60),
             enable_compression: false,
         }
@@ -310,7 +307,6 @@ mod tests {
     #[test]
     fn test_storage_config_defaults() {
         let config = StorageConfig::default();
-        assert!(!config.enable_follower_reads);
         assert_eq!(config.ttl_cleanup_interval, Duration::from_secs(60));
         assert!(!config.enable_compression);
     }

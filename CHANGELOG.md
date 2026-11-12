@@ -6,14 +6,21 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Added
 
-- redb is the default security-event store. `waf.security_events.store_backend`
-  (default `"redb"`) and `[storage] backend` (default `"redb"`) select it; the
-  legacy sled backend stays selectable and existing configs that set
-  `enable_sled = true` keep working. `RedbExporter` records events with the same
-  `timestamp_ms ++ uuid` key layout as the sled exporter and pins
-  `Durability::Immediate`, so an acknowledged event is fsynced and survives a
-  crash (one fsync per write transaction). Unknown backend values are rejected
-  at startup instead of silently creating a sled store.
+- redb is the default security-event store. `[storage]` is now the canonical
+  selector: `enabled = true` opens the store and `backend`/`path`/`max_events`/
+  `ttl_cleanup_interval`/`cache_size` configure it. The legacy
+  `waf.security_events.store_backend` / `enable_sled` keys still work while
+  `[storage] enabled = false`, and are rejected when both select a store.
+  `RedbExporter` records events with the same `timestamp_ms ++ uuid` key layout
+  as the sled exporter and pins `Durability::Immediate`, so an acknowledged
+  event is fsynced and survives a crash (one fsync per write transaction).
+  Unknown backend values are rejected at startup instead of silently creating a
+  sled store.
+
+- `every_config_key_is_consumed_or_removed` guards the config schema: a new
+  serde field must be added to `CONSUMED_KEYS` (after wiring it) or removed.
+  See `docs/developer-guide/config-keys.md` and
+  `scripts/audit-config-keys.sh`.
 
 - `waf-storage-migrate`: sled → redb (and `--reverse` redb → sled) migration
   with per-batch progress, a crash-safe checkpoint for idempotent resume,
@@ -28,6 +35,19 @@ All notable changes to WAF-Rejected are documented here.
   deletion, concurrent readers/writers, restart durability, size/compaction
   accounting and error cases. The trait gained `scan_range`, `scan_prefix`,
   `ttl`, `delete_many` and `backend_name`.
+
+### Removed
+
+- Dead configuration keys that were accepted but never read: `[storage]
+  enable_follower_reads`, `enable_compression`, `max_memory_entries` (and the
+  `memory` backend, which the runtime audit store never supported);
+  `[proxy] upstream_url`/`bind_addr` (top-level `upstream_uri`/`bind_addr` are
+  authoritative); `[waf] upstream_timeout_ms` (`proxy.timeout_seconds` is the
+  deadline); `[waf.security_events] format` and `sled_compress` (the exporter
+  never compressed); `[waf.wasm] rules_config`; `[security.ai.model]` (`model_path`,
+  `anomaly_detection`, `advanced_classification`); and the unwired
+  `[security.compliance]` section (the compliance managers remain a
+  feature-gated library API). These are hard errors naming the file and key.
 
 ### Fixed
 

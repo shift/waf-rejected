@@ -64,7 +64,6 @@ async fn test_memory_storage() -> Result<(), Box<dyn std::error::Error>> {
 async fn test_storage_factory() -> Result<(), Box<dyn std::error::Error>> {
     let config = StorageConfig {
         backend: StorageBackend::Memory { max_size: Some(50) },
-        enable_follower_reads: false,
         ttl_cleanup_interval: Duration::from_secs(30),
         enable_compression: false,
     };

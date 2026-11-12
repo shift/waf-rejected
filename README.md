@@ -143,6 +143,11 @@ require_https = true
 Unknown keys are hard errors, including misspelled security settings and
 `WAF_*` overrides. The loader names the file, section/key path and line before
 binding any listener; run the validation script after editing a file.
+A key that is accepted must also be read: the
+`every_config_key_is_consumed_or_removed` test fails when a schema field is not
+in `CONSUMED_KEYS`. See
+[`docs/developer-guide/config-keys.md`](docs/developer-guide/config-keys.md)
+before adding a configuration key.
 
 ### Request decompression
 

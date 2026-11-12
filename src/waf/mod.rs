@@ -561,7 +561,10 @@ impl WafEngine {
 
         let mut engine = Self {
             rules: Arc::new(RwLock::new(Vec::new())),
-            event_logger: SecurityEventLogger::new(config.waf.security_events.clone()),
+            event_logger: SecurityEventLogger::with_storage(
+                config.waf.security_events.clone(),
+                config.storage.clone(),
+            ),
             geoip_service: Self::initialize_geoip(config),
             enabled: config.waf.enabled,
             fail_closed: config.waf.fail_mode != "open",
@@ -1131,15 +1134,10 @@ impl WafEngine {
             );
         }
 
-        if config.waf.security_events.enabled
-            && !matches!(
-                config.waf.security_events.format.as_str(),
-                "json" | "cef" | "plain"
-            )
-        {
-            warn!(
-                "Unknown security event format '{}'; falling back to json",
-                config.waf.security_events.format
+        if config.waf.security_events.enabled {
+            info!(
+                "Security-event exporters: {:?}",
+                self.event_logger.configured_exporters()
             );
         }
 
