@@ -120,9 +120,13 @@ cef_device_vendor = "WAF-Rejected"
 cef_device_product = "WAF-Rejected"
 cef_device_version = "0.1.0-beta.13"
 enable_otel = false
-enable_sled = true
-sled_db_path = "/var/lib/waf/data/waf_security_events.sled"
-sled_max_events = 100000
+# Persistent audit-trail store (redb default; sled is the legacy backend).
+store_backend = "redb"
+store_path = "/var/lib/waf/data/waf_security_events.redb"
+store_max_events = 100000
+enable_sled = false
+# sled_db_path = "/var/lib/waf/data/waf_security_events.sled"
+# sled_max_events = 100000
 sled_compress = false
 
 [waf.content_inspection]

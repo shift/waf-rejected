@@ -1,3 +1,50 @@
+# redb event store: default, parity, migration (`.worktrees/redb`)
+
+**Branch:** `feat/redb-event-store` (base `64948d7`).
+**MCP discovery:** no MCP resources/templates exposed in this session.
+
+## Plan / status
+
+- [x] Fix `RedbStorageAdapter` (it never compiled) and set
+      `Durability::Immediate`; unique TTL index, stale-index cleanup,
+      `disk_size`, drop releases the file lock.
+- [x] Fix sled TTL parity (reads honour TTL, overwrite clears TTL, linear
+      cleanup, schema-2 TTL tree upgraded in place); sort memory scans.
+- [x] Extend `StorageAdapter` with `scan_range`, `scan_prefix`, `ttl`,
+      `delete_many`, `backend_name`.
+- [x] One parity suite for redb/sled/memory (`src/waf/storage/parity_tests.rs`).
+- [x] Default both `[storage] backend` and
+      `waf.security_events.store_backend` to redb; reject unknown values;
+      `enable_sled = true` keeps selecting legacy sled.
+- [x] `RedbExporter` (default runtime event store, same key layout as sled).
+- [x] `waf-storage-migrate` + verified, resumable, `--force`-guarded
+      sled↔redb migration, including legacy `security_events` trees.
+- [x] `export-redb` (and `export-sled`) in default features; sled stays
+      optional for `--no-default-features` builds.
+- [x] Configs, README, security model, configuration guide, support matrix,
+      feature matrix, module scope, CHANGELOG and migration runbook updated.
+- [x] Gates: `cargo fmt -- --check` clean; `cargo clippy --lib --deny warnings`
+      clean; `cargo test --lib` 667 passed / 0 failed / 10 ignored;
+      `cargo test --lib --features distri-kv` 693 passed / 0 failed / 10
+      ignored; storage parity + migration 33 + 5 tests green;
+      `nix build .#waf-ingress` green; `scripts/validate-configs.sh` 19 files
+      ok. `cargo deny` unavailable offline; `cargo audit` reports 8
+      pre-existing advisories (h2/rustls/rustls-webpki/fxhash/instant/
+      rustls-pemfile), none from redb/sled and none new (Cargo.lock unchanged).
+- [ ] Commit and push `feat/redb-event-store`.
+
+## Findings
+
+- The historical redb adapter was dead code: `cargo check --features
+  export-redb` failed. It had a `pub` method inside a trait impl, a
+  `TableDefinition<u64, _>` used with `&[u8]` keys, and `.value().to_vec()` on
+  `u64`. No redb test ran in the default build.
+- `export-system = ["sled"]` enabled the optional crate but not the
+  `export-sled` feature, so the sled exporter/adapter were absent from default
+  builds. `export-system` now implies `export-sled`.
+- Disk-full is not simulated in tests (needs a quota/tmpfs); corrupt-store,
+  double-open, corrupt-header and memory-capacity errors are covered.
+
 # Delegated: WAF-side distributed integration scaffold (`.worktrees/distri-client`)
 
 **Branch:** `feat/distri-kv-client` (base `main` = `be2324e`).

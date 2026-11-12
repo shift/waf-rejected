@@ -4,11 +4,13 @@
 //! It supports multiple backend implementations including Sled, Redb, and in-memory storage.
 
 use async_trait::async_trait;
+use std::ops::Bound;
 use std::time::Duration;
 use thiserror::Error;
 
 pub mod bulk_deletion;
 pub mod memory;
+pub mod migrate;
 pub mod redb;
 pub mod sled;
 pub mod ttl_enhancements;
@@ -18,11 +20,29 @@ pub use bulk_deletion::{
     TransactionResult,
 };
 pub use memory::MemoryStorageAdapter;
+#[cfg(feature = "export-sled")]
+pub use migrate::{legacy_event_trees, LegacySledTreeAdapter};
+pub use migrate::{migrate, MigrationError, MigrationOptions, MigrationProgress, MigrationSummary};
 pub use redb::RedbStorageAdapter;
 pub use sled::SledStorageAdapter;
 pub use ttl_enhancements::{
     CleanupResult, EnhancedTtlStats, TtlCleanupConfig, TtlEnhancementManager,
 };
+
+/// Upper bound (exclusive) for a byte prefix, or `None` when the prefix is the
+/// whole key space (`[]` or all `0xff`).
+pub fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.last_mut() {
+        if *last == u8::MAX {
+            end.pop();
+        } else {
+            *last += 1;
+            return Some(end);
+        }
+    }
+    None
+}
 
 /// Read consistency levels for storage operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +88,16 @@ pub type StorageResult<T> = Result<T, StorageError>;
 ///
 /// This trait provides a unified interface for different storage backends
 /// including Sled, Redb, and in-memory storage implementations.
+///
+/// Semantics shared by every backend (enforced by `storage::parity_tests`):
+///
+/// * keys are byte strings ordered lexicographically;
+/// * `get`/`exists`/`scan_*` never return an entry whose TTL has elapsed, even
+///   before the background cleanup has removed it;
+/// * `delete`/`delete_many` report whether a physical entry existed;
+/// * `stats().key_count` counts physical entries (an expired entry that has not
+///   been collected yet is still counted);
+/// * an acknowledged `set` is durable across a process crash.
 #[async_trait]
 pub trait StorageAdapter: Send + Sync {
     /// Get a value by key with specified consistency level
@@ -95,6 +125,48 @@ pub trait StorageAdapter: Send + Sync {
 
     /// Compact the storage (if supported by backend)
     async fn compact(&self) -> StorageResult<()>;
+
+    /// Iterate live entries in ascending key order.
+    ///
+    /// `start` is inclusive or exclusive, `end` is normally exclusive. At most
+    /// `limit` entries are returned. Expired entries are skipped.
+    async fn scan_range(
+        &self,
+        start: Bound<&[u8]>,
+        end: Bound<&[u8]>,
+        limit: Option<usize>,
+    ) -> StorageResult<Vec<(Vec<u8>, Vec<u8>)>>;
+
+    /// Iterate live entries whose key starts with `prefix`, in ascending key
+    /// order. At most `limit` entries are returned.
+    async fn scan_prefix(
+        &self,
+        prefix: &[u8],
+        limit: Option<usize>,
+    ) -> StorageResult<Vec<(Vec<u8>, Vec<u8>)>> {
+        let end = prefix_upper_bound(prefix);
+        let end = match end.as_deref() {
+            Some(end) => Bound::Excluded(end),
+            None => Bound::Unbounded,
+        };
+        self.scan_range(Bound::Included(prefix), end, limit).await
+    }
+
+    /// Remaining TTL for a live key.
+    ///
+    /// `None` when the key is absent, has already expired, or was written
+    /// without a TTL.
+    async fn ttl(&self, key: &[u8]) -> StorageResult<Option<Duration>>;
+
+    /// Delete several keys in one backend operation.
+    ///
+    /// Returns the number of physical entries that existed and were removed.
+    /// Keys that do not exist are ignored.
+    async fn delete_many(&self, keys: &[Vec<u8>]) -> StorageResult<u64>;
+
+    /// Stable, human-readable backend name used by diagnostics and the
+    /// migration tool.
+    fn backend_name(&self) -> &'static str;
 }
 
 /// Storage statistics
@@ -140,9 +212,13 @@ pub enum StorageBackend {
 
 impl Default for StorageBackend {
     fn default() -> Self {
-        Self::Sled {
-            path: "./data/waf_storage.sled".to_string(),
-            temporary: false,
+        // redb is the default security-event store. sled remains selectable
+        // (`backend = "sled"`) for operators migrating off the legacy store,
+        // and memory exists for tests. A default here must never create a
+        // sled directory on a fresh deployment.
+        Self::Redb {
+            path: "./data/waf.redb".to_string(),
+            cache_size: None,
         }
     }
 }
@@ -223,6 +299,9 @@ impl StorageAdapterFactory {
         }
     }
 }
+
+#[cfg(test)]
+mod parity_tests;
 
 #[cfg(test)]
 mod tests {

@@ -41,7 +41,8 @@ the reference oracle and an explicit `waf.coraza.backend = "wasm"` switch-back.
 - Configurable maximum request-body size (enforced while streaming).
 - Trusted-proxy aware client IP resolution (`X-Forwarded-For` is ignored unless
   the peer is listed in `server.trusted_proxies`).
-- Security event logging (JSON console, CEF, Sled, optional OpenTelemetry).
+- Security event logging (JSON console, CEF, optional OpenTelemetry) with a
+  durable event store: redb by default, sled kept as the legacy backend.
 - Health, readiness and Prometheus metrics endpoints.
 - Graceful shutdown on `SIGTERM`/`Ctrl+C`.
 

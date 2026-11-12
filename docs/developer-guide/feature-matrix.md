@@ -1,9 +1,12 @@
 # Feature matrix
 
 Optional features (`coraza-native`, `http3`, `webtransport`,
-`ai-threat-detection`, `geoip`, `export-otel`, `export-redb`, `export-sled`,
-`io-uring`) are not all exercised by the default build. A test module or
-binary can therefore break in a feature combination that CI never compiles.
+`ai-threat-detection`, `geoip`, `export-otel`, `io-uring`) are not all exercised
+by the default build. `export-redb` and `export-sled` are enabled by default
+(redb is the default event store, sled is the legacy backend); both can be
+dropped with `--no-default-features` and are covered by that matrix entry. A
+test module or binary can therefore break in a feature combination that CI never
+compiles.
 The `coraza-native` test import regression was one such case: the default
 feature set did not enable the module, so the missing import only surfaced
 with `cargo test --features coraza-native`.

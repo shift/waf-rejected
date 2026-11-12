@@ -9,6 +9,9 @@ pub mod dispatcher;
 #[cfg(feature = "export-otel")]
 pub mod otel;
 
+#[cfg(feature = "export-redb")]
+pub mod redb;
+
 #[cfg(feature = "export-sled")]
 pub mod sled;
 
@@ -18,6 +21,9 @@ pub use dispatcher::ExporterDispatcher;
 
 #[cfg(feature = "export-otel")]
 pub use otel::OpenTelemetryExporter;
+
+#[cfg(feature = "export-redb")]
+pub use redb::RedbExporter;
 
 #[cfg(feature = "export-sled")]
 pub use sled::SledExporter;

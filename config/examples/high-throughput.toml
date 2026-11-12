@@ -152,6 +152,7 @@ enable_cpu_pinning = false
 # cpu_pin_cores = [0, 1, 2, 3]
 
 [storage]
+# redb is the default event store; "sled" is the legacy backend.
 backend = "redb"
 path = "./data/waf.redb"
 enable_follower_reads = true

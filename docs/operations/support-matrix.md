@@ -67,6 +67,22 @@ This table is the operator-facing summary.
 | Response inspection | Opt-in (native Rust engine) | `waf.response_inspection.enabled = true` | Headers and buffered bodies (first `max_body_bytes`) are evaluated; blocks return `block_status` with a generic body. Streamed/gRPC bodies are skipped with a metric. Disabled by default; Coraza backends unsupported. |
 | Header-size / header-count / connection caps | Supported | `server.max_header_count`, `server.max_header_bytes`, `server.max_connections` | Header excess returns `431`; over-limit plaintext connections receive `503 + Retry-After`; hyper parser limits remain a backstop. |
 
+## Event-store matrix
+
+The persistent audit-trail store is selected by
+`waf.security_events.store_backend` (and, for the general KV layer, by
+`[storage] backend`). Both are defaulted to redb.
+
+| Backend | Status | Default path | Durability | Migration |
+|---|---|---|---|---|
+| redb (`store_backend = "redb"`, `[storage] backend = "redb"`) | **Default** | `./data/waf_security_events.redb`, `./data/waf.redb` | `Durability::Immediate`: fsync per acknowledged write transaction | Source of a sled → redb cut-over; reverse migration supported by `waf-storage-migrate --reverse` |
+| sled (legacy) | Supported, legacy | `./waf_security_events.sled` (exporter), `[storage] path` (adapter) | Explicit flush after every write (sled's 500 ms batching is not crash-safe) | Migrate with `waf-storage-migrate`; do not point an old binary at a redb file |
+| memory | Tests only | — | None (lost on restart) | Not applicable |
+
+Unknown `store_backend`/`[storage] backend` values are rejected at startup. A
+fresh deployment never creates a sled directory unless sled is named explicitly.
+See [migrating the event store](migrating-event-store.md).
+
 ## Body inspection policy
 
 The wasm reactor has a hard 64 KiB payload contract (`waf.coraza.max_payload_bytes`).
