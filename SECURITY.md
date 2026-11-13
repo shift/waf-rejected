@@ -146,6 +146,10 @@ issues already fixed on `main` and released.
 
 ## Related documents
 
+- [Penetration-test readiness pack](docs/security/pen-test-scope.md) — scope,
+  stand-up, test cases and known limitations for an external engagement.
+- [Security documentation index](docs/security/README.md)
+
 - [Security architecture and threat model](docs/architecture/security-model.md)
 - [Support policy](docs/operations/support-policy.md)
 - [Supply-chain policy](docs/operations/supply-chain.md)

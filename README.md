@@ -279,6 +279,9 @@ limits and CI guidance. Fuzzing is not part of `nix build`.
 - **Security architecture and threat model:** trust boundaries, request-path
   enforcement points, bypass classes and deployment assumptions:
   [`docs/architecture/security-model.md`](docs/architecture/security-model.md).
+- **Penetration-test readiness:** system scope, trust boundaries, 86 test
+  cases, stand-up commands and the comparable baseline config for an external
+  engagement: [`docs/security/pen-test-scope.md`](docs/security/pen-test-scope.md).
 - **Container operations:** loading the released image tarball, pinning by
   digest, health/metrics ports (`8081`), upgrade and rollback:
   [`docs/operations/container.md`](docs/operations/container.md).
