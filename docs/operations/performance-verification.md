@@ -653,3 +653,231 @@ the source of truth. Compare only runs with the same `environment.json`
 - The underlying guest GC tail (p95 ~373 ms versus p50 ~164 ms on a 4 KiB
   attack body) remains. Fixing it needs a GC/memory-limit tradeoff and a soak
   measurement; it is listed in §7 rather than changed in this report.
+
+## 11. Request-path allocation removal (`perf/request-path-allocs`)
+
+**Branch:** `perf/request-path-allocs`, base `6868a11`. Six alternating
+before/after `bench-subms --only l0` runs, 20 samples per cell; medians are
+reported. Host load average was 3.5–4.4 at the start of each run (shared host).
+
+### 11.1 The 646 KB/4 KiB baseline is historical
+
+The 646 468 B/op and 1 772 allocs/op at 4 KiB in §3.1/§6 were measured at
+`aca35db`. They are **not reproducible on `6868a11`**: the same Rust engine
+cell measures 5 445 B/op and 82 allocs/op, and the allocation-size histogram has
+no bucket above 1 KiB. The body is already borrowed end to end (the transform
+cache copies it once into a reused arena, and the rules see slices); the
+zero-copy work landed before this branch. This section therefore measures the
+*remaining* owned copies, not a 160× amplification.
+
+### 11.2 What was copied and why
+
+- `RequestData::resolve_into` cloned single-value collections for every rule
+  that targeted them: `REQUEST_LINE` (an owned `Cow`), `REQUEST_URI`,
+  `REQUEST_FILENAME`, `REQUEST_BASENAME`, `REQUEST_PROTOCOL`, `QUERY_STRING` and
+  `REQBODY_PROCESSOR`. Each clone allocated once per targeting rule. They are
+  now borrowed with the `'r` lifetime of the request data.
+- GET argument parsing always materialised owned `Entry` keys and values even
+  when `parse_query` returned borrowed slices. `build()` now matches
+  `Cow::Borrowed(query)` and keeps the zero-copy entries; the normalised
+  (owned) query case still owns, as it must.
+- Response single-value collections (`RESPONSE_STATUS`, `RESPONSE_PROTOCOL`,
+  `RESPONSE_BODY`, content type/length) follow the same borrow.
+- TX and MATCHED_VARS candidates still own their bytes. `setvar` and
+  `record_match` mutate those arenas while the candidate list is being
+  evaluated, so borrowing would alias a mutable buffer. Their values are small
+  (scores and names); making them borrowed needs the arena-backed IR change
+  described in §6.1, not a one-line lifetime change.
+- Content inspection still uses `String::from_utf8_lossy` and
+  `urlencoding::decode` because its patterns are `regex::Regex` over `&str`.
+  Valid-UTF-8 bodies borrow (no copy). Bodies that are not valid UTF-8, or that
+  contain `%`/`+`, get **one** owned representation for the decoded/UTF-8 view.
+  That is the only body-proportional copy left in the inspection path (≤1× the
+  body, only when the decoded view is needed). Switching the patterns to
+  `regex::bytes` would change operator semantics and was not done.
+- The proxy forwards the inspected body by moving the same `Bytes` handle into
+  `ProxyBody::buffered`; `RequestContext` holds a refcount clone. The egress
+  normalisation is unchanged (client `Transfer-Encoding` stripped, exact
+  `Content-Length` stamped).
+
+### 11.3 Before/after (L0-engine rust, `bench-subms`)
+
+Medians of six alternating runs:
+
+| size | before p50 ms | after p50 ms | before allocs/op | after allocs/op | before B/op | after B/op |
+|---|---:|---:|---:|---:|---:|---:|
+| bodyless | 0.1266 | 0.1224 | 75 | **28** | 3 103 | **2 774** |
+| 1 KiB | 0.2810 | 0.2770 | 82 | **35** | 5 445 | **5 075** |
+| 4 KiB | 0.5797 | 0.5918 | 82 | **35** | 5 445 | **5 075** |
+| 8 KiB | 1.0070 | 1.0082 | 82 | **35** | 5 445 | **5 075** |
+
+Allocation counts are deterministic. The 4 KiB p50 moved +2.1 % and the 8 KiB
+p50 +0.1 %; the per-run distributions overlap (4 KiB before 0.571–0.612 ms,
+after 0.580–0.673 ms) and the after runs were taken at slightly higher load, so
+this is unchanged within noise. Bodyless and 1 KiB p50 improved 3.3 % and 1.4 %
+respectively. Per-request allocation count fell 57 % at every body size.
+
+### 11.4 Full proxy (L3-proxy rust, loopback)
+
+One run, 30 sequential requests per cell. This row includes the keep-alive
+client and the in-process mock upstream, so its body copies are dominated by
+the harness; the WAF add-on is the L3−L2 delta.
+
+| size | before p50 ms | after p50 ms | before allocs/op | after allocs/op | before B/op | after B/op |
+|---|---:|---:|---:|---:|---:|---:|
+| bodyless | 0.428 | 0.424 | 156 | **109** | 68 082 | 67 753 |
+| 1 KiB | 0.664 | **0.579** | 226 | **179** | 121 372 | 121 011 |
+| 4 KiB | 0.966 | **0.931** | 174 | **127** | 83 710 | 83 340 |
+| 8 KiB | 1.381 | 1.387 | 178 | **131** | 136 686 | 136 308 |
+
+### 11.5 Remaining allocation profile (4 KiB)
+
+`engine-profile`, one profiled request after warm-up (allocation events):
+
+| category | before | after |
+|---|---:|---:|
+| candidate resolution | 56 | **10** |
+| TX values | 13 | 13 |
+| parse / request build | 10 | 10 |
+| operators | 4 | 4 |
+| scoring | 3 | 3 |
+| transforms | 0 | 0 |
+| **total** | **92** | **46** |
+
+After the change the 4 KiB histogram is 15 allocations ≤16 B, 9 at 17–64 B,
+7 at 65–256 B and 4 at 257–1024 B; there is no allocation above 1 KiB. The top
+remaining sites are TX value clones (13), candidate resolution of mixed/owned
+single-value collections and `MATCHED_VARS` (10), request build (10), operator
+captures (4) and first-use TX scoring slots (3).
+
+The single-value body above understates the multi-field case, which is the
+largest allocation site left: a 4 KiB urlencoded body with 64 distinct fields
+allocates **52 529 B / 210 allocations** (before this branch: 55 477 B / 225)
+against 4 979 B / 36 for a one-argument body of the same size — ≈740 B and
+≈2.7 allocations per distinct argument. That is the transform cache's
+per-`(value, pipeline)` output plus the per-argument candidates: each transformed
+value is a distinct byte sequence the rules must see, so it cannot be borrowed.
+`parse_query` now also sizes its `Vec` from the separator count, so a
+many-field body stops growing through log2(N) reallocations (one pass over the
+body, no copy of the payload).
+
+### 11.6 10 MiB cap stress cell
+
+`bench-subms --stress-10m` adds the default `server.max_body_size` cell. At
+10 MiB the Rust engine returns
+
+```text
+Block { status: 500, reason: "Rust engine runtime error (fail-closed):
+transform output exceeded the per-request byte cap" }
+```
+
+because `Collections::process_body_bytes` charges the whole body through
+`Budget::bytes`, whose per-value cap is `Limits::max_value_bytes` (1 MiB;
+`max_total_bytes` is 8 MiB). The body is therefore refused **before phase 2**:
+there is no body-proportional allocation to remove, but a configured 10 MiB
+body is not inspectable. This is a blocker. Raising the cap would change
+verdicts (from a blanket 500 to content-based allow/block) and needs an
+architecture decision; it was not changed here. The stress cell records 209 →
+201 allocs/op and 17 002 → 16 958 B/op at the fail-closed point (the small
+reduction is the same candidate-borrow change).
+
+A second pre-existing fail-closed path was found by the same harness: a 4 KiB
+urlencoded body with **64 fields** returns
+
+```text
+Block { status: 500, reason: "Rust engine runtime error (fail-closed):
+per-request budget exceeded: too many variable values" }
+```
+
+`Limits::max_values_per_rule` (4 096) is charged through one `Budget` for the
+whole request, not per rule, so a form with enough fields exhausts it and the
+request is refused. Like the 10 MiB case this changes decisions if fixed
+(truncation or a per-rule budget), so it is recorded here and not changed.
+
+### 11.7 Cache behaviour: the copy-pressure story does not hold
+
+`perf` 7.1.1 from the Nix store; `kernel.perf_event_paranoid = 2`, uid 1000,
+`CapEff 0`. At that level **`perf stat -p <pid>` is refused** (every event comes
+back `<not counted>`), so counters can only be taken from a process perf itself
+starts. That process also compiles the 505-rule CRS bundle (~2.5 G instructions
+and ~0.8 M last-level misses) before it runs a single measured request, and the
+compile's miss count varies with allocator/hash layout. Repeats of the *same*
+binary, loop counters divided by the completed requests, gave 45, 75 and 122
+LLC-load-misses per request at 4 KiB — a ±50 % spread. The per-request hardware
+figures in the first version of this section (69.28 → 57.91) were within that
+spread: the 16.4 % "improvement" was the compile prologue, not the request path.
+
+The conclusion therefore uses Cachegrind (`--cache-sim=yes`, 8 MiB unified last
+level), where both the prologue and the loop are deterministic: the loop's cost
+is the exact difference between a 0-repeat and a *N*-repeat run of the same
+binary, so the prologue cancels.
+
+| cell | LLd misses/req before | after | D1 misses/req before | after | instructions/req before | after |
+|---|---:|---:|---:|---:|---:|---:|
+| 4 KiB | 3.6 | 27.4 * | 13 212 | 13 079 (−1.0 %) | 4 052 831 | 4 065 700 (+0.3 %) |
+| 10 MiB | 0.03 | −0.1 * | 3 865 | 3 828 (−1.0 %) | 370 679 | 369 565 (−0.3 %) |
+
+\* At the noise floor: two builds of the same harness differ by ~5 000 LLd
+misses in the prologue, which is ±25 misses/request at the 200-request sample
+used here. The value is also not stable in sign, so it is not an effect.
+
+**Falsification condition: held.** Last-level misses per request are ~4 at
+4 KiB (0.001 per body byte) before *and* after and do not fall when the copies
+are removed, because a warmed request already lives in an 8 MiB LLC: the
+removed allocations were ~466 B in ≤64 B size classes (tcache hits, no LLC
+traffic). What moves is the L1 data-miss count (−1.0 %), matching a handful of
+small allocations per request, and nothing else.
+
+The explanation for the latency slope is therefore *instruction-bound rule
+scanning*, not cache pressure: p50 is 0.27 / 0.56 / 0.96 ms at 1 / 4 / 8 KiB,
+i.e. ≈0.12 ms and ≈0.7 M instructions per KiB of body, while per-request
+allocated bytes are constant (4 979 B) from 1 KiB to 8 KiB.
+
+### 11.8 Allocation gate
+
+`perf-gate-bench` now enforces bytes/op and allocs/op for the Rust backend
+(counts are deterministic and do not move with host load). Limits are the
+measured after values plus headroom:
+
+| case | measured B/op | limit | measured allocs/op | limit |
+|---|---:|---:|---:|---:|
+| bodyless | 2 610 | 4 000 | 28 | 45 |
+| 4k-allow | 4 942 | 7 000 | 31 | 50 |
+| 4k-sqli | 9 130 | 13 000 | 37 | 60 |
+
+A row above either limit prints the table and exits non-zero; use
+`--no-alloc-gate` for a measurement-only run.
+
+`perf-gate-bench --only waf` covers the full request path (admission,
+protocol pre-checks, content inspection and the rule chain) at bodyless,
+1 KiB, 4 KiB, 8 KiB, 10 MiB, a 64-field 4 KiB form and 4 KiB SQLi. Limits are
+the measured after values plus ~15 % headroom:
+
+| case | measured B/op | limit | measured allocs/op | limit |
+|---|---:|---:|---:|---:|
+| bodyless | 2 658 | 3 200 | 29 | 40 |
+| 1 KiB / 4 KiB / 8 KiB | 4 979 | 5 888 | 36 | 48 |
+| 10 MiB | 16 941 | 19 968 | 201 | 224 |
+| 4 KiB form, 64 fields | 52 529 | 61 440 | 210 | 240 |
+| 4 KiB SQLi | 9 745 | 11 520 | 54 | 64 |
+
+The 10 MiB and 64-field rows record their fail-closed decisions (§11.6) rather
+than pretending the body was inspected. Every row also carries
+`block_status`/`block_reason` in the JSON so a decision change shows up next to
+the allocation numbers.
+
+### 11.9 Verification
+
+- `rust-engine-parity --engine both`: **2 112/2 112** agree, rust/coraza both
+  1 788 block / 324 allow, 0 errors, rust FN 3 = coraza FN 3, i.e. **0
+  native-only false negatives**.
+- `cargo fmt -- --check`: clean.
+- `cargo clippy --lib -- --deny warnings` and `cargo clippy --release
+  --features wasm-reactor,rust-engine,engine-kernel --bin perf-gate-bench -- --deny warnings`:
+  clean.
+- `cargo test --lib`: 692 passed, 0 failed, 11 ignored.
+- `cargo test --test integration`: 87 passed, 0 failed, 14 ignored.
+- `nix build .#waf-ingress`: exit 0
+  (`/nix/store/npdkbdsiyifpim2n3fsgm6rwgw1vyhd2-waf-ingress-0.1.0-beta.16`).
+- `perf-gate-bench --only waf` with the gate enabled: all seven cases pass
+  their allocation ceilings.

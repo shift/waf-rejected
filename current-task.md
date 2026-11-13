@@ -1479,3 +1479,60 @@ compile-only fixes on code paths that already failed to build.
       tests pass with `distri-kv`; validate-configs 19 files ok; `nix build
       .#waf-ingress` exit 0 (/nix/store/khxhcbxwb1drilqwak11fnrhcqbg8y50-waf-ingress-0.1.0-beta.16).
 - [x] Commit and push `fix/no-dead-config`.
+
+# Delegated: request-path allocation removal (`.worktrees/alloc`)
+
+**Branch:** `perf/request-path-allocs` (base `6868a11`).
+
+## Status
+
+- [x] Measured the base with `bench-subms` (L0-engine rust) and an
+      allocation-size/profile probe. The documented 646 468 B/op at 4 KiB is
+      from `aca35db`; base `6868a11` measures 5 445 B/op, 82 allocs/op, with no
+      allocation above 1 KiB. The 160× body copy was already gone.
+- [x] Removed the remaining owned-candidate copies in
+      `src/waf/rust_engine/request.rs`: `REQUEST_LINE`/URI/filename/protocol/
+      query/REQBODY_PROCESSOR are borrowed; GET arguments borrow from the URI
+      when `parse_query` is zero-copy; response single-value collections borrow.
+- [x] Kept TX/MATCHED_VARS owned: `setvar`/`record_match` mutate those arenas
+      while candidates are evaluated. Documented as the named remaining copy.
+- [x] Added the 10 MiB stress cell (`bench-subms --stress-10m`). It exposes a
+      blocker: `Limits::max_value_bytes` is 1 MiB while `server.max_body_size`
+      is 10 MiB, so a 10 MiB body fails closed (500) before phase 2.
+- [x] Extended `perf-gate-bench` with per-case allocation-bytes/allocs gates
+      (Rust backend, deterministic) and `--no-alloc-gate`.
+- [x] Documented before/after, remaining profile, 10 MiB finding and `perf
+      stat` cache counters in `docs/operations/performance-verification.md` §11.
+- [x] Parity: 2 112/2 112, 0 native-only false negatives.
+- [x] fmt clean; `cargo clippy --lib -- --deny warnings` clean; `cargo test
+      --lib` 692 passed / 0 failed / 11 ignored; `cargo test --test
+      integration` 87 passed / 0 failed / 14 ignored; `nix build .#waf-ingress`
+      green; `perf-gate-bench --only rust` and `--only waf` allocation gates
+      pass.
+- [ ] Commit and push.
+
+## Follow-up: cache counters corrected, form case added
+
+- [x] `perf stat -p` is **refused** at `perf_event_paranoid = 2` (all events
+      `<not counted>`), so the §11.7 counters taken that way could not have
+      come from the request loop. Per-request counters from a perf child include
+      the CRS compile prologue (~2.5 G instructions, ~0.8 M last-level misses)
+      and vary ±50 % between repeats of the same binary; the 69.28 → 57.91
+      LLC-load-misses/request were that prologue, not the change.
+- [x] Re-measured with Cachegrind (8 MiB LLC, prologue cancelled exactly by
+      differencing 0- and N-repeat runs): LLC misses/request ≈ 3.6 → 27.4
+      (noise floor, sign unstable), D1 misses −1.0 %, instructions +0.3 %.
+      **Falsification condition held**; §11.7 now states the copy-pressure story
+      is rejected and the slope is instruction-bound rule scanning.
+- [x] Added a 64-field 4 KiB form case (the top remaining allocation site:
+      52 529 B / 210 allocations, ~740 B per argument) and tightened the `waf`
+      allocation ceilings to measured + ~15 % headroom.
+- [x] Found a second pre-existing fail-closed path: a 64-field form returns 500
+      ("too many variable values", `max_values_per_rule` charged per request).
+      Documented in §11.6, not changed.
+- [x] `parse_query` sizes its vector from the separator count, removing the
+      log2(N) reallocations for many-field bodies.
+- [x] Re-verified on the final tree: fmt clean; clippy `--lib` and the gate bin
+      clean with `--deny warnings`; 692 lib tests; 87 integration tests;
+      2 112/2 112 parity (0 native-only FNs); `nix build .#waf-ingress` green;
+      all seven `waf` gate rows and all three `rust` rows pass.
