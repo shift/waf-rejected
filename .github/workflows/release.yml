@@ -1,0 +1,376 @@
+name: Release
+
+# The local equivalents of the build/verification steps are
+# `./scripts/ci-local.sh` and
+# `./scripts/check-coraza-reactor-size.sh`; publishing still requires a tag and
+# registry credentials. `workflow_dispatch` is not enabled because the release
+# job derives its version from the pushed tag.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      # Canonical OCI package name. It is deliberately not the repository name:
+      # GHCR rejected blob uploads for `ghcr.io/shift/waf-rejected` with HTTP
+      # 403, while `ghcr.io/shift/waf-rejected-waf` publishes successfully.
+      # Keep this value in sync with publish-image.yml and the docs.
+      IMAGE_NAME: ghcr.io/shift/waf-rejected-waf
+      # Registry publishing is on by default for tag releases. Set the
+      # repository variable PUSH_IMAGE to "false" to disable it. A rejected
+      # push (HTTP 403) is a warning, never a release failure: the tarball
+      # below remains the supported artifact. See docs/operations/ci.md and
+      # docs/operations/container.md.
+      PUSH_IMAGE: ${{ vars.PUSH_IMAGE }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Report registry publishing mode
+        run: |
+          if [ "${PUSH_IMAGE}" = "false" ]; then
+            echo "::notice::PUSH_IMAGE=false: skipping the GHCR push. The image tarball is still attached to the release."
+          else
+            echo "Publishing ${IMAGE_NAME} to GHCR (set PUSH_IMAGE=false to disable)"
+          fi
+      - name: Log in to GHCR
+        if: env.PUSH_IMAGE != 'false'
+        continue-on-error: true
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build release image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+            ${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+      # A 403 from GHCR means the token cannot write packages (organization
+      # policy or a fork/PR token). That must not block the release: the
+      # tarball below is the supported fallback. The attempt is still reported
+      # as a warning so the registry problem is visible.
+      - name: Push release image to GHCR
+        id: push
+        if: env.PUSH_IMAGE != 'false'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          TAG_REF="${IMAGE_NAME}:${GITHUB_REF_NAME}"
+          SHA_REF="${IMAGE_NAME}:sha-${GITHUB_SHA}"
+          if docker push "${TAG_REF}" && docker push "${SHA_REF}"; then
+            # Both tags point at the same manifest, so either RepoDigest is the
+            # immutable reference used in image-digest.txt and the release body.
+            DIGEST_REF="$(docker image inspect --format '{{index .RepoDigests 0}}' "${TAG_REF}")"
+            echo "digest=${DIGEST_REF}" >> "${GITHUB_OUTPUT}"
+            echo "Pushed ${DIGEST_REF}"
+          else
+            echo "::warning::GHCR rejected the image push. Verify the token has package write access. The image tarball remains the release fallback."
+          fi
+      - name: Record image digest
+        id: digest
+        if: always()
+        env:
+          PUSHED_DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          TAG_REF="${IMAGE_NAME}:${GITHUB_REF_NAME}"
+          if [[ -n "${PUSHED_DIGEST}" ]]; then
+            printf '%s\n' "${PUSHED_DIGEST}" > image-digest.txt
+            echo "digest=${PUSHED_DIGEST}" >> "${GITHUB_OUTPUT}"
+          else
+            image_id="$(docker image inspect --format '{{.Id}}' "${TAG_REF}")"
+            {
+              echo "registry: not published"
+              echo "image: ${TAG_REF}"
+              echo "local-image-id: ${image_id}"
+              echo "fallback: waf-rejected-${VERSION}-image.tar.gz"
+            } > image-digest.txt
+            echo "::notice::No registry digest for this release; image-digest.txt records the tarball fallback."
+          fi
+          cat image-digest.txt
+      - name: Export image tarball
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          docker save "${IMAGE_NAME}:${GITHUB_REF_NAME}" | gzip -9 > "waf-rejected-${VERSION}-image.tar.gz"
+          test -s "waf-rejected-${VERSION}-image.tar.gz"
+          ls -l "waf-rejected-${VERSION}-image.tar.gz"
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: image
+          path: waf-rejected-*-image.tar.gz
+          if-no-files-found: error
+      - name: Upload image digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-digest
+          path: image-digest.txt
+          if-no-files-found: error
+
+  sbom:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Nix
+        uses: cachix/install-nix-action@v25
+      - name: Generate CycloneDX SBOM
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          # The dev shell provides cargo, cargo-cyclonedx and jq. The script
+          # still falls back to `nix shell nixpkgs#...` outside the shell.
+          nix develop -c ./scripts/generate-sbom.sh "$VERSION" .
+          test -s "waf-rejected-${VERSION}.cdx.json"
+          test -s "waf-rejected-${VERSION}.cdx.json.sha256"
+          ls -l "waf-rejected-${VERSION}.cdx.json"*
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: |
+            waf-rejected-*.cdx.json
+            waf-rejected-*.cdx.json.sha256
+          if-no-files-found: error
+
+  trivy-filesystem:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan filesystem and dependency manifests (Trivy)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-fs.sarif
+          # This gate covers dependency and OS vulnerabilities. Secret detection
+          # is a separate concern (the repository contains test-only TLS keys
+          # under `src/`), so it must not fail the release build.
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          # Only a fixable HIGH/CRITICAL finding blocks the release. Unfixed
+          # upstream advisories are reported in the code-scanning dashboard
+          # but do not hold the release hostage; see docs/operations/ci.md.
+          exit-code: "1"
+          ignore-unfixed: true
+      - name: Upload filesystem SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-filesystem
+
+  trivy-image:
+    needs: build-image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Download image tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: image
+          path: image
+      - name: Resolve image tarball
+        run: |
+          set -euo pipefail
+          tarball="$(find image -maxdepth 1 -name 'waf-rejected-*-image.tar.gz' -print -quit)"
+          test -n "${tarball}"
+          echo "IMAGE_TARBALL=${tarball}" >> "${GITHUB_ENV}"
+      - name: Scan release image (Trivy)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          input: ${{ env.IMAGE_TARBALL }}
+          format: sarif
+          output: trivy-image.sarif
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+      - name: Upload image SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+  build-release:
+    needs:
+      - sbom
+      - build-image
+      - trivy-filesystem
+      - trivy-image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: sbom
+      - name: Download image tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: image
+          path: image
+      - name: Download image digest
+        uses: actions/download-artifact@v4
+        with:
+          name: image-digest
+          path: image-digest
+      - name: Install Nix
+        uses: cachix/install-nix-action@v25
+      - name: Build release binary
+        run: nix build .#waf-ingress
+      - name: Build native Coraza sidecar
+        run: nix build .#coraza-native-sidecar --out-link result-sidecar
+      - name: Verify Coraza reactor digest and size budget
+        run: ./scripts/check-coraza-reactor-size.sh
+      - name: Verify native sidecar executable
+        run: |
+          set -euo pipefail
+          test -x result-sidecar/bin/coraza-sidecar
+          # A probe of a missing socket must exit 1, proving the binary runs in
+          # this environment without starting an engine.
+          if result-sidecar/bin/coraza-sidecar --probe --socket /nonexistent/coraza.sock; then
+            echo "probe unexpectedly succeeded" >&2
+            exit 1
+          else
+            test "$?" -eq 1
+          fi
+      - name: Package artifacts
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist "waf-rejected-v${VERSION}"
+          cp result/bin/waf-ingress "waf-rejected-v${VERSION}/"
+          cp README.md CHANGELOG.md SECURITY.md LICENSE-* "waf-rejected-v${VERSION}/"
+          cp "sbom/waf-rejected-${VERSION}.cdx.json" "waf-rejected-v${VERSION}/"
+          cp -r rules "waf-rejected-v${VERSION}/"
+          install -Dm644 wasm/coraza_reactor/coraza_reactor.wasm \
+            "waf-rejected-v${VERSION}/wasm/coraza_reactor.wasm"
+          install -Dm644 wasm/coraza_reactor/LICENSE-CRS \
+            "waf-rejected-v${VERSION}/wasm/LICENSE-CRS"
+          install -Dm644 wasm/coraza_reactor/PROVENANCE.md \
+            "waf-rejected-v${VERSION}/wasm/PROVENANCE.md"
+          install -Dm644 wasm/coraza_reactor/SHA256SUMS \
+            "waf-rejected-v${VERSION}/wasm/SHA256SUMS"
+          # Installed layout used by the binary's CRS resolver. The legacy
+          # `wasm/` paths above remain for compatibility.
+          mkdir -p "waf-rejected-v${VERSION}/share"
+          cp -r result/share/waf "waf-rejected-v${VERSION}/share/waf"
+          # Native Coraza sidecar: binary plus the same read-only CRS bundle.
+          install -Dm755 result-sidecar/bin/coraza-sidecar \
+            "waf-rejected-v${VERSION}/native/coraza-sidecar"
+          cp -r result-sidecar/share/waf/coraza \
+            "waf-rejected-v${VERSION}/native/coraza"
+          tar -czf "dist/waf-rejected-v${VERSION}-x86_64-linux.tar.gz" "waf-rejected-v${VERSION}"
+          tar -czf "dist/waf-rejected-v${VERSION}-coraza-sidecar-x86_64-linux.tar.gz" \
+            -C result-sidecar bin share
+          cp "image/waf-rejected-${VERSION}-image.tar.gz" dist/
+          cp "image-digest/image-digest.txt" dist/
+          cp "sbom/waf-rejected-${VERSION}.cdx.json" dist/
+          cp wasm/coraza_reactor/coraza_reactor.wasm \
+            "dist/waf-rejected-${VERSION}-coraza_reactor.wasm"
+          cp wasm/coraza_reactor/LICENSE-CRS \
+            "dist/waf-rejected-${VERSION}-coraza-LICENSE"
+          cp wasm/coraza_reactor/PROVENANCE.md \
+            "dist/waf-rejected-${VERSION}-coraza-PROVENANCE.md"
+          cd dist
+          for asset in \
+            "waf-rejected-v${VERSION}-x86_64-linux.tar.gz" \
+            "waf-rejected-v${VERSION}-coraza-sidecar-x86_64-linux.tar.gz" \
+            "waf-rejected-${VERSION}-image.tar.gz" \
+            "image-digest.txt" \
+            "waf-rejected-${VERSION}.cdx.json" \
+            "waf-rejected-${VERSION}-coraza_reactor.wasm" \
+            "waf-rejected-${VERSION}-coraza-LICENSE" \
+            "waf-rejected-${VERSION}-coraza-PROVENANCE.md"; do
+            test -s "${asset}"
+            sha256sum "${asset}" > "${asset}.sha256"
+          done
+          sha256sum --check ./*.sha256
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/waf-rejected-v*-x86_64-linux.tar.gz
+            dist/waf-rejected-v*-coraza-sidecar-x86_64-linux.tar.gz
+            dist/waf-rejected-*-image.tar.gz
+            dist/image-digest.txt
+            dist/waf-rejected-*.cdx.json
+            dist/waf-rejected-*-coraza_reactor.wasm
+            dist/waf-rejected-*-coraza-LICENSE
+            dist/waf-rejected-*-coraza-PROVENANCE.md
+      - name: Prepare release body
+        run: |
+          set -euo pipefail
+          DIGEST_REF="$(grep -E '^ghcr\.io/[^[:space:]]+@sha256:[0-9a-f]{64}$' image-digest/image-digest.txt | head -n1 || true)"
+          {
+            echo "## Container image"
+            echo
+            if [[ -n "${DIGEST_REF}" ]]; then
+              echo "Published to GHCR under the canonical package name:"
+              echo
+              echo '```'
+              echo "${DIGEST_REF}"
+              echo '```'
+              echo
+              echo "Pin this digest in deployments. The human-readable tag is also"
+              echo "available, but tags are mutable and digests are not."
+              echo
+              echo "Verify it with:"
+              echo
+              echo '```bash'
+              echo "./scripts/verify-release.sh --dir . --version ${GITHUB_REF_NAME#v} --verify-registry"
+              echo '```'
+            else
+              echo "The registry image was not published for this release (PUSH_IMAGE=false"
+              echo "or the push was rejected). Use the attached"
+              echo "\`waf-rejected-${GITHUB_REF_NAME#v}-image.tar.gz\` tarball; \`image-digest.txt\`"
+              echo "records the local image ID and the fallback."
+            fi
+          } > release-body.md
+          cat release-body.md
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          generate_release_notes: true
+          append_body: true
+          body_path: release-body.md
+          files: |
+            dist/waf-rejected-v*-x86_64-linux.tar.gz
+            dist/waf-rejected-v*-coraza-sidecar-x86_64-linux.tar.gz
+            dist/waf-rejected-*-image.tar.gz
+            dist/image-digest.txt
+            dist/waf-rejected-*.cdx.json
+            dist/waf-rejected-*-coraza_reactor.wasm
+            dist/waf-rejected-*-coraza-LICENSE
+            dist/waf-rejected-*-coraza-PROVENANCE.md
+            dist/*.sha256

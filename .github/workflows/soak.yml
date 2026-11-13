@@ -1,0 +1,56 @@
+name: Soak Smoke
+
+# Short, CI-friendly smoke of the soak harness and fault suite. This is NOT a
+# soak: the long run is an operator procedure documented in
+# docs/operations/soak-testing.md.
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Soak duration (for example 60s or 5m)"
+        type: string
+        default: "60s"
+      run_faults:
+        description: "Run the deterministic fault scenarios after the soak"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: soak-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  soak-smoke:
+    name: short soak + fault scenarios
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Nix
+        uses: cachix/install-nix-action@v25
+      - name: Short soak
+        env:
+          SOAK_DURATION: ${{ inputs.duration }}
+          SOAK_WARMUP: 10s
+          SOAK_CONCURRENCY: 16
+          SOAK_PROFILE: release
+        run: nix develop -c ./scripts/soak.sh
+      - name: Fault scenarios
+        if: ${{ inputs.run_faults }}
+        env:
+          SOAK_PROFILE: release
+        run: nix develop -c ./scripts/soak.sh faults
+      - name: Upload soak report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-report
+          path: target/soak-report.json
+          if-no-files-found: ignore

@@ -1,0 +1,217 @@
+# Two WAF nodes running the `distri-kv` feature in `local_only` fallback.
+#
+# The image must be built with --features distri-kv (see
+# deploy/distributed/Dockerfile.waf). The published release image does not
+# include the feature yet.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: distributed-waf-config
+  namespace: waf-distributed
+  labels:
+    app.kubernetes.io/name: waf-rejected
+data:
+  config.toml: |
+    bind_addr = "0.0.0.0:8080"
+    health_bind_addr = "0.0.0.0:8081"
+    upstream_uri = "http://upstream.default.svc.cluster.local:3000"
+
+    [proxy]
+    upstream_url = "http://upstream.default.svc.cluster.local:3000"
+    bind_addr = "0.0.0.0:8080"
+    timeout_seconds = 30
+    max_request_size = 10485760
+
+    [server]
+    max_connections = 8192
+    request_timeout_secs = 30
+    keep_alive_timeout_secs = 90
+    enable_http2 = true
+    enable_http3 = false
+    supported_http_versions = ["1.0", "1.1", "2"]
+    max_body_size = 2097152
+    grpc_max_stream_bytes = 4194304
+    grpc_max_stream_seconds = 300
+    grpc_aware_rejections = true
+
+    [logging]
+    level = "info"
+    json_format = true
+
+    [waf]
+    enabled = true
+    fail_mode = "closed"
+
+    [waf.coraza]
+    backend = "rust"
+    fallback = "none"
+    max_payload_bytes = 65536
+    max_inspect_bytes = 65536
+    oversize_action = "reject"
+    eval_timeout_ms = 5000
+
+    [waf.rate_limit]
+    per_ip_enabled = true
+    per_ip_max_requests = 6000
+    per_ip_window_secs = 60
+    global_enabled = true
+    global_max_requests = 100000
+    global_window_secs = 60
+
+    [waf.content_inspection]
+    enabled = true
+    inspect_headers = true
+    inspect_body = true
+    max_body_size = 10485760
+    threat_patterns = ["sql_injection", "xss", "command_injection", "path_traversal"]
+
+    [waf.security_events]
+    enabled = true
+    min_threat_level = "medium"
+    enable_cef = false
+    enable_otel = false
+
+    [waf.distributed]
+    enabled = true
+    node_id = "waf-1"
+    region = "eu-west-1"
+    policy_scope = "default"
+    endpoints = ["http://dkv-client:7443"]
+    fallback = "local_only"
+    policy_cache_ttl_secs = 300
+    reputation_cache_ttl_secs = 300
+    max_stale_secs = 900
+    heartbeat_interval_secs = 10
+    request_timeout_ms = 2000
+    event_queue_capacity = 8192
+    counter_queue_capacity = 4096
+    reconnect_initial_backoff_ms = 100
+    reconnect_max_backoff_ms = 30000
+    shadow = true
+
+    [storage]
+    enabled = true
+    backend = "redb"
+    path = "/var/lib/waf/data/waf_security_events.redb"
+    max_events = 100000
+    ttl_cleanup_interval = { secs = 60, nanos = 0 }
+    cache_size = 16777216
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: waf-rejected
+  namespace: waf-distributed
+  labels:
+    app.kubernetes.io/name: waf-rejected
+    app.kubernetes.io/component: ingress
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: waf-rejected
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: waf-rejected
+        app.kubernetes.io/component: ingress
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: waf-rejected
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: waf-ingress
+          image: waf-rejected-distributed:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: admin
+              containerPort: 8081
+          env:
+            - name: WAF_CONFIG_FILE
+              value: /etc/waf/config.toml
+            - name: RUST_LOG
+              value: info
+            - name: WAF_WAF__DISTRIBUTED__NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: config
+              mountPath: /etc/waf/config.toml
+              subPath: config.toml
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/waf
+            - name: tmp
+              mountPath: /tmp
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: admin
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 4
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: admin
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 500m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: config
+          configMap:
+            name: distributed-waf-config
+        - name: data
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 32Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: waf
+  namespace: waf-distributed
+  labels:
+    app.kubernetes.io/name: waf-rejected
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: waf-rejected
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+    - name: admin
+      port: 8081
+      targetPort: admin

@@ -1,0 +1,21 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: distri-kv
+  namespace: waf-distributed
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: distri-kv
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: waf-rejected
+  namespace: waf-distributed
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: waf-rejected

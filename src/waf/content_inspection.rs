@@ -1,0 +1,969 @@
+use crate::waf::prefilter_extract::{required_literals, RequiredLiterals};
+use crate::waf::{Decision, RequestContext, WafRule};
+use once_cell::sync::Lazy;
+use regex::Regex;
+
+/// Advanced content inspection rules for common web attacks (optimized for performance)
+pub struct ContentInspectionRule {
+    name: String,
+    enabled: bool,
+    inspect_headers: bool,
+    inspect_body: bool,
+    patterns: Vec<ThreatPattern>,
+    // Performance optimization: cache compiled patterns by priority
+    high_priority_patterns: Vec<ThreatPattern>,
+    low_priority_patterns: Vec<ThreatPattern>,
+    /// Sound disjunctive-literal prechecks parallel to `patterns` /
+    /// `high_priority_patterns` / `low_priority_patterns`. A `None` entry means
+    /// "no gate, always run the regex".
+    gates: Vec<Option<RequiredLiterals>>,
+    high_gates: Vec<Option<RequiredLiterals>>,
+    low_gates: Vec<Option<RequiredLiterals>>,
+    /// One multi-pattern automaton over every high-priority gate literal.
+    #[cfg(feature = "rust-engine")]
+    header_matcher: Option<HeaderCandidates>,
+}
+
+/// Multi-pattern candidate prefilter for header inspection.
+///
+/// The per-pattern [`RequiredLiterals`] gate runs one search per literal. A
+/// request hits every enabled content rule, so a bodyless request paid that
+/// cost once per rule and once per header. This automaton scans a header value
+/// once and reports which patterns have a required literal present. It is a
+/// sound over-approximation (case-insensitive for every literal), so a pattern
+/// outside the candidate set provably cannot match and its regex is skipped.
+#[cfg(feature = "rust-engine")]
+struct HeaderCandidates {
+    ac: aho_corasick::AhoCorasick,
+    /// Pattern index for each automaton pattern id.
+    patterns: Vec<usize>,
+    /// Patterns whose gate has an always-matching (empty) literal.
+    always: u64,
+}
+
+#[cfg(feature = "rust-engine")]
+impl HeaderCandidates {
+    fn build(gates: &[Option<RequiredLiterals>]) -> Option<Self> {
+        let mut literals = Vec::new();
+        let mut owners = Vec::new();
+        let mut always = 0u64;
+        for (index, gate) in gates.iter().enumerate() {
+            let Some(gate) = gate else { continue };
+            for (literal, _case_insensitive) in gate.literals() {
+                if literal.is_empty() {
+                    if index < 64 {
+                        always |= 1u64 << index;
+                    }
+                    continue;
+                }
+                literals.push(literal.clone());
+                owners.push(index);
+            }
+        }
+        if literals.is_empty() {
+            return None;
+        }
+        let ac = aho_corasick::AhoCorasickBuilder::new()
+            .ascii_case_insensitive(true)
+            .build(&literals)
+            .ok()?;
+        Some(Self {
+            ac,
+            patterns: owners,
+            always,
+        })
+    }
+
+    /// Fill a candidate bitmask per header, in `HeaderMap` iteration order.
+    fn fill_masks(&self, headers: &hyper::HeaderMap, masks: &mut [u64]) {
+        for (index, (_, value)) in headers.iter().enumerate() {
+            let Some(slot) = masks.get_mut(index) else {
+                break;
+            };
+            let Ok(value) = value.to_str() else { continue };
+            // The per-pattern gate treats a non-ASCII haystack as "cannot rule
+            // out" (Unicode case folding). Keep that: mark every pattern a
+            // candidate so no regex is skipped.
+            if !value.is_ascii() {
+                *slot = u64::MAX;
+                continue;
+            }
+            for matched in self.ac.find_overlapping_iter(value.as_bytes()) {
+                let pattern = self.patterns[matched.pattern().as_usize()];
+                if pattern < 64 {
+                    *slot |= 1u64 << pattern;
+                }
+            }
+        }
+    }
+}
+
+fn gates_for(patterns: &[ThreatPattern]) -> Vec<Option<RequiredLiterals>> {
+    patterns
+        .iter()
+        .map(|pattern| required_literals(pattern.pattern.as_str()))
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+pub struct ThreatPattern {
+    pub name: String,
+    pub pattern: Regex,
+    pub severity: ThreatSeverity,
+    pub attack_type: AttackType,
+    pub check_uri: bool,
+    pub check_headers: bool,
+    pub check_body: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum AttackType {
+    SqlInjection,
+    XssAttack,
+    CommandInjection,
+    PathTraversal,
+    RemoteFileInclusion,
+    LocalFileInclusion,
+    XXEAttack,
+    SSRFAttack,
+}
+
+#[derive(Debug, Clone)]
+pub enum ThreatSeverity {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+// Pre-compiled patterns for performance
+/// Truncate attacker-controlled text on a UTF-8 character boundary.
+fn limited_match_text(value: &str) -> &str {
+    if value.len() <= 100 {
+        return value;
+    }
+    match value.char_indices().nth(100) {
+        Some((index, _)) => &value[..index],
+        None => value,
+    }
+}
+
+fn percent_decode(input: &str) -> Option<String> {
+    if !input.contains('%') && !input.contains('+') {
+        return None;
+    }
+    urlencoding::decode(input)
+        .ok()
+        .map(|decoded| decoded.into_owned())
+}
+
+static COMMON_PATTERNS: Lazy<Vec<ThreatPattern>> = Lazy::new(|| {
+    vec![
+        // SQL Injection patterns
+        ThreatPattern {
+            name: "SQL Injection - UNION SELECT".to_string(),
+            pattern: Regex::new(r"(?i)(?:^|[^a-z0-9_]|%20|\+)union(\s|%20|\+)+select(?:$|[^a-z0-9_]|%20|\+)").unwrap(),
+            severity: ThreatSeverity::High,
+            attack_type: AttackType::SqlInjection,
+            check_uri: true,
+            check_headers: true,
+            check_body: true,
+        },
+        ThreatPattern {
+            name: "SQL Injection - OR 1=1".to_string(),
+            pattern: Regex::new(
+                r#"(?i)(?:^|[^a-z0-9_]|%20|\+)or(\s|%20|\+)+['"]?\d+['"]?(\s|%20|\+)*=(\s|%20|\+)*['"]?\d+"#,
+            )
+            .unwrap(),
+            severity: ThreatSeverity::High,
+            attack_type: AttackType::SqlInjection,
+            check_uri: true,
+            check_headers: true,
+            check_body: true,
+        },
+        ThreatPattern {
+            name: "SQL Injection - DROP TABLE".to_string(),
+            pattern: Regex::new(r"(?i)(?:^|[^a-z0-9_]|%20|\+)drop(\s|%20|\+)+table(?:$|[^a-z0-9_]|%20|\+)").unwrap(),
+            severity: ThreatSeverity::Critical,
+            attack_type: AttackType::SqlInjection,
+            check_uri: true,
+            check_headers: true,
+            check_body: true,
+        },
+        // XSS patterns
+        ThreatPattern {
+            name: "XSS - Script tag".to_string(),
+            pattern: Regex::new(r"(?i)(<|%3C)script[^>%]*?(>|%3E)").unwrap(),
+            severity: ThreatSeverity::High,
+            attack_type: AttackType::XssAttack,
+            check_uri: true,
+            check_headers: true,
+            check_body: true,
+        },
+        ThreatPattern {
+            name: "XSS - JavaScript protocol".to_string(),
+            pattern: Regex::new(r"(?i)javascript:").unwrap(),
+            severity: ThreatSeverity::Medium,
+            attack_type: AttackType::XssAttack,
+            check_uri: true,
+            check_headers: true,
+            check_body: true,
+        },
+        ThreatPattern {
+            name: "XSS - Event handlers".to_string(),
+            pattern: Regex::new(r"(?i)on(load|error|click|mouseover)(\s|%20|\+)*=").unwrap(),
+            severity: ThreatSeverity::High,
+            attack_type: AttackType::XssAttack,
+            check_uri: true,
+            check_headers: true,
+            check_body: true,
+        },
+        // Command Injection patterns
+        ThreatPattern {
+            name: "Command Injection - Shell commands".to_string(),
+            pattern: Regex::new(r"(?i)(;|&&|\|\|)(\s|%20|\+)*(cat|ls|ps|id|whoami|pwd)\b").unwrap(),
+            severity: ThreatSeverity::Critical,
+            attack_type: AttackType::CommandInjection,
+            check_uri: true,
+            check_headers: true,
+            check_body: true,
+        },
+        ThreatPattern {
+            name: "Command Injection - Pipe commands".to_string(),
+            pattern: Regex::new(r"\|(\s|%20|\+)*(wget|curl|nc|netcat)\b").unwrap(),
+            severity: ThreatSeverity::Critical,
+            attack_type: AttackType::CommandInjection,
+            check_uri: true,
+            check_headers: true,
+            check_body: true,
+        },
+        // Path Traversal patterns
+        ThreatPattern {
+            name: "Path Traversal - Directory traversal".to_string(),
+            pattern: Regex::new(r"(\.\./|\.\.\\){2,}").unwrap(),
+            severity: ThreatSeverity::High,
+            attack_type: AttackType::PathTraversal,
+            check_uri: true,
+            check_headers: true,
+            check_body: true,
+        },
+        ThreatPattern {
+            name: "Path Traversal - Absolute paths".to_string(),
+            pattern: Regex::new(r"(?i)(^|[^a-z])/etc/(passwd|shadow|hosts)").unwrap(),
+            severity: ThreatSeverity::High,
+            attack_type: AttackType::PathTraversal,
+            check_uri: true,
+            check_headers: true,
+            check_body: true,
+        },
+        // File Inclusion patterns
+        ThreatPattern {
+            name: "Remote File Inclusion - HTTP URLs".to_string(),
+            pattern: Regex::new(r"(?i)https?://[^/\s]+/").unwrap(),
+            severity: ThreatSeverity::Medium,
+            attack_type: AttackType::RemoteFileInclusion,
+            check_uri: true,
+            check_headers: false,
+            check_body: true,
+        },
+        ThreatPattern {
+            name: "Local File Inclusion - File protocol".to_string(),
+            pattern: Regex::new(r"(?i)file://").unwrap(),
+            severity: ThreatSeverity::High,
+            attack_type: AttackType::LocalFileInclusion,
+            check_uri: true,
+            check_headers: false,
+            check_body: true,
+        },
+        // XXE patterns
+        ThreatPattern {
+            name: "XXE Attack - External entity".to_string(),
+            pattern: Regex::new(r"(?i)<!entity[^>]+system").unwrap(),
+            severity: ThreatSeverity::High,
+            attack_type: AttackType::XXEAttack,
+            check_uri: false,
+            check_headers: false,
+            check_body: true,
+        },
+        // SSRF patterns
+        ThreatPattern {
+            name: "SSRF - Localhost access".to_string(),
+            pattern: Regex::new(r"(?i)(localhost|127\.0\.0\.1|0\.0\.0\.0)").unwrap(),
+            severity: ThreatSeverity::Medium,
+            attack_type: AttackType::SSRFAttack,
+            check_uri: true,
+            check_headers: false,
+            check_body: true,
+        },
+        ThreatPattern {
+            name: "SSRF - Internal IP ranges".to_string(),
+            pattern: Regex::new(r"(?i)(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.)").unwrap(),
+            severity: ThreatSeverity::Medium,
+            attack_type: AttackType::SSRFAttack,
+            check_uri: true,
+            check_headers: false,
+            check_body: true,
+        },
+    ]
+});
+
+impl ContentInspectionRule {
+    pub fn new(name: &str) -> Self {
+        let patterns = COMMON_PATTERNS.clone();
+        let (high_priority, low_priority) = Self::categorize_patterns(&patterns);
+        let gates = gates_for(&patterns);
+        let high_gates = gates_for(&high_priority);
+        let low_gates = gates_for(&low_priority);
+        #[cfg(feature = "rust-engine")]
+        let header_matcher = HeaderCandidates::build(&high_gates);
+
+        Self {
+            name: name.to_string(),
+            enabled: true,
+            inspect_headers: true,
+            inspect_body: true,
+            patterns,
+            high_priority_patterns: high_priority,
+            low_priority_patterns: low_priority,
+            gates,
+            high_gates,
+            low_gates,
+            #[cfg(feature = "rust-engine")]
+            header_matcher,
+        }
+    }
+
+    pub fn with_custom_patterns(name: &str, patterns: Vec<ThreatPattern>) -> Self {
+        let (high_priority, low_priority) = Self::categorize_patterns(&patterns);
+        let gates = gates_for(&patterns);
+        let high_gates = gates_for(&high_priority);
+        let low_gates = gates_for(&low_priority);
+        #[cfg(feature = "rust-engine")]
+        let header_matcher = HeaderCandidates::build(&high_gates);
+
+        Self {
+            name: name.to_string(),
+            enabled: true,
+            inspect_headers: true,
+            inspect_body: true,
+            patterns,
+            high_priority_patterns: high_priority,
+            low_priority_patterns: low_priority,
+            gates,
+            high_gates,
+            low_gates,
+            #[cfg(feature = "rust-engine")]
+            header_matcher,
+        }
+    }
+
+    pub fn enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    pub fn with_inspection(mut self, inspect_headers: bool, inspect_body: bool) -> Self {
+        self.inspect_headers = inspect_headers;
+        self.inspect_body = inspect_body;
+        self
+    }
+
+    pub fn add_pattern(&mut self, pattern: ThreatPattern) {
+        let gate = required_literals(pattern.pattern.as_str());
+        // Categorize new pattern for performance
+        match pattern.severity {
+            ThreatSeverity::Critical | ThreatSeverity::High => {
+                self.high_priority_patterns.push(pattern.clone());
+                self.high_gates.push(gate.clone());
+            }
+            ThreatSeverity::Medium | ThreatSeverity::Low => {
+                self.low_priority_patterns.push(pattern.clone());
+                self.low_gates.push(gate.clone());
+            }
+        }
+        self.patterns.push(pattern);
+        self.gates.push(gate);
+        // The automaton covers the old pattern set; fall back to the
+        // per-pattern literal gates instead of rebuilding on mutation.
+        #[cfg(feature = "rust-engine")]
+        {
+            self.header_matcher = None;
+        }
+    }
+
+    /// Performance optimization: categorize patterns by priority
+    fn categorize_patterns(patterns: &[ThreatPattern]) -> (Vec<ThreatPattern>, Vec<ThreatPattern>) {
+        let mut high_priority = Vec::new();
+        let mut low_priority = Vec::new();
+
+        for pattern in patterns {
+            match pattern.severity {
+                ThreatSeverity::Critical | ThreatSeverity::High => {
+                    high_priority.push(pattern.clone());
+                }
+                ThreatSeverity::Medium | ThreatSeverity::Low => {
+                    low_priority.push(pattern.clone());
+                }
+            }
+        }
+
+        (high_priority, low_priority)
+    }
+
+    /// Check high-priority patterns.
+    ///
+    /// Regex matching is always performed. The SIMD helpers are only a
+    /// fast-path optimisation and must never decide that content is safe,
+    /// otherwise encodings such as `UNION+SELECT` or `%3Cscript%3E` bypass
+    /// inspection.
+    fn fast_check_content(&self, content: &str) -> Option<(&ThreatPattern, String)> {
+        Self::find_match(&self.high_priority_patterns, &self.high_gates, content)
+    }
+
+    fn check_content(&self, content: &str) -> Option<(&ThreatPattern, String)> {
+        // First check high-priority patterns, then medium/low severity ones.
+        if let Some(result) = self.fast_check_content(content) {
+            return Some(result);
+        }
+        Self::find_match(&self.low_priority_patterns, &self.low_gates, content)
+    }
+
+    /// Check both the raw value and its percent-decoded form. Attackers often
+    /// encode quote/space/angle-bracket characters to bypass naive rules.
+    fn check_with_decoding(&self, content: &str, full: bool) -> Option<(&ThreatPattern, String)> {
+        if let Some(found) =
+            Self::find_match(&self.high_priority_patterns, &self.high_gates, content)
+        {
+            return Some(found);
+        }
+        if full {
+            if let Some(found) =
+                Self::find_match(&self.low_priority_patterns, &self.low_gates, content)
+            {
+                return Some(found);
+            }
+        }
+        if let Some(decoded) = percent_decode(content) {
+            if decoded != content {
+                if let Some(found) =
+                    Self::find_match(&self.high_priority_patterns, &self.high_gates, &decoded)
+                {
+                    return Some(found);
+                }
+                if full {
+                    return Self::find_match(
+                        &self.low_priority_patterns,
+                        &self.low_gates,
+                        &decoded,
+                    );
+                }
+            }
+        }
+        None
+    }
+
+    fn inspect_body(&self, content: &str) -> Option<(&ThreatPattern, String)> {
+        for (index, pattern) in self.patterns.iter().enumerate() {
+            if !pattern.check_body {
+                continue;
+            }
+            if self
+                .gates
+                .get(index)
+                .and_then(Option::as_ref)
+                .is_some_and(|gate| !gate.matches(content.as_bytes()))
+            {
+                continue;
+            }
+            if let Some(matched) = pattern.pattern.find(content) {
+                return Some((pattern, limited_match_text(matched.as_str()).to_string()));
+            }
+        }
+        None
+    }
+
+    fn find_match<'a>(
+        patterns: &'a [ThreatPattern],
+        gates: &[Option<RequiredLiterals>],
+        content: &str,
+    ) -> Option<(&'a ThreatPattern, String)> {
+        for (index, pattern) in patterns.iter().enumerate() {
+            if gates
+                .get(index)
+                .and_then(Option::as_ref)
+                .is_some_and(|gate| !gate.matches(content.as_bytes()))
+            {
+                continue;
+            }
+            if let Some(matched) = pattern.pattern.find(content) {
+                return Some((pattern, limited_match_text(matched.as_str()).to_string()));
+            }
+        }
+        None
+    }
+
+    fn severity_to_status(&self, severity: &ThreatSeverity) -> u16 {
+        match severity {
+            ThreatSeverity::Low => 400,
+            ThreatSeverity::Medium => 403,
+            ThreatSeverity::High => 403,
+            ThreatSeverity::Critical => 403,
+        }
+    }
+}
+
+impl WafRule for ContentInspectionRule {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn cacheable(&self) -> bool {
+        true
+    }
+
+    fn fast_allow_policy(&self) -> crate::waf::fast_allow::FastAllowPolicy {
+        // Stateless content inspection: an explicitly allowlisted route opts
+        // out of this rule. The route list is the operator's exemption.
+        crate::waf::fast_allow::FastAllowPolicy::Skip
+    }
+
+    fn evaluate(&self, ctx: &RequestContext) -> Decision {
+        if !self.enabled {
+            return Decision::Allow;
+        }
+
+        // Performance optimization: limit content size to prevent DoS
+        const MAX_CONTENT_SIZE: usize = 8192; // 8KB limit for pattern matching
+
+        // Check URI path (high priority). Over-length URIs are rejected rather
+        // than skipped, otherwise padding can hide a payload.
+        let uri_path = ctx.uri.path();
+        if uri_path.len() > MAX_CONTENT_SIZE {
+            return Decision::Block {
+                status: 414,
+                reason: "Content inspection: URI path too long".to_string(),
+            };
+        }
+        if let Some((pattern, matched)) = self.check_with_decoding(uri_path, false) {
+            if pattern.check_uri {
+                return Decision::Block {
+                    status: self.severity_to_status(&pattern.severity),
+                    reason: format!(
+                        "Content inspection: {} detected in URI: {}",
+                        pattern.name, matched
+                    ),
+                };
+            }
+        }
+
+        // Check query parameters (if present).
+        if let Some(query) = ctx.uri.query() {
+            if query.len() > MAX_CONTENT_SIZE {
+                return Decision::Block {
+                    status: 414,
+                    reason: "Content inspection: query string too long".to_string(),
+                };
+            }
+            // Use full check on query to include medium/low severity patterns.
+            if let Some((pattern, matched)) = self.check_with_decoding(query, true) {
+                if pattern.check_uri {
+                    return Decision::Block {
+                        status: self.severity_to_status(&pattern.severity),
+                        reason: format!(
+                            "Content inspection: {} detected in query: {}",
+                            pattern.name, matched
+                        ),
+                    };
+                }
+            }
+        }
+
+        // Check headers (optimized for performance)
+        if self.inspect_headers {
+            #[cfg(feature = "rust-engine")]
+            let header_matcher = self.header_matcher.as_ref();
+            #[cfg(feature = "rust-engine")]
+            let mut stack_masks = [0u64; 16];
+            #[cfg(feature = "rust-engine")]
+            let mut heap_masks: Vec<u64> = Vec::new();
+            #[cfg(feature = "rust-engine")]
+            let candidate_masks: Option<&[u64]> = match header_matcher {
+                Some(matcher) => {
+                    let len = ctx.headers.len();
+                    if len <= stack_masks.len() {
+                        let masks = &mut stack_masks[..len];
+                        matcher.fill_masks(&ctx.headers, masks);
+                        Some(&*masks)
+                    } else {
+                        heap_masks.resize(len, 0);
+                        matcher.fill_masks(&ctx.headers, &mut heap_masks);
+                        Some(heap_masks.as_slice())
+                    }
+                }
+                None => None,
+            };
+
+            for (index, pattern) in self.high_priority_patterns.iter().enumerate() {
+                if !pattern.check_headers {
+                    continue;
+                }
+                let gate = self.high_gates.get(index).and_then(Option::as_ref);
+                for (header_index, (header_name, header_value)) in ctx.headers.iter().enumerate() {
+                    #[cfg(not(feature = "rust-engine"))]
+                    let _ = header_index;
+                    let Ok(header_str) = header_value.to_str() else {
+                        continue;
+                    };
+                    #[cfg(feature = "rust-engine")]
+                    let candidate = match (candidate_masks, header_matcher) {
+                        // A pattern with no required literal always runs. A
+                        // pattern in the automaton set needs a literal hit (or
+                        // an always-matching empty literal).
+                        (Some(masks), Some(matcher)) if index < 64 && gate.is_some() => {
+                            matcher.always & (1u64 << index) != 0
+                                || masks
+                                    .get(header_index)
+                                    .is_some_and(|mask| mask & (1u64 << index) != 0)
+                        }
+                        _ => gate.is_none_or(|gate| gate.matches(header_str.as_bytes())),
+                    };
+                    #[cfg(not(feature = "rust-engine"))]
+                    let candidate = gate.is_none_or(|gate| gate.matches(header_str.as_bytes()));
+                    if !candidate {
+                        continue;
+                    }
+                    if pattern.pattern.is_match(header_str) {
+                        return Decision::Block {
+                            status: self.severity_to_status(&pattern.severity),
+                            reason: format!(
+                                "Content inspection: {} detected in header {}",
+                                pattern.name, header_name
+                            ),
+                        };
+                    }
+                }
+            }
+        }
+
+        // Inspect the complete accepted body. The proxy enforces
+        // `server.max_body_size`; this hard cap is a final defence against
+        // inspecting an unbounded buffer.
+        const MAX_BODY_INSPECTION: usize = 16 * 1024 * 1024; // 16 MiB
+        if self.inspect_body {
+            if let Some(body) = &ctx.body {
+                if body.len() > MAX_BODY_INSPECTION {
+                    return Decision::Block {
+                        status: 413,
+                        reason: format!(
+                            "Content inspection: body exceeds {} bytes",
+                            MAX_BODY_INSPECTION
+                        ),
+                    };
+                }
+                let content = String::from_utf8_lossy(body);
+                let found = self.inspect_body(&content).or_else(|| {
+                    percent_decode(&content)
+                        .filter(|decoded| decoded != &content)
+                        .and_then(|decoded| self.inspect_body(&decoded))
+                });
+                if let Some((pattern, matched)) = found {
+                    return Decision::Block {
+                        status: self.severity_to_status(&pattern.severity),
+                        reason: format!(
+                            "Content inspection: {} detected in body: {}",
+                            pattern.name, matched
+                        ),
+                    };
+                }
+            }
+        }
+
+        Decision::Allow
+    }
+}
+
+/// Factory for creating common content inspection rules
+pub struct ContentInspectionRuleFactory;
+
+impl ContentInspectionRuleFactory {
+    /// Create a threat rule by pattern name
+    pub fn create_threat_rule(pattern_name: &str) -> ContentInspectionRule {
+        match pattern_name {
+            "sql_injection" => Self::sql_injection_rule(),
+            "xss" => Self::xss_rule(),
+            "command_injection" => Self::command_injection_rule(),
+            "path_traversal" => Self::path_traversal_rule(),
+            _ => {
+                // Default to a combined rule with all patterns
+                ContentInspectionRule::new("Generic Threat Detection")
+            }
+        }
+    }
+
+    pub fn sql_injection_rule() -> ContentInspectionRule {
+        let patterns = COMMON_PATTERNS
+            .iter()
+            .filter(|p| matches!(p.attack_type, AttackType::SqlInjection))
+            .cloned()
+            .collect();
+
+        ContentInspectionRule::with_custom_patterns("SQL Injection Detection", patterns)
+    }
+
+    pub fn xss_rule() -> ContentInspectionRule {
+        let patterns = COMMON_PATTERNS
+            .iter()
+            .filter(|p| matches!(p.attack_type, AttackType::XssAttack))
+            .cloned()
+            .collect();
+
+        ContentInspectionRule::with_custom_patterns("XSS Detection", patterns)
+    }
+
+    pub fn command_injection_rule() -> ContentInspectionRule {
+        let patterns = COMMON_PATTERNS
+            .iter()
+            .filter(|p| matches!(p.attack_type, AttackType::CommandInjection))
+            .cloned()
+            .collect();
+
+        ContentInspectionRule::with_custom_patterns("Command Injection Detection", patterns)
+    }
+
+    pub fn path_traversal_rule() -> ContentInspectionRule {
+        let patterns = COMMON_PATTERNS
+            .iter()
+            .filter(|p| matches!(p.attack_type, AttackType::PathTraversal))
+            .cloned()
+            .collect();
+
+        ContentInspectionRule::with_custom_patterns("Path Traversal Detection", patterns)
+    }
+
+    pub fn all_attacks_rule() -> ContentInspectionRule {
+        ContentInspectionRule::new("All Common Attacks Detection")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyper::{HeaderMap, Method, Uri};
+    use std::str::FromStr;
+
+    fn create_test_context(uri: &str, headers: Option<HeaderMap>) -> RequestContext {
+        RequestContext::new(
+            std::net::IpAddr::from_str("192.168.1.100").unwrap(),
+            Method::GET,
+            Uri::from_str(uri).unwrap(),
+            headers.unwrap_or_default(),
+            None,
+        )
+    }
+
+    #[test]
+    fn test_sql_injection_detection() {
+        let rule = ContentInspectionRuleFactory::sql_injection_rule();
+
+        // Test UNION SELECT attack (using + for spaces which should now work with updated regex)
+        let ctx = create_test_context("/api/users?id=1+UNION+SELECT+*+FROM+passwords", None);
+        match rule.evaluate(&ctx) {
+            Decision::Block { reason, .. } => {
+                assert!(reason.contains("SQL Injection"));
+            }
+            _ => panic!("Expected SQL injection to be blocked"),
+        }
+
+        // Test clean request
+        let ctx = create_test_context("/api/users?id=123", None);
+        assert_eq!(rule.evaluate(&ctx), Decision::Allow);
+    }
+
+    #[test]
+    fn test_xss_detection() {
+        let rule = ContentInspectionRuleFactory::xss_rule();
+
+        // Test script tag injection (URL encoded, should now work with updated regex)
+        let ctx = create_test_context("/search?q=%3Cscript%3Ealert('xss')%3C/script%3E", None);
+        match rule.evaluate(&ctx) {
+            Decision::Block { reason, .. } => {
+                assert!(reason.contains("XSS"));
+            }
+            _ => panic!("Expected XSS to be blocked"),
+        }
+
+        // Test javascript protocol
+        let ctx = create_test_context("/redirect?url=javascript:alert(1)", None);
+        match rule.evaluate(&ctx) {
+            Decision::Block { reason, .. } => {
+                assert!(reason.contains("XSS"));
+            }
+            _ => panic!("Expected XSS to be blocked"),
+        }
+    }
+
+    #[test]
+    fn test_command_injection_detection() {
+        let rule = ContentInspectionRuleFactory::command_injection_rule();
+
+        // Test command chaining (should now work with updated regex for + characters)
+        let ctx = create_test_context("/exec?cmd=test;cat+/etc/passwd", None);
+        match rule.evaluate(&ctx) {
+            Decision::Block { reason, .. } => {
+                assert!(reason.contains("Command Injection"));
+            }
+            _ => panic!("Expected command injection to be blocked"),
+        }
+    }
+
+    #[test]
+    fn test_path_traversal_detection() {
+        let rule = ContentInspectionRuleFactory::path_traversal_rule();
+
+        // Test directory traversal
+        let ctx = create_test_context("/file?path=../../../etc/passwd", None);
+        match rule.evaluate(&ctx) {
+            Decision::Block { reason, .. } => {
+                assert!(reason.contains("Path Traversal"));
+            }
+            _ => panic!("Expected path traversal to be blocked"),
+        }
+    }
+
+    #[test]
+    fn test_disabled_rule() {
+        let rule = ContentInspectionRuleFactory::sql_injection_rule().enabled(false);
+
+        let ctx = create_test_context("/api/users?id=1+UNION+SELECT+*+FROM+passwords", None);
+        assert_eq!(rule.evaluate(&ctx), Decision::Allow);
+    }
+
+    #[test]
+    fn test_custom_pattern() {
+        let custom_pattern = ThreatPattern {
+            name: "Custom Attack Pattern".to_string(),
+            pattern: Regex::new(r"CUSTOM_ATTACK").unwrap(),
+            severity: ThreatSeverity::High,
+            attack_type: AttackType::SqlInjection,
+            check_uri: true,
+            check_headers: false,
+            check_body: false,
+        };
+
+        let mut rule = ContentInspectionRule::new("Custom Rule");
+        rule.add_pattern(custom_pattern);
+
+        let ctx = create_test_context("/test?param=CUSTOM_ATTACK", None);
+        match rule.evaluate(&ctx) {
+            Decision::Block { reason, .. } => {
+                assert!(reason.contains("Custom Attack Pattern"));
+            }
+            _ => panic!("Expected custom pattern to be blocked"),
+        }
+    }
+
+    #[test]
+    fn test_header_inspection() {
+        let pattern = ThreatPattern {
+            name: "Header XSS".to_string(),
+            pattern: Regex::new(r"(?i)<script").unwrap(),
+            severity: ThreatSeverity::High,
+            attack_type: AttackType::XssAttack,
+            check_uri: false,
+            check_headers: true,
+            check_body: false,
+        };
+
+        let rule = ContentInspectionRule::with_custom_patterns("Header Rule", vec![pattern]);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-custom-header",
+            "<script>alert('xss')</script>".parse().unwrap(),
+        );
+        let ctx = create_test_context("/", Some(headers));
+
+        match rule.evaluate(&ctx) {
+            Decision::Block { reason, .. } => {
+                assert!(reason.contains("Header XSS"));
+            }
+            _ => panic!("Expected header XSS to be blocked"),
+        }
+    }
+
+    #[test]
+    fn test_header_candidate_prefilter_is_case_insensitive() {
+        let pattern = ThreatPattern {
+            name: "Header XSS ci".to_string(),
+            pattern: Regex::new(r"(?i)<script").unwrap(),
+            severity: ThreatSeverity::High,
+            attack_type: AttackType::XssAttack,
+            check_uri: false,
+            check_headers: true,
+            check_body: false,
+        };
+        let rule = ContentInspectionRule::with_custom_patterns("Header Rule", vec![pattern]);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-custom-header", "PREFIX <ScRiPt>".parse().unwrap());
+        let ctx = create_test_context("/", Some(headers));
+
+        assert!(matches!(rule.evaluate(&ctx), Decision::Block { .. }));
+    }
+
+    #[test]
+    fn test_severity_status_mapping() {
+        let rule = ContentInspectionRule::new("test");
+
+        assert_eq!(rule.severity_to_status(&ThreatSeverity::Low), 400);
+        assert_eq!(rule.severity_to_status(&ThreatSeverity::Medium), 403);
+        assert_eq!(rule.severity_to_status(&ThreatSeverity::High), 403);
+        assert_eq!(rule.severity_to_status(&ThreatSeverity::Critical), 403);
+    }
+
+    #[test]
+    fn test_overlong_uri_is_rejected_not_skipped() {
+        let rule = ContentInspectionRuleFactory::sql_injection_rule();
+        let uri = format!("/?q={}", "a".repeat(9000));
+        let ctx = create_test_context(&uri, None);
+
+        assert!(matches!(
+            rule.evaluate(&ctx),
+            Decision::Block { status: 414, .. }
+        ));
+    }
+
+    #[test]
+    fn test_body_inspection_can_be_disabled() {
+        let rule = ContentInspectionRuleFactory::sql_injection_rule().with_inspection(true, false);
+        let mut ctx = create_test_context("/login", None);
+        ctx = ctx.with_body(Some(bytes::Bytes::from_static(
+            b"id=1 UNION SELECT * FROM users",
+        )));
+        assert_eq!(rule.evaluate(&ctx), Decision::Allow);
+    }
+
+    #[test]
+    fn test_header_inspection_can_be_disabled() {
+        let rule = ContentInspectionRuleFactory::xss_rule().with_inspection(false, true);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-test", "<script>alert(1)</script>".parse().unwrap());
+        let ctx = create_test_context("/", Some(headers));
+        assert_eq!(rule.evaluate(&ctx), Decision::Allow);
+    }
+
+    #[test]
+    fn test_body_payload_after_one_mib_is_inspected() {
+        let rule = ContentInspectionRuleFactory::sql_injection_rule();
+        let mut body = "A".repeat(1_100_000);
+        body.push_str(" id=1 UNION SELECT * FROM users");
+
+        let mut ctx = create_test_context("/login", None);
+        ctx = ctx.with_body(Some(bytes::Bytes::from(body)));
+        assert!(matches!(rule.evaluate(&ctx), Decision::Block { .. }));
+    }
+}

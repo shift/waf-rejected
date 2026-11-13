@@ -1,0 +1,236 @@
+# WAF-Rejected container configuration
+#
+# Baked into the image as /etc/waf/config.toml and loaded by `waf-ingress`.
+# The request-inspection backend is the native Rust CRS engine (compiled with
+# the default `rust-engine` feature). Coraza remains available with
+# `[waf.coraza] backend = "wasm"`.
+#
+# Any WAF_* environment variable overrides this file, using `__` for nesting,
+# for example WAF_SERVER__MAX_BODY_SIZE=2097152.
+#
+# Authentication is disabled here. Enable `security.auth` with keys injected
+# from a secret before exposing the proxy.
+
+bind_addr = "0.0.0.0:8080"
+health_bind_addr = "0.0.0.0:8081"
+upstream_uri = "http://127.0.0.1:3000"
+
+[proxy]
+timeout_seconds = 30
+max_request_size = 10485760
+# upstream_ca_path = "/etc/waf/certs/upstream-ca.pem"
+# upstream_client_cert_path = "/etc/waf/certs/client.crt"
+# upstream_client_key_path = "/etc/waf/certs/client.key"
+
+[proxy.pool]
+enabled = false
+max_idle_per_host = 32
+idle_timeout_secs = 90
+health_check_interval_secs = 0
+health_check_path = "/healthz"
+
+[proxy.streaming]
+enabled = false
+response_threshold_bytes = 1048576
+
+[server]
+max_connections = 10000
+trusted_proxies = []
+request_timeout_secs = 30
+keep_alive_timeout_secs = 90
+enable_http2 = true
+enable_http3 = false
+supported_http_versions = ["1.0", "1.1", "2"]
+max_body_size = 2097152
+grpc_max_stream_bytes = 4194304
+grpc_max_stream_seconds = 300
+grpc_aware_rejections = false
+io_backend = "tokio"
+
+[server.tls]
+enabled = false
+cert_path = "/etc/waf-rejected/certs/server.crt"
+key_path = "/etc/waf-rejected/certs/server.key"
+min_version = "1.2"
+max_version = "1.3"
+alpn_protocols = ["h2", "http/1.1"]
+require_client_cert = false
+session_resumption = false
+session_cache_size = 256
+tls13_tickets = 2
+tcp_nodelay = false
+tcp_keepalive_secs = 0
+tcp_keepalive_interval_secs = 0
+tcp_fast_open = false
+
+[server.http2]
+enabled = false
+initial_stream_window_bytes = 1048576
+initial_connection_window_bytes = 16777216
+max_concurrent_streams = 256
+max_pending_accept_reset_streams = 1024
+keep_alive_interval_secs = 30
+keep_alive_timeout_secs = 10
+keep_alive_while_idle = false
+adaptive_window = false
+
+[server.webtransport]
+enabled = false
+bind_addr = "0.0.0.0:4434"
+require_origin = true
+allowed_origins = []
+allowed_paths = []
+max_sessions = 1024
+max_sessions_per_ip = 32
+max_bidi_streams = 16
+max_uni_streams = 16
+max_datagram_bytes = 1200
+max_stream_bytes = 1048576
+idle_timeout_secs = 30
+max_session_secs = 300
+inspect_streams = true
+inspect_datagrams = true
+
+[logging]
+level = "info"
+json_format = true
+
+[waf]
+enabled = true
+fail_mode = "closed"
+
+[waf.rate_limit]
+per_ip_enabled = true
+per_ip_max_requests = 100
+per_ip_window_secs = 60
+global_enabled = true
+global_max_requests = 10000
+global_window_secs = 60
+
+[waf.security_events]
+enabled = true
+min_threat_level = "medium"
+enable_cef = true
+cef_output_file = "/var/lib/waf/logs/security_events.cef"
+cef_device_vendor = "WAF-Rejected"
+cef_device_product = "WAF-Rejected"
+cef_device_version = "0.1.0-beta.13"
+enable_otel = false
+# The persistent audit store is configured in [storage].
+
+[waf.content_inspection]
+enabled = true
+inspect_headers = true
+inspect_body = true
+max_body_size = 10485760
+threat_patterns = ["sql_injection", "xss", "command_injection", "path_traversal"]
+
+[waf.geo_blocking]
+enabled = false
+# database_path = "/var/lib/waf/GeoLite2-City.mmdb"
+# anonymous_database_path = "/var/lib/waf/GeoIP2-Anonymous-IP.mmdb"
+blocked_countries = []
+blocked_regions = []
+block_tor = false
+block_vpn = false
+block_datacenter = false
+
+[waf.admission]
+enabled = true
+heavy_permits = 0
+queue_timeout_ms = 250
+max_queued = 64
+
+[waf.coraza]
+enabled = true
+# Default request-inspection backend: "rust" (compiled with `rust-engine`).
+# Set "wasm" for the Coraza reference reactor or "native" for the sidecar.
+# backend = "rust"
+# Runtime-error fallback: "none" (fail closed, default) or "wasm".
+# fallback = "none"
+# native_socket_path = "/run/waf/coraza.sock"
+# max_payload_bytes = 65536
+# max_inspect_bytes = 0
+# oversize_action = "inspect-all"
+# memory_limit_bytes = 268435456
+# eval_timeout_ms = 5000
+# pool_size = 0
+# prefilter = "off"
+
+[waf.grpc]
+enabled = true
+method_allowlist = []
+# allowlist_file = "/etc/waf/grpc/allowlist.json"
+max_message_bytes = 4194304
+max_frames = 64
+max_string_bytes = 1048576
+max_bytes_len = 1048576
+max_repeated = 1024
+max_depth = 32
+max_decoded_fields = 100000
+reject_unknown_fields = false
+validate_strings = true
+content_scan = "strings"
+max_content_scan_bytes = 65536
+
+[waf.graphql]
+enabled = true
+body_scan = "crs"
+operation_allowlist = []
+# allowlist_file = "/etc/waf/graphql/allowlist.json"
+max_body_bytes = 8388608
+max_query_bytes = 1048576
+max_variables_bytes = 1048576
+max_variables = 128
+max_depth = 128
+max_aliases = 1024
+max_fields = 8192
+allow_mutations = true
+allow_subscriptions = true
+
+[waf.allow_cache]
+enabled = false
+ttl_secs = 30
+max_entries = 8192
+max_body_bytes = 65536
+routes = []
+
+[waf.fast_allow]
+enabled = false
+routes = []
+allow_audit_sample_rate = 0.0
+
+[waf.wasm]
+# Legacy component-ABI integration (`wasm-waf` feature only); not the live
+# Coraza engine. Leave disabled.
+enabled = false
+
+[security.auth]
+enabled = false
+api_keys = []
+header_name = "X-API-Key"
+require_https = false
+# Optional auth-stage rate limits:
+# [security.auth.rate_limit]
+# requests_per_minute = 60
+# per_ip_enabled = true
+# per_ip_max_requests = 100
+# per_ip_window_secs = 60
+
+[security.ai]
+enabled = false
+threat_threshold = 0.8
+timeout_ms = 5000
+
+[storage]
+# Persistent audit-trail store. redb is the default; sled is the legacy backend.
+enabled = true
+backend = "redb"
+path = "/var/lib/waf/data/waf_security_events.redb"
+max_events = 100000
+# Minimum seconds between retention passes. 0 = cleanup after every write.
+ttl_cleanup_interval = { secs = 60, nanos = 0 }
+cache_size = 16777216
+
+[runtime]
+enable_cpu_pinning = false
