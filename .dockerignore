@@ -1,0 +1,15 @@
+target
+.git
+.github
+old_docs
+data
+logs
+*.log
+result
+result-*
+.worktrees
+.release-assets
+.container-storage*
+.worktrees
+.release-assets
+.container-storage*

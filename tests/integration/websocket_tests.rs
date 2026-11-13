@@ -1,0 +1,570 @@
+//! End-to-end WebSocket upgrade/tunnel test.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use futures_util::{SinkExt, StreamExt};
+use rcgen::{
+    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+    KeyUsagePurpose,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::oneshot;
+use tokio_rustls::rustls;
+use tokio_rustls::rustls::pki_types::pem::PemObject;
+use tokio_rustls::TlsAcceptor;
+use tokio_tungstenite::tungstenite::handshake::server::{
+    Request as WsRequest, Response as WsResponse,
+};
+use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
+use tokio_tungstenite::tungstenite::protocol::frame::Frame;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::Message;
+
+use waf_ingress::proxy::WafProxyService;
+use waf_ingress::Config;
+
+async fn spawn_ws_upstream() -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        while let Some(Ok(message)) = ws.next().await {
+            if message.is_text() && ws.send(message).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    addr
+}
+
+async fn spawn_proxy(upstream: std::net::SocketAddr) -> String {
+    let mut config = Config {
+        upstream_uri: format!("http://{}", upstream),
+        ..Config::default()
+    };
+    config.server.max_body_size = 4096;
+    config.waf.rate_limit.per_ip_enabled = false;
+    config.waf.rate_limit.global_enabled = false;
+    config.waf.coraza.enabled = false;
+
+    let service = Arc::new(WafProxyService::new(config).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = service.start_with_listener(listener).await;
+    });
+
+    format!("{}", addr)
+}
+
+async fn spawn_proxy_with_ws_limits(
+    upstream: std::net::SocketAddr,
+    max_frame_bytes: usize,
+    max_message_bytes: usize,
+) -> String {
+    let mut config = Config {
+        upstream_uri: format!("http://{}", upstream),
+        ..Config::default()
+    };
+    config.server.max_body_size = 4096;
+    config.server.websocket.max_frame_bytes = max_frame_bytes;
+    config.server.websocket.max_message_bytes = max_message_bytes;
+    config.waf.rate_limit.per_ip_enabled = false;
+    config.waf.rate_limit.global_enabled = false;
+    config.waf.coraza.enabled = false;
+
+    spawn_proxy_for_config(config).await
+}
+
+async fn spawn_proxy_with_ws_response_inspection(
+    upstream: std::net::SocketAddr,
+    inspect_responses: bool,
+) -> String {
+    let mut config = Config {
+        upstream_uri: format!("http://{}", upstream),
+        ..Config::default()
+    };
+    config.server.max_body_size = 4096;
+    config.server.websocket.inspect_responses = inspect_responses;
+    config.waf.rate_limit.per_ip_enabled = false;
+    config.waf.rate_limit.global_enabled = false;
+    config.waf.coraza.enabled = false;
+
+    spawn_proxy_for_config(config).await
+}
+
+async fn spawn_proxy_for_config(config: Config) -> String {
+    let service = Arc::new(WafProxyService::new(config).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = service.start_with_listener(listener).await;
+    });
+
+    format!("{}", addr)
+}
+
+/// Perform a raw client handshake so tests can send headers (extensions) that
+/// the tungstenite client does not expose. Returns the socket and response head.
+async fn raw_ws_handshake(proxy: &str, extra_headers: &str) -> (TcpStream, String) {
+    let mut stream = TcpStream::connect(proxy).await.unwrap();
+    let request = format!(
+        "GET /ws HTTP/1.1\r\nHost: {proxy}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         {extra_headers}\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut head = Vec::new();
+    let mut chunk = [0u8; 512];
+    loop {
+        let read = stream.read(&mut chunk).await.unwrap();
+        assert!(read > 0, "proxy closed during handshake");
+        head.extend_from_slice(&chunk[..read]);
+        if head.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+        assert!(head.len() < 16 * 1024, "handshake head too large");
+    }
+    (stream, String::from_utf8_lossy(&head).into_owned())
+}
+
+/// Write a masked client frame (required by RFC 6455 for client-to-server).
+async fn send_masked_frame(stream: &mut TcpStream, fin: bool, opcode: u8, payload: &[u8]) {
+    let mut frame = Vec::with_capacity(payload.len() + 14);
+    frame.push(if fin { 0x80 | opcode } else { opcode });
+    if payload.len() < 126 {
+        frame.push(0x80 | payload.len() as u8);
+    } else {
+        frame.push(0x80 | 126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    }
+    let mask = [0x12u8, 0x34, 0x56, 0x78];
+    frame.extend_from_slice(&mask);
+    for (index, byte) in payload.iter().enumerate() {
+        frame.push(byte ^ mask[index % 4]);
+    }
+    stream.write_all(&frame).await.unwrap();
+}
+
+async fn read_close_code(stream: &mut TcpStream) -> Option<u16> {
+    let mut header = [0u8; 2];
+    stream.read_exact(&mut header).await.ok()?;
+    assert_eq!(header[0] & 0x0f, 0x8, "expected a close frame");
+    let length = (header[1] & 0x7f) as usize;
+    if length < 2 {
+        return None;
+    }
+    let mut payload = vec![0u8; length];
+    stream.read_exact(&mut payload).await.ok()?;
+    Some(u16::from_be_bytes([payload[0], payload[1]]))
+}
+
+fn permissive_client_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_frame_size(None)
+        .max_message_size(None)
+}
+
+#[tokio::test]
+async fn websocket_upgrade_is_tunneled_to_upstream() {
+    let upstream = spawn_ws_upstream().await;
+    let proxy = spawn_proxy(upstream).await;
+
+    let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{}/ws", proxy))
+        .await
+        .expect("websocket handshake through proxy");
+
+    client
+        .send(Message::Text("hello-through-waf".into()))
+        .await
+        .unwrap();
+
+    let echoed = tokio::time::timeout(std::time::Duration::from_secs(3), client.next())
+        .await
+        .expect("echo timeout")
+        .expect("stream closed")
+        .expect("websocket error");
+
+    assert_eq!(echoed, Message::Text("hello-through-waf".into()));
+}
+
+#[tokio::test]
+async fn websocket_fragmented_oversized_message_is_rejected_before_forwarding() {
+    let upstream = spawn_ws_upstream().await;
+    let proxy = spawn_proxy_with_ws_limits(upstream, 1024, 1024).await;
+
+    let (mut client, _) = tokio_tungstenite::connect_async_with_config(
+        format!("ws://{}/ws", proxy),
+        Some(permissive_client_config()),
+        false,
+    )
+    .await
+    .expect("websocket handshake through proxy");
+
+    // Each fragment is below the frame cap, but the reassembled message
+    // exceeds the message cap. The proxy parser must reject it before the
+    // complete message is assembled or forwarded.
+    let first = vec![b'A'; 700];
+    let second = vec![b'B'; 700];
+    client
+        .send(Message::Frame(Frame::message(
+            first,
+            OpCode::Data(Data::Text),
+            false,
+        )))
+        .await
+        .unwrap();
+    client
+        .send(Message::Frame(Frame::message(
+            second,
+            OpCode::Data(Data::Continue),
+            true,
+        )))
+        .await
+        .unwrap();
+
+    let next = tokio::time::timeout(std::time::Duration::from_secs(3), client.next())
+        .await
+        .expect("proxy must reject the oversized fragmented message");
+    match next {
+        Some(Ok(Message::Close(frame))) => {
+            assert_eq!(
+                frame.map(|frame| frame.code),
+                Some(tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy)
+            );
+        }
+        Some(Err(_)) | None => {}
+        Some(Ok(other)) => panic!("oversized fragmented message was forwarded: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn websocket_normal_fragmented_message_is_forwarded() {
+    let upstream = spawn_ws_upstream().await;
+    let proxy = spawn_proxy_with_ws_limits(upstream, 1024, 1024).await;
+
+    let (mut client, _) = tokio_tungstenite::connect_async_with_config(
+        format!("ws://{}/ws", proxy),
+        Some(permissive_client_config()),
+        false,
+    )
+    .await
+    .expect("websocket handshake through proxy");
+
+    let first = vec![b'A'; 200];
+    let second = vec![b'B'; 200];
+    client
+        .send(Message::Frame(Frame::message(
+            first.clone(),
+            OpCode::Data(Data::Text),
+            false,
+        )))
+        .await
+        .unwrap();
+    client
+        .send(Message::Frame(Frame::message(
+            second.clone(),
+            OpCode::Data(Data::Continue),
+            true,
+        )))
+        .await
+        .unwrap();
+
+    let echoed = tokio::time::timeout(std::time::Duration::from_secs(3), client.next())
+        .await
+        .expect("echo timeout")
+        .expect("stream closed")
+        .expect("websocket error");
+
+    let mut expected = first;
+    expected.extend_from_slice(&second);
+    assert_eq!(
+        echoed,
+        Message::Text(String::from_utf8(expected).unwrap().into())
+    );
+}
+
+#[tokio::test]
+async fn websocket_frame_payload_is_inspected_by_waf() {
+    let upstream = spawn_ws_upstream().await;
+    let proxy = spawn_proxy(upstream).await;
+
+    let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{}/ws", proxy))
+        .await
+        .expect("websocket handshake through proxy");
+
+    client
+        .send(Message::Text("id=1 UNION SELECT * FROM users".into()))
+        .await
+        .unwrap();
+
+    let next = tokio::time::timeout(std::time::Duration::from_secs(3), client.next()).await;
+    match next {
+        Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Ok(Some(Err(_))) | Err(_) => {}
+        Ok(Some(Ok(other))) => panic!("malicious frame was forwarded: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn websocket_upgrade_is_blocked_by_waf() {
+    let upstream = spawn_ws_upstream().await;
+    let proxy = spawn_proxy(upstream).await;
+
+    let result =
+        tokio_tungstenite::connect_async(format!("ws://{}/ws?id=1%20UNION%20SELECT%201", proxy))
+            .await;
+
+    assert!(result.is_err(), "WAF should block the upgrade handshake");
+}
+
+#[tokio::test]
+async fn websocket_extensions_are_stripped_in_both_directions() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_hdr_async(
+            stream,
+            move |req: &WsRequest, mut response: WsResponse| {
+                let saw = req.headers().contains_key("sec-websocket-extensions");
+                let _ = tx.send(saw);
+                // An origin may accept an extension even when the proxy's codec
+                // cannot decode it; the proxy must strip this response header.
+                response.headers_mut().insert(
+                    "sec-websocket-extensions",
+                    "permessage-deflate".parse().unwrap(),
+                );
+                Ok(response)
+            },
+        )
+        .await
+        .unwrap();
+        let _ = ws.next().await;
+    });
+
+    let proxy = spawn_proxy(upstream).await;
+    let (mut stream, head) =
+        raw_ws_handshake(&proxy, "Sec-WebSocket-Extensions: permessage-deflate\r\n").await;
+
+    assert!(
+        !head
+            .to_ascii_lowercase()
+            .contains("sec-websocket-extensions"),
+        "proxy forwarded an unnegotiated extension response: {head}"
+    );
+    let upstream_saw_extension = tokio::time::timeout(std::time::Duration::from_secs(3), rx)
+        .await
+        .expect("upstream handshake callback timeout")
+        .expect("upstream callback dropped");
+    assert!(
+        !upstream_saw_extension,
+        "proxy forwarded an unnegotiated extension request upstream"
+    );
+    let _ = stream.shutdown().await;
+}
+
+#[tokio::test]
+async fn websocket_fragmented_control_frame_is_rejected_with_protocol_close() {
+    let upstream = spawn_ws_upstream().await;
+    let proxy = spawn_proxy(upstream).await;
+    let (mut stream, _) = raw_ws_handshake(&proxy, "").await;
+
+    // FIN=0 on a ping is a protocol violation (RFC 6455 section 5.5).
+    send_masked_frame(&mut stream, false, 0x9, &[]).await;
+
+    let code = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        read_close_code(&mut stream),
+    )
+    .await
+    .expect("proxy must close the tunnel");
+    assert_eq!(code, Some(1002), "fragmented control frame must close 1002");
+}
+
+#[tokio::test]
+async fn websocket_oversized_control_payload_is_rejected_with_protocol_close() {
+    let upstream = spawn_ws_upstream().await;
+    let proxy = spawn_proxy(upstream).await;
+    let (mut stream, _) = raw_ws_handshake(&proxy, "").await;
+
+    send_masked_frame(&mut stream, true, 0x9, &vec![0u8; 126]).await;
+
+    let code = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        read_close_code(&mut stream),
+    )
+    .await
+    .expect("proxy must close the tunnel");
+    assert_eq!(code, Some(1002), "oversized control frame must close 1002");
+}
+
+async fn spawn_ws_upstream_sending(payload: &'static str) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let _ = ws.next().await;
+        let _ = ws.send(Message::Text(payload.into())).await;
+        let _ = ws.next().await;
+    });
+    addr
+}
+
+#[tokio::test]
+async fn websocket_upstream_payload_is_blocked_when_response_inspection_is_enabled() {
+    let upstream = spawn_ws_upstream_sending("id=1 UNION SELECT * FROM users").await;
+    let proxy = spawn_proxy_with_ws_response_inspection(upstream, true).await;
+
+    let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{}/ws", proxy))
+        .await
+        .expect("websocket handshake through proxy");
+    client.send(Message::Text("benign".into())).await.unwrap();
+
+    let next = tokio::time::timeout(std::time::Duration::from_secs(3), client.next())
+        .await
+        .expect("upstream frame should have been inspected");
+    match next {
+        Some(Ok(Message::Close(frame))) => {
+            assert_eq!(
+                frame.map(|frame| frame.code),
+                Some(tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy)
+            );
+        }
+        Some(Err(_)) | None => {}
+        Some(Ok(other)) => panic!("upstream malicious frame was forwarded: {other:?}"),
+    }
+}
+
+/// Generate a self-signed test CA and a server certificate for 127.0.0.1
+/// signed by that CA. Returns `(ca_path, cert_path, key_path)`.
+fn generate_test_ca_and_server_cert(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "waf-websocket-test-ca");
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+
+    let ca_key = KeyPair::generate().unwrap();
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+    let mut server_params = CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
+    server_params.is_ca = IsCa::NoCa;
+    server_params
+        .distinguished_name
+        .push(DnType::CommonName, "127.0.0.1");
+    server_params.use_authority_key_identifier_extension = true;
+    server_params
+        .key_usages
+        .push(KeyUsagePurpose::DigitalSignature);
+    server_params
+        .extended_key_usages
+        .push(ExtendedKeyUsagePurpose::ServerAuth);
+
+    let server_key = KeyPair::generate().unwrap();
+    let issuer = Issuer::from_params(&ca_params, &ca_key);
+    let server_cert = server_params.signed_by(&server_key, &issuer).unwrap();
+
+    let ca_path = dir.join("ca.pem");
+    let cert_path = dir.join("server.pem");
+    let key_path = dir.join("server.key");
+    std::fs::write(&ca_path, ca_cert.pem()).unwrap();
+    std::fs::write(&cert_path, server_cert.pem()).unwrap();
+    std::fs::write(&key_path, server_key.serialize_pem()).unwrap();
+
+    (ca_path, cert_path, key_path)
+}
+
+async fn spawn_tls_ws_upstream(dir: &Path) -> (std::net::SocketAddr, PathBuf) {
+    let (ca_path, cert_path, key_path) = generate_test_ca_and_server_cert(dir);
+
+    let cert_pem = std::fs::read(&cert_path).unwrap();
+    let certs = rustls::pki_types::CertificateDer::pem_slice_iter(&cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let key_pem = std::fs::read(&key_path).unwrap();
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(&key_pem).expect("server key");
+
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .unwrap();
+    let acceptor = TlsAcceptor::from(Arc::new(config));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let tls = acceptor.accept(stream).await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tls).await.unwrap();
+        while let Some(Ok(message)) = ws.next().await {
+            if message.is_text() && ws.send(message).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    (addr, ca_path)
+}
+
+async fn spawn_proxy_with_upstream_ca(upstream: std::net::SocketAddr, ca_path: &Path) -> String {
+    let mut config = Config {
+        upstream_uri: format!("https://127.0.0.1:{}", upstream.port()),
+        ..Config::default()
+    };
+    config.proxy.upstream_ca_path = Some(ca_path.to_string_lossy().into_owned());
+    config.server.max_body_size = 4096;
+    config.waf.rate_limit.per_ip_enabled = false;
+    config.waf.rate_limit.global_enabled = false;
+    config.waf.coraza.enabled = false;
+
+    let service = Arc::new(WafProxyService::new(config).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = service.start_with_listener(listener).await;
+    });
+
+    format!("{}", addr)
+}
+
+#[tokio::test]
+async fn websocket_tls_upstream_with_custom_ca_is_tunneled() {
+    let cert_dir = tempfile::tempdir().unwrap();
+    let (upstream, ca_path) = spawn_tls_ws_upstream(cert_dir.path()).await;
+    let proxy = spawn_proxy_with_upstream_ca(upstream, &ca_path).await;
+
+    let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{}/ws", proxy))
+        .await
+        .expect("websocket handshake through proxy to TLS upstream");
+
+    client
+        .send(Message::Text("hello-over-tls".into()))
+        .await
+        .unwrap();
+
+    let echoed = tokio::time::timeout(std::time::Duration::from_secs(3), client.next())
+        .await
+        .expect("echo timeout")
+        .expect("stream closed")
+        .expect("websocket error");
+
+    assert_eq!(echoed, Message::Text("hello-over-tls".into()));
+
+    drop(client);
+    drop(cert_dir);
+    assert!(!ca_path.exists(), "temporary CA file should be removed");
+}

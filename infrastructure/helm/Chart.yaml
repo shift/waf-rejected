@@ -1,0 +1,20 @@
+apiVersion: v2
+name: waf-rejected
+description: Enterprise Web Application Firewall with AI threat detection
+type: application
+version: 0.1.0-beta.21
+appVersion: "0.1.0-beta.21"
+
+keywords:
+  - waf
+  - security
+  - firewall
+  - ai
+  - threat-detection
+
+maintainers:
+  - name: WAF-Rejected Team
+    email: shift+security-waf-r@someone.section.me
+
+# Prometheus/Grafana are installed separately; keeping undeclared subchart
+# dependencies here would make `helm upgrade` fail without `helm dependency build`.
