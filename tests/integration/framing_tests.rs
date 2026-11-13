@@ -231,6 +231,169 @@ async fn trace_and_connect_are_rejected_with_405_and_not_forwarded() {
 }
 
 #[tokio::test]
+async fn keep_alive_after_chunked_body_validates_the_next_head() {
+    let (origin, records) = spawn_origin().await;
+    let proxy = spawn_proxy(origin).await;
+
+    let addr = proxy.strip_prefix("http://").unwrap();
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            b"POST /first HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n\
+              GET /second HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk)).await {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(read)) => {
+                response.extend_from_slice(&chunk[..read]);
+                if response
+                    .windows(b"HTTP/1.1 200".len())
+                    .filter(|window| *window == b"HTTP/1.1 200")
+                    .count()
+                    >= 2
+                {
+                    break;
+                }
+            }
+            Ok(Err(error)) => panic!("read failed: {error}"),
+        }
+    }
+    let response = String::from_utf8_lossy(&response);
+    assert_eq!(
+        response.matches("HTTP/1.1 200").count(),
+        2,
+        "both requests must be served: {response:?}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let records = records.lock().unwrap();
+    assert_eq!(records.len(), 2, "both valid requests must be forwarded");
+    assert_eq!(records[0].method, "POST");
+    assert_eq!(records[0].body, b"hello");
+    assert_eq!(records[1].method, "GET");
+}
+
+#[tokio::test]
+async fn second_request_with_cl_te_is_rejected_and_not_forwarded() {
+    let (origin, records) = spawn_origin().await;
+    let proxy = spawn_proxy(origin).await;
+
+    let addr = proxy.strip_prefix("http://").unwrap();
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    // The first request is valid and must be served on a keep-alive connection.
+    stream
+        .write_all(b"GET /first HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    let mut first_response = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk))
+            .await
+            .expect("first response timed out")
+            .expect("first response read failed");
+        assert!(read > 0, "first response ended before its headers");
+        first_response.extend_from_slice(&chunk[..read]);
+        if first_response
+            .windows(4)
+            .any(|window| window == b"\r\n\r\n")
+        {
+            break;
+        }
+    }
+    let first_response = String::from_utf8_lossy(&first_response);
+    assert_eq!(
+        status(&first_response),
+        Some(200),
+        "the first request must be served: {first_response:?}"
+    );
+
+    // The second request reuses the connection and carries ambiguous framing.
+    // It must be rejected, and neither its head nor its body may be forwarded.
+    stream
+        .write_all(
+            b"POST /smuggle HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let mut second_response = Vec::new();
+    let _ = tokio::time::timeout(
+        Duration::from_millis(500),
+        stream.read_to_end(&mut second_response),
+    )
+    .await;
+    assert!(
+        !String::from_utf8_lossy(&second_response).contains("HTTP/1.1 200"),
+        "the invalid second request was served: {:?}",
+        String::from_utf8_lossy(&second_response)
+    );
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let records = records.lock().unwrap();
+    assert_eq!(
+        records.len(),
+        1,
+        "the invalid second request reached the origin: {records:?}"
+    );
+    assert_eq!(records[0].method, "GET");
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.method == "POST" || !record.body.is_empty()),
+        "the second request reached the origin: {records:?}"
+    );
+}
+
+#[tokio::test]
+async fn egress_normalises_chunked_body_to_exact_content_length() {
+    let (origin, records) = spawn_origin().await;
+    let proxy = spawn_proxy(origin).await;
+
+    let response = send_raw(
+        &proxy,
+        b"POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+    )
+    .await;
+    assert_eq!(
+        status(&response),
+        Some(200),
+        "unexpected response: {response:?}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let records = records.lock().unwrap();
+    assert_eq!(records.len(), 1, "valid request was not forwarded");
+    let record = &records[0];
+    assert_eq!(record.body, b"hello");
+    assert!(
+        !record
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding")),
+        "origin received Transfer-Encoding: {:?}",
+        record.headers
+    );
+    let content_length = record
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .map(|(_, value)| value.as_str());
+    assert_eq!(
+        content_length,
+        Some("5"),
+        "origin did not receive the exact Content-Length: {:?}",
+        record.headers
+    );
+}
+
+#[tokio::test]
 async fn valid_chunked_request_is_forwarded_without_ambiguous_framing() {
     let (origin, records) = spawn_origin().await;
     let proxy = spawn_proxy(origin).await;

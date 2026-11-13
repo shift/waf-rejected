@@ -9,7 +9,7 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
-use hyper::body::{Body, Frame, Incoming};
+use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::service::service_fn;
 use hyper::{HeaderMap, Request, Response, StatusCode, Uri};
@@ -48,8 +48,8 @@ use crate::proxy::decompression::{
 };
 use crate::proxy::framing::{
     read_request_head, reconcile_content_length, reject_request_head,
-    request_head_requests_upgrade, validate_request_framing_for_version, validate_request_head,
-    validate_request_trailers, FramingVersion, PrefixedStream,
+    validate_request_framing_for_version, validate_request_head, validate_request_trailers,
+    FramingVersion, Http1RequestGate,
 };
 use crate::proxy::grpc_body::{
     probe_grpc_body, GrpcBodyMode, GrpcProbeError, GrpcStreamError, GrpcStreamGuard, PrefixedBody,
@@ -405,6 +405,29 @@ where
 impl Body for ProxyBody {
     type Data = Bytes;
     type Error = ProxyBodyError;
+
+    fn size_hint(&self) -> SizeHint {
+        match self {
+            ProxyBody::Full(body) => body.size_hint(),
+            ProxyBody::Buffered { data, trailers } => {
+                // A non-empty trailer block cannot be combined with an exact
+                // Content-Length on HTTP/1.x. Report an unknown size so hyper
+                // keeps chunked framing and emits the trailers instead of
+                // silently dropping them.
+                if trailers
+                    .as_ref()
+                    .is_some_and(|trailers| !trailers.is_empty())
+                {
+                    SizeHint::default()
+                } else {
+                    SizeHint::with_exact(data.as_ref().map_or(0, |data| data.len() as u64))
+                }
+            }
+            ProxyBody::Incoming(body) => body.size_hint(),
+            ProxyBody::Guarded(body) => body.size_hint(),
+            ProxyBody::Boxed(body) => body.size_hint(),
+        }
+    }
 
     fn poll_frame(
         self: Pin<&mut Self>,
@@ -1665,9 +1688,7 @@ impl WafProxyService {
             // CL+TE and duplicate CL invisible to the service layer. The gate
             // rejects them (and absolute-form targets, whitespace before a
             // header colon, CONNECT/TRACE) with a fail-closed 400/405 before
-            // any bytes are forwarded. One request per connection guarantees
-            // every head passes through the gate; HTTP/1.0/1.1 clients
-            // reconnect transparently.
+            // any bytes are forwarded.
             let head = match read_request_head(
                 &mut stream,
                 max_header_bytes.saturating_add(8192).max(8192),
@@ -1690,15 +1711,29 @@ impl WafProxyService {
                 reject_request_head(&mut stream, error).await;
                 return Ok(());
             }
-            // Upgrade connections (WebSocket) must stay open after the 101 so
-            // the tunnel can run. Every other HTTP/1.x connection serves one
-            // request, which guarantees the next request head also passes
-            // through the wire gate.
-            let keep_alive = request_head_requests_upgrade(&head);
-            let io = hyper_util::rt::TokioIo::new(PrefixedStream::new(head, stream));
+            // Keep-alive stays on for every HTTP/1.x connection. The gate
+            // validates each subsequent head on the wire (tracking the
+            // validated body framing to find it), so a second pipelined or
+            // keep-alive request cannot bypass the smuggling checks.
+            let io = hyper_util::rt::TokioIo::new(
+                match Http1RequestGate::new(
+                    stream,
+                    head,
+                    max_header_bytes.saturating_add(8192).max(8192),
+                ) {
+                    Ok(gate) => gate,
+                    Err(error) => {
+                        warn!(
+                            "Rejected wire-level request framing from {}: {}",
+                            peer_ip, error
+                        );
+                        return Ok(());
+                    }
+                },
+            );
             let mut builder = hyper::server::conn::http1::Builder::new();
             builder
-                .keep_alive(keep_alive)
+                .keep_alive(true)
                 .pipeline_flush(true)
                 .timer(TokioTimer::new())
                 .header_read_timeout(Some(keep_alive_timeout))
@@ -3415,6 +3450,11 @@ impl WafProxyService {
         // buffered body the names are known now; for a streamed body the client
         // must have announced them (the header is forwarded below).
         let announced_trailers = body.announced_trailer_fields();
+        let has_buffered_trailers = announced_trailers.is_some();
+        // The body sent upstream is the body the WAF inspected and possibly
+        // re-framed (decompressed), so its length is authoritative. It is
+        // stamped explicitly below rather than inherited from the client.
+        let body_length = body.size_hint().exact();
         let has_trailer_header = parts.headers.contains_key(hyper::header::TRAILER);
 
         let mut proxy_req = Request::builder()
@@ -3447,12 +3487,13 @@ impl WafProxyService {
         // without allocating a lowercase copy per forwarded header.
         let skip_header = |key: &hyper::header::HeaderName| {
             let name = key.as_str();
-            const FIXED: [&str; 9] = [
+            const FIXED: [&str; 10] = [
                 "host",
                 "connection",
                 "proxy-connection",
                 "upgrade",
                 "transfer-encoding",
+                "content-length",
                 "keep-alive",
                 "x-forwarded-for",
                 "x-real-ip",
@@ -3496,6 +3537,17 @@ impl WafProxyService {
         if !has_trailer_header && matches!(http_version, "1.0" | "1.1") {
             if let Some(names) = announced_trailers {
                 proxy_req = proxy_req.header(hyper::header::TRAILER, names);
+            }
+        }
+
+        // Egress normalisation: never forward the client's framing. The
+        // inspected/forwarded body is length-delimited unless it is a genuinely
+        // streaming body or carries HTTP/1.x trailers (which require chunked
+        // framing and cannot be combined with an exact Content-Length).
+        if let Some(length) = body_length {
+            let streaming_trailers = has_buffered_trailers && matches!(http_version, "1.0" | "1.1");
+            if !streaming_trailers {
+                proxy_req = proxy_req.header(hyper::header::CONTENT_LENGTH, length.to_string());
             }
         }
 
@@ -5379,9 +5431,9 @@ mod tests {
             .uri("/public")
             .header("connection", "X-Custom-Hop, Content-Length")
             .header("x-custom-hop", "secret")
-            .header("content-length", "0")
+            .header("content-length", "5")
             .header("x-keep", "yes")
-            .body(ProxyBody::full(Bytes::new()))
+            .body(ProxyBody::full(Bytes::from_static(b"abc")))
             .unwrap();
 
         let built = build_upstream_for_test(request);
@@ -5389,9 +5441,13 @@ mod tests {
             built.headers().get("x-custom-hop").is_none(),
             "Connection-nominated header must not reach the upstream"
         );
-        assert!(
-            built.headers().get("content-length").is_none(),
-            "Connection-nominated framing header must not reach the upstream"
+        assert_eq!(
+            built
+                .headers()
+                .get("content-length")
+                .and_then(|value| value.to_str().ok()),
+            Some("3"),
+            "the upstream must receive the WAF's exact body length, not the client's"
         );
         assert_eq!(
             built

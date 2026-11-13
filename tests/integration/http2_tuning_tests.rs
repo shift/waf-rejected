@@ -215,6 +215,45 @@ async fn response_inspection_skips_streamed_body_and_passes_through() {
 }
 
 #[tokio::test]
+async fn http1_pipelined_requests_are_served_in_order() {
+    let upstream = spawn_upstream().await;
+    let proxy = spawn_proxy(upstream.addr, |_| {}).await;
+
+    let mut stream = TcpStream::connect(proxy).await.unwrap();
+    let request = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    let mut pipelined = Vec::new();
+    for _ in 0..3 {
+        pipelined.extend_from_slice(request);
+    }
+    stream.write_all(&pipelined).await.unwrap();
+
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline
+        && response
+            .windows(b"HTTP/1.1 200".len())
+            .filter(|window| *window == b"HTTP/1.1 200")
+            .count()
+            < 3
+    {
+        match tokio::time::timeout(Duration::from_millis(200), stream.read(&mut chunk)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(read)) => response.extend_from_slice(&chunk[..read]),
+            Ok(Err(error)) => panic!("pipelined read failed: {error}"),
+            Err(_) => {}
+        }
+    }
+
+    let response = String::from_utf8_lossy(&response);
+    assert_eq!(
+        response.matches("HTTP/1.1 200").count(),
+        3,
+        "three pipelined requests must be answered: {response:?}"
+    );
+}
+
+#[tokio::test]
 async fn http1_keep_alive_reuses_client_connection() {
     let upstream = spawn_upstream().await;
     let proxy = spawn_proxy(upstream.addr, |_| {}).await;
