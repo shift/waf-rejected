@@ -4,6 +4,18 @@ All notable changes to WAF-Rejected are documented here.
 
 ## [Unreleased]
 
+### Behaviour change
+
+- `server.max_body_size` now defaults to **2 MiB** (down from 10 MiB). Every
+  accepted body is inspected in full, and a 10 MiB body measured 1.43 s p50
+  with ~230 MiB of transient memory per in-flight request, so the old default
+  was a self-inflicted resource-exhaustion vector. Deployments that relied on
+  the 10 MiB default must now set `server.max_body_size` explicitly. Values
+  above 2 MiB remain supported, are an explicit opt-in, and log one start-up
+  warning naming the cap and its measured cost. Fail-closed behaviour is
+  unchanged: over-cap bodies are still `413` and are never forwarded. See
+  [`docs/operations/body-inspection-memory.md`](docs/operations/body-inspection-memory.md#choosing-a-body-cap).
+
 ### Added
 
 - `perf-gate-bench --only waf` measures the full request path (`WafEngine`:

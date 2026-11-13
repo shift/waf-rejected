@@ -6,7 +6,7 @@
 # `[waf.coraza] backend = "wasm"`.
 #
 # Any WAF_* environment variable overrides this file, using `__` for nesting,
-# for example WAF_SERVER__MAX_BODY_SIZE=10485760.
+# for example WAF_SERVER__MAX_BODY_SIZE=2097152.
 #
 # Authentication is disabled here. Enable `security.auth` with keys injected
 # from a secret before exposing the proxy.
@@ -41,7 +41,7 @@ keep_alive_timeout_secs = 90
 enable_http2 = true
 enable_http3 = false
 supported_http_versions = ["1.0", "1.1", "2"]
-max_body_size = 10485760
+max_body_size = 2097152
 grpc_max_stream_bytes = 4194304
 grpc_max_stream_seconds = 300
 grpc_aware_rejections = false

@@ -6,6 +6,14 @@ image:
   tag: "v0.1.0-beta.3"
   pullPolicy: Always
 
+# Server limits
+server:
+  # Accepted request-body size in bytes. Bodies are inspected in full, so
+  # raising this above the 2 MiB default logs a start-up warning and increases
+  # per-request memory and latency. See
+  # docs/operations/body-inspection-memory.md.
+  maxBodySize: 2097152
+
 # Service configuration
 service:
   type: LoadBalancer

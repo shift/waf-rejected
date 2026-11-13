@@ -763,8 +763,10 @@ body, no copy of the payload).
 
 ### 11.6 10 MiB cap stress cell
 
-`bench-subms --stress-10m` adds the default `server.max_body_size` cell. The
-engine's per-value cap is now derived from that configured body cap, so the
+`bench-subms --stress-10m` adds the 10 MiB `server.max_body_size` cell. 10 MiB
+was the former default and is now an explicit opt-in; the cell remains the
+worst-case reference. The engine's per-value cap is derived from that configured
+body cap, so the
 10 MiB body is inspected instead of being refused before phase 2. Measured on
 the reference host with `--only l0 --no-wasm --stress-10m --samples 30
 --warmup 5` (rustc 1.99.1, 2026-11-13):
