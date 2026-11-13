@@ -178,9 +178,10 @@ struct Cli {
     #[arg(long)]
     no_wasm: bool,
 
-    /// Add the 10 MiB cap cell (L0 rust engine and L3 rust proxy). This is the
-    /// default `server.max_body_size`; the cell shows the worst-case
-    /// amplification and whether the body is inspectable at all.
+    /// Add the 10 MiB cap cell (L0 rust engine and L3 rust proxy). 10 MiB was
+    /// the former default `server.max_body_size` (now an explicit opt-in); the
+    /// cell shows the worst-case amplification and whether the body is
+    /// inspectable at all.
     #[arg(long)]
     stress_10m: bool,
 
@@ -217,7 +218,8 @@ enum SizeClass {
     K1,
     K4,
     K8,
-    /// 10 MiB, the default `server.max_body_size`. Stress cell only.
+    /// 10 MiB; the former default `server.max_body_size` (now opt-in). Stress
+    /// cell only.
     M10,
 }
 

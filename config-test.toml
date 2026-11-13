@@ -13,7 +13,7 @@ keep_alive_timeout_secs = 90
 enable_http2 = true
 enable_http3 = false
 supported_http_versions = ["1.0", "1.1", "2"]
-max_body_size = 10485760
+max_body_size = 2097152
 
 [logging]
 level = "info"

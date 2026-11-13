@@ -557,6 +557,15 @@ pub enum GrpcStreamingPolicy {
     Reject,
 }
 
+/// Default accepted request-body size.
+///
+/// Kept at 2 MiB: the native engine inspects bodies in full, and the measured
+/// cost grows linearly with the body (1 MiB is roughly 0.28 ms, 10 MiB is
+/// roughly 1.4 s p50 with ~230 MiB of transient memory per in-flight request
+/// on the reference hardware). A cap above this is supported but must be an
+/// explicit operator opt-in and logs a start-up warning.
+pub const DEFAULT_MAX_BODY_SIZE: usize = 2 * 1024 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
@@ -582,7 +591,14 @@ pub struct ServerConfig {
     /// Supported HTTP versions (1.0, 1.1, 2, 3)
     pub supported_http_versions: Vec<String>,
 
-    /// Maximum request body size in bytes
+    /// Maximum accepted request body size in bytes.
+    ///
+    /// Defaults to [`DEFAULT_MAX_BODY_SIZE`] (2 MiB). Bodies above the
+    /// effective cap (`min(proxy.max_request_size, server.max_body_size)`) are
+    /// rejected with `413` before inspection and are never forwarded. Raising
+    /// this above 2 MiB is an explicit trade-off: every accepted body is
+    /// inspected in full, so the per-request memory and latency cost scales
+    /// linearly with the cap. A value above 2 MiB logs a start-up warning.
     pub max_body_size: usize,
 
     /// Maximum number of header fields accepted in one request head.
@@ -2870,7 +2886,7 @@ impl Default for ServerConfig {
                 "2".to_string(),
                 "3".to_string(),
             ],
-            max_body_size: 10 * 1024 * 1024, // 10MB
+            max_body_size: DEFAULT_MAX_BODY_SIZE,
             max_header_count: 128,
             max_header_bytes: 64 * 1024,
             h3_max_connections: 1024,
@@ -3247,6 +3263,9 @@ impl Config {
         if self.server.max_body_size == 0 {
             anyhow::bail!("server.max_body_size must be greater than zero");
         }
+        if let Some(warning) = self.body_cap_warning() {
+            tracing::warn!("{warning}");
+        }
         if self.waf.coraza.max_value_bytes != 0
             && self.waf.coraza.max_value_bytes < self.server.max_body_size
         {
@@ -3613,6 +3632,28 @@ impl Config {
         self.proxy.max_request_size.min(self.server.max_body_size)
     }
 
+    /// Start-up warning for an inspectable body cap above the 2 MiB default.
+    ///
+    /// Returns `None` at or below [`DEFAULT_MAX_BODY_SIZE`]. The trigger uses
+    /// the resolved cap ([`Self::effective_max_request_body`]) so a tightening
+    /// `proxy.max_request_size` that keeps inspected bodies small does not
+    /// warn. The message names the configured `server.max_body_size` value and
+    /// the measured per-request cost the operator is accepting.
+    pub fn body_cap_warning(&self) -> Option<String> {
+        if self.effective_max_request_body() <= DEFAULT_MAX_BODY_SIZE {
+            return None;
+        }
+        let bytes = self.server.max_body_size;
+        Some(format!(
+            "server.max_body_size = {bytes} bytes ({:.2} MiB) exceeds the 2 MiB default: bodies \
+             are inspected in full, and 10 MiB measured 1.4 s p50 with ~230 MiB of transient \
+             memory per in-flight request on the reference hardware (1 MiB: ~0.28 ms). You are \
+             explicitly accepting that per-request cost; keep 2 MiB unless larger uploads are \
+             required and concurrency and memory are sized for them",
+            bytes as f64 / (1024.0 * 1024.0)
+        ))
+    }
+
     /// Get the upstream URI as a hyper::Uri
     #[cfg_attr(not(test), allow(dead_code))] // Used in tests and future API compatibility
     pub fn upstream_uri(&self) -> anyhow::Result<http::Uri> {
@@ -3632,6 +3673,7 @@ mod tests {
         assert_eq!(config.bind_addr.to_string(), "0.0.0.0:8080");
         assert_eq!(config.upstream_uri, "http://127.0.0.1:3000");
         assert_eq!(config.server.max_connections, 10000);
+        assert_eq!(config.server.max_body_size, DEFAULT_MAX_BODY_SIZE);
         assert_eq!(config.logging.level, "info");
     }
 
@@ -3648,6 +3690,37 @@ mod tests {
         assert!(config.server.websocket.idle_timeout_secs > 0);
         assert!(config.server.websocket.max_lifetime_secs > 0);
         config.validate().expect("defaults must validate");
+    }
+
+    #[test]
+    fn default_body_cap_is_two_mib_and_does_not_warn() {
+        let config = Config::default();
+        assert_eq!(config.server.max_body_size, 2 << 20);
+        assert_eq!(config.effective_max_request_body(), 2 << 20);
+        assert!(config.body_cap_warning().is_none());
+    }
+
+    #[test]
+    fn a_body_cap_above_the_default_warns_once_at_load() {
+        let mut config = Config::default();
+        config.server.max_body_size = 10 << 20;
+        let warning = config.body_cap_warning().expect("a 10 MiB cap must warn");
+        assert!(warning.contains("server.max_body_size"), "{warning}");
+        assert!(warning.contains("10485760"), "{warning}");
+        assert!(warning.contains("MiB"), "{warning}");
+        assert!(warning.contains("1.4 s"), "{warning}");
+        assert!(warning.contains("230 MiB"), "{warning}");
+        config
+            .validate()
+            .expect("an explicit larger cap must still load");
+    }
+
+    #[test]
+    fn a_tightening_proxy_cap_suppresses_the_body_cap_warning() {
+        let mut config = Config::default();
+        config.server.max_body_size = 10 << 20;
+        config.proxy.max_request_size = 1 << 20;
+        assert!(config.body_cap_warning().is_none());
     }
 
     #[test]

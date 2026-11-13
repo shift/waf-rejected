@@ -402,7 +402,7 @@ fn large_body(len: usize) -> String {
 async fn two_mib_body_is_inspected_with_the_default_cap() {
     let upstream = spawn_upstream().await;
     let config = inspected_config(upstream);
-    assert_eq!(config.server.max_body_size, 10 << 20);
+    assert_eq!(config.server.max_body_size, 2 << 20);
     let proxy = spawn_proxy(config).await;
 
     let response = reqwest::Client::new()
@@ -423,17 +423,63 @@ async fn two_mib_body_is_inspected_with_the_default_cap() {
 }
 
 #[cfg(feature = "rust-engine")]
-#[tokio::test]
-async fn ten_mib_body_at_the_default_cap_is_inspected() {
-    let upstream = spawn_upstream().await;
-    let config = inspected_config(upstream);
-    let cap = config.server.max_body_size;
-    let proxy = spawn_proxy(config).await;
+fn counting_warning_subscriber(count: Arc<AtomicUsize>) -> impl tracing::Subscriber + Send + Sync {
+    struct WarningCounter(Arc<AtomicUsize>);
 
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarningCounter {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    use tracing_subscriber::layer::SubscriberExt;
+    tracing_subscriber::registry().with(WarningCounter(count))
+}
+
+/// Load-validate a config while counting `warn` events. The subscriber is
+/// scoped to this call, so concurrent tests are unaffected.
+#[cfg(feature = "rust-engine")]
+fn load_and_count_warnings(config: &Config) -> usize {
+    let count = Arc::new(AtomicUsize::new(0));
+    let subscriber = counting_warning_subscriber(Arc::clone(&count));
+    tracing::subscriber::with_default(subscriber, || {
+        config.validate().expect("configuration must load");
+    });
+    count.load(Ordering::SeqCst)
+}
+
+#[cfg(feature = "rust-engine")]
+#[test]
+fn the_default_body_cap_does_not_log_a_warning() {
+    let config = Config::default();
+    assert_eq!(config.server.max_body_size, 2 << 20);
+    assert_eq!(load_and_count_warnings(&config), 0);
+}
+
+#[cfg(feature = "rust-engine")]
+#[tokio::test]
+async fn ten_mib_opt_in_cap_warns_once_and_inspects_above_the_default() {
+    let upstream = spawn_upstream().await;
+    let mut config = inspected_config(upstream);
+    config.server.max_body_size = 10 << 20;
+
+    assert_eq!(
+        load_and_count_warnings(&config),
+        1,
+        "a cap above 2 MiB must log exactly one start-up warning"
+    );
+
+    let proxy = spawn_proxy(config).await;
     let response = reqwest::Client::new()
         .post(format!("http://{proxy}/upload"))
         .header("content-type", "application/x-www-form-urlencoded")
-        .body(large_body(cap))
+        .body(large_body(3 << 20))
         .send()
         .await
         .unwrap();
@@ -443,7 +489,7 @@ async fn ten_mib_body_at_the_default_cap_is_inspected() {
     assert_eq!(
         status,
         StatusCode::OK,
-        "a body at the cap must be inspected: {text}"
+        "an opted-in cap must inspect a body above 2 MiB, not fail closed: {text}"
     );
 }
 
@@ -451,14 +497,13 @@ async fn ten_mib_body_at_the_default_cap_is_inspected() {
 #[tokio::test]
 async fn body_over_the_cap_returns_413_and_is_not_forwarded() {
     let (upstream, forwarded) = spawn_counting_upstream().await;
-    let mut config = inspected_config(upstream);
-    config.server.max_body_size = 1 << 20;
-    config.proxy.max_request_size = 1 << 20;
+    let config = inspected_config(upstream);
+    assert_eq!(config.server.max_body_size, 2 << 20);
     let proxy = spawn_proxy(config).await;
 
     let response = reqwest::Client::new()
         .post(format!("http://{proxy}/upload"))
-        .body(vec![b'A'; (1 << 20) + 1])
+        .body(vec![b'A'; (2 << 20) + 1])
         .send()
         .await
         .unwrap();
@@ -478,8 +523,9 @@ async fn a_rule_match_inside_a_two_mib_body_is_blocked() {
     let config = inspected_config(upstream);
     let proxy = spawn_proxy(config).await;
 
-    let mut body = large_body(2 << 20);
-    body.push_str("&q=%27+OR+%271%27%3D%271%27");
+    let suffix = "&q=%27+OR+%271%27%3D%271%27";
+    let mut body = large_body((2 << 20) - suffix.len());
+    body.push_str(suffix);
     let response = reqwest::Client::new()
         .post(format!("http://{proxy}/upload"))
         .header("content-type", "application/x-www-form-urlencoded")

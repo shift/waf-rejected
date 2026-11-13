@@ -47,7 +47,7 @@ keep_alive_timeout_secs = 90
 enable_http2 = true
 enable_http3 = false
 supported_http_versions = ["1.0", "1.1", "2"]
-max_body_size = 10485760
+max_body_size = 2097152
 # HTTP/3 admission (only used when enable_http3 = true and the binary is built
 # with the `http3` feature). Bounds concurrent handlers before body reads.
 h3_max_inflight_requests = 256
