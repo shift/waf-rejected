@@ -418,7 +418,8 @@ impl<'a> Collections<'a> {
         } else if json {
             // Coraza's JSON processor writes only ARGS_POST; it does not set
             // REQUEST_BODY. Malformed input produces no arguments.
-            if let Ok(values) = processors::json::process(body, &ProcessorLimits::default()) {
+            let limits = ProcessorLimits::for_value_cap(budget.limits().max_value_bytes);
+            if let Ok(values) = processors::json::process(body, &limits) {
                 for (key, value) in values {
                     self.data.args_post.push(Entry {
                         key: Cow::Owned(key),
@@ -1047,12 +1048,21 @@ impl<'a> RequestData<'a> {
         out: &mut Vec<Candidate<'r>>,
     ) -> Result<(), EngineError> {
         budget.value()?;
-        budget.bytes(value.len())?;
+        // Borrowed values already exist in the request buffer. Charging them
+        // again for every rule would multiply the body by the rule count even
+        // though no new bytes are materialised.
+        if matches!(value, Cow::Owned(_)) {
+            budget.bytes(value.len())?;
+        }
         out.push(Candidate {
             collection,
             key: None,
             value,
-            cache_id: None,
+            // The request body is immutable for the whole transaction, so its
+            // transformed forms can be shared by every rule instead of being
+            // recomputed per rule.
+            cache_id: (collection == Collection::RequestBody)
+                .then(|| entry_cache_id(Collection::RequestBody, 0)),
         });
         Ok(())
     }
@@ -1071,7 +1081,9 @@ impl<'a> RequestData<'a> {
                 continue;
             }
             budget.value()?;
-            budget.bytes(entry.value.len())?;
+            if matches!(entry.value, Cow::Owned(_)) {
+                budget.bytes(entry.value.len())?;
+            }
             out.push(Candidate {
                 collection,
                 key: Some(Cow::Borrowed(entry.key.as_ref())),
@@ -1096,7 +1108,9 @@ impl<'a> RequestData<'a> {
                 continue;
             }
             budget.value()?;
-            budget.bytes(entry.key.len())?;
+            if matches!(entry.key, Cow::Owned(_)) {
+                budget.bytes(entry.key.len())?;
+            }
             out.push(Candidate {
                 collection,
                 key: Some(Cow::Borrowed(entry.key.as_ref())),

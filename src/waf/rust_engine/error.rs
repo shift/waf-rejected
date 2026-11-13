@@ -122,6 +122,29 @@ pub enum EngineError {
     Internal(&'static str),
 }
 
+impl EngineError {
+    /// True when the failure is a configured inspection bound, not a fault.
+    ///
+    /// A bound that is exceeded is a policy outcome: the request is larger
+    /// than the engine was configured to inspect. It is still fail-closed, but
+    /// it is not an internal error.
+    pub fn is_policy_limit(&self) -> bool {
+        matches!(self, Self::Budget(_) | Self::OutputTooLarge)
+    }
+
+    /// Status for the fail-closed block produced by this error.
+    ///
+    /// Inspection bounds map to `413 Payload Too Large`, matching the proxy's
+    /// own over-cap rejection. Internal invariant failures stay `500`.
+    pub fn fail_closed_status(&self) -> u16 {
+        if self.is_policy_limit() {
+            413
+        } else {
+            500
+        }
+    }
+}
+
 impl From<crate::waf::transforms::TransformError> for EngineError {
     fn from(error: crate::waf::transforms::TransformError) -> Self {
         match error {

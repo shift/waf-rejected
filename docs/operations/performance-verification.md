@@ -763,25 +763,27 @@ body, no copy of the payload).
 
 ### 11.6 10 MiB cap stress cell
 
-`bench-subms --stress-10m` adds the default `server.max_body_size` cell. At
-10 MiB the Rust engine returns
+`bench-subms --stress-10m` adds the default `server.max_body_size` cell. The
+engine's per-value cap is now derived from that configured body cap, so the
+10 MiB body is inspected instead of being refused before phase 2. Measured on
+the reference host with `--only l0 --no-wasm --stress-10m --samples 30
+--warmup 5` (rustc 1.99.1, 2026-11-13):
 
-```text
-Block { status: 500, reason: "Rust engine runtime error (fail-closed):
-transform output exceeded the per-request byte cap" }
-```
+| cell | p50 ms | p95 ms | p99 ms | alloc B/op | allocs/op | decision |
+|---|---:|---:|---:|---:|---:|---|
+| L0-engine-stress rust, 10 MiB | 1 433.044 | 1 441.080 | 1 441.080 | 4 979 | 36 | allow |
 
-because `Collections::process_body_bytes` charges the whole body through
-`Budget::bytes`, whose per-value cap is `Limits::max_value_bytes` (1 MiB;
-`max_total_bytes` is 8 MiB). The body is therefore refused **before phase 2**:
-there is no body-proportional allocation to remove, but a configured 10 MiB
-body is not inspectable. This is a blocker. Raising the cap would change
-verdicts (from a blanket 500 to content-based allow/block) and needs an
-architecture decision; it was not changed here. The stress cell records 209 →
-201 allocs/op and 17 002 → 16 958 B/op at the fail-closed point (the small
-reduction is the same candidate-borrow change).
+The allocation columns stay flat because the body and transform buffers are
+reused across calls; the 1.43 s p50 is the cost of scanning the full 10 MiB
+through the CRS rule set. The previous 500
+(`transform output exceeded the per-request byte cap`) no longer occurs:
+`Limits::max_value_bytes` and the processor value cap follow
+`server.max_body_size`, and the request-wide budget follows the body cap
+(§[body inspection memory](body-inspection-memory.md)). A body above the cap is
+rejected by the transport with `413` before inspection; a budget breach inside
+the engine is also a fail-closed `413`, not an internal error.
 
-A second pre-existing fail-closed path was found by the same harness: a 4 KiB
+A second pre-existing fail-closed path remains outside this change: a 4 KiB
 urlencoded body with **64 fields** returns
 
 ```text
@@ -816,6 +818,9 @@ binary, so the prologue cancels.
 |---|---:|---:|---:|---:|---:|---:|
 | 4 KiB | 3.6 | 27.4 * | 13 212 | 13 079 (−1.0 %) | 4 052 831 | 4 065 700 (+0.3 %) |
 | 10 MiB | 0.03 | −0.1 * | 3 865 | 3 828 (−1.0 %) | 370 679 | 369 565 (−0.3 %) |
+
+The 10 MiB row above was taken while the engine still failed closed before
+phase 2; it is not comparable with the inspected 10 MiB cell in §11.6.
 
 \* At the noise floor: two builds of the same harness differ by ~5 000 LLd
 misses in the prologue, which is ±25 misses/request at the 200-request sample
@@ -861,10 +866,11 @@ the measured after values plus ~15 % headroom:
 | 4 KiB form, 64 fields | 52 529 | 61 440 | 210 | 240 |
 | 4 KiB SQLi | 9 745 | 11 520 | 54 | 64 |
 
-The 10 MiB and 64-field rows record their fail-closed decisions (§11.6) rather
-than pretending the body was inspected. Every row also carries
-`block_status`/`block_reason` in the JSON so a decision change shows up next to
-the allocation numbers.
+The 64-field row records its fail-closed decision (§11.6). The 10 MiB row was
+measured before the cap-alignment fix and is retained as a fail-closed
+baseline; the inspected 10 MiB p50 and allocation figures are in §11.6. Every
+row also carries `block_status`/`block_reason` in the JSON so a decision change
+shows up next to the allocation numbers.
 
 ### 11.9 Verification
 

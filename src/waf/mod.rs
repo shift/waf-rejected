@@ -774,7 +774,13 @@ impl WafEngine {
             crate::config::CorazaBackend::Rust => {
                 let path = rust_engine::default_crs_conf_path();
                 let started = Instant::now();
+                let value_cap = config
+                    .waf
+                    .coraza
+                    .resolved_max_value_bytes(config.server.max_body_size);
+                let limits = rust_engine::Limits::for_value_cap(value_cap);
                 rust_engine::RustEngine::from_conf_path(&path)
+                    .map(|engine| engine.with_limits(limits))
                     .map_err(|err| err.to_string())
                     .and_then(|engine| {
                         let load_ms = started.elapsed().as_secs_f64() * 1000.0;

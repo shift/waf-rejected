@@ -19,12 +19,53 @@ pub struct Limits {
     pub max_matches_per_rule: usize,
 }
 
+impl Limits {
+    /// Default per-value cap. Tests and embedders that do not know the
+    /// transport body cap use this baseline.
+    pub const DEFAULT_MAX_VALUE_BYTES: usize = 1 << 20;
+    /// Default request-wide materialisation cap.
+    pub const DEFAULT_MAX_TOTAL_BYTES: usize = 8 << 20;
+
+    /// Limits aligned with the transport's accepted request-body size.
+    ///
+    /// The serving path derives the per-value cap from
+    /// `server.max_body_size`, so anything the proxy accepts can be charged to
+    /// the budget and inspected. The compiler default stays the floor: a
+    /// config that accepts less than 1 MiB still gets the historical cap.
+    ///
+    /// The request-wide cap is 32 times the per-value cap. A body is charged
+    /// once when it is processed, extracted values are charged when rules
+    /// materialise them, and each distinct transform pipeline can materialise
+    /// one more copy. The bound scales with the body, not with the number of
+    /// rules: rules that never read the body cost nothing and share the cached
+    /// transforms.
+    pub fn for_body_cap(max_body_size: usize) -> Self {
+        Self::for_value_cap(max_body_size)
+    }
+
+    /// Limits for an explicit per-value cap.
+    ///
+    /// Used when the operator configures `waf.coraza.max_value_bytes`; the
+    /// compiler default remains the floor.
+    pub fn for_value_cap(max_value_bytes: usize) -> Self {
+        let max_value_bytes = max_value_bytes.max(Self::DEFAULT_MAX_VALUE_BYTES);
+        Self {
+            max_values_per_rule: 4_096,
+            max_value_bytes,
+            max_total_bytes: max_value_bytes
+                .saturating_mul(32)
+                .max(Self::DEFAULT_MAX_TOTAL_BYTES),
+            max_matches_per_rule: 4_096,
+        }
+    }
+}
+
 impl Default for Limits {
     fn default() -> Self {
         Self {
             max_values_per_rule: 4_096,
-            max_value_bytes: 1 << 20,
-            max_total_bytes: 8 << 20,
+            max_value_bytes: Self::DEFAULT_MAX_VALUE_BYTES,
+            max_total_bytes: Self::DEFAULT_MAX_TOTAL_BYTES,
             max_matches_per_rule: 4_096,
         }
     }
@@ -115,5 +156,29 @@ impl Budget {
             return Err(EngineError::Budget("too many materialised bytes"));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn body_cap_is_the_value_cap_and_honours_the_default_floor() {
+        let limits = Limits::for_body_cap(10 << 20);
+        assert_eq!(limits.max_value_bytes, 10 << 20);
+        assert_eq!(limits.max_total_bytes, 320 << 20);
+
+        let small = Limits::for_body_cap(4 << 10);
+        assert_eq!(small.max_value_bytes, Limits::DEFAULT_MAX_VALUE_BYTES);
+        assert_eq!(small.max_total_bytes, Limits::DEFAULT_MAX_VALUE_BYTES * 32);
+    }
+
+    #[test]
+    fn a_body_at_the_configured_cap_is_chargeable() {
+        let limits = Limits::for_body_cap(10 << 20);
+        let mut budget = Budget::new(limits);
+        budget.bytes(10 << 20).expect("body at the cap");
+        assert_eq!(budget.used_bytes(), 10 << 20);
     }
 }

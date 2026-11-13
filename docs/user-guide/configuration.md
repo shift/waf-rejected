@@ -214,6 +214,14 @@ io_backend = "tokio"
   above these values as a backstop, not as the primary control.
 - `keep_alive_timeout_secs` bounds idle keep-alive and request-head reads. A
   connection that sends no next request within this window is closed.
+- `max_body_size` is the accepted request-body size (10 MiB by default) and
+  the effective cap is `min(proxy.max_request_size, server.max_body_size)`.
+  Bodies above it are rejected with `413` before inspection and are never
+  forwarded. The Rust engine derives its per-value inspection cap from this
+  value, so every accepted body is inspectable; see
+  [body inspection memory](../operations/body-inspection-memory.md) for the
+  per-request memory bound. Raising this value raises the worst-case memory of
+  one in-flight request, not the cost per rule.
 - `h3_max_connections`, `h3_max_concurrent_bidi_streams`,
   `h3_stateless_retry` and `h3_idle_timeout_secs` apply only to HTTP/3.
   Stateless retry challenges an unvalidated QUIC peer before connection state
@@ -533,6 +541,7 @@ fallback = "none"          # "none" (fail closed) or "wasm"
 # module_path = "/usr/share/waf/wasm/coraza_reactor.wasm"
 max_payload_bytes = 65536  # wasm contract
 max_inspect_bytes = 0      # 0 = whole body (default)
+max_value_bytes = 0        # 0 = derive from server.max_body_size (default)
 oversize_action = "inspect-all"
 memory_limit_bytes = 268435456
 eval_timeout_ms = 5000
@@ -549,6 +558,11 @@ prefilter = "off"          # "dry-run"/"gated" need `crs-prefilter`
   - `reject` — return `413` above `max_inspect_bytes`.
   - `forward-uninspected` — scan the prefix and forward the uninspected tail.
     This is an explicit inspection gap; document it.
+- `max_value_bytes` is the native Rust engine's per-value budget cap (`0`
+  derives it from `server.max_body_size`). An explicit value smaller than
+  `server.max_body_size` fails at load, naming both keys and the config file,
+  because the proxy would otherwise accept a body the engine cannot inspect.
+  Raise it to at least the body cap, or leave it at `0`.
 - `prefilter = "gated"` requires the non-default `crs-prefilter` feature.
 - `module_path` selects an alternate reactor module; the embedded module is used
   when unset.

@@ -296,10 +296,17 @@ impl crate::waf::grpc::GrpcContentScanner for RustEngineContentScanner {
             headers: &payload.headers,
             body: body.as_deref(),
         };
-        self.engine
-            .evaluate_detailed(&request)
-            .map(|outcome| outcome.decision)
-            .map_err(|err| err.to_string())
+        match self.engine.evaluate_detailed(&request) {
+            Ok(outcome) => Ok(outcome.decision),
+            // A configured inspection bound is a policy outcome, not a
+            // scanner fault: keep the fail-closed block but report it as
+            // Payload Too Large instead of an internal error.
+            Err(err) if err.is_policy_limit() => Ok(Decision::Block {
+                status: err.fail_closed_status(),
+                reason: format!("Rust engine inspection bound: {err}"),
+            }),
+            Err(err) => Err(err.to_string()),
+        }
     }
 }
 
@@ -321,6 +328,10 @@ impl WafRule for RustEngineRule {
     fn evaluate(&self, ctx: &RequestContext) -> Decision {
         match evaluate_request(&self.engine, ctx) {
             Ok(decision) => decision,
+            Err(err) if err.is_policy_limit() => Decision::Block {
+                status: err.fail_closed_status(),
+                reason: format!("Rust engine inspection bound (fail-closed): {err}"),
+            },
             Err(err) => match &self.fallback {
                 Some(fallback) => {
                     tracing::warn!(
@@ -386,16 +397,16 @@ mod adapter_tests {
     }
 
     #[test]
-    fn runtime_error_without_fallback_fails_closed() {
+    fn budget_breach_without_fallback_is_a_policy_block() {
         let rule = RustEngineRule::new(Arc::new(engine_with_zero_budget()));
         assert!(matches!(
             rule.evaluate(&context()),
-            Decision::Block { status: 500, .. }
+            Decision::Block { status: 413, .. }
         ));
     }
 
     #[test]
-    fn runtime_error_with_fallback_uses_the_fallback_decision() {
+    fn policy_limit_breach_does_not_delegate_to_the_fallback() {
         let fallback = Arc::new(RecordingFallback {
             decision: Decision::Block {
                 status: 403,
@@ -416,9 +427,9 @@ mod adapter_tests {
             .with_fallback(Box::new(SharedFallback(Arc::clone(&fallback))));
         assert!(matches!(
             rule.evaluate(&context()),
-            Decision::Block { status: 403, .. }
+            Decision::Block { status: 413, .. }
         ));
-        assert_eq!(fallback.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(fallback.calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]
