@@ -195,6 +195,7 @@ enum CaseKind {
     Allow4k,
     Allow8k,
     Allow10m,
+    Form4k,
     Sqli4k,
 }
 
@@ -206,6 +207,7 @@ impl CaseKind {
             Self::Allow4k => "4k-allow",
             Self::Allow8k => "8k-allow",
             Self::Allow10m => "10m-allow",
+            Self::Form4k => "4k-form",
             Self::Sqli4k => "4k-sqli",
         }
     }
@@ -225,6 +227,22 @@ fn form_body(payload: &[u8], size: usize) -> Vec<u8> {
     body.extend_from_slice(payload);
     while body.len() < size {
         body.push(b'A');
+    }
+    body
+}
+
+/// A realistic urlencoded form: many short fields rather than one large value.
+///
+/// This is the shape that materialises the most per-request allocations, so the
+/// gate needs a ceiling for it as well.
+fn multi_field_body(fields: usize, value_len: usize) -> Vec<u8> {
+    let mut body = Vec::new();
+    for index in 0..fields {
+        if index > 0 {
+            body.push(b'&');
+        }
+        body.extend_from_slice(format!("f{index:02}=").as_bytes());
+        body.resize(body.len() + value_len, b'A');
     }
     body
 }
@@ -312,6 +330,13 @@ fn waf_cases() -> Vec<Case> {
         sized(CaseKind::Allow4k, 4096),
         sized(CaseKind::Allow8k, 8192),
         sized(CaseKind::Allow10m, 10 * 1024 * 1024),
+        Case {
+            kind: CaseKind::Form4k,
+            method: "POST",
+            uri: "/submit",
+            headers: base_headers(multi_field_body(64, 56).len()),
+            body: multi_field_body(64, 56),
+        },
         Case {
             kind: CaseKind::Sqli4k,
             method: "POST",
@@ -621,20 +646,26 @@ fn run_waf(cli: &Cli) -> Result<Vec<serde_json::Value>> {
         let (alloc_bytes, alloc_calls) = measure_alloc(cli.alloc_reps, || {
             runtime.block_on(engine.evaluate(&context))
         });
-        let decision = match runtime.block_on(engine.evaluate(&context)) {
+        let decision = runtime.block_on(engine.evaluate(&context));
+        let label = match &decision {
             Decision::Allow => "allow",
             Decision::Block { .. } => "block",
             Decision::RateLimit { .. } => "rate-limit",
         };
-        rows.push(row_json(
+        let mut row = row_json(
             "waf",
             case.kind,
             stats,
             throughput,
             alloc_bytes,
             alloc_calls,
-            decision,
-        ));
+            label,
+        );
+        if let Decision::Block { status, reason } = &decision {
+            row["block_status"] = json!(status);
+            row["block_reason"] = json!(reason);
+        }
+        rows.push(row);
     }
     Ok(rows)
 }
@@ -702,35 +733,46 @@ const RUST_ALLOC_LIMITS: &[AllocLimit] = &[
 /// Set from the measured baseline plus ~15 % headroom; see
 /// `docs/operations/performance-verification.md`.
 const WAF_ALLOC_LIMITS: &[AllocLimit] = &[
+    // 2 658 B / 29 allocations measured.
     AllocLimit {
         case: "bodyless",
-        max_bytes: 4_096.0,
-        max_allocs: 100.0,
+        max_bytes: 3_200.0,
+        max_allocs: 40.0,
     },
+    // 4 979 B / 36 allocations at every size: the body is borrowed, so the
+    // ceiling does not scale with the payload.
     AllocLimit {
         case: "1k-allow",
-        max_bytes: 7_168.0,
-        max_allocs: 110.0,
+        max_bytes: 5_888.0,
+        max_allocs: 48.0,
     },
     AllocLimit {
         case: "4k-allow",
-        max_bytes: 7_168.0,
-        max_allocs: 110.0,
+        max_bytes: 5_888.0,
+        max_allocs: 48.0,
     },
     AllocLimit {
         case: "8k-allow",
-        max_bytes: 7_168.0,
-        max_allocs: 110.0,
+        max_bytes: 5_888.0,
+        max_allocs: 48.0,
     },
+    // 16 941 B / 201 allocations; the body is rejected by the value budget
+    // before it is inspected (see the operations report).
     AllocLimit {
         case: "10m-allow",
-        max_bytes: 20_480.0,
-        max_allocs: 260.0,
+        max_bytes: 19_968.0,
+        max_allocs: 224.0,
+    },
+    // 52 529 B / 210 allocations for 64 distinct arguments.
+    AllocLimit {
+        case: "4k-form",
+        max_bytes: 61_440.0,
+        max_allocs: 240.0,
     },
     AllocLimit {
         case: "4k-sqli",
-        max_bytes: 14_000.0,
-        max_allocs: 75.0,
+        max_bytes: 11_520.0,
+        max_allocs: 64.0,
     },
 ];
 

@@ -1510,3 +1510,29 @@ compile-only fixes on code paths that already failed to build.
       green; `perf-gate-bench --only rust` and `--only waf` allocation gates
       pass.
 - [ ] Commit and push.
+
+## Follow-up: cache counters corrected, form case added
+
+- [x] `perf stat -p` is **refused** at `perf_event_paranoid = 2` (all events
+      `<not counted>`), so the §11.7 counters taken that way could not have
+      come from the request loop. Per-request counters from a perf child include
+      the CRS compile prologue (~2.5 G instructions, ~0.8 M last-level misses)
+      and vary ±50 % between repeats of the same binary; the 69.28 → 57.91
+      LLC-load-misses/request were that prologue, not the change.
+- [x] Re-measured with Cachegrind (8 MiB LLC, prologue cancelled exactly by
+      differencing 0- and N-repeat runs): LLC misses/request ≈ 3.6 → 27.4
+      (noise floor, sign unstable), D1 misses −1.0 %, instructions +0.3 %.
+      **Falsification condition held**; §11.7 now states the copy-pressure story
+      is rejected and the slope is instruction-bound rule scanning.
+- [x] Added a 64-field 4 KiB form case (the top remaining allocation site:
+      52 529 B / 210 allocations, ~740 B per argument) and tightened the `waf`
+      allocation ceilings to measured + ~15 % headroom.
+- [x] Found a second pre-existing fail-closed path: a 64-field form returns 500
+      ("too many variable values", `max_values_per_rule` charged per request).
+      Documented in §11.6, not changed.
+- [x] `parse_query` sizes its vector from the separator count, removing the
+      log2(N) reallocations for many-field bodies.
+- [x] Re-verified on the final tree: fmt clean; clippy `--lib` and the gate bin
+      clean with `--deny warnings`; 692 lib tests; 87 integration tests;
+      2 112/2 112 parity (0 native-only FNs); `nix build .#waf-ingress` green;
+      all seven `waf` gate rows and all three `rust` rows pass.

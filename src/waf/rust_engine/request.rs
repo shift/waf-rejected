@@ -1582,7 +1582,11 @@ fn parse_cookies<'a>(value: &[u8], out: &mut Vec<Entry<'a>>) {
 /// rules (invalid escapes are preserved). Values borrow from `query` when no
 /// percent-decoding is needed.
 pub fn parse_query<'a>(query: &'a [u8], separator: u8) -> Vec<Entry<'a>> {
-    let mut out = Vec::new();
+    // Size the vector from the separator count so a form body with N fields
+    // does not grow through log2(N) reallocations (each of which copies every
+    // entry). The count is an upper bound: empty fields are skipped below.
+    let fields = query.iter().filter(|byte| **byte == separator).count() + 1;
+    let mut out = Vec::with_capacity(fields);
     for field in query.split(|byte| *byte == separator) {
         if field.is_empty() {
             continue;

@@ -750,6 +750,17 @@ remaining sites are TX value clones (13), candidate resolution of mixed/owned
 single-value collections and `MATCHED_VARS` (10), request build (10), operator
 captures (4) and first-use TX scoring slots (3).
 
+The single-value body above understates the multi-field case, which is the
+largest allocation site left: a 4 KiB urlencoded body with 64 distinct fields
+allocates **52 529 B / 210 allocations** (before this branch: 55 477 B / 225)
+against 4 979 B / 36 for a one-argument body of the same size — ≈740 B and
+≈2.7 allocations per distinct argument. That is the transform cache's
+per-`(value, pipeline)` output plus the per-argument candidates: each transformed
+value is a distinct byte sequence the rules must see, so it cannot be borrowed.
+`parse_query` now also sizes its `Vec` from the separator count, so a
+many-field body stops growing through log2(N) reallocations (one pass over the
+body, no copy of the payload).
+
 ### 11.6 10 MiB cap stress cell
 
 `bench-subms --stress-10m` adds the default `server.max_body_size` cell. At
@@ -770,44 +781,57 @@ architecture decision; it was not changed here. The stress cell records 209 →
 201 allocs/op and 17 002 → 16 958 B/op at the fail-closed point (the small
 reduction is the same candidate-borrow change).
 
-### 11.7 Cache behaviour (`perf stat`, user-space counters)
+A second pre-existing fail-closed path was found by the same harness: a 4 KiB
+urlencoded body with **64 fields** returns
 
-`perf` 7.1.1 from the Nix store; `perf_event_paranoid=2`, no capabilities, so
-only user-space (`:u`) counters of our own process were collected. The probe
-(`src/bin/alloc_probe.rs`, `--cell`) warms up, prints `READY`, sleeps, then runs
-the measured loop; `perf stat -p <pid>` attaches during the sleep.
+```text
+Block { status: 500, reason: "Rust engine runtime error (fail-closed):
+per-request budget exceeded: too many variable values" }
+```
 
-4 KiB, 3 000 requests per run:
+`Limits::max_values_per_rule` (4 096) is charged through one `Budget` for the
+whole request, not per rule, so a form with enough fields exhausts it and the
+request is refused. Like the 10 MiB case this changes decisions if fixed
+(truncation or a per-rule budget), so it is recorded here and not changed.
 
-| counter | before | after | before / req | after / req |
-|---|---:|---:|---:|---:|
-| cache-misses | 5 954 358 | 6 365 441 | 1 984.8 | 2 121.8 |
-| cache-references | 150 764 238 | 154 783 265 | 50 254.7 | 51 594.4 |
-| LLC-load-misses | 207 836 | 173 725 | **69.28** | **57.91** |
-| LLC-loads | 19 443 439 | 19 852 374 | 6 481.1 | 6 617.5 |
-| instructions | 12 774 211 513 | 12 190 646 503 | 4 258 070 | 4 063 549 |
-| cycles | 5 855 430 610 | 5 391 400 214 | 1 951 810 | 1 797 133 |
+### 11.7 Cache behaviour: the copy-pressure story does not hold
 
-LLC-load-misses per request fell 16.4 % and LLC-load-misses per body byte fell
-from 0.01691 to 0.01414. Instructions and cycles fell 4.6 % and 7.9 %. Total
-`cache-misses` rose 6.9 %, so the cache-pressure explanation is only partly
-supported at this size: the removed copies were small (hundreds of bytes per
-request), and the dominant LLC traffic is the rule/transform working set rather
-than the payload.
+`perf` 7.1.1 from the Nix store; `kernel.perf_event_paranoid = 2`, uid 1000,
+`CapEff 0`. At that level **`perf stat -p <pid>` is refused** (every event comes
+back `<not counted>`), so counters can only be taken from a process perf itself
+starts. That process also compiles the 505-rule CRS bundle (~2.5 G instructions
+and ~0.8 M last-level misses) before it runs a single measured request, and the
+compile's miss count varies with allocator/hash layout. Repeats of the *same*
+binary, loop counters divided by the completed requests, gave 45, 75 and 122
+LLC-load-misses per request at 4 KiB — a ±50 % spread. The per-request hardware
+figures in the first version of this section (69.28 → 57.91) were within that
+spread: the 16.4 % "improvement" was the compile prologue, not the request path.
 
-10 MiB, 500 requests (all fail-closed before phase 2):
+The conclusion therefore uses Cachegrind (`--cache-sim=yes`, 8 MiB unified last
+level), where both the prologue and the loop are deterministic: the loop's cost
+is the exact difference between a 0-repeat and a *N*-repeat run of the same
+binary, so the prologue cancels.
 
-| counter | before / req | after / req |
-|---|---:|---:|
-| cache-misses | 1 265.9 | 1 230.9 |
-| LLC-load-misses | 90.64 | 92.03 |
-| LLC-loads | 1 930.5 | 1 978.0 |
-| instructions | 523 881 | 448 604 |
-| cycles | 295 140 | 234 545 |
+| cell | LLd misses/req before | after | D1 misses/req before | after | instructions/req before | after |
+|---|---:|---:|---:|---:|---:|---:|
+| 4 KiB | 3.6 | 27.4 * | 13 212 | 13 079 (−1.0 %) | 4 052 831 | 4 065 700 (+0.3 %) |
+| 10 MiB | 0.03 | −0.1 * | 3 865 | 3 828 (−1.0 %) | 370 679 | 369 565 (−0.3 %) |
 
-The 10 MiB LLC counters are flat because the body never reaches the transform
-or rule loop; they measure the header-phase fail-closed path, not body-copy
-pressure. LLC-load-misses per body byte is 8.64e-6 before and 8.78e-6 after.
+\* At the noise floor: two builds of the same harness differ by ~5 000 LLd
+misses in the prologue, which is ±25 misses/request at the 200-request sample
+used here. The value is also not stable in sign, so it is not an effect.
+
+**Falsification condition: held.** Last-level misses per request are ~4 at
+4 KiB (0.001 per body byte) before *and* after and do not fall when the copies
+are removed, because a warmed request already lives in an 8 MiB LLC: the
+removed allocations were ~466 B in ≤64 B size classes (tcache hits, no LLC
+traffic). What moves is the L1 data-miss count (−1.0 %), matching a handful of
+small allocations per request, and nothing else.
+
+The explanation for the latency slope is therefore *instruction-bound rule
+scanning*, not cache pressure: p50 is 0.27 / 0.56 / 0.96 ms at 1 / 4 / 8 KiB,
+i.e. ≈0.12 ms and ≈0.7 M instructions per KiB of body, while per-request
+allocated bytes are constant (4 979 B) from 1 KiB to 8 KiB.
 
 ### 11.8 Allocation gate
 
@@ -826,16 +850,34 @@ A row above either limit prints the table and exits non-zero; use
 
 `perf-gate-bench --only waf` covers the full request path (admission,
 protocol pre-checks, content inspection and the rule chain) at bodyless,
-1 KiB, 4 KiB, 8 KiB, 10 MiB and 4 KiB SQLi with its own limits (bodyless
-4 096 B / 100 allocs; 1–8 KiB 7 168 B / 110 allocs; 4 KiB SQLi 14 000 B /
-75 allocs — measured 9 841 B / 53; 10 MiB 20 480 B / 260 allocs). The 10 MiB
-row records the fail-closed decision from §11.6 rather than pretending the body
-was inspected.
+1 KiB, 4 KiB, 8 KiB, 10 MiB, a 64-field 4 KiB form and 4 KiB SQLi. Limits are
+the measured after values plus ~15 % headroom:
+
+| case | measured B/op | limit | measured allocs/op | limit |
+|---|---:|---:|---:|---:|
+| bodyless | 2 658 | 3 200 | 29 | 40 |
+| 1 KiB / 4 KiB / 8 KiB | 4 979 | 5 888 | 36 | 48 |
+| 10 MiB | 16 941 | 19 968 | 201 | 224 |
+| 4 KiB form, 64 fields | 52 529 | 61 440 | 210 | 240 |
+| 4 KiB SQLi | 9 745 | 11 520 | 54 | 64 |
+
+The 10 MiB and 64-field rows record their fail-closed decisions (§11.6) rather
+than pretending the body was inspected. Every row also carries
+`block_status`/`block_reason` in the JSON so a decision change shows up next to
+the allocation numbers.
 
 ### 11.9 Verification
 
 - `rust-engine-parity --engine both`: **2 112/2 112** agree, rust/coraza both
-  1 788 block / 324 allow, 0 errors, 0 native-only false negatives.
-- `cargo fmt -- --check`, `cargo clippy --lib -- --deny warnings`,
-  `cargo test --lib`, `cargo test --test integration`, `nix build
-  .#waf-ingress`: see the PR/commit for the recorded results.
+  1 788 block / 324 allow, 0 errors, rust FN 3 = coraza FN 3, i.e. **0
+  native-only false negatives**.
+- `cargo fmt -- --check`: clean.
+- `cargo clippy --lib -- --deny warnings` and `cargo clippy --release
+  --features wasm-reactor,rust-engine,engine-kernel --bin perf-gate-bench -- --deny warnings`:
+  clean.
+- `cargo test --lib`: 692 passed, 0 failed, 11 ignored.
+- `cargo test --test integration`: 87 passed, 0 failed, 14 ignored.
+- `nix build .#waf-ingress`: exit 0
+  (`/nix/store/npdkbdsiyifpim2n3fsgm6rwgw1vyhd2-waf-ingress-0.1.0-beta.16`).
+- `perf-gate-bench --only waf` with the gate enabled: all seven cases pass
+  their allocation ceilings.

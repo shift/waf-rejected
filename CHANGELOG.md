@@ -6,6 +6,13 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Added
 
+- `perf-gate-bench --only waf` measures the full request path (`WafEngine`:
+  admission, protocol pre-checks, content inspection, rule chain) at bodyless,
+  1 KiB, 4 KiB, 8 KiB, 10 MiB and a 64-field 4 KiB form, and enforces
+  allocation-byte and allocation-count ceilings per case for the `waf` and
+  `rust` backends. Allocations are deterministic, so the gate is safe on a
+  loaded host.
+
 - redb is the default security-event store. `[storage]` is now the canonical
   selector: `enabled = true` opens the store and `backend`/`path`/`max_events`/
   `ttl_cleanup_interval`/`cache_size` configure it. The legacy
