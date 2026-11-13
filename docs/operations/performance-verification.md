@@ -785,6 +785,13 @@ through the CRS rule set. The previous 500
 rejected by the transport with `413` before inspection; a budget breach inside
 the engine is also a fail-closed `413`, not an internal error.
 
+After the 2 MiB default landed, this cell silently regressed to a 0.07 ms
+fail-closed `413`: the stress engine inherited the 2 MiB transport cap, so the
+10 MiB body never reached phase 2. `bench-subms` now raises
+`server.max_body_size` on the stress engine only, so the row again measures
+inspection. Re-measured with the size-controlled harness in §11.10, the same
+body takes 1.4–3.9 s p50 depending on host load.
+
 A second pre-existing fail-closed path remains outside this change: a 4 KiB
 urlencoded body with **64 fields** returns
 
@@ -889,3 +896,104 @@ shows up next to the allocation numbers.
   (`/nix/store/npdkbdsiyifpim2n3fsgm6rwgw1vyhd2-waf-ingress-0.1.0-beta.16`).
 - `perf-gate-bench --only waf` with the gate enabled: all seven cases pass
   their allocation ceilings.
+
+### 11.10 Body-size scaling: the reported 5 000× is a KiB/MiB mix-up
+
+A superlinear body-inspection report compared two rows that were not the same
+unit. The "1 MiB" figure of 0.28 ms is the **1 KiB** `bench-subms` row from
+§11.3 (0.2810 ms), while the 10 MiB figure (1 433 ms) is the stress cell from
+§11.6. That pair is a 10 240× body increase for a 5 100× latency increase:
+sublinear, not superlinear.
+
+The curve was re-measured at eight sizes with one body shape, one rule set and
+the same engine limits (`Limits::for_body_cap(10 MiB)`), using
+`examples/body_scale.rs`:
+
+```sh
+cargo run --release --features rust-engine,engine-profile \
+  --example body_scale -- \
+  --sizes 64KiB,256KiB,512KiB,1MiB,2MiB,4MiB,8MiB,10MiB \
+  --reps 9 --warmup 2 --profile
+```
+
+The payload is `data=AAAA…` with `Content-Type:
+application/x-www-form-urlencoded` (the same shape as `bench-subms` and the
+parity benchmark). `cpu` is `CLOCK_THREAD_CPUTIME_ID`, which is immune to the
+concurrent release-gate build; wall p50/p95 are shown for comparison. Host load
+average was 8.4 → 11.2 on 6 cores during the run, so absolute wall values are
+inflated and the shape is the result.
+
+| size | p50 ms | p95 ms | cpu min ms | cpu ms/MiB |
+|---|---:|---:|---:|---:|
+| 64 KiB | 8.91 | 9.10 | 8.68 | 138.9 |
+| 256 KiB | 34.41 | 70.97 | 33.26 | 133.0 |
+| 512 KiB | 114.17 | 196.31 | 68.10 | 136.2 |
+| 1 MiB | 183.19 | 280.47 | 138.71 | 138.7 |
+| 2 MiB | 332.12 | 413.86 | 287.61 | 143.8 |
+| 4 MiB | 1 057.18 | 1 153.97 | 757.96 | 189.5 |
+| 8 MiB | 1 721.40 | 2 409.90 | 1 293.49 | 161.7 |
+| 10 MiB | 2 215.79 | 2 650.46 | 1 805.16 | 180.5 |
+
+CPU cost per MiB is flat at 133–144 ms through 2 MiB, then 162–190 ms from
+4 MiB. The step is the working set leaving the last-level cache: the body is
+scanned by 18 gate representations and 132 operator regex evaluations, so each
+MiB is read many times and larger bodies miss more often. That is a memory-hierarchy
+penalty, not an algorithmic exponent: there is no size at which the per-MiB
+cost keeps growing. Repeats at load 4–11 moved absolute values by up to 1.6×
+(frequency and SMT contention) but did not change that shape.
+
+#### Phase split at 1 MiB and 10 MiB
+
+`engine-profile` attributes the same request (median of three profiled
+repetitions):
+
+| phase | 1 MiB ms | 10 MiB ms | ratio | share at 10 MiB |
+|---|---:|---:|---:|---:|
+| parse (head + body) | 2.18 | 21.86 | 10.0× | 1.5 % |
+| transform cache | 23.16 | 254.07 | 11.0× | 17.9 % |
+| candidate extraction | 0.06 | 0.06 | 1.1× | <0.1 % |
+| literal/subsequence gate | 59.46 | 642.43 | 10.8× | 45.3 % |
+| operator regexes | 50.68 | 501.24 | 9.9× | 35.3 % |
+| scoring/captures/TX/matched | 0.18 | 0.18 | 1.0× | <0.1 % |
+| **accounted** | **135.70** | **1 419.84** | **10.5×** | **100 %** |
+
+Every phase scales with the body, and none scales with its square. The regex
+evaluation count is identical at both sizes (132 executed, 150 skipped by
+gates), so the rule count is constant and each scan is linear in the value.
+
+#### Suspects, checked
+
+- **Quadratic string building.** `parse_query` sizes its vector from the
+  separator count and splits once; `percent_decode` borrows unless a `%`/`+`
+  is present. Candidate extraction is 0.06 ms at both sizes. Multipart
+  flattening advances a cursor and copies each part once.
+- **Transform cache sharing.** The cache is keyed by `(value id, prefix)` and
+  the 10 MiB body value is registered once (`engine.rs:2168`). Transform time
+  per MiB is constant (23.2 ms/MiB at 1 MiB, 25.4 ms/MiB at 10 MiB), which is
+  only possible if the big value is shared, not copied per rule.
+- **Repeated regex/`contains` scans.** Gates are cached per value and phase, so
+  the 18 gate representations are scanned once per value, not once per rule;
+  150 regexes are skipped by them. The remaining 132 rules each scan the value
+  once, by definition of CRS.
+- **Budget accounting.** `Budget::bytes`/`materialised` are integer counters;
+  they never copy or measure the value. The transform arena is charged by
+  delta and reuses its capacity across requests.
+- **JSON/multipart token per byte.** JSON has `max_values = 16 384` and
+  `max_depth = 64`; arrays contribute one entry per element plus one length
+  entry. No processor emits a token per byte.
+
+#### Verdict
+
+No inspection-path change is justified: none of the suspects reproduces, and the
+observed "5 000×" is a unit error in the report. 10 MiB remains an explicit
+opt-in, now with a documented cost of roughly **1.4–3.9 s p50** (130–280 ms
+of CPU per MiB) for a one-argument body, versus roughly **0.29–0.75 s p50** at
+the 2 MiB default. It is viable only for a route that genuinely needs 10 MiB bodies
+and can afford that latency; it is not a default.
+
+If large-body latency becomes a requirement, the constant factor can be
+reduced by collapsing the 18 gate representations that resolve to the same
+bytes and by early-exiting a gate scan once every gate bit for its group is
+set. Both are detection-neutral (a gate may only be more permissive, never
+less) but touch the CRS gate compiler, so they belong in a separate,
+verdict-parity-tested change rather than this measurement task.

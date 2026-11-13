@@ -514,6 +514,15 @@ required-features = ["coraza-native"]
 name = "graphql_inspection"
 required-features = ["wasm-reactor"]
 
+# Body-size scaling harness for the native engine. Measures one URLENCODED
+# body shape across a size list and reports CPU/wall time per MiB, with an
+# optional per-phase split when built with `engine-profile`.
+#   cargo run --release --features rust-engine,engine-profile \
+#     --example body_scale -- --sizes 64KiB,1MiB,10MiB --profile
+[[example]]
+name = "body_scale"
+required-features = ["rust-engine"]
+
 
 # Native Rust CRS engine microbenchmarks (bodyless / 1 / 4 / 8 KiB).
 #   cargo bench --features rust-engine --bench rust_engine
