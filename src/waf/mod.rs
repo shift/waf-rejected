@@ -968,6 +968,11 @@ impl WafEngine {
         self.event_logger.event_store_configured()
     }
 
+    /// Name of the configured persistent event store (`Redb` or `Sled`).
+    pub fn event_store_name(&self) -> Option<&'static str> {
+        self.event_logger.event_store_name()
+    }
+
     fn initialize_geoip(config: &Config) -> Arc<GeoIpService> {
         let mut service = match &config.waf.geo_blocking.database_path {
             Some(path) => match GeoIpService::from_database(path) {

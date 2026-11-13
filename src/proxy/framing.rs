@@ -12,9 +12,11 @@
 //! they are read after the body.
 
 use std::fmt;
+use std::time::Duration;
 
 use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
 use http::HeaderMap;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Header fields that are scoped to a single connection and are forbidden in
 /// HTTP/2 and HTTP/3 (and in trailers).
@@ -105,6 +107,420 @@ impl FramingVersion {
     fn is_multiplexed(self) -> bool {
         matches!(self, Self::Http2 | Self::Http3)
     }
+}
+
+/// Reason a raw HTTP/1.x request head was rejected before hyper parsed it.
+///
+/// hyper normalises `Content-Length` + `Transfer-Encoding` (it drops the
+/// `Content-Length`) and collapses duplicate identical `Content-Length`
+/// fields while parsing. Once the request reaches the application neither
+/// ambiguity is observable, so the wire-level head is validated before it is
+/// handed to hyper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestHeadError {
+    /// The head violated the framing checks in [`validate_request_framing`].
+    Framing(FramingError),
+    /// The request line or a header field was not valid HTTP/1.x.
+    Malformed,
+    /// The request target was not origin-form or asterisk-form.
+    InvalidRequestTarget,
+    /// The method was rejected (CONNECT is a tunnel request; TRACE reflects).
+    MethodNotAllowed,
+}
+
+impl RequestHeadError {
+    /// HTTP status returned to the client for this rejection.
+    pub fn status(self) -> u16 {
+        match self {
+            Self::MethodNotAllowed => 405,
+            Self::Framing(_) | Self::Malformed | Self::InvalidRequestTarget => 400,
+        }
+    }
+
+    /// Stable server-side reason for logs and metrics.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Framing(_) => "invalid request framing",
+            Self::Malformed => "malformed request head",
+            Self::InvalidRequestTarget => "invalid request target",
+            Self::MethodNotAllowed => "method not allowed",
+        }
+    }
+}
+
+impl fmt::Display for RequestHeadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Framing(error) => write!(f, "{error}"),
+            Self::Malformed => f.write_str("malformed HTTP/1.x request head"),
+            Self::InvalidRequestTarget => {
+                f.write_str("request target must be origin-form or asterisk-form")
+            }
+            Self::MethodNotAllowed => {
+                f.write_str("CONNECT and TRACE are not allowed on this listener")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RequestHeadError {}
+
+/// Validate a complete HTTP/1.x request head (`...\r\n\r\n`) at the wire level.
+///
+/// This runs before hyper's parser so the WAF can see ambiguous framing that
+/// hyper would otherwise normalise away. It is deliberately stricter than
+/// [`validate_request_framing`]: any repeated `Content-Length` field (even an
+/// identical value), any comma-separated length list, `CL`+`TE`, an invalid
+/// `Transfer-Encoding`, absolute-form targets, whitespace before a header
+/// colon, and obs-fold are rejected. `CONNECT` and `TRACE` are rejected with
+/// `405` before any tunnel or reflection path is considered.
+pub fn validate_request_head(head: &[u8]) -> Result<(), RequestHeadError> {
+    let Some(header_end) = find_head_end(head) else {
+        return Err(RequestHeadError::Malformed);
+    };
+    let head = &head[..header_end];
+    // Every line ending must be CRLF; bare LF is ambiguous and rejected.
+    if head
+        .windows(2)
+        .any(|window| window[1] == b'\n' && window[0] != b'\r')
+    {
+        return Err(RequestHeadError::Malformed);
+    }
+
+    let mut lines = head.split(|byte| *byte == b'\n');
+    let request_line = lines.next().ok_or(RequestHeadError::Malformed)?;
+    let request_line = request_line
+        .strip_suffix(b"\r")
+        .ok_or(RequestHeadError::Malformed)?;
+    let mut parts = request_line.split(|byte| *byte == b' ');
+    let method = parts.next().ok_or(RequestHeadError::Malformed)?;
+    let target = parts.next().ok_or(RequestHeadError::Malformed)?;
+    let version = parts.next().ok_or(RequestHeadError::Malformed)?;
+    if parts.next().is_some() || method.is_empty() || target.is_empty() || version.is_empty() {
+        return Err(RequestHeadError::Malformed);
+    }
+    if !method.iter().all(|byte| is_tchar(*byte)) {
+        return Err(RequestHeadError::Malformed);
+    }
+    if method.eq_ignore_ascii_case(b"CONNECT") || method.eq_ignore_ascii_case(b"TRACE") {
+        return Err(RequestHeadError::MethodNotAllowed);
+    }
+    // Origin-form (`/path`) and asterisk-form (`*`) only. Absolute-form and
+    // authority-form request targets are not accepted by this proxy.
+    if target != b"*" && !target.starts_with(b"/") {
+        return Err(RequestHeadError::InvalidRequestTarget);
+    }
+    if target.iter().any(|byte| *byte <= b' ' || *byte == 0x7f) {
+        return Err(RequestHeadError::InvalidRequestTarget);
+    }
+    let is_http_10 = match version {
+        b"HTTP/1.1" => false,
+        b"HTTP/1.0" => true,
+        _ => return Err(RequestHeadError::Malformed),
+    };
+
+    let mut content_lengths: Vec<&[u8]> = Vec::new();
+    let mut transfer_encodings: Vec<&[u8]> = Vec::new();
+
+    for line in lines {
+        if line.is_empty() {
+            // The split includes a final empty element after the terminating
+            // CRLF.
+            break;
+        }
+        let line = line
+            .strip_suffix(b"\r")
+            .ok_or(RequestHeadError::Malformed)?;
+        if line.is_empty() {
+            // The blank line terminating the head.
+            break;
+        }
+        // obs-fold (continuation lines) is obsolete and ambiguous.
+        if line[0] == b' ' || line[0] == b'\t' {
+            return Err(RequestHeadError::Malformed);
+        }
+        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+            return Err(RequestHeadError::Malformed);
+        };
+        let (name, value) = line.split_at(colon);
+        if name.is_empty() || !name.iter().all(|byte| is_tchar(*byte)) {
+            // This also rejects whitespace before the colon (`Host : value`)
+            // and whitespace inside the field name.
+            return Err(RequestHeadError::Malformed);
+        }
+        let value = &value[1..];
+        // Strip optional leading/trailing OWS.
+        let value = trim_ows(value);
+        if value.iter().any(|byte| *byte == b'\r' || *byte == b'\n') {
+            return Err(RequestHeadError::Malformed);
+        }
+        if name.eq_ignore_ascii_case(b"content-length") {
+            content_lengths.push(value);
+        } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
+            transfer_encodings.push(value);
+        }
+    }
+
+    if !content_lengths.is_empty() && !transfer_encodings.is_empty() {
+        return Err(RequestHeadError::Framing(
+            FramingError::ContentLengthAndTransferEncoding,
+        ));
+    }
+
+    if !transfer_encodings.is_empty() {
+        validate_raw_transfer_encoding(&transfer_encodings, is_http_10)?;
+    }
+
+    if !content_lengths.is_empty() {
+        validate_raw_content_length(&content_lengths)?;
+    }
+
+    Ok(())
+}
+
+/// True when a validated HTTP/1.x head is an upgrade request (WebSocket).
+///
+/// Upgrade connections switch protocol after the response and must stay open;
+/// every other HTTP/1.x connection is limited to one request per connection so
+/// each head passes through [`validate_request_head`].
+pub fn request_head_requests_upgrade(head: &[u8]) -> bool {
+    let mut connection_upgrade = false;
+    let mut has_upgrade = false;
+    for line in head.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+            continue;
+        };
+        let name = trim_ows(&line[..colon]);
+        let value = trim_ows(&line[colon + 1..]);
+        if name.eq_ignore_ascii_case(b"upgrade") {
+            has_upgrade = true;
+        } else if name.eq_ignore_ascii_case(b"connection") {
+            connection_upgrade = value
+                .split(|byte| *byte == b',')
+                .any(|token| trim_ows(token).eq_ignore_ascii_case(b"upgrade"));
+        }
+    }
+    has_upgrade && connection_upgrade
+}
+
+/// Read one HTTP/1.x request head from `stream`, stopping after `\r\n\r\n`.
+///
+/// Bytes read beyond the head are returned too so they can be replayed to
+/// hyper (a body already in flight, or a pipelined request).
+pub async fn read_request_head<S>(
+    stream: &mut S,
+    max_bytes: usize,
+    timeout: Duration,
+) -> Result<Vec<u8>, RequestHeadError>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut buffer = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 2048];
+
+    let read = async {
+        loop {
+            if find_head_end(&buffer).is_some() {
+                return Ok(buffer);
+            }
+            if buffer.len() >= max_bytes {
+                return Err(RequestHeadError::Malformed);
+            }
+            let read = stream
+                .read(&mut chunk)
+                .await
+                .map_err(|_| RequestHeadError::Malformed)?;
+            if read == 0 {
+                return Err(RequestHeadError::Malformed);
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if buffer.len() > max_bytes {
+                return Err(RequestHeadError::Malformed);
+            }
+        }
+    };
+
+    tokio::time::timeout(timeout, read)
+        .await
+        .map_err(|_| RequestHeadError::Malformed)?
+}
+
+/// A stream that replays an already-read prefix before reading from the inner
+/// stream. Used to hand a validated request head back to hyper.
+pub struct PrefixedStream<S> {
+    prefix: Vec<u8>,
+    position: usize,
+    inner: S,
+}
+
+impl<S> PrefixedStream<S> {
+    pub fn new(prefix: Vec<u8>, inner: S) -> Self {
+        Self {
+            prefix,
+            position: 0,
+            inner,
+        }
+    }
+}
+
+impl<S> AsyncRead for PrefixedStream<S>
+where
+    S: AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.position < this.prefix.len() {
+            let remaining = &this.prefix[this.position..];
+            let take = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..take]);
+            this.position += take;
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S> AsyncWrite for PrefixedStream<S>
+where
+    S: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// Write a minimal fail-closed rejection and close the connection.
+pub async fn reject_request_head<S>(stream: &mut S, error: RequestHeadError)
+where
+    S: AsyncWrite + Unpin,
+{
+    let status = error.status();
+    let reason = match status {
+        405 => "Method Not Allowed",
+        _ => "Bad Request",
+    };
+    let body = format!("{status} {reason}");
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.shutdown().await;
+}
+
+fn find_head_end(bytes: &[u8]) -> Option<usize> {
+    bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)
+}
+
+fn is_tchar(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'!' | b'#'
+            | b'$'
+            | b'%'
+            | b'&'
+            | b'\''
+            | b'*'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'|'
+            | b'~'
+            | b'0'..=b'9'
+            | b'A'..=b'Z'
+            | b'a'..=b'z'
+    )
+}
+
+fn trim_ows(mut value: &[u8]) -> &[u8] {
+    while let [b' ' | b'\t', rest @ ..] = value {
+        value = rest;
+    }
+    while let [rest @ .., b' ' | b'\t'] = value {
+        value = rest;
+    }
+    value
+}
+
+fn validate_raw_content_length(values: &[&[u8]]) -> Result<(), RequestHeadError> {
+    // A repeated field or a comma-separated list means the peer supplied more
+    // than one length. Reject all of them: hyper collapses identical values,
+    // which hides the ambiguity from every later stage.
+    if values.len() != 1 || values[0].contains(&b',') {
+        return Err(RequestHeadError::Framing(
+            FramingError::ConflictingContentLengthValues,
+        ));
+    }
+    let value = values[0];
+    if value.is_empty() || !value.iter().all(|byte| byte.is_ascii_digit()) {
+        return Err(RequestHeadError::Framing(
+            FramingError::InvalidContentLength,
+        ));
+    }
+    value
+        .iter()
+        .try_fold(0u64, |acc, byte| {
+            acc.checked_mul(10)?.checked_add((byte - b'0') as u64)
+        })
+        .ok_or(RequestHeadError::Framing(
+            FramingError::InvalidContentLength,
+        ))?;
+    Ok(())
+}
+
+fn validate_raw_transfer_encoding(
+    values: &[&[u8]],
+    is_http_10: bool,
+) -> Result<(), RequestHeadError> {
+    if is_http_10 || values.len() != 1 {
+        return Err(RequestHeadError::Framing(
+            FramingError::InvalidTransferEncoding,
+        ));
+    }
+    let value = values[0];
+    let mut tokens = value.split(|byte| *byte == b',');
+    let Some(token) = tokens.next() else {
+        return Err(RequestHeadError::Framing(
+            FramingError::InvalidTransferEncoding,
+        ));
+    };
+    let token = trim_ows(token);
+    if tokens.next().is_some() || !token.eq_ignore_ascii_case(b"chunked") {
+        return Err(RequestHeadError::Framing(
+            FramingError::InvalidTransferEncoding,
+        ));
+    }
+    Ok(())
 }
 
 /// Validate request framing for a specific HTTP version.
@@ -592,6 +1008,156 @@ mod tests {
         assert_eq!(
             validate_request_trailers(&headers(&[("grpc-status", "0"), ("grpc-message", "ok"),])),
             Ok(())
+        );
+    }
+
+    fn head(request_line: &str, fields: &[&str]) -> Vec<u8> {
+        let mut raw = String::from(request_line);
+        raw.push_str("\r\nHost: localhost\r\n");
+        for field in fields {
+            raw.push_str(field);
+            raw.push_str("\r\n");
+        }
+        raw.push_str("\r\n");
+        raw.into_bytes()
+    }
+
+    #[test]
+    fn raw_head_accepts_clean_framing() {
+        assert_eq!(
+            validate_request_head(&head("POST /upload HTTP/1.1", &["Content-Length: 5"])),
+            Ok(())
+        );
+        assert_eq!(
+            validate_request_head(&head(
+                "POST /upload HTTP/1.1",
+                &["Transfer-Encoding: chunked"]
+            )),
+            Ok(())
+        );
+        assert_eq!(
+            validate_request_head(&head("OPTIONS * HTTP/1.1", &[])),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn raw_head_rejects_cl_te_in_either_order() {
+        for fields in [
+            &["Content-Length: 5", "Transfer-Encoding: chunked"][..],
+            &["Transfer-Encoding: chunked", "Content-Length: 5"][..],
+        ] {
+            assert_eq!(
+                validate_request_head(&head("POST / HTTP/1.1", fields)),
+                Err(RequestHeadError::Framing(
+                    FramingError::ContentLengthAndTransferEncoding
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn raw_head_rejects_identical_and_conflicting_duplicate_content_length() {
+        for fields in [
+            &["Content-Length: 5", "Content-Length: 5"][..],
+            &["Content-Length: 5", "Content-Length: 6"][..],
+            &["Content-Length: 5, 5"][..],
+            &["Content-Length: 5, 6"][..],
+        ] {
+            assert_eq!(
+                validate_request_head(&head("POST / HTTP/1.1", fields)),
+                Err(RequestHeadError::Framing(
+                    FramingError::ConflictingContentLengthValues
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn raw_head_rejects_non_chunked_and_stacked_transfer_encoding() {
+        for value in [
+            "gzip",
+            "chunked, gzip",
+            "gzip, chunked",
+            "chunked, chunked",
+            "xchunked",
+            "",
+        ] {
+            let field = format!("Transfer-Encoding: {value}");
+            assert_eq!(
+                validate_request_head(&head("POST / HTTP/1.1", &[&field])),
+                Err(RequestHeadError::Framing(
+                    FramingError::InvalidTransferEncoding
+                )),
+                "value {value:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_head_rejects_absolute_form_and_authority_form_targets() {
+        for line in [
+            "GET http://example.com/ HTTP/1.1",
+            "GET https://example.com/ HTTP/1.1",
+            "CONNECT example.com:443 HTTP/1.1",
+        ] {
+            let error = validate_request_head(&head(line, &[])).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    RequestHeadError::InvalidRequestTarget | RequestHeadError::MethodNotAllowed
+                ),
+                "{line:?} returned {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_head_rejects_whitespace_before_colon_and_obs_fold() {
+        for field in [
+            "Content-Length : 5",
+            "Content-Length\t: 5",
+            " Content-Length: 5",
+        ] {
+            assert_eq!(
+                validate_request_head(&head("POST / HTTP/1.1", &[field])),
+                Err(RequestHeadError::Malformed),
+                "field {field:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_head_rejects_trace_and_connect_with_405() {
+        for line in ["TRACE / HTTP/1.1", "CONNECT example.com:443 HTTP/1.1"] {
+            let error = validate_request_head(&head(line, &[])).unwrap_err();
+            assert_eq!(error, RequestHeadError::MethodNotAllowed);
+            assert_eq!(error.status(), 405);
+        }
+    }
+
+    #[test]
+    fn raw_head_detects_upgrade_requests() {
+        assert!(request_head_requests_upgrade(&head(
+            "GET /ws HTTP/1.1",
+            &["Connection: Upgrade", "Upgrade: websocket"]
+        )));
+        assert!(!request_head_requests_upgrade(&head(
+            "GET / HTTP/1.1",
+            &["Connection: close"]
+        )));
+        assert!(!request_head_requests_upgrade(&head(
+            "GET / HTTP/1.1",
+            &["Upgrade: websocket"]
+        )));
+    }
+
+    #[test]
+    fn raw_head_rejects_bare_lf_line_endings() {
+        let raw = b"POST / HTTP/1.1\nHost: localhost\nContent-Length: 5\n\n".to_vec();
+        assert_eq!(
+            validate_request_head(&raw),
+            Err(RequestHeadError::Malformed)
         );
     }
 }

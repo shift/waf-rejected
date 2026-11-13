@@ -47,8 +47,9 @@ use crate::proxy::decompression::{
     decompress_request_body, strip_encoding_headers, DecompressionError,
 };
 use crate::proxy::framing::{
-    reconcile_content_length, validate_request_framing_for_version, validate_request_trailers,
-    FramingVersion,
+    read_request_head, reconcile_content_length, reject_request_head,
+    request_head_requests_upgrade, validate_request_framing_for_version, validate_request_head,
+    validate_request_trailers, FramingVersion, PrefixedStream,
 };
 use crate::proxy::grpc_body::{
     probe_grpc_body, GrpcBodyMode, GrpcProbeError, GrpcStreamError, GrpcStreamGuard, PrefixedBody,
@@ -1064,12 +1065,16 @@ impl ReadinessProbe for ProxyReadinessProbe {
         let mut dependencies = Vec::new();
 
         // The persistent event store is a required dependency when enabled.
-        if self.engine.event_store_configured() {
+        // Probe the configured backend by name (redb is the default, sled is
+        // the legacy backend); a hard-coded Sled probe made a healthy redb
+        // deployment permanently report `event_store_unavailable:Sled`.
+        let event_store = self.engine.event_store_name();
+        if let Some(store_name) = event_store {
             let healthy = engine_health
                 .iter()
-                .any(|(name, healthy)| name == "Sled" && *healthy);
+                .any(|(name, healthy)| name == store_name && *healthy);
             dependencies.push(DependencyHealth {
-                name: "Sled".to_string(),
+                name: store_name.to_string(),
                 status: if healthy { "healthy" } else { "down" }.to_string(),
                 required: true,
                 detail: Some(if healthy {
@@ -1081,7 +1086,7 @@ impl ReadinessProbe for ProxyReadinessProbe {
         }
 
         for name in configured {
-            if name == "Sled" {
+            if Some(name) == event_store {
                 continue;
             }
             let healthy = engine_health
@@ -1595,7 +1600,7 @@ impl WafProxyService {
     }
 
     async fn handle_connection<S>(
-        stream: S,
+        mut stream: S,
         state: ProxyState,
         peer_ip: IpAddr,
         is_https: bool,
@@ -1604,7 +1609,6 @@ impl WafProxyService {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
-        let io = hyper_util::rt::TokioIo::new(stream);
         // HTTP/2 over cleartext requires h2c negotiation/prior knowledge.
         // Plaintext listeners therefore speak HTTP/1.1; HTTP/2 is enabled only
         // when TLS ALPN negotiated h2.
@@ -1621,6 +1625,7 @@ impl WafProxyService {
             service_fn(move |req| Self::handle_request(req, state.clone(), peer_ip, is_https));
 
         if enable_http2 {
+            let io = hyper_util::rt::TokioIo::new(stream);
             let tuning = &http2_tuning;
             let mut builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
             builder.timer(TokioTimer::new());
@@ -1654,9 +1659,46 @@ impl WafProxyService {
                 .await
                 .map_err(|e| WafError::NetworkError(format!("HTTP/2 connection error: {}", e)))
         } else {
+            // Validate the wire-level request head before hyper sees it. hyper
+            // collapses duplicate identical Content-Length fields and removes
+            // Content-Length when Transfer-Encoding is present, which makes
+            // CL+TE and duplicate CL invisible to the service layer. The gate
+            // rejects them (and absolute-form targets, whitespace before a
+            // header colon, CONNECT/TRACE) with a fail-closed 400/405 before
+            // any bytes are forwarded. One request per connection guarantees
+            // every head passes through the gate; HTTP/1.0/1.1 clients
+            // reconnect transparently.
+            let head = match read_request_head(
+                &mut stream,
+                max_header_bytes.saturating_add(8192).max(8192),
+                keep_alive_timeout,
+            )
+            .await
+            {
+                Ok(head) => head,
+                Err(error) => {
+                    debug!("Rejected request head from {}: {}", peer_ip, error);
+                    reject_request_head(&mut stream, error).await;
+                    return Ok(());
+                }
+            };
+            if let Err(error) = validate_request_head(&head) {
+                warn!(
+                    "Rejected wire-level request framing from {}: {}",
+                    peer_ip, error
+                );
+                reject_request_head(&mut stream, error).await;
+                return Ok(());
+            }
+            // Upgrade connections (WebSocket) must stay open after the 101 so
+            // the tunnel can run. Every other HTTP/1.x connection serves one
+            // request, which guarantees the next request head also passes
+            // through the wire gate.
+            let keep_alive = request_head_requests_upgrade(&head);
+            let io = hyper_util::rt::TokioIo::new(PrefixedStream::new(head, stream));
             let mut builder = hyper::server::conn::http1::Builder::new();
             builder
-                .keep_alive(true)
+                .keep_alive(keep_alive)
                 .pipeline_flush(true)
                 .timer(TokioTimer::new())
                 .header_read_timeout(Some(keep_alive_timeout))
@@ -1757,6 +1799,24 @@ impl WafProxyService {
             return Ok(Self::create_error_response(
                 StatusCode::BAD_REQUEST,
                 "Bad Request",
+            ));
+        }
+
+        // CONNECT is a tunnel request and TRACE reflects the request back at
+        // the caller. Reject both before inspection so a rule-engine block
+        // (which may use 403) cannot mask the documented 405, and so no
+        // tunnel/upgrade path is ever considered for CONNECT.
+        if req.method() == hyper::Method::CONNECT || req.method() == hyper::Method::TRACE {
+            warn!(
+                "Rejected unsupported method {} from {}",
+                req.method(),
+                client_ip
+            );
+            telemetry.reject(RequestRejection::MethodNotAllowed);
+            state.metrics.record_blocked();
+            return Ok(Self::create_error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "Method Not Allowed",
             ));
         }
 
@@ -3312,6 +3372,16 @@ impl WafProxyService {
         strip_policy.strip(&mut parts.headers, client_ip);
 
         let classification = classify_request(&parts.headers);
+        // Downstream version negotiation is independent of the upstream
+        // connection. Default to HTTP/1.1 (the capability every configured
+        // origin supports); gRPC multiplexed over an h2/h3 ingress keeps
+        // HTTP/2 because the gRPC transport requires it. Mirrored versions
+        // caused `502 UserUnsupportedVersion` against HTTP/1.1-only origins.
+        let upstream_version = if classification.is_grpc && matches!(http_version, "2" | "3") {
+            hyper::Version::HTTP_2
+        } else {
+            hyper::Version::HTTP_11
+        };
 
         let upstream_path_and_query = parts
             .uri
@@ -3350,7 +3420,7 @@ impl WafProxyService {
         let mut proxy_req = Request::builder()
             .method(parts.method)
             .uri(new_uri)
-            .version(parts.version); // Preserve HTTP version
+            .version(upstream_version);
 
         match http_version {
             "1.0" => {
@@ -5102,6 +5172,162 @@ mod tests {
             Ok(request) => request,
             Err(_) => panic!("upstream request construction failed"),
         }
+    }
+
+    fn build_upstream_for_version(
+        version: hyper::Version,
+        http_version: &str,
+    ) -> Request<ProxyBody> {
+        let (parts, body) = Request::builder()
+            .method("GET")
+            .uri("/")
+            .version(version)
+            .body(ProxyBody::full(Bytes::new()))
+            .unwrap()
+            .into_parts();
+        let upstream: Uri = "http://upstream.local".parse().unwrap();
+        WafProxyService::build_upstream_request_with_policy(
+            parts,
+            body,
+            &upstream,
+            http_version,
+            "127.0.0.1".parse().unwrap(),
+            false,
+            &HeaderStripPolicy::defaults(),
+        )
+        .unwrap_or_else(|_| panic!("upstream request construction failed"))
+    }
+
+    #[test]
+    fn h2_downstream_defaults_to_http1_upstream() {
+        let built = build_upstream_for_version(hyper::Version::HTTP_2, "2");
+        assert_eq!(
+            built.version(),
+            hyper::Version::HTTP_11,
+            "h2 ingress must not require an h2 origin"
+        );
+    }
+
+    #[test]
+    fn http1_downstream_uses_http1_upstream() {
+        let built = build_upstream_for_version(hyper::Version::HTTP_11, "1.1");
+        assert_eq!(built.version(), hyper::Version::HTTP_11);
+    }
+
+    #[test]
+    fn multiplexed_grpc_keeps_http2_upstream() {
+        let (mut parts, body) = Request::builder()
+            .method("POST")
+            .uri("/svc/Method")
+            .version(hyper::Version::HTTP_2)
+            .header("content-type", "application/grpc")
+            .body(ProxyBody::full(Bytes::new()))
+            .unwrap()
+            .into_parts();
+        parts.version = hyper::Version::HTTP_2;
+        let upstream: Uri = "http://upstream.local".parse().unwrap();
+        let built = WafProxyService::build_upstream_request_with_policy(
+            parts,
+            body,
+            &upstream,
+            "2",
+            "127.0.0.1".parse().unwrap(),
+            false,
+            &HeaderStripPolicy::defaults(),
+        )
+        .unwrap_or_else(|_| panic!("upstream request construction failed"));
+        assert_eq!(built.version(), hyper::Version::HTTP_2);
+    }
+
+    async fn probe_for(config: &Config) -> ReadinessSnapshot {
+        let engine = Arc::new(WafEngine::with_config(config));
+        ProxyReadinessProbe {
+            engine,
+            backend: "rust".to_string(),
+        }
+        .snapshot()
+        .await
+    }
+
+    #[tokio::test]
+    async fn readiness_probes_the_configured_redb_store() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let mut config = Config::default();
+        config.waf.coraza.enabled = false;
+        config.storage.enabled = true;
+        config.storage.backend = "redb".to_string();
+        config.storage.path = directory.path().join("audit.redb").display().to_string();
+
+        let snapshot = probe_for(&config).await;
+        let store = snapshot
+            .dependencies
+            .iter()
+            .find(|dependency| dependency.name == "Redb")
+            .expect("redb dependency must be probed");
+        assert_eq!(store.status, "healthy");
+        assert!(store.required);
+        assert!(
+            !snapshot
+                .dependencies
+                .iter()
+                .any(|dependency| dependency.name == "Sled"),
+            "a redb deployment must not report a Sled dependency"
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_reports_memory_when_no_store_is_configured() {
+        let mut config = Config::default();
+        config.waf.coraza.enabled = false;
+        config.storage.enabled = false;
+
+        let snapshot = probe_for(&config).await;
+        assert!(
+            !snapshot
+                .dependencies
+                .iter()
+                .any(|dependency| matches!(dependency.name.as_str(), "Redb" | "Sled")),
+            "in-memory event handling must not require a persistent store"
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_reports_a_genuinely_unavailable_store() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let mut config = Config::default();
+        config.waf.coraza.enabled = false;
+        config.storage.enabled = true;
+        config.storage.backend = "redb".to_string();
+        // A directory cannot be opened as a redb database file.
+        config.storage.path = directory.path().display().to_string();
+
+        let snapshot = probe_for(&config).await;
+        let store = snapshot
+            .dependencies
+            .iter()
+            .find(|dependency| dependency.name == "Redb")
+            .expect("configured redb dependency must still be reported");
+        assert_eq!(store.status, "down");
+        assert!(store.required);
+    }
+
+    #[cfg(feature = "export-sled")]
+    #[tokio::test]
+    async fn readiness_probes_the_configured_sled_store() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let mut config = Config::default();
+        config.waf.coraza.enabled = false;
+        config.storage.enabled = true;
+        config.storage.backend = "sled".to_string();
+        config.storage.path = directory.path().join("audit.sled").display().to_string();
+
+        let snapshot = probe_for(&config).await;
+        let store = snapshot
+            .dependencies
+            .iter()
+            .find(|dependency| dependency.name == "Sled")
+            .expect("sled dependency must be probed");
+        assert_eq!(store.status, "healthy");
     }
 
     #[test]

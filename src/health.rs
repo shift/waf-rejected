@@ -402,7 +402,7 @@ impl HealthService {
 
 fn dependency_kind(dependency: &DependencyHealth) -> &'static str {
     match dependency.name.as_str() {
-        "Sled" => "event_store",
+        "Sled" | "Redb" => "event_store",
         _ => "exporter",
     }
 }
