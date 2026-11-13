@@ -412,6 +412,374 @@ where
     }
 }
 
+/// Request body framing derived from a validated HTTP/1.x head.
+enum BodyFraming {
+    None,
+    Fixed(u64),
+    Chunked,
+}
+
+/// Derive the body framing from a head that already passed
+/// [`validate_request_head`]. The head is unambiguous at this point, so the
+/// only question is where the next request head starts.
+fn request_body_framing(head: &[u8]) -> Result<BodyFraming, RequestHeadError> {
+    let mut content_length = None;
+    let mut has_transfer_encoding = false;
+    for line in head.split(|byte| *byte == b'\n').skip(1) {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            break;
+        }
+        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+            return Err(RequestHeadError::Malformed);
+        };
+        let name = trim_ows(&line[..colon]);
+        let value = trim_ows(&line[colon + 1..]);
+        if name.eq_ignore_ascii_case(b"transfer-encoding") {
+            has_transfer_encoding = true;
+        } else if name.eq_ignore_ascii_case(b"content-length") {
+            let value = std::str::from_utf8(value).map_err(|_| RequestHeadError::Malformed)?;
+            content_length = Some(
+                value
+                    .parse::<u64>()
+                    .map_err(|_| RequestHeadError::Malformed)?,
+            );
+        }
+    }
+    if has_transfer_encoding {
+        Ok(BodyFraming::Chunked)
+    } else if let Some(length) = content_length {
+        Ok(BodyFraming::Fixed(length))
+    } else {
+        Ok(BodyFraming::None)
+    }
+}
+
+/// Streaming parser for a chunked body on the request side.
+///
+/// The gate must know where a chunked body ends so it can tell where the next
+/// request head begins. It forwards every chunk-framing byte unchanged (hyper
+/// still parses the body itself) and only tracks boundaries.
+struct ChunkedBody {
+    phase: ChunkPhase,
+    complete: bool,
+}
+
+enum ChunkPhase {
+    SizeLine(Vec<u8>),
+    Data(u64),
+    DataCrlf(u8),
+    Trailers(Vec<u8>),
+}
+
+impl ChunkedBody {
+    fn new() -> Self {
+        Self {
+            phase: ChunkPhase::SizeLine(Vec::new()),
+            complete: false,
+        }
+    }
+
+    /// Consume bytes from `data`, appending the body bytes (unchanged) to
+    /// `out`. Returns how many input bytes were consumed. Stops early once the
+    /// terminating trailer block is complete; the remainder is the next head.
+    fn consume(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<usize, RequestHeadError> {
+        let mut index = 0;
+        while index < data.len() {
+            match &mut self.phase {
+                ChunkPhase::SizeLine(line) => {
+                    let byte = data[index];
+                    index += 1;
+                    line.push(byte);
+                    out.push(byte);
+                    if line.ends_with(b"\r\n") {
+                        let size_line = &line[..line.len() - 2];
+                        if size_line
+                            .iter()
+                            .any(|byte| *byte == b'\r' || *byte == b'\n')
+                        {
+                            return Err(RequestHeadError::Malformed);
+                        }
+                        let token = size_line.split(|byte| *byte == b';').next().unwrap_or(b"");
+                        let token = trim_ows(token);
+                        if token.is_empty() || !token.iter().all(|byte| byte.is_ascii_hexdigit()) {
+                            return Err(RequestHeadError::Malformed);
+                        }
+                        let mut size = 0u64;
+                        for byte in token {
+                            let digit = (*byte as char)
+                                .to_digit(16)
+                                .ok_or(RequestHeadError::Malformed)?;
+                            size = size
+                                .checked_mul(16)
+                                .and_then(|value| value.checked_add(digit as u64))
+                                .ok_or(RequestHeadError::Malformed)?;
+                        }
+                        self.phase = if size == 0 {
+                            ChunkPhase::Trailers(Vec::new())
+                        } else {
+                            ChunkPhase::Data(size)
+                        };
+                    } else if line.len() > 4096 {
+                        return Err(RequestHeadError::Malformed);
+                    }
+                }
+                ChunkPhase::Data(remaining) => {
+                    let take = (*remaining).min((data.len() - index) as u64) as usize;
+                    out.extend_from_slice(&data[index..index + take]);
+                    index += take;
+                    *remaining -= take as u64;
+                    if *remaining == 0 {
+                        self.phase = ChunkPhase::DataCrlf(0);
+                    }
+                }
+                ChunkPhase::DataCrlf(expected) => {
+                    let wanted = if *expected == 0 { b'\r' } else { b'\n' };
+                    if data[index] != wanted {
+                        return Err(RequestHeadError::Malformed);
+                    }
+                    out.push(data[index]);
+                    index += 1;
+                    *expected += 1;
+                    if *expected == 2 {
+                        self.phase = ChunkPhase::SizeLine(Vec::new());
+                    }
+                }
+                ChunkPhase::Trailers(line) => {
+                    let byte = data[index];
+                    index += 1;
+                    line.push(byte);
+                    out.push(byte);
+                    if line.ends_with(b"\r\n") {
+                        if line.as_slice() == b"\r\n" {
+                            self.complete = true;
+                            return Ok(index);
+                        }
+                        // A non-empty trailer field line is end-to-end metadata;
+                        // the application validates its contents after hyper
+                        // parses it. Only the blank line terminates the body.
+                        line.clear();
+                    } else if line.len() > 8192 {
+                        return Err(RequestHeadError::Malformed);
+                    }
+                }
+            }
+        }
+        Ok(index)
+    }
+}
+
+enum GateState {
+    Head(Vec<u8>),
+    Fixed(u64),
+    Chunked(ChunkedBody),
+    /// An upgraded connection: bytes belong to another protocol and must not be
+    /// interpreted as HTTP request heads.
+    Passthrough,
+    Poisoned,
+}
+
+/// An I/O wrapper that validates every HTTP/1.x request head on a connection
+/// before hyper can normalise its framing.
+///
+/// The first head is validated by the caller and supplied to
+/// [`Http1RequestGate::new`]. The gate then tracks the body framing
+/// (`Content-Length` or chunked) so it can find each subsequent head, buffer
+/// it to `\r\n\r\n`, and validate it before releasing a single byte to hyper.
+/// Invalid heads are never released, so nothing from them can be forwarded.
+/// This keeps HTTP/1.1 keep-alive and pipelining while retaining the wire-level
+/// smuggling defence on every request.
+pub struct Http1RequestGate<S> {
+    inner: S,
+    state: GateState,
+    out: Vec<u8>,
+    out_position: usize,
+    pending: Vec<u8>,
+    max_head_bytes: usize,
+}
+
+impl<S> Http1RequestGate<S> {
+    /// Build a gate around `stream` after `head` has been validated.
+    ///
+    /// `head` may contain bytes read past the first head (a body already in
+    /// flight or a pipelined request). Only the first head is released
+    /// immediately; the remainder is held as unvalidated input and runs
+    /// through the same gate once the first head has been handed to hyper.
+    pub fn new(stream: S, head: Vec<u8>, max_head_bytes: usize) -> Result<Self, RequestHeadError> {
+        let end = find_head_end(&head).ok_or(RequestHeadError::Malformed)?;
+        let first = head[..end].to_vec();
+        let pending = head[end..].to_vec();
+        let framing = request_body_framing(&first)?;
+        let state = if request_head_requests_upgrade(&first) {
+            // After a successful upgrade the connection carries the tunnel's
+            // protocol, not further HTTP requests. Stop parsing and splice the
+            // bytes through unchanged.
+            GateState::Passthrough
+        } else {
+            match framing {
+                BodyFraming::None => GateState::Head(Vec::new()),
+                BodyFraming::Fixed(length) => GateState::Fixed(length),
+                BodyFraming::Chunked => GateState::Chunked(ChunkedBody::new()),
+            }
+        };
+        Ok(Self {
+            inner: stream,
+            state,
+            out: first,
+            out_position: 0,
+            pending,
+            max_head_bytes,
+        })
+    }
+
+    fn process(&mut self, data: &[u8]) -> Result<(), RequestHeadError> {
+        let mut offset = 0;
+        while offset < data.len() {
+            match &mut self.state {
+                GateState::Head(buffer) => {
+                    buffer.extend_from_slice(&data[offset..]);
+                    if buffer.len() > self.max_head_bytes {
+                        return Err(RequestHeadError::Malformed);
+                    }
+                    let Some(end) = find_head_end(buffer) else {
+                        return Ok(());
+                    };
+                    let head = buffer[..end].to_vec();
+                    validate_request_head(&head)?;
+                    let framing = request_body_framing(&head)?;
+                    let upgrade = request_head_requests_upgrade(&head);
+                    self.out.extend_from_slice(&head);
+                    let rest = buffer[end..].to_vec();
+                    buffer.clear();
+                    self.state = if upgrade {
+                        GateState::Passthrough
+                    } else {
+                        match framing {
+                            BodyFraming::None => GateState::Head(Vec::new()),
+                            BodyFraming::Fixed(length) => GateState::Fixed(length),
+                            BodyFraming::Chunked => GateState::Chunked(ChunkedBody::new()),
+                        }
+                    };
+                    return self.process(&rest);
+                }
+                GateState::Fixed(remaining) => {
+                    let take = (*remaining).min((data.len() - offset) as u64) as usize;
+                    self.out.extend_from_slice(&data[offset..offset + take]);
+                    offset += take;
+                    *remaining -= take as u64;
+                    if *remaining == 0 {
+                        self.state = GateState::Head(Vec::new());
+                    } else {
+                        return Ok(());
+                    }
+                }
+                GateState::Chunked(parser) => {
+                    let consumed = parser.consume(&data[offset..], &mut self.out)?;
+                    offset += consumed;
+                    if parser.complete {
+                        self.state = GateState::Head(Vec::new());
+                    } else {
+                        return Ok(());
+                    }
+                }
+                GateState::Passthrough => {
+                    self.out.extend_from_slice(&data[offset..]);
+                    return Ok(());
+                }
+                GateState::Poisoned => return Err(RequestHeadError::Malformed),
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<S> AsyncRead for Http1RequestGate<S>
+where
+    S: AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        loop {
+            if this.out_position < this.out.len() {
+                let remaining = &this.out[this.out_position..];
+                let take = remaining.len().min(buf.remaining());
+                buf.put_slice(&remaining[..take]);
+                this.out_position += take;
+                if this.out_position == this.out.len() {
+                    this.out.clear();
+                    this.out_position = 0;
+                }
+                return std::task::Poll::Ready(Ok(()));
+            }
+
+            if !this.pending.is_empty() {
+                let pending = std::mem::take(&mut this.pending);
+                if let Err(error) = this.process(&pending) {
+                    this.state = GateState::Poisoned;
+                    return std::task::Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        error.to_string(),
+                    )));
+                }
+                continue;
+            }
+
+            let mut scratch = [0u8; 8192];
+            let mut read_buf = tokio::io::ReadBuf::new(&mut scratch);
+            match std::pin::Pin::new(&mut this.inner).poll_read(cx, &mut read_buf) {
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+                std::task::Poll::Ready(Err(error)) => {
+                    return std::task::Poll::Ready(Err(error));
+                }
+                std::task::Poll::Ready(Ok(())) => {
+                    let filled = read_buf.filled();
+                    if filled.is_empty() {
+                        return std::task::Poll::Ready(Ok(()));
+                    }
+                    if let Err(error) = this.process(filled) {
+                        this.state = GateState::Poisoned;
+                        return std::task::Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            error.to_string(),
+                        )));
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<S> AsyncWrite for Http1RequestGate<S>
+where
+    S: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 /// Write a minimal fail-closed rejection and close the connection.
 pub async fn reject_request_head<S>(stream: &mut S, error: RequestHeadError)
 where
