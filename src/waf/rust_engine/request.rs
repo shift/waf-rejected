@@ -273,13 +273,20 @@ impl<'a> Collections<'a> {
         }
 
         let args_get = if parsed.valid {
-            parse_query(parsed.query.as_ref(), b'&')
-                .into_iter()
-                .map(|entry| Entry {
-                    key: Cow::Owned(entry.key.into_owned()),
-                    value: Cow::Owned(entry.value.into_owned()),
-                })
-                .collect()
+            match &parsed.query {
+                // The common origin-form case borrows the query slice from the
+                // request URI, so argument keys and values stay zero-copy.
+                Cow::Borrowed(query) => parse_query(*query, b'&'),
+                // A normalised (owned) query is local to this call, so its
+                // entries must own their bytes.
+                Cow::Owned(query) => parse_query(query, b'&')
+                    .into_iter()
+                    .map(|entry| Entry {
+                        key: Cow::Owned(entry.key.into_owned()),
+                        value: Cow::Owned(entry.value.into_owned()),
+                    })
+                    .collect(),
+            }
         } else {
             Vec::new()
         };
@@ -816,25 +823,25 @@ impl<'a> RequestData<'a> {
             )?,
             Collection::RequestUri => self.single(
                 Collection::RequestUri,
-                self.request_uri.clone(),
+                Cow::Borrowed(self.request_uri.as_ref()),
                 budget,
                 out,
             )?,
             Collection::RequestUriRaw => self.single(
                 Collection::RequestUriRaw,
-                self.request_uri_raw.clone(),
+                Cow::Borrowed(self.request_uri_raw.as_ref()),
                 budget,
                 out,
             )?,
             Collection::RequestMethod => self.single(
                 Collection::RequestMethod,
-                self.request_method.clone(),
+                Cow::Borrowed(self.request_method.as_ref()),
                 budget,
                 out,
             )?,
             Collection::RequestBody => self.single(
                 Collection::RequestBody,
-                self.request_body.clone().unwrap_or(Cow::Borrowed(&[])),
+                Cow::Borrowed(self.request_body.as_deref().unwrap_or(&[])),
                 budget,
                 out,
             )?,
@@ -849,31 +856,31 @@ impl<'a> RequestData<'a> {
             }
             Collection::RequestFilename => self.single(
                 Collection::RequestFilename,
-                self.request_filename.clone(),
+                Cow::Borrowed(self.request_filename.as_ref()),
                 budget,
                 out,
             )?,
             Collection::RequestBasename => self.single(
                 Collection::RequestBasename,
-                self.request_basename.clone(),
+                Cow::Borrowed(self.request_basename.as_ref()),
                 budget,
                 out,
             )?,
             Collection::RequestLine => self.single(
                 Collection::RequestLine,
-                self.request_line.clone(),
+                Cow::Borrowed(self.request_line.as_ref()),
                 budget,
                 out,
             )?,
             Collection::RequestProtocol => self.single(
                 Collection::RequestProtocol,
-                self.request_protocol.clone(),
+                Cow::Borrowed(self.request_protocol.as_ref()),
                 budget,
                 out,
             )?,
             Collection::QueryString => self.single(
                 Collection::QueryString,
-                self.query_string.clone(),
+                Cow::Borrowed(self.query_string.as_ref()),
                 budget,
                 out,
             )?,
@@ -923,7 +930,7 @@ impl<'a> RequestData<'a> {
             )?,
             Collection::ReqbodyProcessor => self.single(
                 Collection::ReqbodyProcessor,
-                Cow::Owned(self.reqbody_processor.clone().into_bytes()),
+                Cow::Borrowed(self.reqbody_processor.as_bytes()),
                 budget,
                 out,
             )?,
@@ -941,13 +948,13 @@ impl<'a> RequestData<'a> {
             )?,
             Collection::ResponseStatus => self.single(
                 Collection::ResponseStatus,
-                Cow::Owned(self.response_status.clone().into_bytes()),
+                Cow::Borrowed(self.response_status.as_bytes()),
                 budget,
                 out,
             )?,
             Collection::ResponseProtocol => self.single(
                 Collection::ResponseProtocol,
-                Cow::Owned(self.response_protocol.clone().into_bytes()),
+                Cow::Borrowed(self.response_protocol.as_bytes()),
                 budget,
                 out,
             )?,
@@ -969,7 +976,7 @@ impl<'a> RequestData<'a> {
             )?,
             Collection::ResponseBody => self.single(
                 Collection::ResponseBody,
-                Cow::Owned(self.response_body.clone().unwrap_or_default()),
+                Cow::Borrowed(self.response_body.as_deref().unwrap_or(&[])),
                 budget,
                 out,
             )?,
@@ -988,13 +995,13 @@ impl<'a> RequestData<'a> {
             )?,
             Collection::ResponseContentType => self.single(
                 Collection::ResponseContentType,
-                Cow::Owned(self.response_content_type.clone().into_bytes()),
+                Cow::Borrowed(self.response_content_type.as_bytes()),
                 budget,
                 out,
             )?,
             Collection::ResponseContentLength => self.single(
                 Collection::ResponseContentLength,
-                Cow::Owned(self.response_content_length.clone().into_bytes()),
+                Cow::Borrowed(self.response_content_length.as_bytes()),
                 budget,
                 out,
             )?,
@@ -1035,7 +1042,7 @@ impl<'a> RequestData<'a> {
     fn single<'r>(
         &'r self,
         collection: Collection,
-        value: Cow<'a, [u8]>,
+        value: Cow<'r, [u8]>,
         budget: &mut Budget,
         out: &mut Vec<Candidate<'r>>,
     ) -> Result<(), EngineError> {

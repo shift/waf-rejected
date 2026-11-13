@@ -9,6 +9,11 @@
 //! * `rust` — the native Rust CRS engine (`RustEngine::evaluate`).
 //! * `kernel` — the experimental native evaluation kernel
 //!   (`KernelEngine::evaluate`).
+//! * `waf` — the full request path behind the proxy
+//!   (`WafEngine::evaluate`: admission, protocol pre-checks, content
+//!   inspection and the CRS rule chain) at bodyless, 1 KiB, 4 KiB, 8 KiB and
+//!   10 MiB. This backend also enforces the committed allocation-byte budget
+//!   per case, which is deterministic and therefore host-independent.
 //!
 //! Every row reports p50/p95/p99, mean, throughput, host allocations per
 //! operation and the decision. Process RSS and the CPU affinity mask are
@@ -39,6 +44,7 @@ use waf_ingress::waf::coraza_payload::{
     build_payload_with_policy, BodyInspectionPolicy, PayloadBuild,
 };
 use waf_ingress::waf::wasm_reactor::{ReactorLimits, WasmReactor};
+use waf_ingress::waf::{Decision, RequestContext, WafEngine};
 
 #[repr(C)]
 struct Timespec {
@@ -144,6 +150,7 @@ enum Backend {
     Coraza,
     Rust,
     Kernel,
+    Waf,
 }
 
 #[derive(Debug, Parser)]
@@ -175,12 +182,19 @@ struct Cli {
     /// Write the report as JSON.
     #[arg(long)]
     json_out: Option<PathBuf>,
+
+    /// Skip the per-case allocation-bytes/allocation-count gate.
+    #[arg(long)]
+    no_alloc_gate: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum CaseKind {
     Bodyless,
+    Allow1k,
     Allow4k,
+    Allow8k,
+    Allow10m,
     Sqli4k,
 }
 
@@ -188,7 +202,10 @@ impl CaseKind {
     fn label(self) -> &'static str {
         match self {
             Self::Bodyless => "bodyless",
+            Self::Allow1k => "1k-allow",
             Self::Allow4k => "4k-allow",
+            Self::Allow8k => "8k-allow",
+            Self::Allow10m => "10m-allow",
             Self::Sqli4k => "4k-sqli",
         }
     }
@@ -249,6 +266,57 @@ fn cases() -> Vec<Case> {
             method: "POST",
             uri: "/submit",
             headers: base_headers(Some("application/x-www-form-urlencoded"), 4096),
+            body: form_body(b"1+union+select+password+from+users", 4096),
+        },
+    ]
+}
+
+/// Cases for the `waf` backend: the request path at every size the mission
+/// specifies, plus the 4 KiB attack case so the attack/allow ratio can be read
+/// from the same run.
+fn waf_cases() -> Vec<Case> {
+    let base_headers = |body_len: usize| {
+        vec![
+            ("Host".to_string(), "benchmark.test".to_string()),
+            ("User-Agent".to_string(), "Mozilla/5.0".to_string()),
+            (
+                "Accept".to_string(),
+                "text/html,application/xhtml+xml".to_string(),
+            ),
+            (
+                "Content-Type".to_string(),
+                "application/x-www-form-urlencoded".to_string(),
+            ),
+            ("Content-Length".to_string(), body_len.to_string()),
+        ]
+    };
+    let sized = |kind: CaseKind, size: usize| Case {
+        kind,
+        method: "POST",
+        uri: "/submit",
+        headers: base_headers(size),
+        body: form_body(b"", size),
+    };
+    vec![
+        Case {
+            kind: CaseKind::Bodyless,
+            method: "GET",
+            uri: "/index.html",
+            headers: base_headers(0)
+                .into_iter()
+                .filter(|(name, _)| name != "Content-Type" && name != "Content-Length")
+                .collect(),
+            body: Vec::new(),
+        },
+        sized(CaseKind::Allow1k, 1024),
+        sized(CaseKind::Allow4k, 4096),
+        sized(CaseKind::Allow8k, 8192),
+        sized(CaseKind::Allow10m, 10 * 1024 * 1024),
+        Case {
+            kind: CaseKind::Sqli4k,
+            method: "POST",
+            uri: "/submit",
+            headers: base_headers(4096),
             body: form_body(b"1+union+select+password+from+users", 4096),
         },
     ]
@@ -499,6 +567,78 @@ fn run_kernel(_cli: &Cli) -> Result<Vec<serde_json::Value>> {
     anyhow::bail!("perf-gate-bench was built without the `engine-kernel` feature")
 }
 
+/// Builds the proxy-side request context for one case.
+fn waf_context(case: &Case) -> Result<RequestContext> {
+    let mut headers = HeaderMap::new();
+    for (name, value) in &case.headers {
+        headers.insert(
+            hyper::header::HeaderName::from_bytes(name.as_bytes())?,
+            HeaderValue::from_str(value)?,
+        );
+    }
+    let body = (!case.body.is_empty()).then(|| Bytes::from(case.body.clone()));
+    Ok(RequestContext::with_http_version(
+        "127.0.0.1".parse::<IpAddr>()?,
+        Method::from_bytes(case.method.as_bytes())?,
+        case.uri.parse::<Uri>()?,
+        headers,
+        body.as_ref().map(Bytes::len),
+        "1.1",
+    )
+    .with_body(body))
+}
+
+/// The request path as the proxy drives it: admission, protocol pre-checks,
+/// content inspection and the CRS rule chain.
+fn run_waf(cli: &Cli) -> Result<Vec<serde_json::Value>> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build the single-threaded runtime")?;
+
+    let mut config = waf_ingress::config::Config::default();
+    // The rate limiters keep per-IP state across cases; the gate measures the
+    // request path, not limiter behaviour.
+    config.waf.rate_limit.per_ip_enabled = false;
+    config.waf.rate_limit.global_enabled = false;
+    config.waf.coraza.backend = waf_ingress::config::CorazaBackend::Rust;
+    config.waf.coraza.fallback = waf_ingress::config::CorazaFallback::None;
+    // A 10 MiB body is a legitimate case; keep the evaluation clock generous so
+    // the row measures the engine rather than a timeout.
+    config.waf.coraza.eval_timeout_ms = 120_000;
+
+    let engine = WafEngine::with_config_and_metrics(&config, None);
+    if let Some(error) = engine.waf_init_error() {
+        anyhow::bail!("initialise the request-path engine: {error}");
+    }
+
+    let mut rows = Vec::new();
+    for case in waf_cases() {
+        let context = waf_context(&case)?;
+        let (stats, throughput) = measure(cli.samples, cli.warmup, || {
+            runtime.block_on(engine.evaluate(&context))
+        });
+        let (alloc_bytes, alloc_calls) = measure_alloc(cli.alloc_reps, || {
+            runtime.block_on(engine.evaluate(&context))
+        });
+        let decision = match runtime.block_on(engine.evaluate(&context)) {
+            Decision::Allow => "allow",
+            Decision::Block { .. } => "block",
+            Decision::RateLimit { .. } => "rate-limit",
+        };
+        rows.push(row_json(
+            "waf",
+            case.kind,
+            stats,
+            throughput,
+            alloc_bytes,
+            alloc_calls,
+            decision,
+        ));
+    }
+    Ok(rows)
+}
+
 fn row_json(
     backend: &str,
     kind: CaseKind,
@@ -524,13 +664,153 @@ fn row_json(
     })
 }
 
+/// Allocation-bytes and allocation-count limits for the native engine cases.
+///
+/// Counts are deterministic (they do not depend on host load), so the gate is
+/// enforced by default. Limits are the measured post-optimisation baseline plus
+/// headroom; see `docs/operations/performance-verification.md`.
+struct AllocLimit {
+    case: &'static str,
+    max_bytes: f64,
+    max_allocs: f64,
+}
+
+const RUST_ALLOC_LIMITS: &[AllocLimit] = &[
+    AllocLimit {
+        case: "bodyless",
+        max_bytes: 4_000.0,
+        max_allocs: 45.0,
+    },
+    AllocLimit {
+        case: "4k-allow",
+        max_bytes: 7_000.0,
+        max_allocs: 50.0,
+    },
+    AllocLimit {
+        case: "4k-sqli",
+        max_bytes: 13_000.0,
+        max_allocs: 60.0,
+    },
+];
+
+/// Ceilings for the full request path (`waf` backend), per payload size.
+///
+/// These bound *host* allocations, not payload size: the body is borrowed from
+/// the caller's `Bytes` for the whole evaluation, so the ceilings are flat from
+/// bodyless through 8 KiB; the 4 KiB SQLi and 10 MiB cells are higher (the
+/// attack input and the large URL-encoded argument list).
+/// Set from the measured baseline plus ~15 % headroom; see
+/// `docs/operations/performance-verification.md`.
+const WAF_ALLOC_LIMITS: &[AllocLimit] = &[
+    AllocLimit {
+        case: "bodyless",
+        max_bytes: 4_096.0,
+        max_allocs: 100.0,
+    },
+    AllocLimit {
+        case: "1k-allow",
+        max_bytes: 7_168.0,
+        max_allocs: 110.0,
+    },
+    AllocLimit {
+        case: "4k-allow",
+        max_bytes: 7_168.0,
+        max_allocs: 110.0,
+    },
+    AllocLimit {
+        case: "8k-allow",
+        max_bytes: 7_168.0,
+        max_allocs: 110.0,
+    },
+    AllocLimit {
+        case: "10m-allow",
+        max_bytes: 20_480.0,
+        max_allocs: 260.0,
+    },
+    AllocLimit {
+        case: "4k-sqli",
+        max_bytes: 14_000.0,
+        max_allocs: 75.0,
+    },
+];
+
+struct AllocGateResult {
+    case: &'static str,
+    max_bytes: f64,
+    max_allocs: f64,
+    measured_bytes: f64,
+    measured_allocs: f64,
+    passed: bool,
+}
+
+fn alloc_gates(rows: &[serde_json::Value], backend: Backend) -> Vec<AllocGateResult> {
+    let limits: &[AllocLimit] = match backend {
+        Backend::Rust => RUST_ALLOC_LIMITS,
+        Backend::Waf => WAF_ALLOC_LIMITS,
+        Backend::Coraza | Backend::Kernel => return Vec::new(),
+    };
+    limits
+        .iter()
+        .map(|limit| {
+            let row = rows
+                .iter()
+                .find(|row| row["case"].as_str() == Some(limit.case));
+            let measured_bytes = row
+                .and_then(|row| row["alloc_bytes_per_op"].as_f64())
+                .unwrap_or(f64::INFINITY);
+            let measured_allocs = row
+                .and_then(|row| row["allocs_per_op"].as_f64())
+                .unwrap_or(f64::INFINITY);
+            AllocGateResult {
+                case: limit.case,
+                max_bytes: limit.max_bytes,
+                max_allocs: limit.max_allocs,
+                measured_bytes,
+                measured_allocs,
+                passed: measured_bytes <= limit.max_bytes && measured_allocs <= limit.max_allocs,
+            }
+        })
+        .collect()
+}
+
+fn print_alloc_gates(gates: &[AllocGateResult]) {
+    if gates.is_empty() {
+        return;
+    }
+    eprintln!();
+    eprintln!("## Allocation gate");
+    eprintln!(
+        "{:<10} {:>12} {:>12} {:>10} {:>10} {:>8}",
+        "case", "bytes/op", "limit", "allocs/op", "limit", "result"
+    );
+    for gate in gates {
+        eprintln!(
+            "{:<10} {:>12.1} {:>12.1} {:>10.1} {:>10.1} {:>8}",
+            gate.case,
+            gate.measured_bytes,
+            gate.max_bytes,
+            gate.measured_allocs,
+            gate.max_allocs,
+            if gate.passed { "PASS" } else { "FAIL" }
+        );
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let rows = match cli.only {
         Backend::Coraza => run_coraza(&cli)?,
         Backend::Rust => run_rust(&cli)?,
         Backend::Kernel => run_kernel(&cli)?,
+        Backend::Waf => run_waf(&cli)?,
     };
+
+    let alloc_gates = if cli.no_alloc_gate {
+        Vec::new()
+    } else {
+        alloc_gates(&rows, cli.only)
+    };
+    print_alloc_gates(&alloc_gates);
 
     let report = json!({
         "schema": 1,
@@ -546,12 +826,24 @@ fn main() -> Result<()> {
             "target_arch": std::env::consts::ARCH,
         },
         "rows": rows,
+        "alloc_gates": alloc_gates.iter().map(|gate| json!({
+            "case": gate.case,
+            "max_bytes_per_op": gate.max_bytes,
+            "max_allocs_per_op": gate.max_allocs,
+            "measured_bytes_per_op": gate.measured_bytes,
+            "measured_allocs_per_op": gate.measured_allocs,
+            "passed": gate.passed,
+        })).collect::<Vec<_>>(),
     });
 
     println!("{}", serde_json::to_string_pretty(&report)?);
     if let Some(path) = cli.json_out.as_deref() {
         std::fs::write(path, serde_json::to_vec_pretty(&report)?)
             .with_context(|| format!("write {}", path.display()))?;
+    }
+
+    if alloc_gates.iter().any(|gate| !gate.passed) {
+        anyhow::bail!("allocation gate failed");
     }
     Ok(())
 }

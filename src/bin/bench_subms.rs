@@ -178,6 +178,12 @@ struct Cli {
     #[arg(long)]
     no_wasm: bool,
 
+    /// Add the 10 MiB cap cell (L0 rust engine and L3 rust proxy). This is the
+    /// default `server.max_body_size`; the cell shows the worst-case
+    /// amplification and whether the body is inspectable at all.
+    #[arg(long)]
+    stress_10m: bool,
+
     /// Enable `[waf.distributed]` and start the controller on the proxy's
     /// shared state. Requires the non-default `distri-kv` feature.
     #[cfg(feature = "distri-kv")]
@@ -211,6 +217,8 @@ enum SizeClass {
     K1,
     K4,
     K8,
+    /// 10 MiB, the default `server.max_body_size`. Stress cell only.
+    M10,
 }
 
 const SIZES: [SizeClass; 4] = [
@@ -220,6 +228,9 @@ const SIZES: [SizeClass; 4] = [
     SizeClass::K8,
 ];
 
+/// The 10 MiB cap cell. Opt-in because it is far slower than the other rows.
+const STRESS_SIZES: [SizeClass; 1] = [SizeClass::M10];
+
 impl SizeClass {
     fn label(self) -> &'static str {
         match self {
@@ -227,6 +238,7 @@ impl SizeClass {
             SizeClass::K1 => "1 KiB",
             SizeClass::K4 => "4 KiB",
             SizeClass::K8 => "8 KiB",
+            SizeClass::M10 => "10 MiB",
         }
     }
 
@@ -236,6 +248,7 @@ impl SizeClass {
             SizeClass::K1 => 1024,
             SizeClass::K4 => 4 * 1024,
             SizeClass::K8 => 8 * 1024,
+            SizeClass::M10 => 10 * 1024 * 1024,
         }
     }
 
@@ -714,6 +727,21 @@ fn run_l0(cli: &Cli, runtime: &tokio::runtime::Runtime) -> Result<Vec<Row>> {
                     .with_alloc(bytes, calls)
                     .with_note(describe(&decision)),
             );
+        }
+
+        if cli.stress_10m {
+            for size in STRESS_SIZES {
+                let ctx = synthetic_context(size);
+                let reps = cli.samples.min(3);
+                let (stats, decision) =
+                    measure_engine(runtime, &engine, &ctx, reps, cli.warmup.min(1));
+                let (bytes, calls) = measure_engine_alloc(runtime, &engine, &ctx, reps);
+                rows.push(
+                    Row::new("L0-engine-stress", "rust", size.label(), stats)
+                        .with_alloc(bytes, calls)
+                        .with_note(describe(&decision)),
+                );
+            }
         }
     }
 
@@ -1238,6 +1266,7 @@ fn print_budget(rows: &[Row]) {
             SizeClass::K1 => Some(0.8),
             SizeClass::K4 => Some(1.5),
             SizeClass::K8 => None,
+            SizeClass::M10 => None,
         };
         let outside = match (l3, l0) {
             (Some(l3), Some(l0)) => format!("{:.3} ms", l3 - l0),
@@ -1288,6 +1317,7 @@ fn print_budget(rows: &[Row]) {
             SizeClass::K1 => 0.8,
             SizeClass::K4 => 1.5,
             SizeClass::K8 => continue,
+            SizeClass::M10 => continue,
         };
         let floor = find_concurrent(rows, "L2-proxy", "no-waf", label).map(|row| row.stats.p50_ms);
         let budget = floor

@@ -653,3 +653,189 @@ the source of truth. Compare only runs with the same `environment.json`
 - The underlying guest GC tail (p95 ~373 ms versus p50 ~164 ms on a 4 KiB
   attack body) remains. Fixing it needs a GC/memory-limit tradeoff and a soak
   measurement; it is listed in §7 rather than changed in this report.
+
+## 11. Request-path allocation removal (`perf/request-path-allocs`)
+
+**Branch:** `perf/request-path-allocs`, base `6868a11`. Six alternating
+before/after `bench-subms --only l0` runs, 20 samples per cell; medians are
+reported. Host load average was 3.5–4.4 at the start of each run (shared host).
+
+### 11.1 The 646 KB/4 KiB baseline is historical
+
+The 646 468 B/op and 1 772 allocs/op at 4 KiB in §3.1/§6 were measured at
+`aca35db`. They are **not reproducible on `6868a11`**: the same Rust engine
+cell measures 5 445 B/op and 82 allocs/op, and the allocation-size histogram has
+no bucket above 1 KiB. The body is already borrowed end to end (the transform
+cache copies it once into a reused arena, and the rules see slices); the
+zero-copy work landed before this branch. This section therefore measures the
+*remaining* owned copies, not a 160× amplification.
+
+### 11.2 What was copied and why
+
+- `RequestData::resolve_into` cloned single-value collections for every rule
+  that targeted them: `REQUEST_LINE` (an owned `Cow`), `REQUEST_URI`,
+  `REQUEST_FILENAME`, `REQUEST_BASENAME`, `REQUEST_PROTOCOL`, `QUERY_STRING` and
+  `REQBODY_PROCESSOR`. Each clone allocated once per targeting rule. They are
+  now borrowed with the `'r` lifetime of the request data.
+- GET argument parsing always materialised owned `Entry` keys and values even
+  when `parse_query` returned borrowed slices. `build()` now matches
+  `Cow::Borrowed(query)` and keeps the zero-copy entries; the normalised
+  (owned) query case still owns, as it must.
+- Response single-value collections (`RESPONSE_STATUS`, `RESPONSE_PROTOCOL`,
+  `RESPONSE_BODY`, content type/length) follow the same borrow.
+- TX and MATCHED_VARS candidates still own their bytes. `setvar` and
+  `record_match` mutate those arenas while the candidate list is being
+  evaluated, so borrowing would alias a mutable buffer. Their values are small
+  (scores and names); making them borrowed needs the arena-backed IR change
+  described in §6.1, not a one-line lifetime change.
+- Content inspection still uses `String::from_utf8_lossy` and
+  `urlencoding::decode` because its patterns are `regex::Regex` over `&str`.
+  Valid-UTF-8 bodies borrow (no copy). Bodies that are not valid UTF-8, or that
+  contain `%`/`+`, get **one** owned representation for the decoded/UTF-8 view.
+  That is the only body-proportional copy left in the inspection path (≤1× the
+  body, only when the decoded view is needed). Switching the patterns to
+  `regex::bytes` would change operator semantics and was not done.
+- The proxy forwards the inspected body by moving the same `Bytes` handle into
+  `ProxyBody::buffered`; `RequestContext` holds a refcount clone. The egress
+  normalisation is unchanged (client `Transfer-Encoding` stripped, exact
+  `Content-Length` stamped).
+
+### 11.3 Before/after (L0-engine rust, `bench-subms`)
+
+Medians of six alternating runs:
+
+| size | before p50 ms | after p50 ms | before allocs/op | after allocs/op | before B/op | after B/op |
+|---|---:|---:|---:|---:|---:|---:|
+| bodyless | 0.1266 | 0.1224 | 75 | **28** | 3 103 | **2 774** |
+| 1 KiB | 0.2810 | 0.2770 | 82 | **35** | 5 445 | **5 075** |
+| 4 KiB | 0.5797 | 0.5918 | 82 | **35** | 5 445 | **5 075** |
+| 8 KiB | 1.0070 | 1.0082 | 82 | **35** | 5 445 | **5 075** |
+
+Allocation counts are deterministic. The 4 KiB p50 moved +2.1 % and the 8 KiB
+p50 +0.1 %; the per-run distributions overlap (4 KiB before 0.571–0.612 ms,
+after 0.580–0.673 ms) and the after runs were taken at slightly higher load, so
+this is unchanged within noise. Bodyless and 1 KiB p50 improved 3.3 % and 1.4 %
+respectively. Per-request allocation count fell 57 % at every body size.
+
+### 11.4 Full proxy (L3-proxy rust, loopback)
+
+One run, 30 sequential requests per cell. This row includes the keep-alive
+client and the in-process mock upstream, so its body copies are dominated by
+the harness; the WAF add-on is the L3−L2 delta.
+
+| size | before p50 ms | after p50 ms | before allocs/op | after allocs/op | before B/op | after B/op |
+|---|---:|---:|---:|---:|---:|---:|
+| bodyless | 0.428 | 0.424 | 156 | **109** | 68 082 | 67 753 |
+| 1 KiB | 0.664 | **0.579** | 226 | **179** | 121 372 | 121 011 |
+| 4 KiB | 0.966 | **0.931** | 174 | **127** | 83 710 | 83 340 |
+| 8 KiB | 1.381 | 1.387 | 178 | **131** | 136 686 | 136 308 |
+
+### 11.5 Remaining allocation profile (4 KiB)
+
+`engine-profile`, one profiled request after warm-up (allocation events):
+
+| category | before | after |
+|---|---:|---:|
+| candidate resolution | 56 | **10** |
+| TX values | 13 | 13 |
+| parse / request build | 10 | 10 |
+| operators | 4 | 4 |
+| scoring | 3 | 3 |
+| transforms | 0 | 0 |
+| **total** | **92** | **46** |
+
+After the change the 4 KiB histogram is 15 allocations ≤16 B, 9 at 17–64 B,
+7 at 65–256 B and 4 at 257–1024 B; there is no allocation above 1 KiB. The top
+remaining sites are TX value clones (13), candidate resolution of mixed/owned
+single-value collections and `MATCHED_VARS` (10), request build (10), operator
+captures (4) and first-use TX scoring slots (3).
+
+### 11.6 10 MiB cap stress cell
+
+`bench-subms --stress-10m` adds the default `server.max_body_size` cell. At
+10 MiB the Rust engine returns
+
+```text
+Block { status: 500, reason: "Rust engine runtime error (fail-closed):
+transform output exceeded the per-request byte cap" }
+```
+
+because `Collections::process_body_bytes` charges the whole body through
+`Budget::bytes`, whose per-value cap is `Limits::max_value_bytes` (1 MiB;
+`max_total_bytes` is 8 MiB). The body is therefore refused **before phase 2**:
+there is no body-proportional allocation to remove, but a configured 10 MiB
+body is not inspectable. This is a blocker. Raising the cap would change
+verdicts (from a blanket 500 to content-based allow/block) and needs an
+architecture decision; it was not changed here. The stress cell records 209 →
+201 allocs/op and 17 002 → 16 958 B/op at the fail-closed point (the small
+reduction is the same candidate-borrow change).
+
+### 11.7 Cache behaviour (`perf stat`, user-space counters)
+
+`perf` 7.1.1 from the Nix store; `perf_event_paranoid=2`, no capabilities, so
+only user-space (`:u`) counters of our own process were collected. The probe
+(`src/bin/alloc_probe.rs`, `--cell`) warms up, prints `READY`, sleeps, then runs
+the measured loop; `perf stat -p <pid>` attaches during the sleep.
+
+4 KiB, 3 000 requests per run:
+
+| counter | before | after | before / req | after / req |
+|---|---:|---:|---:|---:|
+| cache-misses | 5 954 358 | 6 365 441 | 1 984.8 | 2 121.8 |
+| cache-references | 150 764 238 | 154 783 265 | 50 254.7 | 51 594.4 |
+| LLC-load-misses | 207 836 | 173 725 | **69.28** | **57.91** |
+| LLC-loads | 19 443 439 | 19 852 374 | 6 481.1 | 6 617.5 |
+| instructions | 12 774 211 513 | 12 190 646 503 | 4 258 070 | 4 063 549 |
+| cycles | 5 855 430 610 | 5 391 400 214 | 1 951 810 | 1 797 133 |
+
+LLC-load-misses per request fell 16.4 % and LLC-load-misses per body byte fell
+from 0.01691 to 0.01414. Instructions and cycles fell 4.6 % and 7.9 %. Total
+`cache-misses` rose 6.9 %, so the cache-pressure explanation is only partly
+supported at this size: the removed copies were small (hundreds of bytes per
+request), and the dominant LLC traffic is the rule/transform working set rather
+than the payload.
+
+10 MiB, 500 requests (all fail-closed before phase 2):
+
+| counter | before / req | after / req |
+|---|---:|---:|
+| cache-misses | 1 265.9 | 1 230.9 |
+| LLC-load-misses | 90.64 | 92.03 |
+| LLC-loads | 1 930.5 | 1 978.0 |
+| instructions | 523 881 | 448 604 |
+| cycles | 295 140 | 234 545 |
+
+The 10 MiB LLC counters are flat because the body never reaches the transform
+or rule loop; they measure the header-phase fail-closed path, not body-copy
+pressure. LLC-load-misses per body byte is 8.64e-6 before and 8.78e-6 after.
+
+### 11.8 Allocation gate
+
+`perf-gate-bench` now enforces bytes/op and allocs/op for the Rust backend
+(counts are deterministic and do not move with host load). Limits are the
+measured after values plus headroom:
+
+| case | measured B/op | limit | measured allocs/op | limit |
+|---|---:|---:|---:|---:|
+| bodyless | 2 610 | 4 000 | 28 | 45 |
+| 4k-allow | 4 942 | 7 000 | 31 | 50 |
+| 4k-sqli | 9 130 | 13 000 | 37 | 60 |
+
+A row above either limit prints the table and exits non-zero; use
+`--no-alloc-gate` for a measurement-only run.
+
+`perf-gate-bench --only waf` covers the full request path (admission,
+protocol pre-checks, content inspection and the rule chain) at bodyless,
+1 KiB, 4 KiB, 8 KiB, 10 MiB and 4 KiB SQLi with its own limits (bodyless
+4 096 B / 100 allocs; 1–8 KiB 7 168 B / 110 allocs; 4 KiB SQLi 14 000 B /
+75 allocs — measured 9 841 B / 53; 10 MiB 20 480 B / 260 allocs). The 10 MiB
+row records the fail-closed decision from §11.6 rather than pretending the body
+was inspected.
+
+### 11.9 Verification
+
+- `rust-engine-parity --engine both`: **2 112/2 112** agree, rust/coraza both
+  1 788 block / 324 allow, 0 errors, 0 native-only false negatives.
+- `cargo fmt -- --check`, `cargo clippy --lib -- --deny warnings`,
+  `cargo test --lib`, `cargo test --test integration`, `nix build
+  .#waf-ingress`: see the PR/commit for the recorded results.

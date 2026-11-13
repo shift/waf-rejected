@@ -1479,3 +1479,34 @@ compile-only fixes on code paths that already failed to build.
       tests pass with `distri-kv`; validate-configs 19 files ok; `nix build
       .#waf-ingress` exit 0 (/nix/store/khxhcbxwb1drilqwak11fnrhcqbg8y50-waf-ingress-0.1.0-beta.16).
 - [x] Commit and push `fix/no-dead-config`.
+
+# Delegated: request-path allocation removal (`.worktrees/alloc`)
+
+**Branch:** `perf/request-path-allocs` (base `6868a11`).
+
+## Status
+
+- [x] Measured the base with `bench-subms` (L0-engine rust) and an
+      allocation-size/profile probe. The documented 646 468 B/op at 4 KiB is
+      from `aca35db`; base `6868a11` measures 5 445 B/op, 82 allocs/op, with no
+      allocation above 1 KiB. The 160× body copy was already gone.
+- [x] Removed the remaining owned-candidate copies in
+      `src/waf/rust_engine/request.rs`: `REQUEST_LINE`/URI/filename/protocol/
+      query/REQBODY_PROCESSOR are borrowed; GET arguments borrow from the URI
+      when `parse_query` is zero-copy; response single-value collections borrow.
+- [x] Kept TX/MATCHED_VARS owned: `setvar`/`record_match` mutate those arenas
+      while candidates are evaluated. Documented as the named remaining copy.
+- [x] Added the 10 MiB stress cell (`bench-subms --stress-10m`). It exposes a
+      blocker: `Limits::max_value_bytes` is 1 MiB while `server.max_body_size`
+      is 10 MiB, so a 10 MiB body fails closed (500) before phase 2.
+- [x] Extended `perf-gate-bench` with per-case allocation-bytes/allocs gates
+      (Rust backend, deterministic) and `--no-alloc-gate`.
+- [x] Documented before/after, remaining profile, 10 MiB finding and `perf
+      stat` cache counters in `docs/operations/performance-verification.md` §11.
+- [x] Parity: 2 112/2 112, 0 native-only false negatives.
+- [x] fmt clean; `cargo clippy --lib -- --deny warnings` clean; `cargo test
+      --lib` 692 passed / 0 failed / 11 ignored; `cargo test --test
+      integration` 87 passed / 0 failed / 14 ignored; `nix build .#waf-ingress`
+      green; `perf-gate-bench --only rust` and `--only waf` allocation gates
+      pass.
+- [ ] Commit and push.
