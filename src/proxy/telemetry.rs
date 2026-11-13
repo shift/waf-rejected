@@ -22,6 +22,7 @@ use crate::metrics::Metrics;
 pub(crate) enum RequestRejection {
     UnsupportedHttpVersion,
     AmbiguousRouting,
+    MethodNotAllowed,
     InvalidFraming,
     InvalidTrailerFraming,
     HeaderLimit,
@@ -46,6 +47,7 @@ impl RequestRejection {
         match self {
             Self::UnsupportedHttpVersion => "unsupported_http_version",
             Self::AmbiguousRouting => "ambiguous_routing",
+            Self::MethodNotAllowed => "method_not_allowed",
             Self::InvalidFraming => "invalid_framing",
             Self::InvalidTrailerFraming => "invalid_trailer_framing",
             Self::HeaderLimit => "header_limit",

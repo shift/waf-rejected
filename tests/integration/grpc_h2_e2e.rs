@@ -933,9 +933,12 @@ async fn grpc_web_over_http1_preserves_body_encoded_trailers() {
     let mut sender = http1_client::<Full<Bytes>>(proxy, &env.ca_path).await;
 
     let frame = grpc_frame(&protobuf_string(1, "web-hello"));
+    // HTTP/1.1 connections carry origin-form targets; absolute-form is
+    // rejected by the wire framing gate.
     let request = Request::builder()
         .method("POST")
-        .uri(format!("https://127.0.0.1:{}{}", proxy.port(), WEB))
+        .uri(WEB)
+        .header("host", format!("127.0.0.1:{}", proxy.port()))
         .header("content-type", "application/grpc-web+proto")
         .header("te", "trailers")
         .body(Full::new(frame.clone()))
@@ -1237,7 +1240,8 @@ async fn grpc_media_type_matching_is_case_and_parameter_insensitive() {
     let web_frame = grpc_frame(&protobuf_string(1, "web-case"));
     let request = Request::builder()
         .method("POST")
-        .uri(format!("https://127.0.0.1:{}{}", proxy.port(), WEB))
+        .uri(WEB)
+        .header("host", format!("127.0.0.1:{}", proxy.port()))
         .header("content-type", "Application/GRPC-WEB+Proto; charset=utf-8")
         .header("te", "trailers")
         .body(Full::new(web_frame.clone()))

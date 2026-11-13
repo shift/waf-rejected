@@ -602,6 +602,15 @@ impl SecurityEventLogger {
         self.store.is_some()
     }
 
+    /// Name of the configured persistent event store (`Redb`, `Sled`), or
+    /// `None` when events are kept in memory only.
+    pub fn event_store_name(&self) -> Option<&'static str> {
+        self.store.as_ref().map(|store| match store.backend {
+            "sled" => "Sled",
+            _ => "Redb",
+        })
+    }
+
     /// Flush all exporters
     pub async fn flush(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.dispatcher.flush().await

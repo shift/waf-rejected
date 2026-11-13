@@ -27,6 +27,9 @@ mod maxmind_tests;
 #[path = "integration/native_coraza_tests.rs"]
 mod native_coraza_tests;
 
+#[path = "integration/framing_tests.rs"]
+mod framing_tests;
+
 #[path = "integration/https_upstream_tests.rs"]
 mod https_upstream_tests;
 
