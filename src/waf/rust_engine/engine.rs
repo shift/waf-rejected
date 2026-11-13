@@ -221,7 +221,7 @@ impl RustEngine {
         match self.evaluate_detailed(request) {
             Ok(outcome) => outcome.decision,
             Err(err) => Decision::Block {
-                status: 500,
+                status: err.fail_closed_status(),
                 reason: format!("rust-engine fail-closed: {err}"),
             },
         }
@@ -244,7 +244,7 @@ impl RustEngine {
             Ok(outcome) => (outcome.decision, report),
             Err(err) => (
                 Decision::Block {
-                    status: 500,
+                    status: err.fail_closed_status(),
                     reason: format!("rust-engine fail-closed: {err}"),
                 },
                 report,
@@ -414,7 +414,7 @@ impl RustEngine {
         match self.evaluate_response_detailed(request, response, config) {
             Ok(outcome) => outcome.decision,
             Err(err) => Decision::Block {
-                status: 500,
+                status: err.fail_closed_status(),
                 reason: format!("rust-engine response fail-closed: {err}"),
             },
         }
@@ -2884,7 +2884,7 @@ SecRule RESPONSE_BODY "@rx (?i)<script[^>]*>" "id:2002,phase:4,deny,status:403"
     }
 
     #[test]
-    fn response_engine_errors_fail_closed() {
+    fn response_engine_budget_breach_is_a_policy_outcome() {
         let engine = response_engine().with_limits(Limits {
             max_values_per_rule: 0,
             max_value_bytes: 0,
@@ -2898,7 +2898,7 @@ SecRule RESPONSE_BODY "@rx (?i)<script[^>]*>" "id:2002,phase:4,deny,status:403"
                 &response(&headers, b"benign"),
                 &ResponseConfig::raw_body(),
             ),
-            Decision::Block { status: 500, .. }
+            Decision::Block { status: 413, .. }
         ));
     }
 }

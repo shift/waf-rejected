@@ -2,6 +2,7 @@
 //! upstream timeouts, keep-alive and WebSocket tunnels.
 
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,6 +46,43 @@ async fn spawn_upstream() -> std::net::SocketAddr {
     });
 
     addr
+}
+
+/// Upstream that counts how many requests reached it, so a test can prove a
+/// rejected body was not forwarded.
+async fn spawn_counting_upstream() -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let forwarded = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&forwarded);
+
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let counter = Arc::clone(&counter);
+            tokio::spawn(async move {
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        TokioIo::new(stream),
+                        service_fn(move |_req: Request<hyper::body::Incoming>| {
+                            let counter = Arc::clone(&counter);
+                            async move {
+                                counter.fetch_add(1, Ordering::Relaxed);
+                                Ok::<_, Infallible>(
+                                    Response::builder()
+                                        .status(StatusCode::OK)
+                                        .header("content-length", "11")
+                                        .body(Full::new(Bytes::from_static(b"upstream-ok")))
+                                        .unwrap(),
+                                )
+                            }
+                        }),
+                    )
+                    .await;
+            });
+        }
+    });
+
+    (addr, forwarded)
 }
 
 async fn spawn_silent_upstream() -> std::net::SocketAddr {
@@ -337,4 +375,124 @@ async fn websocket_lifetime_cap_closes_with_policy_violation() {
         Some(Ok(Message::Close(None))) | Some(Err(_)) | None => {}
         Some(Ok(other)) => panic!("unexpected message after lifetime cap: {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Body cap / engine inspection cap alignment
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "rust-engine")]
+fn inspected_config(upstream: std::net::SocketAddr) -> Config {
+    let mut config = base_config(upstream);
+    config.waf.coraza.enabled = true;
+    config.waf.coraza.backend = waf_ingress::config::CorazaBackend::Rust;
+    config
+}
+
+#[cfg(feature = "rust-engine")]
+fn large_body(len: usize) -> String {
+    let mut body = String::with_capacity(len);
+    body.push_str("data=");
+    body.extend(std::iter::repeat('A').take(len - body.len()));
+    body
+}
+
+#[cfg(feature = "rust-engine")]
+#[tokio::test]
+async fn two_mib_body_is_inspected_with_the_default_cap() {
+    let upstream = spawn_upstream().await;
+    let config = inspected_config(upstream);
+    assert_eq!(config.server.max_body_size, 10 << 20);
+    let proxy = spawn_proxy(config).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy}/upload"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(large_body(2 << 20))
+        .send()
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let text = response.text().await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a 2 MiB body must be inspected, not fail closed: {text}"
+    );
+}
+
+#[cfg(feature = "rust-engine")]
+#[tokio::test]
+async fn ten_mib_body_at_the_default_cap_is_inspected() {
+    let upstream = spawn_upstream().await;
+    let config = inspected_config(upstream);
+    let cap = config.server.max_body_size;
+    let proxy = spawn_proxy(config).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy}/upload"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(large_body(cap))
+        .send()
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let text = response.text().await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a body at the cap must be inspected: {text}"
+    );
+}
+
+#[cfg(feature = "rust-engine")]
+#[tokio::test]
+async fn body_over_the_cap_returns_413_and_is_not_forwarded() {
+    let (upstream, forwarded) = spawn_counting_upstream().await;
+    let mut config = inspected_config(upstream);
+    config.server.max_body_size = 1 << 20;
+    config.proxy.max_request_size = 1 << 20;
+    let proxy = spawn_proxy(config).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy}/upload"))
+        .body(vec![b'A'; (1 << 20) + 1])
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        forwarded.load(Ordering::Relaxed),
+        0,
+        "an over-cap body must not reach the upstream"
+    );
+}
+
+#[cfg(feature = "rust-engine")]
+#[tokio::test]
+async fn a_rule_match_inside_a_two_mib_body_is_blocked() {
+    let upstream = spawn_upstream().await;
+    let config = inspected_config(upstream);
+    let proxy = spawn_proxy(config).await;
+
+    let mut body = large_body(2 << 20);
+    body.push_str("&q=%27+OR+%271%27%3D%271%27");
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy}/upload"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let text = response.text().await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a CRS match at 2 MiB must block: {text}"
+    );
 }

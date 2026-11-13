@@ -2136,6 +2136,15 @@ pub struct WafCorazaConfig {
     /// Must not exceed `max_payload_bytes` when non-zero.
     pub max_inspect_bytes: usize,
 
+    /// Per-value byte cap for the native Rust engine's per-request budget.
+    ///
+    /// `0` (the default) derives the cap from `server.max_body_size`, so the
+    /// engine can inspect every body the proxy accepts. A non-zero value is an
+    /// explicit operator cap and must be at least `server.max_body_size`;
+    /// otherwise start-up fails because an accepted body could not be
+    /// inspected.
+    pub max_value_bytes: usize,
+
     /// Policy applied when the body exceeds `max_inspect_bytes`.
     pub oversize_action: CorazaOversizeAction,
 
@@ -2159,6 +2168,18 @@ pub struct WafCorazaConfig {
 }
 
 impl WafCorazaConfig {
+    /// Resolve the Rust engine's per-value byte cap against the transport cap.
+    ///
+    /// `0` derives the cap from `server.max_body_size`; any explicit value is
+    /// returned unchanged (validation rejects one below the body cap).
+    pub fn resolved_max_value_bytes(&self, max_body_size: usize) -> usize {
+        if self.max_value_bytes == 0 {
+            max_body_size
+        } else {
+            self.max_value_bytes
+        }
+    }
+
     /// Resolve `pool_size = 0` to one worker per available core, clamped to
     /// `1..=8`.
     pub fn resolved_pool_size(&self) -> usize {
@@ -2184,6 +2205,8 @@ impl Default for WafCorazaConfig {
             max_payload_bytes: 64 * 1024,
             // 0 = inspect the whole body (historical behaviour).
             max_inspect_bytes: 0,
+            // 0 = derive the engine value cap from server.max_body_size.
+            max_value_bytes: 0,
             oversize_action: CorazaOversizeAction::InspectAll,
             memory_limit_bytes: 256 * 1024 * 1024,
             // Generous DoS bound: CRS body inspection is byte-linear and a
@@ -3200,13 +3223,21 @@ impl Config {
             .map_err(|error| {
                 anyhow::anyhow!("invalid configuration from {source_context}: {error}")
             })?;
-        config.validate()?;
+        config.validate_with_source(&source_context)?;
 
         Ok(config)
     }
 
     /// Reject configurations that would make the proxy unsafe or unusable.
     pub fn validate(&self) -> anyhow::Result<()> {
+        self.validate_with_source("configuration")
+    }
+
+    /// [`Self::validate`] with a source description used in error messages.
+    ///
+    /// The loader passes the config file (and environment override) context so
+    /// cross-field failures name the file the operator must edit.
+    pub fn validate_with_source(&self, source: &str) -> anyhow::Result<()> {
         if self.waf.wasm.enabled && !cfg!(feature = "wasm-waf") {
             tracing::warn!(
                 "waf.wasm is the legacy component-ABI integration and is ignored by this \
@@ -3215,6 +3246,18 @@ impl Config {
         }
         if self.server.max_body_size == 0 {
             anyhow::bail!("server.max_body_size must be greater than zero");
+        }
+        if self.waf.coraza.max_value_bytes != 0
+            && self.waf.coraza.max_value_bytes < self.server.max_body_size
+        {
+            anyhow::bail!(
+                "waf.coraza.max_value_bytes ({}) is smaller than server.max_body_size ({}): the \
+                 proxy would accept a body the Rust engine cannot inspect; raise \
+                 waf.coraza.max_value_bytes or set it to 0 to derive it from the body cap \
+                 (source: {source})",
+                self.waf.coraza.max_value_bytes,
+                self.server.max_body_size
+            );
         }
         if self.server.max_connections == 0 {
             anyhow::bail!("server.max_connections must be greater than zero");
@@ -4058,6 +4101,32 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
         assert!(config.validate().is_ok());
     }
 
+    #[test]
+    fn explicit_engine_value_cap_below_the_body_cap_is_rejected() {
+        let mut config = Config::default();
+        config.server.max_body_size = 10 << 20;
+        config.waf.coraza.max_value_bytes = 1 << 20;
+        let error = config
+            .validate_with_source("file '/etc/waf/config.toml'")
+            .expect_err("a smaller engine cap must fail at load")
+            .to_string();
+        assert!(error.contains("waf.coraza.max_value_bytes"), "{error}");
+        assert!(error.contains("server.max_body_size"), "{error}");
+        assert!(error.contains("/etc/waf/config.toml"), "{error}");
+
+        config.waf.coraza.max_value_bytes = 10 << 20;
+        assert!(config.validate().is_ok());
+        config.waf.coraza.max_value_bytes = 0;
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            config
+                .waf
+                .coraza
+                .resolved_max_value_bytes(config.server.max_body_size),
+            10 << 20
+        );
+    }
+
     #[cfg(feature = "rust-engine")]
     #[test]
     fn rust_coraza_backend_does_not_require_a_socket() {
@@ -4839,6 +4908,7 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
         "waf.coraza.fallback",
         "waf.coraza.max_inspect_bytes",
         "waf.coraza.max_payload_bytes",
+        "waf.coraza.max_value_bytes",
         "waf.coraza.memory_limit_bytes",
         "waf.coraza.module_path",
         "waf.coraza.native_socket_path",

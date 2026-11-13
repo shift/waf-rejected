@@ -34,12 +34,29 @@ pub struct ProcessorLimits {
     pub max_value_bytes: usize,
 }
 
+impl ProcessorLimits {
+    /// Default per-value cap, matching [`super::budget::Limits::default`].
+    pub const DEFAULT_MAX_VALUE_BYTES: usize = 1024 * 1024;
+
+    /// Aligns the processor's per-value cap with the engine value cap.
+    ///
+    /// Body processors copy decoded values into owned storage, so the cap must
+    /// cover anything the engine budget accepts. Depth and value-count bounds
+    /// are unchanged: the body size is already bounded by the transport.
+    pub fn for_value_cap(max_value_bytes: usize) -> Self {
+        Self {
+            max_value_bytes: max_value_bytes.max(Self::DEFAULT_MAX_VALUE_BYTES),
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for ProcessorLimits {
     fn default() -> Self {
         Self {
             max_depth: 64,
             max_values: 16_384,
-            max_value_bytes: 1024 * 1024,
+            max_value_bytes: Self::DEFAULT_MAX_VALUE_BYTES,
         }
     }
 }
@@ -62,3 +79,21 @@ impl std::fmt::Display for ProcessorError {
 }
 
 impl std::error::Error for ProcessorError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn processor_cap_tracks_the_engine_value_cap() {
+        let limits = ProcessorLimits::for_value_cap(10 << 20);
+        assert_eq!(limits.max_value_bytes, 10 << 20);
+        assert_eq!(limits.max_depth, ProcessorLimits::default().max_depth);
+        assert_eq!(limits.max_values, ProcessorLimits::default().max_values);
+
+        assert_eq!(
+            ProcessorLimits::for_value_cap(1).max_value_bytes,
+            ProcessorLimits::DEFAULT_MAX_VALUE_BYTES
+        );
+    }
+}
