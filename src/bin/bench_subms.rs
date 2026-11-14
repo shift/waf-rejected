@@ -178,10 +178,9 @@ struct Cli {
     #[arg(long)]
     no_wasm: bool,
 
-    /// Add the 10 MiB cap cell (L0 rust engine and L3 rust proxy). 10 MiB was
-    /// the former default `server.max_body_size` (now an explicit opt-in); the
-    /// cell shows the worst-case amplification and whether the body is
-    /// inspectable at all.
+    /// Add the 10 MiB cap cell (L0 rust engine). 10 MiB was the former default
+    /// `server.max_body_size` (now an explicit opt-in); the cell shows the
+    /// worst-case amplification and whether the body is inspectable at all.
     #[arg(long)]
     stress_10m: bool,
 
@@ -732,12 +731,22 @@ fn run_l0(cli: &Cli, runtime: &tokio::runtime::Runtime) -> Result<Vec<Row>> {
         }
 
         if cli.stress_10m {
+            // The shipped default body cap is 2 MiB, so the stress cell must
+            // raise it or the 10 MiB row measures the transport's 413 instead
+            // of body inspection. The engine value cap is derived from this
+            // setting, exactly as in the serving path.
+            let mut stress_config = rust_config("127.0.0.1:1".parse().expect("valid addr"), 5_000);
+            stress_config.server.max_body_size = SizeClass::M10.bytes();
+            let stress_engine = WafEngine::with_config_and_metrics(&stress_config, None);
+            if let Some(error) = stress_engine.waf_init_error() {
+                bail!("rust WAF stress engine failed to initialise: {error}");
+            }
             for size in STRESS_SIZES {
                 let ctx = synthetic_context(size);
                 let reps = cli.samples.min(3);
                 let (stats, decision) =
-                    measure_engine(runtime, &engine, &ctx, reps, cli.warmup.min(1));
-                let (bytes, calls) = measure_engine_alloc(runtime, &engine, &ctx, reps);
+                    measure_engine(runtime, &stress_engine, &ctx, reps, cli.warmup.min(1));
+                let (bytes, calls) = measure_engine_alloc(runtime, &stress_engine, &ctx, reps);
                 rows.push(
                     Row::new("L0-engine-stress", "rust", size.label(), stats)
                         .with_alloc(bytes, calls)

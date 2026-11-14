@@ -1536,3 +1536,59 @@ compile-only fixes on code paths that already failed to build.
       clean with `--deny warnings`; 692 lib tests; 87 integration tests;
       2 112/2 112 parity (0 native-only FNs); `nix build .#waf-ingress` green;
       all seven `waf` gate rows and all three `rust` rows pass.
+
+# Body-size scaling in WAF inspection (`perf/body-size-scaling`)
+
+**Branch:** `perf/body-size-scaling` (base `ce2d054`).
+
+## Finding
+
+The reported "1 MiB → 0.28 ms, 10 MiB → 1 433 ms" pair mixes units: 0.2810 ms
+is the **1 KiB** `bench-subms` row (§11.3), 1 433 ms is the 10 MiB stress cell
+(§11.6). 10 240× the body for 5 100× the time is sublinear.
+
+Measured on this host (`examples/body_scale.rs`, same URLENCODED shape,
+`Limits::for_body_cap(10 MiB)`, thread CPU time, load 8.4–11.2):
+
+| size | p50 ms | cpu ms/MiB |
+|---|---:|---:|
+| 64 KiB | 8.9 | 138.9 |
+| 256 KiB | 34.4 | 133.0 |
+| 512 KiB | 114.2 | 136.2 |
+| 1 MiB | 183.2 | 138.7 |
+| 2 MiB | 332.1 | 143.8 |
+| 4 MiB | 1 057.2 | 189.5 |
+| 8 MiB | 1 721.4 | 161.7 |
+| 10 MiB | 2 215.8 | 180.5 |
+
+Phase split (1 → 10 MiB): parse 2.18 → 21.86, transforms 23.16 → 254.07, gate
+59.46 → 642.43, operators 50.68 → 501.24, candidates/scoring flat, accounted
+135.70 → 1 419.84 (10.5×). Every phase is linear; 4 MiB+ pays a last-level
+cache penalty, not an exponent.
+
+## Plan / status
+
+- [x] Size-controlled harness (`examples/body_scale.rs`) with wall p50/p95 and
+      thread CPU time per MiB.
+- [x] Curve at 64 KiB … 10 MiB; per-MiB cost flat through 2 MiB.
+- [x] Phase attribution at 1 MiB vs 10 MiB (engine-profile).
+- [x] Check each suspect: no quadratic build, cache shared, gates cached once
+      per value, budget counters copy nothing, processors bounded.
+- [x] Docs: `docs/operations/performance-verification.md` §11.10 with the
+      before/after table, phase split and the 10 MiB opt-in cost.
+- [x] Gates: fmt clean; clippy --lib clean; cargo test --lib 699 passed
+      / 0 failed / 11 ignored; integration 92 passed / 0 failed / 14
+      ignored; parity 2 112/2 112, rust FN 3 = coraza FN 3 (0 native-only
+      false negatives); nix build .#waf-ingress exit 0.
+- [ ] Commit and push. `git fetch origin` fails without SSH access in this
+      session; push must use the HTTPS token remote.
+
+## Fix (measurement, not inspection)
+
+- `bench-subms --stress-10m` inherited the 2 MiB `server.max_body_size`, so
+  the 10 MiB stress row became a 0.07 ms fail-closed 413 and no longer measured
+  inspection. The stress engine now raises `server.max_body_size` to 10 MiB
+  (the serving path derives the engine value cap from it), and the stale "L3
+  rust proxy" claim was removed from the flag docs.
+- Re-run: `L0-engine-stress rust, 10 MiB` is `allow` again at 3.93 s p50
+  (load 4.0; the same row was 1.4 s on the reference host).
