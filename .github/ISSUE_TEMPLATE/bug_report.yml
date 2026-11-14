@@ -1,0 +1,58 @@
+name: Bug report
+description: Report a defect in WAF-Rejected (not a security vulnerability)
+labels: ["type:fix", "status:needs-review"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not report security vulnerabilities here.** Follow SECURITY.md and use GitHub private vulnerability reporting.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Release tag or commit, and how it was built (Nix, Cargo, container digest).
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: Include error messages and logs with secrets redacted.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: Configuration excerpt (redacted), request shape, upstream behaviour, commands.
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Inspection backend
+      options:
+        - Rust engine (default)
+        - Coraza wasm reference
+        - Native sidecar
+        - Disabled
+        - Not sure
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, kernel, CPU, Nix/Cargo versions.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I have read the support matrix and this is expected to work.
+        - label: This is not a security vulnerability report.
+          required: true

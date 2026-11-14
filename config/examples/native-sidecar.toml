@@ -1,0 +1,87 @@
+# Native Coraza sidecar backend.
+#
+# This profile selects the opt-in Go sidecar over a Unix domain socket. It is
+# not the default and not a drop-in replacement for the Rust engine: you must
+# run the `coraza-sidecar` process, make its socket reachable, and keep the
+# proxy and sidecar on a shared uid or gid (socket mode 0660).
+#
+# Requirements:
+#   * waf-ingress built with `--features wasm-reactor,coraza-native`
+#   * the sidecar started with `--socket /run/waf/coraza.sock`
+#   * `--max-body` at least `max_payload_bytes` + request line/header overhead
+#
+# See docs/operations/native-performance-profile.md and
+# docs/user-guide/engine-selection.md.
+#
+# Run:
+#   WAF_CONFIG_FILE=config/examples/native-sidecar.toml waf-ingress
+
+bind_addr = "0.0.0.0:8080"
+health_bind_addr = "0.0.0.0:8081"
+upstream_uri = "http://127.0.0.1:3000"
+
+[proxy]
+timeout_seconds = 30
+max_request_size = 10485760
+
+[server]
+max_connections = 8192
+request_timeout_secs = 30
+keep_alive_timeout_secs = 90
+enable_http2 = true
+enable_http3 = false
+supported_http_versions = ["1.0", "1.1", "2"]
+max_body_size = 1048576
+grpc_max_stream_bytes = 4194304
+grpc_max_stream_seconds = 300
+grpc_aware_rejections = true
+
+[logging]
+level = "info"
+json_format = true
+
+[waf]
+enabled = true
+# A sidecar outage must fail closed (503), never silently allow traffic.
+fail_mode = "closed"
+
+[waf.coraza]
+enabled = true
+backend = "native"
+native_socket_path = "/run/waf/coraza.sock"
+max_payload_bytes = 65536
+# Bound the byte-linear CRS cost: scan the first 64 KiB and reject larger
+# bodies before they reach the sidecar. Use "forward-uninspected" only if the
+# documented inspection gap is acceptable for your threat model.
+max_inspect_bytes = 65536
+oversize_action = "reject"
+eval_timeout_ms = 5000
+# One pooled connection per concurrent evaluation; 8 is the validation ceiling.
+pool_size = 8
+
+[waf.admission]
+enabled = true
+heavy_permits = 4
+queue_timeout_ms = 500
+max_queued = 256
+
+[waf.rate_limit]
+per_ip_enabled = true
+per_ip_max_requests = 6000
+per_ip_window_secs = 60
+global_enabled = true
+global_max_requests = 100000
+global_window_secs = 60
+
+[waf.content_inspection]
+enabled = true
+inspect_headers = true
+inspect_body = true
+max_body_size = 65536
+threat_patterns = ["sql_injection", "xss", "command_injection", "path_traversal"]
+
+[waf.security_events]
+enabled = true
+min_threat_level = "medium"
+enable_cef = false
+enable_otel = false

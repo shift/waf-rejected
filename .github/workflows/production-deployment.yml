@@ -1,0 +1,263 @@
+name: Production Deployment Pipeline
+
+# Run the build/test half of this pipeline locally with `./scripts/ci-local.sh`;
+# deployment steps still require
+# cluster credentials and are not reproduced locally. `workflow_dispatch` is
+# intentionally not enabled because this pipeline deploys on push.
+
+on:
+  push:
+    branches: [ main, production ]
+  pull_request:
+    branches: [ main, production ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Security and quality checks
+  security-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required by github/codeql-action/upload-sarif below. Without it the
+      # job fails with "Resource not accessible by integration".
+      security-events: write
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install cargo-audit
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-audit
+    - name: Run cargo audit
+      run: cargo audit
+    - name: Install cargo-deny
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-deny
+    - name: Supply-chain policy (cargo deny)
+      run: cargo deny check
+    - name: Security scan with Trivy
+      uses: aquasecurity/trivy-action@v0.36.0
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v3
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  # Build and test
+  test:
+    runs-on: ubuntu-latest
+    needs: [security-scan, preflight]
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Nix
+      uses: cachix/install-nix-action@v25
+    # Cachix is an optional accelerator, not a requirement. GitHub does not
+    # expose `secrets` to a step/job `if`, so `preflight` publishes whether
+    # CACHIX_AUTH_TOKEN exists. Without it the build runs against the public
+    # substituters supplied by install-nix-action. `continue-on-error` keeps a
+    # cache/auth failure from failing the build.
+    - name: Cache Nix store
+      if: needs.preflight.outputs.cachix_configured == 'true'
+      continue-on-error: true
+      uses: cachix/cachix-action@v14
+      with:
+        name: waf-rejected
+        authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+    - name: Report Cachix status
+      run: |
+        if [ "${{ needs.preflight.outputs.cachix_configured }}" = "true" ]; then
+          echo "::notice::CACHIX_AUTH_TOKEN is configured; the waf-rejected cache is used when writable."
+        else
+          echo "::notice::CACHIX_AUTH_TOKEN is not configured; building with the default Nix substituters only."
+        fi
+    - name: Check formatting
+      run: nix develop -c cargo fmt -- --check
+    - name: Clippy
+      run: nix develop -c cargo clippy --lib -- --deny warnings
+    - name: Build with Nix
+      run: nix build .#waf-ingress
+    - name: Check all targets compile
+      run: nix develop -c cargo check --all-targets
+    - name: Run unit tests
+      run: nix develop -c cargo test --lib --release
+    - name: Run integration tests
+      run: nix develop -c cargo test --test integration --release
+
+  # Build container images
+  build-image:
+    runs-on: ubuntu-latest
+    needs: test
+    permissions:
+      contents: read
+      packages: write
+    env:
+      # Canonical OCI package name, shared with release.yml and
+      # publish-image.yml. It differs from the repository name because GHCR
+      # rejected blob uploads for `ghcr.io/shift/waf-rejected` with HTTP 403.
+      IMAGE_NAME: ghcr.io/shift/waf-rejected-waf
+      # Snapshot publishing stays opt-in: the default GITHUB_TOKEN may not have
+      # package write access. Set the repository variable PUSH_IMAGE=true to
+      # publish. Pull requests always build only, which also catches Dockerfile
+      # regressions.
+      PUSH_IMAGE: ${{ vars.PUSH_IMAGE }}
+    steps:
+    - uses: actions/checkout@v4
+    - name: Report registry publishing mode
+      run: |
+        if [ "${PUSH_IMAGE}" = "true" ] && [ "${GITHUB_EVENT_NAME}" != "pull_request" ]; then
+          echo "Publishing ${IMAGE_NAME} to GHCR"
+        else
+          echo "::notice::Registry push skipped (PUSH_IMAGE is not 'true' or this is a pull request). The image is still built."
+        fi
+    - name: Log in to Container Registry
+      if: github.event_name != 'pull_request' && env.PUSH_IMAGE == 'true'
+      continue-on-error: true
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Build Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: false
+        load: true
+        tags: |
+          ${{ env.IMAGE_NAME }}:latest
+          ${{ env.IMAGE_NAME }}:${{ github.sha }}
+    # A registry 403 must not fail the build. Only attempt the push when
+    # PUSH_IMAGE is enabled and this is not a pull request; a rejected push
+    # leaves the locally built/loaded image available to later jobs.
+    - name: Push Docker image
+      if: github.event_name != 'pull_request' && env.PUSH_IMAGE == 'true'
+      run: |
+        set -euo pipefail
+        for tag in latest "${GITHUB_SHA}"; do
+          image="${IMAGE_NAME}:${tag}"
+          if docker push "${image}"; then
+            echo "Pushed ${image}"
+          else
+            echo "::warning::GHCR rejected ${image}. Verify the token has package write access; the build itself succeeded."
+          fi
+        done
+
+  # Deployment credential check
+  #
+  # GitHub does not expose the `secrets` context to jobs.<job_id>.if, so the
+  # presence of the kubeconfigs is resolved in a job and published as outputs.
+  # Deploy/rollback jobs consume those outputs and skip (rather than fail) when
+  # the corresponding secret is missing.
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      staging_configured: ${{ steps.check.outputs.staging }}
+      production_configured: ${{ steps.check.outputs.production }}
+      cachix_configured: ${{ steps.check.outputs.cachix }}
+    steps:
+    - name: Check deployment credentials
+      id: check
+      env:
+        STAGING_KUBE_CONFIG: ${{ secrets.STAGING_KUBE_CONFIG }}
+        PRODUCTION_KUBE_CONFIG: ${{ secrets.PRODUCTION_KUBE_CONFIG }}
+        CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      run: |
+        set -euo pipefail
+        if [ -n "${CACHIX_AUTH_TOKEN}" ]; then
+          echo "cachix=true" >> "${GITHUB_OUTPUT}"
+        else
+          echo "cachix=false" >> "${GITHUB_OUTPUT}"
+          echo "::notice::CACHIX_AUTH_TOKEN is not configured; the Nix build will not use the waf-rejected Cachix cache."
+        fi
+        if [ -n "${STAGING_KUBE_CONFIG}" ]; then
+          echo "staging=true" >> "${GITHUB_OUTPUT}"
+        else
+          echo "staging=false" >> "${GITHUB_OUTPUT}"
+          echo "::notice::STAGING_KUBE_CONFIG is not configured; staging deployment will be skipped."
+        fi
+        if [ -n "${PRODUCTION_KUBE_CONFIG}" ]; then
+          echo "production=true" >> "${GITHUB_OUTPUT}"
+        else
+          echo "production=false" >> "${GITHUB_OUTPUT}"
+          echo "::notice::PRODUCTION_KUBE_CONFIG is not configured; production deployment and rollback will be skipped."
+        fi
+
+  # Deploy to staging
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: [build-image, preflight]
+    if: ${{ github.ref == 'refs/heads/main' && needs.preflight.outputs.staging_configured == 'true' }}
+    environment: staging
+    steps:
+    - uses: actions/checkout@v4
+    - name: Configure kubectl for staging
+      run: |
+        mkdir -p "${HOME}/.kube"
+        echo "${{ secrets.STAGING_KUBE_CONFIG }}" | base64 -d > "${HOME}/.kube/config"
+    - name: Deploy to staging
+      run: |
+        kubectl config use-context staging
+        helm upgrade --install waf-rejected ./infrastructure/helm \
+          --namespace security \
+          --set image.tag=${{ github.sha }} \
+          --wait \
+          --timeout 10m
+    - name: Run staging tests
+      run: |
+        # Wait for deployment to be ready
+        kubectl wait --for=condition=available --timeout=300s deployment/waf-rejected -n security
+        # Run smoke tests against staging
+        curl -f http://staging-waf.example.com/health
+
+  # Deploy to production
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, preflight]
+    if: ${{ github.ref == 'refs/heads/main' && needs.preflight.outputs.production_configured == 'true' }}
+    environment: production
+    steps:
+    - uses: actions/checkout@v4
+    - name: Configure kubectl for production
+      run: |
+        mkdir -p "${HOME}/.kube"
+        echo "${{ secrets.PRODUCTION_KUBE_CONFIG }}" | base64 -d > "${HOME}/.kube/config"
+    - name: Deploy to production
+      run: |
+        kubectl config use-context production
+        helm upgrade --install waf-rejected ./infrastructure/helm \
+          --namespace security \
+          --set image.tag=${{ github.sha }} \
+          --wait \
+          --timeout 15m
+    - name: Run production validation
+      run: |
+        # Wait for deployment to be ready
+        kubectl wait --for=condition=available --timeout=600s deployment/waf-rejected -n security
+        # Run health checks
+        curl -f https://waf.example.com/health
+        # Run security validation
+        # (Additional validation steps would go here)
+
+  # Rollback on failure
+  rollback:
+    runs-on: ubuntu-latest
+    needs: [deploy-production, preflight]
+    if: ${{ failure() && github.ref == 'refs/heads/main' && needs.preflight.outputs.production_configured == 'true' }}
+    environment: production
+    steps:
+    - name: Configure kubectl for production
+      run: |
+        mkdir -p "${HOME}/.kube"
+        echo "${{ secrets.PRODUCTION_KUBE_CONFIG }}" | base64 -d > "${HOME}/.kube/config"
+    - name: Rollback deployment
+      run: |
+        kubectl rollout undo deployment/waf-rejected -n security
+        kubectl rollout status deployment/waf-rejected -n security

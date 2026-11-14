@@ -1,0 +1,141 @@
+# WAF-Rejected high-throughput profile: native Coraza sidecar in the same pod.
+#
+#   kubectl apply -f deploy/kubernetes/native-performance.yaml
+#
+# The proxy and sidecar share an emptyDir at /run/waf. The pod's fsGroup makes
+# that directory group-writable by uid/gid 1000, matching the 0660 socket. The
+# sidecar image ships the CRS bundle read-only at /usr/share/waf/coraza; the
+# sidecar has a read-only root filesystem and no capabilities.
+#
+# This profile is opt-in. The default configuration still uses the wasm
+# backend. Replace the upstream URI and image tags for your environment.
+# The ConfigMap mirrors config/performance-native.toml; keep them in sync.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: waf-native
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: waf-native-config
+  namespace: waf-native
+data:
+  config.toml: |
+    bind_addr = "0.0.0.0:8080"
+    health_bind_addr = "0.0.0.0:8081"
+    # Replace with the in-cluster Service of the protected application.
+    upstream_uri = "http://upstream.default.svc.cluster.local:8080"
+
+    [proxy]
+    upstream_url = "http://upstream.default.svc.cluster.local:8080"
+    bind_addr = "0.0.0.0:8080"
+    timeout_seconds = 30
+    max_request_size = 1048576
+
+    [server]
+    max_connections = 8192
+    trusted_proxies = []
+    request_timeout_secs = 30
+    keep_alive_timeout_secs = 90
+    enable_http2 = true
+    enable_http3 = false
+    supported_http_versions = ["1.0", "1.1", "2"]
+    max_body_size = 1048576
+    grpc_max_stream_bytes = 4194304
+    grpc_max_stream_seconds = 300
+    grpc_aware_rejections = true
+
+    [logging]
+    level = "info"
+    json_format = true
+
+    [waf]
+    enabled = true
+    fail_mode = "closed"
+
+    [waf.coraza]
+    enabled = true
+    backend = "native"
+    native_socket_path = "/run/waf/coraza.sock"
+    max_payload_bytes = 65536
+    max_inspect_bytes = 65536
+    oversize_action = "reject"
+    eval_timeout_ms = 5000
+    pool_size = 8
+
+    [waf.admission]
+    enabled = true
+    heavy_permits = 4
+    queue_timeout_ms = 500
+    max_queued = 256
+
+    [waf.rate_limit]
+    per_ip_enabled = true
+    per_ip_max_requests = 6000
+    per_ip_window_secs = 60
+    global_enabled = true
+    global_max_requests = 100000
+    global_window_secs = 60
+
+    [waf.security_events]
+    enabled = true
+    min_threat_level = "medium"
+    enable_cef = false
+    enable_otel = false
+
+    [storage]
+    enabled = true
+    backend = "redb"
+    path = "/var/lib/waf/data/waf_security_events.redb"
+    max_events = 100000
+    ttl_cleanup_interval = { secs = 60, nanos = 0 }
+    cache_size = 16777216
+
+    [waf.content_inspection]
+    enabled = true
+    inspect_headers = true
+    inspect_body = true
+    max_body_size = 65536
+    threat_patterns = ["sql_injection", "xss", "command_injection", "path_traversal"]
+
+    [waf.geo_blocking]
+    enabled = false
+    blocked_countries = []
+    blocked_regions = []
+    block_tor = false
+    block_vpn = false
+    block_datacenter = false
+
+    [waf.grpc]
+    enabled = true
+    method_allowlist = []
+    max_message_bytes = 4194304
+    max_frames = 64
+    content_scan = "strings"
+    max_content_scan_bytes = 65536
+
+    [waf.graphql]
+    enabled = true
+    body_scan = "crs"
+    operation_allowlist = []
+    max_body_bytes = 8388608
+    max_query_bytes = 1048576
+    max_variables_bytes = 1048576
+    max_variables = 128
+    max_depth = 128
+    max_aliases = 1024
+    max_fields = 8192
+    allow_mutations = true
+    allow_subscriptions = true
+
+    [security.auth]
+    enabled = false
+    api_keys = []
+    header_name = "X-API-Key"
+    require_https = false
+
+    [security.ai]
+    enabled = false
+    threat_threshold = 0.8
+    timeout_ms = 5000

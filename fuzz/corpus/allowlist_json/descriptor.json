@@ -1,0 +1,15 @@
+{
+  "file": [
+    {
+      "name": "test.proto",
+      "package": "pkg",
+      "messageType": [
+        {"name": "Request", "field": [{"name": "name", "number": 1, "label": "LABEL_OPTIONAL", "type": "TYPE_STRING"}]},
+        {"name": "Response", "field": []}
+      ],
+      "service": [
+        {"name": "Service", "method": [{"name": "Method", "inputType": ".pkg.Request", "outputType": ".pkg.Response"}]}
+      ]
+    }
+  ]
+}

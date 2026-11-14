@@ -1,0 +1,26 @@
+{
+  "ir_version": 2,
+  "source": {
+    "kind": "protobuf",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "methods": [
+    {
+      "path": "/pkg.Service/Method",
+      "client_streaming": false,
+      "server_streaming": false,
+      "input": "pkg.Request",
+      "output": "pkg.Response",
+      "max_message_bytes": 1024
+    }
+  ],
+  "messages": [
+    {
+      "message": "pkg.Request",
+      "fields": [
+        {"name": "name", "number": 1, "type": "string"}
+      ]
+    }
+  ],
+  "unknown_method_action": "block"
+}

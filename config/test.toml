@@ -1,0 +1,42 @@
+# Simple WAF configuration for testing.
+#
+# Migrated from the historical schema: server.host/port/workers, proxy.upstream,
+# retry_attempts, [security], [health], [metrics] and [export] are no longer
+# configuration keys. Their current equivalents are the top-level listener
+# addresses, [proxy]/[server] transport settings, [runtime] worker count,
+# [waf.rate_limit] and [waf.security_events].
+
+bind_addr = "0.0.0.0:8080"
+health_bind_addr = "0.0.0.0:8081"
+upstream_uri = "http://httpbin.org"
+
+[proxy]
+timeout_seconds = 10
+max_request_size = 1048576
+
+[runtime]
+worker_threads = 2
+
+[server]
+max_body_size = 1048576
+
+[waf.rate_limit]
+per_ip_enabled = true
+per_ip_max_requests = 100
+per_ip_window_secs = 60
+global_enabled = true
+global_max_requests = 1000
+global_window_secs = 60
+
+[waf.geo_blocking]
+enabled = false
+blocked_countries = []
+
+[waf.security_events]
+enabled = true
+enable_cef = false
+enable_otel = false
+
+[logging]
+level = "info"
+json_format = true

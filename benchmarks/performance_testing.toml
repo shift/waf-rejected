@@ -1,0 +1,98 @@
+# Performance Testing Configuration
+# This file defines performance benchmarking parameters and requirements
+
+[benchmarks]
+# Benchmark execution settings
+measurement_time = "30s"
+warm_up_time = "3s" 
+sample_size = 100
+noise_threshold = 0.05
+
+[requirements]
+# Performance requirements for each security module
+
+[requirements.security_event_logging]
+# Security Event Logging System Requirements
+event_generation_latency_us = 100      # <100μs per event generation
+throughput_events_per_sec = 50000      # 50K+ events/sec sustained
+memory_overhead_mb = 1                  # <1MB for event buffer management  
+cpu_overhead_percent = 1                # <1% additional load per 10K events/sec
+batch_processing_overhead_percent = 2   # <2% overhead for batch processing
+
+[requirements.content_inspection]  
+# Content Inspection Engine Requirements
+pattern_match_latency_us = 50          # <50μs per request inspection
+large_payload_latency_ms = 5           # <5ms for 1MB request body inspection
+cpu_overhead_percent = 2               # <2% additional load for full inspection
+memory_usage_mb = 10                   # <10MB for pattern compilation and caching
+pattern_compilation_ms = 100           # <100ms for rule compilation
+
+[requirements.geoip_blocking]
+# Geographic IP Blocking Requirements  
+ip_lookup_latency_us = 10              # <10μs per request (with caching)
+database_init_ms = 100                 # <100ms for MaxMind GeoLite2 initialization
+memory_footprint_mb = 50               # <50MB for full geolocation database
+cache_hit_ratio_percent = 95           # >95% cache hit ratio for production IP patterns
+bulk_lookup_latency_us = 50            # <50μs per lookup in bulk operations
+
+[requirements.integrated_pipeline]
+# Complete WAF Pipeline Requirements
+full_pipeline_latency_ms = 1           # <1ms additional latency for security processing
+concurrent_request_overhead_percent = 5 # <5% overhead under concurrent load
+memory_scaling_mb_per_1k_rules = 2    # <2MB memory increase per 1000 rules
+
+[test_scenarios]
+# Test scenario configurations
+
+[test_scenarios.security_events]
+# Security event logging test scenarios
+single_event_iterations = 1000000
+batch_sizes = [100, 1000, 10000]
+concurrent_loggers = [1, 4, 8, 16]
+event_types = ["low", "medium", "high", "critical"]
+
+[test_scenarios.content_inspection]
+# Content inspection test scenarios  
+payload_sizes = ["small", "medium", "large", "xlarge"]
+payload_size_bytes = [64, 1024, 102400, 1048576]  # 64B, 1KB, 100KB, 1MB
+attack_types = ["sql_injection", "xss", "command_injection", "path_traversal", "lfi"]
+concurrent_inspections = [1, 10, 50, 100]
+
+[test_scenarios.geoip_blocking]
+# Geographic IP blocking test scenarios
+ip_ranges = ["domestic", "international", "mixed"]
+batch_sizes = [100, 1000, 10000]
+cache_scenarios = ["cold", "warm", "hot"]
+blocked_countries = ["CN", "RU", "IR", "KP"]
+
+[test_scenarios.load_testing]
+# Load testing scenarios
+concurrent_users = [10, 50, 100, 500]
+duration_seconds = [30, 60, 300]
+request_patterns = ["constant", "ramp_up", "spike", "sustained"]
+
+[reporting]
+# Performance reporting configuration
+output_format = "markdown"
+include_system_info = true
+include_charts = true
+benchmark_history = true
+percentiles = [50, 95, 99, 99.9]
+
+[reporting.thresholds]
+# Performance threshold alerting
+warning_threshold_percent = 80    # Warn if >80% of requirement
+critical_threshold_percent = 100  # Critical if >100% of requirement
+
+[system_requirements]
+# Minimum system requirements for testing
+min_cpu_cores = 4
+min_memory_gb = 8
+recommended_cpu_cores = 8
+recommended_memory_gb = 16
+
+[validation]
+# Validation settings
+require_all_tests_pass = true
+allow_performance_regression_percent = 5  # Allow up to 5% performance regression
+baseline_comparison = true

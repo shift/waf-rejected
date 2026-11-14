@@ -1,0 +1,1 @@
+{"query":"{ a: user { id } b: user { id } }"}

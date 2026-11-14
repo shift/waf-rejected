@@ -1,0 +1,438 @@
+syntax = "proto3";
+
+package waf.distri.v1;
+
+// DistriWaf is the owned control-plane contract between WAF-Rejected nodes and
+// a distri-kv regional cluster (ADR-0007, section 7).
+//
+// Compatibility: field numbers are stable once published. Additive changes are
+// allowed within a major contract version; breaking changes require a new
+// package version (waf.distri.v2) and a new `contract_version` value.
+service DistriWaf {
+  // Register a WAF node and obtain a lease. Idempotent on (node_id, epoch).
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+
+  // Refresh a node lease and report applied policy/queue state. Monotonic
+  // epoch and sequence checks prevent a restarted process resurrecting state.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // Discover live nodes in a region, optionally filtered by capability.
+  rpc Discover(DiscoverRequest) returns (DiscoverResponse);
+
+  // Watch versioned control-plane objects. Server-streaming; resume from
+  // `from_version`, a RESET event forces a full resync.
+  rpc Watch(WatchRequest) returns (stream WatchEvent);
+
+  // Fetch the active (or a specific) signed policy bundle.
+  rpc GetPolicy(GetPolicyRequest) returns (PolicyBundle);
+
+  // CAS-activate an immutable policy bundle. `bundle` may be supplied to
+  // publish and activate atomically; otherwise the version must already exist.
+  rpc ActivatePolicy(ActivatePolicyRequest) returns (ActivatePolicyResponse);
+
+  // Look up IP reputation. Background-only; never on the request hot path.
+  rpc LookupReputation(LookupReputationRequest) returns (ReputationResponse);
+
+  // Ingest a bounded stream of security events. At-least-once, deduplicated by
+  // event_id. Never returns events; the server queues them locally.
+  rpc IngestEvents(stream SecurityEvent) returns (IngestSummary);
+
+  // Apply a bounded batch of rate-limit counter deltas. Deduplicated by
+  // batch_id for `counter_batch_dedup_ttl_secs`.
+  rpc IngestCounterDeltas(CounterDeltas) returns (CounterAck);
+
+  // Acquire a bounded shared-budget token lease for a bucket key. Enforcement
+  // stays local; a denied grant means the shared bucket is exhausted.
+  rpc AcquireLease(AcquireLeaseRequest) returns (AcquireLeaseResponse);
+
+  // Return unused leased tokens to the shared bucket. Zero revokes the lease
+  // without a refund; expired leases are reaped without a refund (fail closed).
+  rpc ReleaseLease(ReleaseLeaseRequest) returns (ReleaseLeaseResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Common metadata
+// ---------------------------------------------------------------------------
+
+enum NodeHealth {
+  NODE_HEALTH_UNSPECIFIED = 0;
+  HEALTHY = 1;
+  DEGRADED = 2;
+  DRAINING = 3;
+  UNHEALTHY = 4;
+}
+
+enum ReviewState {
+  REVIEW_STATE_UNSPECIFIED = 0;
+  AUTO = 1;
+  QUARANTINED = 2;
+  APPROVED = 3;
+  REJECTED = 4;
+}
+
+enum WatchOp {
+  WATCH_OP_UNSPECIFIED = 0;
+  PUT = 1;
+  DELETE = 2;
+  RESET = 3;
+  PUT_CHUNK = 4;
+}
+
+message NodeMetadata {
+  string node_id = 1;
+  string region = 2;
+  string zone = 3;
+  string cluster_id = 4;
+  string version = 5;
+  string build_commit = 6;
+  repeated string capabilities = 7;
+  // gRPC ingest endpoint, e.g. "10.0.4.12:9443".
+  string endpoint = 8;
+  map<string, string> labels = 9;
+  uint64 epoch = 10;
+  uint64 policy_generation = 11;
+  string ruleset_version = 12;
+  NodeHealth health = 13;
+  uint32 queue_depth = 14;
+  // Filled by Discover from the registry lease. Not persisted on the node.
+  uint64 lease_expires_at_unix_ms = 15;
+}
+
+// Server-side registry record. Not a client-facing object; kept in the
+// contract so the record has one schema.
+message NodeRecord {
+  NodeMetadata node = 1;
+  uint64 registered_at_unix_ms = 2;
+  uint64 lease_expires_at_unix_ms = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Register / Heartbeat / Discover
+// ---------------------------------------------------------------------------
+
+message RegisterRequest {
+  uint32 contract_version = 1;
+  NodeMetadata node = 2;
+  // Caller-provided idempotency key; a retry with the same key and epoch is a
+  // no-op. Defaults to node_id if empty.
+  string request_id = 3;
+  // Requested lease TTL. Clamped by the server to [5, 300] seconds.
+  uint32 lease_ttl_secs = 4;
+}
+
+message RegisterResponse {
+  uint32 contract_version = 1;
+  bool accepted = 2;
+  uint64 epoch = 3;
+  uint32 lease_ttl_secs = 4;
+  uint64 server_time_unix_ms = 5;
+}
+
+message HeartbeatRequest {
+  uint32 contract_version = 1;
+  string node_id = 2;
+  uint64 epoch = 3;
+  uint64 policy_generation = 4;
+  string ruleset_version = 5;
+  uint32 queue_depth = 6;
+  NodeHealth health = 7;
+  // Monotonic per lease. A lower sequence is rejected.
+  uint64 sequence = 8;
+}
+
+message HeartbeatResponse {
+  uint32 contract_version = 1;
+  uint32 lease_ttl_secs = 2;
+  uint64 server_time_unix_ms = 3;
+  bool drain = 4;
+}
+
+message DiscoverRequest {
+  uint32 contract_version = 1;
+  string region = 2;
+  repeated string capabilities = 3;
+  // Pagination: 0 uses the server default (100), max 1000.
+  uint32 page_size = 4;
+  // Opaque token from a previous response. Empty starts from the beginning.
+  string page_token = 5;
+}
+
+// Region/partition routing hint derived from the live registry. Until Multi-Raft
+// partition metadata is exposed these are advisory and `partial` is true.
+message PartitionHint {
+  uint32 partition_id = 1;
+  string region = 2;
+  string leader_id = 3;
+  repeated string replica_ids = 4;
+}
+
+message DiscoverResponse {
+  uint32 contract_version = 1;
+  repeated NodeMetadata nodes = 2;
+  // Advisory partition names, retained for clients built against the initial
+  // contract. Prefer `partition_hints`.
+  repeated string partitions = 3;
+  string watch_endpoint = 4;
+  // SHA-256 of the server certificate SPKI, for client pinning.
+  bytes server_cert_spki_sha256 = 5;
+  uint64 generated_at_unix_ms = 6;
+  string next_page_token = 7;
+  string region = 8;
+  string leader_hint = 9;
+  repeated PartitionHint partition_hints = 10;
+  // Public key material for verifying signed policy bundles.
+  bytes policy_signing_public_key = 11;
+  string policy_key_id = 12;
+  // True when hints are registry-derived rather than Multi-Raft-authoritative.
+  bool partial = 13;
+}
+
+// ---------------------------------------------------------------------------
+// Watch
+// ---------------------------------------------------------------------------
+
+message WatchRequest {
+  uint32 contract_version = 1;
+  string region = 2;
+  // Key prefixes, e.g. ["cfg/active/", "intel/ip/"]. Max 64.
+  repeated string prefixes = 3;
+  // Highest contiguous applied version; 0 means from the beginning.
+  uint64 from_version = 4;
+  string node_id = 5;
+  bool include_initial_snapshot = 6;
+  // Opaque resume token from the last fully applied WatchEvent. When set it
+  // takes precedence over from_version. An expired token yields a RESET.
+  string resume_token = 7;
+  // Maximum replayed events before the server returns a RESET. 0 = default.
+  uint32 max_events = 8;
+}
+
+message WatchEvent {
+  string key = 1;
+  uint64 version = 2;
+  WatchOp op = 3;
+  bytes payload = 4;
+  // SHA-256 over the canonical (un-chunked) payload.
+  bytes payload_hash = 5;
+  uint64 committed_at_unix_ms = 6;
+  string scope = 7;
+  // Monotonic across all journals and restarts. Chunks of one logical event
+  // share a sequence number.
+  uint64 sequence = 8;
+  // Cursor that makes this stream resumable. Persist the token from the last
+  // event that was fully applied.
+  string resume_token = 9;
+  // Chunking metadata. chunk_count > 1 means payload is one slice of a larger
+  // object identified by chunk_id; payload_total_bytes is the full size.
+  string chunk_id = 10;
+  uint32 chunk_index = 11;
+  uint32 chunk_count = 12;
+  uint64 payload_total_bytes = 13;
+}
+
+// ---------------------------------------------------------------------------
+// Policy
+// ---------------------------------------------------------------------------
+
+message PolicyPayload {
+  string ruleset_uri = 1;
+  string ruleset_version = 2;
+  string compiled_artifact = 3;
+  map<string, bool> features = 4;
+}
+
+message PolicyBundle {
+  uint32 contract_version = 1;
+  uint32 schema_version = 2;
+  string scope = 3;
+  uint64 version = 4;
+  uint64 generation = 5;
+  uint64 created_at_unix_ms = 6;
+  string author = 7;
+  // Hash chain: SHA-256 of the previous bundle's content (empty for v1).
+  bytes previous_hash = 8;
+  // SHA-256 over the canonical payload. Exactly 32 bytes.
+  bytes content_hash = 9;
+  // Ed25519 signature over content_hash.
+  bytes signature = 10;
+  string key_id = 11;
+  PolicyPayload payload = 12;
+  uint64 stale_after_unix_ms = 13;
+}
+
+message GetPolicyRequest {
+  uint32 contract_version = 1;
+  string scope = 2;
+  // 0 = currently active version, otherwise a specific immutable version.
+  uint64 version = 3;
+}
+
+message ActivatePolicyRequest {
+  uint32 contract_version = 1;
+  string scope = 2;
+  uint64 bundle_version = 3;
+  // Optimistic concurrency: if set and the active version differs, ABORTED.
+  optional uint64 expected_current = 4;
+  string reason = 5;
+  string approval_id = 6;
+  // Idempotency key; retries with the same key return the original response.
+  string idempotency_key = 7;
+  // Optional inline bundle for atomic publish+activate.
+  PolicyBundle bundle = 8;
+}
+
+message ActivatePolicyResponse {
+  uint32 contract_version = 1;
+  bool activated = 2;
+  uint64 active_version = 3;
+  uint64 generation = 4;
+  bytes content_hash = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Reputation
+// ---------------------------------------------------------------------------
+
+message ReputationEntry {
+  string ip = 1;
+  // 0.0 (benign) .. 1.0 (malicious).
+  float score = 2;
+  // 0.0 .. 1.0.
+  float confidence = 3;
+  repeated string labels = 4;
+  repeated string sources = 5;
+  uint64 first_seen_unix_ms = 6;
+  uint64 last_seen_unix_ms = 7;
+  uint64 expires_at_unix_ms = 8;
+  uint64 version = 9;
+  ReviewState review_state = 10;
+}
+
+message LookupReputationRequest {
+  uint32 contract_version = 1;
+  // Max 256 addresses.
+  repeated string ips = 2;
+  string scope = 3;
+  // Entries older than this are reported as stale. 0 disables the check.
+  uint32 max_age_ms = 4;
+}
+
+message ReputationResponse {
+  uint32 contract_version = 1;
+  repeated ReputationEntry entries = 2;
+  uint64 as_of_version = 3;
+  bool stale = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Events and counters
+// ---------------------------------------------------------------------------
+
+message SecurityEvent {
+  // UUIDv7 string; the dedupe key.
+  string event_id = 1;
+  string node_id = 2;
+  string region = 3;
+  string event_type = 4;
+  string rule_id = 5;
+  string action = 6;
+  // Hashed client address; raw IPs do not cross the region boundary.
+  string client_ip_hash = 7;
+  uint64 timestamp_unix_ms = 8;
+  uint32 severity = 9;
+  bytes payload_hash = 10;
+  map<string, string> metadata = 11;
+}
+
+message IngestSummary {
+  uint32 contract_version = 1;
+  string node_id = 2;
+  uint64 accepted = 3;
+  uint64 duplicate = 4;
+  uint64 rejected = 5;
+  uint64 dropped = 6;
+  uint32 retry_after_ms = 7;
+}
+
+message CounterDelta {
+  string policy_id = 1;
+  uint32 window_start_unix = 2;
+  uint32 shard = 3;
+  // 128-bit key hash.
+  bytes key_hash = 4;
+  uint64 consumed = 5;
+  uint64 rejected = 6;
+  sint32 clock_offset_ms = 7;
+}
+
+message CounterDeltas {
+  uint32 contract_version = 1;
+  string node_id = 2;
+  uint64 epoch = 3;
+  // Max 4096 deltas.
+  repeated CounterDelta deltas = 4;
+  string batch_id = 5;
+}
+
+message CounterAck {
+  uint32 contract_version = 1;
+  uint64 accepted = 2;
+  uint64 duplicate = 3;
+  uint64 applied_window = 4;
+  uint32 retry_after_ms = 5;
+}
+
+message AcquireLeaseRequest {
+  uint32 contract_version = 1;
+  string node_id = 2;
+  // Stable bucket identifier, e.g. a hashed client IP or hashed route. Raw IPs
+  // do not need to cross the region boundary.
+  string bucket_key = 3;
+  // Tokens to lease. Clamped to the configured per-request maximum and to the
+  // bucket's shared capacity.
+  uint32 requested_tokens = 4;
+  // Lease lifetime. Clamped by the server to [100 ms, 60000 ms]; expired
+  // leases are reaped without a refund (fail closed).
+  uint32 ttl_ms = 5;
+  // Caller-supplied dedupe key. A retry with the same key returns the original
+  // grant without debiting the bucket again.
+  string idempotency_key = 6;
+}
+
+message AcquireLeaseResponse {
+  uint32 contract_version = 1;
+  // False when the shared bucket has no tokens left; `retry_after_ms` is then
+  // a refill estimate.
+  bool granted = 2;
+  uint32 granted_tokens = 3;
+  // Tokens still available in the shared bucket (not leased or consumed).
+  uint32 remaining_tokens = 4;
+  // Total tokens currently leased by this node for the bucket, including the
+  // grant in this response.
+  uint32 lease_tokens = 5;
+  uint64 expires_at_unix_ms = 6;
+  string bucket_key = 7;
+  string idempotency_key = 8;
+  uint32 retry_after_ms = 9;
+  // Expired leases reaped while applying this command, for observability.
+  uint32 expired_leases = 10;
+}
+
+message ReleaseLeaseRequest {
+  uint32 contract_version = 1;
+  string node_id = 2;
+  string bucket_key = 3;
+  // Unused tokens to return. Values above the recorded lease are capped at the
+  // lease amount. Zero revokes the lease without a refund.
+  uint32 remaining_tokens = 4;
+  string idempotency_key = 5;
+}
+
+message ReleaseLeaseResponse {
+  uint32 contract_version = 1;
+  uint32 released_tokens = 2;
+  // Tokens available in the shared bucket after the refund.
+  uint32 remaining_tokens = 3;
+  string bucket_key = 4;
+  uint32 expired_leases = 5;
+}

@@ -1,0 +1,6 @@
+[server
+max_body_size = "not-a-number"
+
+[proxy]
+timeout_seconds = -1
+upstream_url = 42
