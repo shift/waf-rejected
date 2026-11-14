@@ -6,13 +6,20 @@ All notable changes to WAF-Rejected are documented here.
 
 ### Behaviour change
 
-- `server.max_body_size` now defaults to **2 MiB** (down from 10 MiB). Every
-  accepted body is inspected in full, and a 10 MiB body measured 1.43 s p50
-  with ~230 MiB of transient memory per in-flight request, so the old default
-  was a self-inflicted resource-exhaustion vector. Deployments that relied on
-  the 10 MiB default must now set `server.max_body_size` explicitly. Values
-  above 2 MiB remain supported, are an explicit opt-in, and log one start-up
-  warning naming the cap and its measured cost. Fail-closed behaviour is
+- **The default inspectable body cap drops from 2 MiB to 256 KiB.** Every
+  accepted body is inspected in full, and inspection is byte-linear at roughly
+  **140 ms CPU per MiB** on the reference hardware (measured: 64 KiB 8.9 ms,
+  256 KiB 34.4 ms, 512 KiB 114 ms, 1 MiB 183 ms, 2 MiB 332 ms, 10 MiB 2.2 s
+  p50), so the 2 MiB default cost about a third of a second of worker time per
+  upload. `0.1.0-beta.22` shipped the 2 MiB default for one release; it was
+  itself a reduction from the historical 10 MiB default. **Deployments that
+  relied on the beta.22 default are affected:** any upload between 256 KiB and
+  2 MiB now receives `413 Payload Too Large` and is never forwarded. To restore
+  the previous cap, set it explicitly, for example
+  `server.max_body_size = 2097152` (2 MiB); for the older default use
+  `server.max_body_size = 10485760` (10 MiB). Larger caps remain supported as
+  an explicit opt-in and log one start-up warning per process naming the key,
+  the configured value and the measured cost. Fail-closed behaviour is
   unchanged: over-cap bodies are still `413` and are never forwarded. See
   [`docs/operations/body-inspection-memory.md`](docs/operations/body-inspection-memory.md#choosing-a-body-cap).
 

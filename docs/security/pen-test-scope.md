@@ -290,7 +290,7 @@ Status vocabulary: **T** = automated test exists in this repository;
 | T3 | Rule bypass by request compression (gzip/br/deflate bomb) | Bounded decode before inspection (`decompression.rs`) | RES-03…RES-06 | T |
 | T4 | Protocol confusion (h2→h1, gRPC-as-HTTP, GraphQL JSON) | Version allowlist, gRPC classification, GraphQL pre-check, same pipeline on h3 | FRM-09, GRP-01…GRP-07, H3-02 | T (gap: h3 silent degrade, see T4a) |
 | T4a | HTTP/3 fails to start and traffic silently downgrades | `http3::serve` returns `Ok(())` without binding on QUIC config failure | H3-05 | **U** — no test asserts the listener actually exists |
-| T5 | Resource exhaustion via bodies/headers/connections/streams | Body cap (2 MiB default; larger is an explicit opt-in that warns with its measured cost), header bounds, connection cap, admission, WS/H3 caps | RES-01…RES-12 | T |
+| T5 | Resource exhaustion via bodies/headers/connections/streams | Body cap (256 KiB default; larger is an explicit opt-in that warns with its measured cost), header bounds, connection cap, admission, WS/H3 caps | RES-01…RES-12 | T |
 | T5a | Resource exhaustion via query-parameter count | None | — | **N** — no query-param-count limit (security model §5.3) |
 | T5b | Resource exhaustion via response header flood | Only hyper defaults | RSP-07 | **U** — no explicit bound or test |
 | T6 | Auth bypass / brute force / key stuffing | Constant-time digest, failure budget, per-key/per-IP/global throttles, expiry | AUT-01…AUT-09 | T |

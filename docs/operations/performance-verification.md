@@ -987,9 +987,9 @@ gates), so the rule count is constant and each scan is linear in the value.
 No inspection-path change is justified: none of the suspects reproduces, and the
 observed "5 000×" is a unit error in the report. 10 MiB remains an explicit
 opt-in, now with a documented cost of roughly **1.4–3.9 s p50** (130–280 ms
-of CPU per MiB) for a one-argument body, versus roughly **0.29–0.75 s p50** at
-the 2 MiB default. It is viable only for a route that genuinely needs 10 MiB bodies
-and can afford that latency; it is not a default.
+of CPU per MiB) for a one-argument body, versus roughly **34 ms p50** at the
+256 KiB default (2 MiB ≈ 0.29–0.75 s). It is viable only for a route that
+genuinely needs 10 MiB bodies and can afford that latency; it is not a default.
 
 If large-body latency becomes a requirement, the constant factor can be
 reduced by collapsing the 18 gate representations that resolve to the same

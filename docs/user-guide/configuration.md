@@ -11,7 +11,7 @@ live in [`config/examples/`](../../config/examples/).
 1. Compiled defaults.
 2. The TOML file named by `WAF_CONFIG_FILE` (or `CONFIG_PATH`).
 3. `WAF_*` environment variables, using `__` for nesting:
-   `WAF_SERVER__MAX_BODY_SIZE=2097152`,
+   `WAF_SERVER__MAX_BODY_SIZE=262144`,
    `WAF_WAF__CORAZA__BACKEND=wasm`.
 
 A configured file that is missing or malformed is fatal, as is any value that
@@ -183,7 +183,7 @@ keep_alive_timeout_secs = 90
 enable_http2 = true
 enable_http3 = false
 supported_http_versions = ["1.0", "1.1", "2"]
-max_body_size = 2097152
+max_body_size = 262144
 max_header_count = 128
 max_header_bytes = 65536
 h3_max_connections = 1024
@@ -214,17 +214,17 @@ io_backend = "tokio"
   above these values as a backstop, not as the primary control.
 - `keep_alive_timeout_secs` bounds idle keep-alive and request-head reads. A
   connection that sends no next request within this window is closed.
-- `max_body_size` is the accepted request-body size (2 MiB by default) and
+- `max_body_size` is the accepted request-body size (256 KiB by default) and
   the effective cap is `min(proxy.max_request_size, server.max_body_size)`.
   Bodies above it are rejected with `413` before inspection and are never
   forwarded. The Rust engine derives its per-value inspection cap from this
   value, so every accepted body is inspectable. The whole body is inspected in
-  full, so latency and transient memory scale with the cap (1 MiB ≈ 0.28 ms;
-  10 MiB ≈ 1.43 s p50 and ~230 MiB per in-flight request on the reference
-  hardware). Values above 2 MiB are supported but are an explicit opt-in and
-  log one start-up warning naming the cap and its cost. Keep 2 MiB unless a
-  specific workload needs larger bodies and concurrency and memory are sized
-  for it; see
+  full at roughly 140 ms CPU per MiB, so latency and transient memory scale
+  with the cap (256 KiB ≈ 34 ms; 2 MiB ≈ 332 ms; 10 MiB ≈ 2.2 s p50 and
+  ~230 MiB per in-flight request on the reference hardware). Values above
+  256 KiB are supported but are an explicit opt-in and log one start-up
+  warning naming the cap and its cost. Keep 256 KiB unless a specific workload
+  needs larger bodies and concurrency and memory are sized for it; see
   [body inspection memory](../operations/body-inspection-memory.md#choosing-a-body-cap)
   for the measured table and the per-request memory bound.
 - `h3_max_connections`, `h3_max_concurrent_bidi_streams`,

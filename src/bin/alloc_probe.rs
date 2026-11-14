@@ -203,6 +203,9 @@ fn engine_config() -> Config {
     config.waf.rate_limit.global_enabled = false;
     config.waf.coraza.backend = CorazaBackend::Rust;
     config.waf.coraza.fallback = CorazaFallback::None;
+    // The probe includes a 10 MiB cell; the shipped default cap is 256 KiB, so
+    // raise it explicitly to keep measuring inspection rather than a 413.
+    config.server.max_body_size = 10 * 1024 * 1024;
     config.waf.coraza.eval_timeout_ms = 120_000;
     config
 }

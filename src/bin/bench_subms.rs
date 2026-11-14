@@ -731,7 +731,7 @@ fn run_l0(cli: &Cli, runtime: &tokio::runtime::Runtime) -> Result<Vec<Row>> {
         }
 
         if cli.stress_10m {
-            // The shipped default body cap is 2 MiB, so the stress cell must
+            // The shipped default body cap is 256 KiB, so the stress cell must
             // raise it or the 10 MiB row measures the transport's 413 instead
             // of body inspection. The engine value cap is derived from this
             // setting, exactly as in the serving path.

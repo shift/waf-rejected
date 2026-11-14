@@ -115,7 +115,7 @@ upstream_uri = "http://127.0.0.1:3000"
 
 [server]
 trusted_proxies = ["10.0.0.0/8"]
-max_body_size = 2097152
+max_body_size = 262144
 
 [waf.rate_limit]
 per_ip_enabled = true

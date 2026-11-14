@@ -629,7 +629,9 @@ fn run_waf(cli: &Cli) -> Result<Vec<serde_json::Value>> {
     config.waf.coraza.backend = waf_ingress::config::CorazaBackend::Rust;
     config.waf.coraza.fallback = waf_ingress::config::CorazaFallback::None;
     // A 10 MiB body is a legitimate case; keep the evaluation clock generous so
-    // the row measures the engine rather than a timeout.
+    // the row measures the engine rather than a timeout. The body cap must be
+    // raised explicitly because the shipped default is 256 KiB.
+    config.server.max_body_size = 10 * 1024 * 1024;
     config.waf.coraza.eval_timeout_ms = 120_000;
 
     let engine = WafEngine::with_config_and_metrics(&config, None);

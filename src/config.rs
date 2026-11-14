@@ -559,12 +559,12 @@ pub enum GrpcStreamingPolicy {
 
 /// Default accepted request-body size.
 ///
-/// Kept at 2 MiB: the native engine inspects bodies in full, and the measured
-/// cost grows linearly with the body (1 MiB is roughly 0.28 ms, 10 MiB is
-/// roughly 1.4 s p50 with ~230 MiB of transient memory per in-flight request
-/// on the reference hardware). A cap above this is supported but must be an
-/// explicit operator opt-in and logs a start-up warning.
-pub const DEFAULT_MAX_BODY_SIZE: usize = 2 * 1024 * 1024;
+/// 256 KiB. The native engine inspects bodies in full, and the measured cost
+/// grows linearly at roughly 140 ms of CPU per MiB on the reference hardware
+/// (64 KiB ≈ 8.9 ms, 256 KiB ≈ 34.4 ms, 512 KiB ≈ 114 ms, 1 MiB ≈ 183 ms,
+/// 2 MiB ≈ 332 ms, 10 MiB ≈ 2.2 s p50). A larger cap is supported but must be
+/// an explicit operator opt-in and logs one start-up warning per process.
+pub const DEFAULT_MAX_BODY_SIZE: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -593,12 +593,13 @@ pub struct ServerConfig {
 
     /// Maximum accepted request body size in bytes.
     ///
-    /// Defaults to [`DEFAULT_MAX_BODY_SIZE`] (2 MiB). Bodies above the
+    /// Defaults to [`DEFAULT_MAX_BODY_SIZE`] (256 KiB). Bodies above the
     /// effective cap (`min(proxy.max_request_size, server.max_body_size)`) are
     /// rejected with `413` before inspection and are never forwarded. Raising
-    /// this above 2 MiB is an explicit trade-off: every accepted body is
-    /// inspected in full, so the per-request memory and latency cost scales
-    /// linearly with the cap. A value above 2 MiB logs a start-up warning.
+    /// this above 256 KiB is an explicit trade-off: every accepted body is
+    /// inspected in full at roughly 140 ms of CPU per MiB, so the per-request
+    /// latency and memory cost scales linearly with the cap. A value above
+    /// 256 KiB logs one start-up warning per process.
     pub max_body_size: usize,
 
     /// Maximum number of header fields accepted in one request head.
@@ -3632,7 +3633,7 @@ impl Config {
         self.proxy.max_request_size.min(self.server.max_body_size)
     }
 
-    /// Start-up warning for an inspectable body cap above the 2 MiB default.
+    /// Start-up warning for an inspectable body cap above the 256 KiB default.
     ///
     /// Returns `None` at or below [`DEFAULT_MAX_BODY_SIZE`]. The trigger uses
     /// the resolved cap ([`Self::effective_max_request_body`]) so a tightening
@@ -3645,11 +3646,11 @@ impl Config {
         }
         let bytes = self.server.max_body_size;
         Some(format!(
-            "server.max_body_size = {bytes} bytes ({:.2} MiB) exceeds the 2 MiB default: bodies \
-             are inspected in full, and 10 MiB measured 1.4 s p50 with ~230 MiB of transient \
-             memory per in-flight request on the reference hardware (1 MiB: ~0.28 ms). You are \
-             explicitly accepting that per-request cost; keep 2 MiB unless larger uploads are \
-             required and concurrency and memory are sized for them",
+            "server.max_body_size = {bytes} bytes ({:.2} MiB) exceeds the 256 KiB default: \
+             bodies are inspected in full at ~140 ms CPU per MiB on this hardware; 2 MiB ≈ 332 ms, \
+             10 MiB ≈ 2.2 s per in-flight request. You are explicitly accepting that per-request \
+             cost; keep the 256 KiB default unless larger uploads are required and concurrency and \
+             memory are sized for them",
             bytes as f64 / (1024.0 * 1024.0)
         ))
     }
@@ -3693,10 +3694,10 @@ mod tests {
     }
 
     #[test]
-    fn default_body_cap_is_two_mib_and_does_not_warn() {
+    fn default_body_cap_is_256_kib_and_does_not_warn() {
         let config = Config::default();
-        assert_eq!(config.server.max_body_size, 2 << 20);
-        assert_eq!(config.effective_max_request_body(), 2 << 20);
+        assert_eq!(config.server.max_body_size, 256 << 10);
+        assert_eq!(config.effective_max_request_body(), 256 << 10);
         assert!(config.body_cap_warning().is_none());
     }
 
@@ -3708,18 +3709,30 @@ mod tests {
         assert!(warning.contains("server.max_body_size"), "{warning}");
         assert!(warning.contains("10485760"), "{warning}");
         assert!(warning.contains("MiB"), "{warning}");
-        assert!(warning.contains("1.4 s"), "{warning}");
-        assert!(warning.contains("230 MiB"), "{warning}");
+        assert!(warning.contains("140 ms CPU per MiB"), "{warning}");
+        assert!(warning.contains("332 ms"), "{warning}");
+        assert!(warning.contains("2.2 s"), "{warning}");
+        assert!(warning.contains("256 KiB default"), "{warning}");
         config
             .validate()
             .expect("an explicit larger cap must still load");
     }
 
     #[test]
+    fn a_two_mib_cap_warns_at_load() {
+        let mut config = Config::default();
+        config.server.max_body_size = 2 << 20;
+        assert!(config.body_cap_warning().is_some());
+        config
+            .validate()
+            .expect("an explicit 2 MiB cap must still load");
+    }
+
+    #[test]
     fn a_tightening_proxy_cap_suppresses_the_body_cap_warning() {
         let mut config = Config::default();
         config.server.max_body_size = 10 << 20;
-        config.proxy.max_request_size = 1 << 20;
+        config.proxy.max_request_size = 256 << 10;
         assert!(config.body_cap_warning().is_none());
     }
 
@@ -4177,8 +4190,8 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
     #[test]
     fn explicit_engine_value_cap_below_the_body_cap_is_rejected() {
         let mut config = Config::default();
-        config.server.max_body_size = 10 << 20;
-        config.waf.coraza.max_value_bytes = 1 << 20;
+        assert_eq!(config.server.max_body_size, DEFAULT_MAX_BODY_SIZE);
+        config.waf.coraza.max_value_bytes = 128 << 10;
         let error = config
             .validate_with_source("file '/etc/waf/config.toml'")
             .expect_err("a smaller engine cap must fail at load")
@@ -4187,7 +4200,7 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
         assert!(error.contains("server.max_body_size"), "{error}");
         assert!(error.contains("/etc/waf/config.toml"), "{error}");
 
-        config.waf.coraza.max_value_bytes = 10 << 20;
+        config.waf.coraza.max_value_bytes = 2 << 20;
         assert!(config.validate().is_ok());
         config.waf.coraza.max_value_bytes = 0;
         assert!(config.validate().is_ok());
@@ -4196,7 +4209,7 @@ anonymous_database_path = "/tmp/GeoIP2-Anonymous-IP.mmdb"
                 .waf
                 .coraza
                 .resolved_max_value_bytes(config.server.max_body_size),
-            10 << 20
+            DEFAULT_MAX_BODY_SIZE
         );
     }
 

@@ -151,7 +151,7 @@ Notes:
 
 - `WAF_CONFIG_FILE` already defaults to `/etc/waf/config.toml`. Known `WAF_*`
   environment variables override the file, using `__` for nesting, for example
-  `WAF_SERVER__MAX_BODY_SIZE=2097152` or
+  `WAF_SERVER__MAX_BODY_SIZE=262144` or
   `WAF_WAF__CORAZA__BACKEND=wasm`. Unknown keys are rejected at start-up.
 - The default backend is the native Rust CRS engine. Select the Coraza reference
   reactor with `WAF_WAF__CORAZA__BACKEND=wasm` or the opt-in sidecar with

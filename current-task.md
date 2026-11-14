@@ -1592,3 +1592,42 @@ cache penalty, not an exponent.
   rust proxy" claim was removed from the flag docs.
 - Re-run: `L0-engine-stress rust, 10 MiB` is `allow` again at 3.93 s p50
   (load 4.0; the same row was 1.4 s on the reference host).
+
+# fix: default inspectable body cap 2 MiB -> 256 KiB (`.worktrees/body256`)
+
+**Branch:** `fix/default-body-cap-256k` (base `448995f`).
+**MCP discovery:** no MCP resources/templates exposed in this session.
+**Basis:** `docs/operations/performance-verification.md` §11.10 — byte-linear
+inspection at ~140 ms CPU per MiB (256 KiB 34.4 ms, 2 MiB 332 ms, 10 MiB 2.2 s
+p50). beta.22 shipped the 2 MiB default for one release.
+
+## Plan
+
+- [x] `DEFAULT_MAX_BODY_SIZE = 256 KiB`; `ServerConfig`/`Config` defaults and
+      engine/processor derivation follow the configured value (no second
+      constant); `resolved_max_*` helpers unchanged (parameterised).
+- [x] Warning threshold at 256 KiB; message carries the measured per-MiB cost;
+      one `warn` per process in `Config::validate`.
+- [x] Config surfaces: root/test/example configs, Docker, compose, K8s,
+      Helm `server.maxBodySize`, fuzz corpus, README/configuration reference.
+- [x] Docs: `body-inspection-memory.md` (new bounds + measured cap table),
+      security-model resource rows, pen-test T5, performance-verification
+      verdict.
+- [x] Bench/probe harnesses that intentionally use 10 MiB bodies
+      (`perf-gate-bench`, `alloc-probe`, `bench-subms` stress cell) raise the
+      cap explicitly so they still measure inspection.
+- [x] CHANGELOG Unreleased behaviour change (2 MiB -> 256 KiB, affected
+      deployments, restore instructions, beta.22 note).
+- [x] Tests: 256 KiB default inspected + rule match blocks; 256 KiB + 1 -> 413
+      with zero forwards; explicit 2 MiB/10 MiB load, warn once, inspect
+      >256 KiB; no warning at default; engine value cap below body cap fails.
+
+## Gates
+
+- `nix develop -c cargo fmt -- --check` — pass.
+- `nix develop -c cargo clippy --lib -- --deny warnings` — pass.
+- `nix develop -c cargo test --lib` — 700 passed / 0 failed / 11 ignored.
+- `nix develop -c cargo test --test integration` — 94 passed / 0 failed /
+  14 ignored.
+- `./scripts/validate-configs.sh` — 20 configs ok, 7 tests pass.
+- `nix build .#waf-ingress` — exit 0.

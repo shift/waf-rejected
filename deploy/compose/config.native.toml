@@ -3,7 +3,7 @@ health_bind_addr = "0.0.0.0:8081"
 upstream_uri = "http://upstream:3000"
 
 [server]
-max_body_size = 2097152
+max_body_size = 262144
 enable_http2 = true
 enable_http3 = false
 supported_http_versions = ["1.0", "1.1", "2"]

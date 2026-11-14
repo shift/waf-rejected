@@ -1,6 +1,6 @@
 # Body inspection memory budget
 
-The proxy accepts request bodies up to `server.max_body_size` (2 MiB by
+The proxy accepts request bodies up to `server.max_body_size` (256 KiB by
 default). The native Rust engine's per-value budget is derived from the same
 value at engine construction, so a body the proxy accepts can always be charged
 to the engine budget and inspected. Status semantics:
@@ -16,24 +16,27 @@ An explicit `waf.coraza.max_value_bytes` below `server.max_body_size` is
 rejected at load, because it would recreate the gap where a body is accepted
 but cannot be inspected. `0` (the default) derives the cap from the body cap.
 
-A resolved cap above 2 MiB is supported but is an explicit opt-in: start-up
-logs one `warn` line naming `server.max_body_size`, its value, and the measured
-per-request cost. At the default no warning is emitted.
+A resolved cap above 256 KiB is supported but is an explicit opt-in: start-up
+logs one `warn` line per process naming `server.max_body_size`, its value, and
+the measured per-request cost (≈140 ms CPU per MiB on the reference hardware).
+At the default no warning is emitted.
 
 ## Worst case for one in-flight request
 
-At the 2 MiB default the engine uses a 2 MiB per-value cap and a 64 MiB
-request-wide budget. The request-wide multiplier is 32×: CRS applies many
-distinct transform pipelines to `REQUEST_BODY`, and each pipeline's output is
-real materialised bytes that the budget must admit.
+The engine's per-value cap has a historical 1 MiB floor
+(`Limits::DEFAULT_MAX_VALUE_BYTES`), so at the 256 KiB body default the engine
+uses a 1 MiB per-value cap and a 32 MiB request-wide budget. The request-wide
+multiplier is 32×: CRS applies many distinct transform pipelines to
+`REQUEST_BODY`, and each pipeline's output is real materialised bytes that the
+budget must admit.
 
 | component | bound | notes |
 |---|---:|---|
-| transport body buffer | 2 MiB | read once; the engine borrows this slice |
-| request-wide engine budget | 64 MiB | 32 × the per-value cap; accounting for body, decoded values and transform output |
-| body-processor decoded values | 2 MiB | at most one value at the per-value cap (JSON/XML/form) |
-| transform cache arena | 128 MiB | hard stop at 2 × the request-wide budget |
-| **hard ceiling** | **≈132 MiB** | plus fixed per-request scratch and headers |
+| transport body buffer | 256 KiB | read once; the engine borrows this slice |
+| request-wide engine budget | 32 MiB | 32 × the 1 MiB per-value cap (the floor applies below 1 MiB bodies) |
+| body-processor decoded values | 1 MiB | at most one value at the per-value cap (JSON/XML/form) |
+| transform cache arena | 64 MiB | hard stop at 2 × the request-wide budget |
+| **hard ceiling** | **≈65 MiB** | arena + transport buffer + one processor copy, plus fixed per-request scratch and headers |
 
 The hard ceiling is deliberately conservative: it is the point at which the
 engine fails closed, not a number the shipped CRS bundle reaches. At the 10 MiB
@@ -47,24 +50,32 @@ header-only request never allocates body-proportional memory.
 
 Inspection cost scales with the number of bytes accepted, because the whole
 body is buffered and inspected in full. Measurements on the reference host
-(CRS bundle, native Rust engine):
+(CRS bundle, native Rust engine, URL-encoded body, thread CPU time; load
+8.4–11.2, so absolute wall-clock values are pessimistic):
 
 | `server.max_body_size` | p50 inspection | transient memory per in-flight request |
 |---:|---:|---:|
-| 1 MiB | ≈ 0.28 ms | ≈ 23 MiB |
-| 2 MiB (default) | ≈ 0.6 ms | ≈ 46 MiB |
-| 10 MiB | 1.43 s | ≈ 230 MiB |
+| 64 KiB | 8.9 ms | ≈ 1.4 MiB |
+| **256 KiB (default)** | **34.4 ms** | **≈ 5.8 MiB** |
+| 512 KiB | 114 ms | ≈ 11.5 MiB |
+| 1 MiB | 183 ms | ≈ 23 MiB |
+| 2 MiB | 332 ms | ≈ 46 MiB |
+| 10 MiB | 2.2 s | ≈ 230 MiB |
 
-The memory column scales roughly linearly with the cap and is dominated by
-materialised transform output. The 10 MiB figures are measured; smaller rows
-are interpolated from the same linear model, not separately benchmarked.
+CPU cost per MiB is flat at 133–144 ms through 2 MiB, then 162–190 ms from
+4 MiB up (a last-level cache effect, not an exponent). The memory column
+scales roughly linearly with the cap and is dominated by materialised
+transform output; the 10 MiB figure is measured and the smaller rows are
+interpolated from the same linear model. The full curve and phase split are in
+[`performance-verification.md`](performance-verification.md#1110-body-size-scaling-the-reported-5-000-is-a-kibmib-mix-up).
 
 A handful of concurrent 10 MiB uploads can therefore consume gigabytes and pin
-worker threads for seconds. Keep the 2 MiB default unless a specific workload
+worker threads for seconds. Keep the 256 KiB default unless a specific workload
 needs larger bodies, and then size process memory and concurrency for the cost
-above. Raising the cap requires setting `server.max_body_size` explicitly and
-accepts that cost; the process logs a start-up warning to make the trade-off
-visible.
+above. Raising the cap requires setting `server.max_body_size` explicitly (for
+example `server.max_body_size = 2097152` for the beta.22 default, or
+`10485760` for 10 MiB) and accepts that cost; the process logs a start-up
+warning to make the trade-off visible.
 
 ## Why the body is not copied per rule
 

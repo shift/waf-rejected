@@ -399,16 +399,16 @@ fn large_body(len: usize) -> String {
 
 #[cfg(feature = "rust-engine")]
 #[tokio::test]
-async fn two_mib_body_is_inspected_with_the_default_cap() {
+async fn default_256_kib_body_is_inspected() {
     let upstream = spawn_upstream().await;
     let config = inspected_config(upstream);
-    assert_eq!(config.server.max_body_size, 2 << 20);
+    assert_eq!(config.server.max_body_size, 256 << 10);
     let proxy = spawn_proxy(config).await;
 
     let response = reqwest::Client::new()
         .post(format!("http://{proxy}/upload"))
         .header("content-type", "application/x-www-form-urlencoded")
-        .body(large_body(2 << 20))
+        .body(large_body(256 << 10))
         .send()
         .await
         .unwrap();
@@ -418,7 +418,7 @@ async fn two_mib_body_is_inspected_with_the_default_cap() {
     assert_eq!(
         status,
         StatusCode::OK,
-        "a 2 MiB body must be inspected, not fail closed: {text}"
+        "a 256 KiB body must be inspected, not fail closed: {text}"
     );
 }
 
@@ -458,8 +458,39 @@ fn load_and_count_warnings(config: &Config) -> usize {
 #[test]
 fn the_default_body_cap_does_not_log_a_warning() {
     let config = Config::default();
-    assert_eq!(config.server.max_body_size, 2 << 20);
+    assert_eq!(config.server.max_body_size, 256 << 10);
     assert_eq!(load_and_count_warnings(&config), 0);
+}
+
+#[cfg(feature = "rust-engine")]
+#[tokio::test]
+async fn two_mib_opt_in_cap_warns_once_and_inspects_above_the_default() {
+    let upstream = spawn_upstream().await;
+    let mut config = inspected_config(upstream);
+    config.server.max_body_size = 2 << 20;
+
+    assert_eq!(
+        load_and_count_warnings(&config),
+        1,
+        "a cap above 256 KiB must log exactly one start-up warning"
+    );
+
+    let proxy = spawn_proxy(config).await;
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy}/upload"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(large_body(512 << 10))
+        .send()
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let text = response.text().await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an opted-in 2 MiB cap must inspect a body above 256 KiB, not fail closed: {text}"
+    );
 }
 
 #[cfg(feature = "rust-engine")]
@@ -472,7 +503,7 @@ async fn ten_mib_opt_in_cap_warns_once_and_inspects_above_the_default() {
     assert_eq!(
         load_and_count_warnings(&config),
         1,
-        "a cap above 2 MiB must log exactly one start-up warning"
+        "a cap above 256 KiB must log exactly one start-up warning"
     );
 
     let proxy = spawn_proxy(config).await;
@@ -489,8 +520,21 @@ async fn ten_mib_opt_in_cap_warns_once_and_inspects_above_the_default() {
     assert_eq!(
         status,
         StatusCode::OK,
-        "an opted-in cap must inspect a body above 2 MiB, not fail closed: {text}"
+        "an opted-in cap must inspect a body above 256 KiB, not fail closed: {text}"
     );
+}
+
+#[cfg(feature = "rust-engine")]
+#[test]
+fn an_engine_value_cap_below_the_body_cap_fails_at_load() {
+    let mut config = Config::default();
+    config.waf.coraza.max_value_bytes = 128 << 10;
+    let error = config
+        .validate_with_source("file '/etc/waf/config.toml'")
+        .expect_err("a smaller engine value cap must fail at load")
+        .to_string();
+    assert!(error.contains("waf.coraza.max_value_bytes"), "{error}");
+    assert!(error.contains("server.max_body_size"), "{error}");
 }
 
 #[cfg(feature = "rust-engine")]
@@ -498,12 +542,12 @@ async fn ten_mib_opt_in_cap_warns_once_and_inspects_above_the_default() {
 async fn body_over_the_cap_returns_413_and_is_not_forwarded() {
     let (upstream, forwarded) = spawn_counting_upstream().await;
     let config = inspected_config(upstream);
-    assert_eq!(config.server.max_body_size, 2 << 20);
+    assert_eq!(config.server.max_body_size, 256 << 10);
     let proxy = spawn_proxy(config).await;
 
     let response = reqwest::Client::new()
         .post(format!("http://{proxy}/upload"))
-        .body(vec![b'A'; (2 << 20) + 1])
+        .body(vec![b'A'; (256 << 10) + 1])
         .send()
         .await
         .unwrap();
@@ -518,13 +562,13 @@ async fn body_over_the_cap_returns_413_and_is_not_forwarded() {
 
 #[cfg(feature = "rust-engine")]
 #[tokio::test]
-async fn a_rule_match_inside_a_two_mib_body_is_blocked() {
+async fn a_rule_match_inside_a_256_kib_body_is_blocked() {
     let upstream = spawn_upstream().await;
     let config = inspected_config(upstream);
     let proxy = spawn_proxy(config).await;
 
     let suffix = "&q=%27+OR+%271%27%3D%271%27";
-    let mut body = large_body((2 << 20) - suffix.len());
+    let mut body = large_body((256 << 10) - suffix.len());
     body.push_str(suffix);
     let response = reqwest::Client::new()
         .post(format!("http://{proxy}/upload"))
@@ -539,6 +583,6 @@ async fn a_rule_match_inside_a_two_mib_body_is_blocked() {
     assert_eq!(
         status,
         StatusCode::FORBIDDEN,
-        "a CRS match at 2 MiB must block: {text}"
+        "a CRS match at 256 KiB must block: {text}"
     );
 }

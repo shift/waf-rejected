@@ -612,12 +612,13 @@ inspected window, or exhaust memory.
 **Current control:** path and query over 8 KiB return `414`; body over the
 effective cap returns `413`; the proxy streams and rejects bodies over
 `min(server.max_body_size, proxy.max_request_size)` before inspection. The
-default body cap is 2 MiB because every accepted body is inspected in full;
-larger caps are an explicit opt-in that logs a start-up warning with the
-measured cost (10 MiB ≈ 1.43 s p50 and ~230 MiB of transient memory per
-in-flight request). Header count and header-section size are enforced by
-`server.max_header_count` and `server.max_header_bytes` before body handling,
-returning a generic `431` with details only in server logs.
+default body cap is 256 KiB because every accepted body is inspected in full
+at roughly 140 ms CPU per MiB; larger caps are an explicit opt-in that logs one
+start-up warning with the measured cost (2 MiB ≈ 332 ms, 10 MiB ≈ 2.2 s p50 and
+~230 MiB of transient memory per in-flight request). Header count and
+header-section size are enforced by `server.max_header_count` and
+`server.max_header_bytes` before body handling, returning a generic `431` with
+details only in server logs.
 `server.max_connections` caps concurrent ingress connections, so concurrent
 large uploads cannot grow without bound. See
 [body inspection memory](../operations/body-inspection-memory.md).
@@ -867,9 +868,9 @@ The model holds only if the operator satisfies these assumptions:
    or committed. The config file is readable only by the service account.
 6. The process runs as a non-root user with a read-only root filesystem except
    for the event-store/CEF paths, and has CPU/memory limits sized for
-   `max_body_size × expected concurrency` (at the 2 MiB default budget the
-   measured ~46 MiB of transient memory per in-flight large upload; a 10 MiB
-   cap measures ~230 MiB).
+   `max_body_size × expected concurrency` (at the 256 KiB default budget the
+   measured ~6 MiB of transient memory per in-flight large upload; a 2 MiB cap
+   measures ~46 MiB and a 10 MiB cap ~230 MiB).
 7. MaxMind databases, if used, are licensed, mounted read-only and refreshed on
    a schedule; their absence is treated as a configuration error by monitoring.
 8. Logs and events are shipped to a SIEM with retention that meets the
