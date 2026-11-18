@@ -89,7 +89,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Nix
-        uses: cachix/install-nix-action@v25
+        uses: cachix/install-nix-action@v31
       - name: Check formatting
         run: nix develop -c cargo fmt -- --check
       - name: Clippy (default features)
@@ -122,7 +122,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Nix
-        uses: cachix/install-nix-action@v25
+        uses: cachix/install-nix-action@v31
       - name: Run library tests
         run: nix develop -c cargo test --lib ${{ matrix.args }}
 
@@ -149,7 +149,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Nix
-        uses: cachix/install-nix-action@v25
+        uses: cachix/install-nix-action@v31
       - name: Check target compilation
         run: nix develop -c cargo check ${{ matrix.args }}
 
@@ -163,7 +163,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Nix
-        uses: cachix/install-nix-action@v25
+        uses: cachix/install-nix-action@v31
       - name: Run CRS corpus (wasm + native parity)
         run: ./scripts/run-crs-corpus.sh --engine both --json target/crs-corpus.json
       - name: Upload corpus report
@@ -187,7 +187,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Nix
-        uses: cachix/install-nix-action@v25
+        uses: cachix/install-nix-action@v31
       - name: Run engine guarantees
         run: ./scripts/check-engine-guarantees.sh
       - name: Upload guarantee reports
