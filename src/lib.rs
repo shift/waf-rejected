@@ -49,6 +49,7 @@ pub mod affinity;
 
 // Core modules for Strategic Roadmap v0.1
 pub mod config;
+pub mod egress;
 pub mod engine;
 pub mod error;
 pub mod health;

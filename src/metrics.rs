@@ -112,6 +112,13 @@ pub struct Metrics {
     response_skipped_streaming_total: AtomicU64,
     response_skipped_unsupported_total: AtomicU64,
     response_body_truncated_total: AtomicU64,
+    // Egress mode: outcomes and fixed rule ids. Kept here so the existing
+    // `/metrics` listener and the egress listener render the same snapshot.
+    egress_fetched_total: AtomicU64,
+    egress_recorded_total: AtomicU64,
+    egress_blocked_total: AtomicU64,
+    egress_failed_total: AtomicU64,
+    egress_rule_hits: [AtomicU64; crate::egress::ALL_RULE_IDS.len()],
     /// Attached distributed fabric handle, when compiled and enabled.
     #[cfg(feature = "distri-kv")]
     distributed:
@@ -220,6 +227,11 @@ impl Metrics {
             response_skipped_streaming_total: AtomicU64::new(0),
             response_skipped_unsupported_total: AtomicU64::new(0),
             response_body_truncated_total: AtomicU64::new(0),
+            egress_fetched_total: AtomicU64::new(0),
+            egress_recorded_total: AtomicU64::new(0),
+            egress_blocked_total: AtomicU64::new(0),
+            egress_failed_total: AtomicU64::new(0),
+            egress_rule_hits: std::array::from_fn(|_| AtomicU64::new(0)),
             #[cfg(feature = "distri-kv")]
             distributed: std::sync::RwLock::new(None),
         }
@@ -247,6 +259,30 @@ impl Metrics {
 
     pub fn record_blocked(&self) {
         self.blocked_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one egress fetch outcome (`fetched`, `recorded`, `blocked`,
+    /// `failed`). Unknown outcomes are ignored.
+    pub fn record_egress_outcome(&self, outcome: &str) {
+        let counter = match outcome {
+            "fetched" => &self.egress_fetched_total,
+            "recorded" => &self.egress_recorded_total,
+            "blocked" => &self.egress_blocked_total,
+            "failed" => &self.egress_failed_total,
+            _ => return,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one egress rule match by its fixed id (`EG-*`). Unknown ids are
+    /// ignored so a new rule id can never silently land in another bucket.
+    pub fn record_egress_rule(&self, rule_id: &str) {
+        if let Some(index) = crate::egress::ALL_RULE_IDS
+            .iter()
+            .position(|known| *known == rule_id)
+        {
+            self.egress_rule_hits[index].fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn record_auth_failure(&self) {
@@ -1137,6 +1173,30 @@ impl Metrics {
             self.allow_cache_invalidations_total.load(Ordering::Relaxed),
             self.allow_cache_entries.load(Ordering::Relaxed),
         ));
+
+        out.push_str(&format!(
+            "# HELP waf_egress_outcome_total Egress fetch requests by outcome.\n\
+             # TYPE waf_egress_outcome_total counter\n\
+             waf_egress_outcome_total{{outcome=\"fetched\"}} {}\n\
+             waf_egress_outcome_total{{outcome=\"recorded\"}} {}\n\
+             waf_egress_outcome_total{{outcome=\"blocked\"}} {}\n\
+             waf_egress_outcome_total{{outcome=\"failed\"}} {}\n",
+            self.egress_fetched_total.load(Ordering::Relaxed),
+            self.egress_recorded_total.load(Ordering::Relaxed),
+            self.egress_blocked_total.load(Ordering::Relaxed),
+            self.egress_failed_total.load(Ordering::Relaxed),
+        ));
+
+        out.push_str(
+            "# HELP waf_egress_rule_hits_total Egress rule matches by fixed rule id.\n\
+             # TYPE waf_egress_rule_hits_total counter\n",
+        );
+        for (index, rule_id) in crate::egress::ALL_RULE_IDS.iter().enumerate() {
+            out.push_str(&format!(
+                "waf_egress_rule_hits_total{{rule_id=\"{rule_id}\"}} {}\n",
+                self.egress_rule_hits[index].load(Ordering::Relaxed)
+            ));
+        }
 
         out.push_str(&format!(
             "# HELP waf_uptime_seconds Process uptime in seconds.\n\

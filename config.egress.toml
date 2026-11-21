@@ -1,0 +1,45 @@
+# Laptop egress preset for waf-rejected.
+#
+# Use it when an agent on the same machine should be able to ask the WAF for
+# a URL and receive the body plus a verdict:
+#
+#   WAF_CONFIG_FILE=config.egress.toml cargo run --release
+#
+# Egress mode is a *fetch service*, not a proxy. It performs the request
+# itself, sees the plaintext response and returns a verdict. It needs no
+# upstream, no TLS certificate and no local CA.
+#
+# Bind loopback only: whoever can reach this port can make the service fetch
+# on their behalf.
+
+[egress]
+enabled = true
+bind_addr = "127.0.0.1:8082"
+
+# "record" returns the body and warns when a rule matches; "refuse" blocks an
+# injection match with 403. SSRF, scheme, port, credential-query and body-cap
+# rules refuse in both modes.
+mode = "record"
+
+# Hard response-body cap (2 MiB). A larger response is cut at the cap, refused
+# with EG-2002 and reported as truncated.
+max_bytes = 2097152
+
+# Wall-clock budget for one fetch, including DNS, redirects and TLS.
+timeout_ms = 15000
+
+# Each redirect target is re-checked before it is followed.
+max_redirects = 3
+
+allow_schemes = ["https"]
+allow_ports = [443]
+allow_domains = []               # empty = any domain that passes the IP checks
+deny_domains = []
+
+allow_content_types = [
+  "text/html",
+  "text/plain",
+  "application/json",
+  "application/xml",
+  "text/markdown",
+]
