@@ -118,8 +118,10 @@ cap. EG-2003 remains a record even in refuse mode.
 At most `max_redirects` (default 3) redirects are followed. Every hop is
 re-resolved and re-checked against EG-1001, EG-1002, EG-1003, EG-1004, EG-1005,
 EG-1006 and EG-1007 **before the next connection**. A redirect to
-`http://169.254.169.254/` is refused with EG-1002; the metadata endpoint is never
-contacted.
+`http://169.254.169.254/` is refused before the metadata endpoint is contacted:
+with the default allowlist the scheme or port rule names the mismatch first,
+and when the target scheme and port are allowed the address rule refuses it as
+EG-1002. In every ordering the second hop is never requested.
 
 The service resolves the name once per hop, checks every returned address, and
 connects to the checked address rather than passing the name to a connector that
@@ -181,6 +183,9 @@ egress mode running.
   `display:none` and `font-size:0` blocks over 200 characters. Other hiding
   techniques (off-screen positioning, tiny opacity, colour matching) are not
   covered.
+- **It does not decompress `Content-Encoding`.** A gzipped or brotli response
+  is inspected as stored bytes, so a marker compressed by the origin can be
+  missed. Plain responses, which is what the rule table describes, are covered.
 - **It is not a credential store.** EG-1005 refuses credential-looking query
   names; it does not scrub headers, cookies or bodies, and it never stores
   secrets.
