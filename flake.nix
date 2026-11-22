@@ -22,7 +22,8 @@
   };
 
   outputs = { self, nixpkgs, flake-utils, rust-overlay, crane }:
-    flake-utils.lib.eachDefaultSystem (system:
+    let
+      systems = flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs {
@@ -271,6 +272,11 @@
             mainProgram = "hyperscan-bench";
           };
         });
+
+        # OCI image (layered) built from the same crane package.
+        container = pkgs.callPackage ./nix/container.nix {
+          inherit waf-ingress;
+        };
       in
       {
         packages = {
@@ -302,6 +308,9 @@
 
           # Experimental Vectorscan/Hyperscan prefilter benchmark
           hyperscan-bench = hyperscan-bench;
+
+          # OCI image
+          container = container;
         };
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
@@ -393,4 +402,15 @@
           WASM_OPT_PATH = "${pkgs.binaryen}/bin/wasm-opt";
         };
       });
+    in
+    systems // {
+      nixosModules = {
+        waf-rejected = { pkgs, lib, ... }: {
+          imports = [ ./nix/module.nix ];
+          services.waf-rejected.package = lib.mkDefault
+            self.packages.${pkgs.stdenv.hostPlatform.system}.waf-ingress;
+        };
+        default = self.nixosModules.waf-rejected;
+      };
+    };
 }
