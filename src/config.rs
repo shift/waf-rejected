@@ -40,6 +40,92 @@ pub struct Config {
     pub security: SecurityConfig,
     /// Runtime / scheduling configuration (Tokio tuning and CPU pinning).
     pub runtime: RuntimeConfig,
+
+    /// Optional local fetch service used by agents ("egress mode").
+    ///
+    /// Disabled by default, so deployments that never set `[egress]` keep the
+    /// edge behaviour exactly as before.
+    pub egress: EgressConfig,
+}
+
+/// How an egress rule that defaults to `record` behaves in this deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EgressMode {
+    /// Return the body and record the rule match (`200`, outcome `recorded`).
+    Record,
+    /// Refuse the response when an injection rule matches (`403`).
+    Refuse,
+}
+
+impl Default for EgressMode {
+    fn default() -> Self {
+        Self::Record
+    }
+}
+
+/// Local, laptop-friendly fetch service for agents.
+///
+/// It is a fetch service, not a proxy: the agent asks the service for a URL,
+/// the service performs the request itself, and returns the body plus a
+/// verdict. This lets it inspect the plaintext response without terminating
+/// TLS or installing a local CA.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EgressConfig {
+    /// Start the egress listener. Default `false`: existing deployments are
+    /// unchanged and no extra port is bound.
+    pub enabled: bool,
+    /// Listener address. Loopback by default: the service is for the agent on
+    /// the same laptop, not for the network.
+    pub bind_addr: SocketAddr,
+    /// `record` returns the body with a warning; `refuse` blocks an injection
+    /// match with `403`.
+    pub mode: EgressMode,
+    /// Hard response-body cap. Larger bodies are cut at the cap and refused by
+    /// `EG-2002`; `truncated` is reported as `true`.
+    pub max_bytes: usize,
+    /// Per-fetch wall-clock budget in milliseconds.
+    pub timeout_ms: u64,
+    /// Maximum number of redirects followed (each hop is re-checked).
+    pub max_redirects: usize,
+    /// Schemes the fetcher may use. Default `["https"]`.
+    pub allow_schemes: Vec<String>,
+    /// Destination ports the fetcher may use. Default `[443]`.
+    pub allow_ports: Vec<u16>,
+    /// Optional domain allowlist. Empty means any domain that passes the IP
+    /// checks. Matching is case-insensitive and includes subdomains.
+    pub allow_domains: Vec<String>,
+    /// Explicitly denied domains (and their subdomains).
+    pub deny_domains: Vec<String>,
+    /// Response content types returned without an `EG-2003` record.
+    pub allow_content_types: Vec<String>,
+}
+
+impl Default for EgressConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_addr: "127.0.0.1:8082"
+                .parse()
+                .expect("default egress bind address is valid"),
+            mode: EgressMode::Record,
+            max_bytes: 2 * 1024 * 1024,
+            timeout_ms: 15_000,
+            max_redirects: 3,
+            allow_schemes: vec!["https".to_string()],
+            allow_ports: vec![443],
+            allow_domains: Vec::new(),
+            deny_domains: Vec::new(),
+            allow_content_types: vec![
+                "text/html".to_string(),
+                "text/plain".to_string(),
+                "application/json".to_string(),
+                "application/xml".to_string(),
+                "text/markdown".to_string(),
+            ],
+        }
+    }
 }
 
 /// Health and readiness probe configuration.
@@ -2811,6 +2897,7 @@ impl Default for Config {
             storage: StorageConfig::default(),
             security: SecurityConfig::default(),
             runtime: RuntimeConfig::default(),
+            egress: EgressConfig::default(),
         }
     }
 }
@@ -3255,6 +3342,28 @@ impl Config {
     /// The loader passes the config file (and environment override) context so
     /// cross-field failures name the file the operator must edit.
     pub fn validate_with_source(&self, source: &str) -> anyhow::Result<()> {
+        if self.egress.enabled {
+            if self.egress.max_bytes == 0 {
+                anyhow::bail!("egress.max_bytes must be greater than zero");
+            }
+            if self.egress.timeout_ms == 0 {
+                anyhow::bail!("egress.timeout_ms must be greater than zero");
+            }
+            if self.egress.allow_schemes.is_empty() {
+                anyhow::bail!("egress.allow_schemes must not be empty when egress is enabled");
+            }
+            if self.egress.allow_ports.is_empty() {
+                anyhow::bail!("egress.allow_ports must not be empty when egress is enabled");
+            }
+            if !self.egress.bind_addr.ip().is_loopback() {
+                tracing::warn!(
+                    "egress.bind_addr {} is not a loopback address: egress mode performs \
+                     requests on behalf of whoever can reach it; bind 127.0.0.1 unless you \
+                     intend to share it",
+                    self.egress.bind_addr
+                );
+            }
+        }
         if self.waf.wasm.enabled && !cfg!(feature = "wasm-waf") {
             tracing::warn!(
                 "waf.wasm is the legacy component-ABI integration and is ignored by this \

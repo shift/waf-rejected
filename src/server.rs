@@ -180,6 +180,24 @@ pub async fn run_with_config(config: Config) -> Result<(), Box<dyn Error>> {
     let proxy_addr = config.bind_addr;
     info!("WAF-Rejected listening on http://{}", proxy_addr);
 
+    // Egress mode is its own loopback listener, started only when
+    // `[egress].enabled` is true. It shares the metrics snapshot, so the
+    // existing `/metrics` and the egress one agree.
+    if let Some(egress) =
+        crate::egress::EgressService::maybe_from_config(&config, proxy_service.metrics())
+    {
+        let egress_addr = config.egress.bind_addr;
+        let egress = std::sync::Arc::new(egress);
+        info!("Egress mode enabled on http://{}", egress_addr);
+        tokio::spawn(async move {
+            if let Err(e) = egress.start(egress_addr).await {
+                error!("Egress service failed: {}", e);
+            }
+        });
+    } else {
+        info!("Egress mode disabled");
+    }
+
     tokio::select! {
         result = proxy_service.start(proxy_addr) => {
             if let Err(e) = result {
